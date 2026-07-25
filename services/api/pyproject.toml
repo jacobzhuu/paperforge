@@ -1,0 +1,40 @@
+[project]
+name = "paperforge-api"
+version = "0.1.0"
+description = "PaperForge FastAPI 服务：REST + SSE"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic-settings>=2.3",
+    "paperforge-observability",
+    "paperforge-db",
+    "llm-runtime",
+    "paper-ir",
+    "scholar-gateway",
+    "ingest",
+    "paperforge-storage",
+    "paperforge-worker",
+    "arq>=0.26",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+paperforge-api = "paperforge_api.__main__:main"
+
+[tool.uv.sources]
+paperforge-observability = { workspace = true }
+paperforge-db = { workspace = true }
+llm-runtime = { workspace = true }
+paper-ir = { workspace = true }
+scholar-gateway = { workspace = true }
+ingest = { workspace = true }
+paperforge-storage = { workspace = true }
+paperforge-worker = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["paperforge_api"]

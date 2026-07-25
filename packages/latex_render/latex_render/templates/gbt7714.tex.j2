@@ -1,0 +1,37 @@
+%% PaperForge 生成的 LaTeX 工程（模板：中文学报 / GB-T 7714 参考文献）
+%% 导言区由模板锁定，LLM 不可修改（设计 §4.6）。
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+%% gbt7714 宏包缺失时降级为 unsrt：编译成功优先于书目风格（draft-first）。
+\IfFileExists{gbt7714.sty}{\usepackage[super]{gbt7714}}{}
+
+\providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\title{ {{- title -}} }
+{% if authors %}\author{ {{- authors -}} }{% else %}\author{}{% endif %}
+\date{}
+
+\begin{document}
+\maketitle
+
+{% if abstract %}\begin{abstract}
+{{ abstract }}
+\end{abstract}{% endif %}
+{% if keywords %}
+
+\noindent\textbf{关键词：} {{ keywords }}
+{% endif %}
+
+{{ body }}
+
+{% if has_bibliography %}\IfFileExists{gbt7714.sty}{\bibliographystyle{gbt7714-numerical}}{\bibliographystyle{unsrt}}
+\bibliography{refs}
+{% endif %}
+\end{document}

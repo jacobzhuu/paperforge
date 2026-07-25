@@ -1,0 +1,56 @@
+%% 与 latex_render/templates/gbt7714.tex.j2 的导言区保持一致（含中文排版）。
+\documentclass[11pt,a4paper]{article}
+\usepackage{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+\IfFileExists{gbt7714.sty}{\usepackage[super]{gbt7714}}{}
+\providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\title{预热文档}\author{}\date{}
+\begin{document}
+\maketitle
+\begin{abstract}中文摘要预热。\end{abstract}
+\section{中文章节}\label{sec:zh}
+中文正文与引用~\cite{warmup2020sample}，以及占位 \todo{待补充实验数据}。
+\IfFileExists{gbt7714.sty}{
+%% 字体族预热：数学下标/上标会拉取 cmr5/cmr7/cmmi7 等小号字，
+%% 只有在构建期真正排版过一次，networkless 运行时才拿得到。
+\section{Font warmup}
+\begin{equation}\label{eq:warm}
+  \sum_{i=1}^{n} x_i^{2} + \alpha_{jk} \approx \frac{1}{2}\int_0^\infty e^{-t^2}\,dt
+\end{equation}
+{\tiny tiny}\ {\scriptsize scriptsize}\ {\footnotesize footnotesize}\ {\small small}\
+{\large large}\ {\Large Large}\ {\LARGE LARGE}\ {\huge huge}
+\begin{itemize}\item item one\item item two\end{itemize}
+\textbf{bold} \textit{italic} \texttt{mono} \underline{underline}\footnote{footnote warmup}
+
+
+%% 字号 × 字形 全组合预热：Tectonic 按 *文件* 缓存字体，
+%% \tiny 加粗这类组合会拉 lmroman6-bold.otf 等独立字体文件，
+%% 只有构建期真的排版过，networkless + read-only 的运行时才拿得到。
+{\tiny normal} {\tiny \textbf{bold}} {\tiny \textit{italic}} {\tiny \textsc{smallcaps}} {\tiny \texttt{mono}}
+
+{\scriptsize normal} {\scriptsize \textbf{bold}} {\scriptsize \textit{italic}} {\scriptsize \textsc{smallcaps}} {\scriptsize \texttt{mono}}
+
+{\footnotesize normal} {\footnotesize \textbf{bold}} {\footnotesize \textit{italic}} {\footnotesize \textsc{smallcaps}} {\footnotesize \texttt{mono}}
+
+{\small normal} {\small \textbf{bold}} {\small \textit{italic}} {\small \textsc{smallcaps}} {\small \texttt{mono}}
+
+{\normalsize normal} {\normalsize \textbf{bold}} {\normalsize \textit{italic}} {\normalsize \textsc{smallcaps}} {\normalsize \texttt{mono}}
+
+{\large normal} {\large \textbf{bold}} {\large \textit{italic}} {\large \textsc{smallcaps}} {\large \texttt{mono}}
+
+{\Large normal} {\Large \textbf{bold}} {\Large \textit{italic}} {\Large \textsc{smallcaps}} {\Large \texttt{mono}}
+
+{\LARGE normal} {\LARGE \textbf{bold}} {\LARGE \textit{italic}} {\LARGE \textsc{smallcaps}} {\LARGE \texttt{mono}}
+
+{\huge normal} {\huge \textbf{bold}} {\huge \textit{italic}} {\huge \textsc{smallcaps}} {\huge \texttt{mono}}
+
+$x_{i_{j}}^{2^{3}} + \sqrt{\alpha_\beta}$
+
+\bibliographystyle{gbt7714-numerical}}{\bibliographystyle{unsrt}}
+\bibliography{refs}
+\end{document}

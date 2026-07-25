@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+apps/web/.next/
+apps/web/out/
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.*
+!.env.example
+
+# Data / artifacts / build
+data/
+artifacts/
+*.log
+.DS_Store
+
+# Object storage / minio local
+.minio/
+.pg/
+.paperforge/
+
+# Local planning/session notes
+task_plan.md
+progress.md
+findings.md
+_tmp_*
+apps/web/_tmp_*

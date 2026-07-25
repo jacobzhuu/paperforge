@@ -1,0 +1,63 @@
+[project]
+name = "paper-forge"
+version = "0.1.0"
+description = "PaperForge — AI 科研论文生成系统（成稿优先、引用真实、流程宽松）"
+requires-python = ">=3.12"
+readme = "README.md"
+
+# 顶层聚合依赖；各包在自身 pyproject 中声明精确依赖。
+dependencies = [
+    "paperforge-observability",
+    "paperforge-storage",
+    "paperforge-db",
+    "scholar-gateway",
+    "ingest",
+    "llm-runtime",
+    "paper-ir",
+    "latex-render",
+]
+
+[tool.uv.workspace]
+members = [
+    "packages/*",
+    "services/api",
+    "services/worker",
+    "services/texd",
+]
+
+[tool.uv.sources]
+paperforge-observability = { workspace = true }
+paperforge-storage = { workspace = true }
+paperforge-db = { workspace = true }
+scholar-gateway = { workspace = true }
+ingest = { workspace = true }
+llm-runtime = { workspace = true }
+paper-ir = { workspace = true }
+latex-render = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic 自动生成的迁移保持原样，便于与 --autogenerate 输出逐字比对。
+"packages/db/migrations/versions/*.py" = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["packages", "services"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

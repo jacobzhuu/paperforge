@@ -1,0 +1,82 @@
+# PaperForge 基建编排（裁剪自 DeepSearch infra：去 OpenSearch/SearXNG/caddy/grafana）
+# 用途：本地一键起 postgres + redis + minio + texd。应用服务(api/worker)本地运行或另行容器化。
+name: paperforge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: paperforge
+      POSTGRES_PASSWORD: paperforge
+      POSTGRES_DB: paperforge
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-16379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: paperforge
+      MINIO_ROOT_PASSWORD: paperforge-secret
+    ports:
+      - "127.0.0.1:${MINIO_API_HOST_PORT:-19000}:9000"       # S3 API
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-19001}:9001"   # 控制台
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Tectonic 编译沙箱：无外网、只读模板、资源限额。构建见 services/texd/Dockerfile。
+  texd:
+    build:
+      context: ..
+      dockerfile: services/texd/Dockerfile
+    ports:
+      - "127.0.0.1:8081:8081"
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - texd_isolated
+      - texd_ingress
+    mem_limit: 1g
+    cpus: 1.0
+
+networks:
+  texd_isolated:
+    internal: true
+  # Host-only development ingress. Disabling masquerade prevents this bridge
+  # from becoming an outbound Internet path while preserving localhost:8081.
+  texd_ingress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

@@ -1,0 +1,17 @@
+[project]
+name = "paperforge-db"
+version = "0.1.0"
+description = "PaperForge ORM 模型、会话、迁移约定"
+requires-python = ">=3.12"
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["db"]

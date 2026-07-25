@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      # R1 白名单、bibtex_key 唯一性等不变量活在 SQL 里，契约测试跑真实 Postgres。
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: paperforge
+          POSTGRES_PASSWORD: paperforge
+          POSTGRES_DB: paperforge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U paperforge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PAPERFORGE_TEST_DATABASE_URL: postgresql+asyncpg://paperforge:paperforge@localhost:5432/paperforge_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - name: Sync workspace
+        run: uv sync --all-packages --frozen
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Alembic migration
+        run: uv run alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://paperforge:paperforge@localhost:5432/paperforge
+      - name: Migration drift check
+        run: uv run alembic check
+        env:
+          DATABASE_URL: postgresql+asyncpg://paperforge:paperforge@localhost:5432/paperforge
+      - name: Tests
+        run: uv run pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm build

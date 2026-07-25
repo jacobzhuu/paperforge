@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="${ROOT_DIR}/infra/docker-compose.yml"
+STATE_DIR="${ROOT_DIR}/.paperforge"
+RUN_DIR="${STATE_DIR}/run"
+LOG_DIR="${STATE_DIR}/logs"
+WEB_URL="${PAPERFORGE_WEB_URL:-http://localhost:3000}"
+API_URL="${PAPERFORGE_API_URL:-http://localhost:8080}"
+TEXD_URL="${PAPERFORGE_TEXD_URL:-http://localhost:8081}"
+POSTGRES_HOST_PORT="${PAPERFORGE_POSTGRES_PORT:-15432}"
+REDIS_HOST_PORT="${PAPERFORGE_REDIS_PORT:-16379}"
+MINIO_API_HOST_PORT="${PAPERFORGE_MINIO_API_PORT:-19000}"
+MINIO_CONSOLE_HOST_PORT="${PAPERFORGE_MINIO_CONSOLE_PORT:-19001}"
+MINIO_API_URL="http://localhost:${MINIO_API_HOST_PORT}"
+MINIO_CONSOLE_URL="http://localhost:${MINIO_CONSOLE_HOST_PORT}"
+
+export POSTGRES_HOST_PORT REDIS_HOST_PORT MINIO_API_HOST_PORT MINIO_CONSOLE_HOST_PORT
+
+COMPOSE=(docker compose --progress plain -f "${COMPOSE_FILE}")
+PNPM_COMMAND=(pnpm)
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/dev <command>
+
+Commands:
+  up       Install locked dependencies and start every local service
+  down     Stop PaperForge services (persistent database volumes are kept)
+  status   Show service status and local URLs
+  logs     Show recent application and Docker service logs
+EOF
+}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+prepare_state() {
+  mkdir -p "${RUN_DIR}" "${LOG_DIR}"
+}
+
+expected_process_marker() {
+  case "$1" in
+    api) echo "paperforge-api" ;;
+    worker) echo "paperforge_worker.worker.WorkerSettings" ;;
+    web) echo "pnpm" ;;
+    *) return 1 ;;
+  esac
+}
+
+managed_process_is_running() {
+  local name="$1"
+  local pid_file="${RUN_DIR}/${name}.pid"
+  local pid=""
+  local marker=""
+  local command_line=""
+
+  [ -s "${pid_file}" ] || return 1
+  pid="$(tr -d '[:space:]' < "${pid_file}")"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" >/dev/null 2>&1 || return 1
+  marker="$(expected_process_marker "${name}")"
+  command_line="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  [[ "${command_line}" == *"${marker}"* ]]
+}
+
+start_process() {
+  local name="$1"
+  local cwd="$2"
+  shift 2
+  local pid_file="${RUN_DIR}/${name}.pid"
+  local log_file="${LOG_DIR}/${name}.log"
+  local pid=""
+
+  if managed_process_is_running "${name}"; then
+    echo "✓ ${name} already running"
+    return
+  fi
+
+  : > "${log_file}"
+  (
+    cd "${cwd}"
+    nohup "$@" >> "${log_file}" 2>&1 < /dev/null &
+    echo "$!" > "${pid_file}"
+  )
+  sleep 1
+  pid="$(tr -d '[:space:]' < "${pid_file}")"
+  if ! managed_process_is_running "${name}"; then
+    echo "Failed to start ${name}; recent log:" >&2
+    tail -n 40 "${log_file}" >&2 || true
+    return 1
+  fi
+  echo "✓ ${name} started (pid ${pid})"
+}
+
+stop_process() {
+  local name="$1"
+  local pid_file="${RUN_DIR}/${name}.pid"
+  local pid=""
+  local attempt=0
+
+  if ! managed_process_is_running "${name}"; then
+    [ -e "${pid_file}" ] && : > "${pid_file}"
+    return 0
+  fi
+
+  pid="$(tr -d '[:space:]' < "${pid_file}")"
+  kill "${pid}"
+  for attempt in $(seq 1 20); do
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+      : > "${pid_file}"
+      echo "✓ ${name} stopped"
+      return
+    fi
+    sleep 0.25
+  done
+  kill -KILL "${pid}" >/dev/null 2>&1 || true
+  : > "${pid_file}"
+  echo "✓ ${name} force-stopped"
+}
+
+stop_host_processes() {
+  stop_process web
+  stop_process worker
+  stop_process api
+}
+
+ensure_docker() {
+  if docker info >/dev/null 2>&1; then
+    return
+  fi
+
+  if [ "$(uname -s)" = "Darwin" ] && open -Ra Docker >/dev/null 2>&1; then
+    echo "Docker Desktop is not running; starting it now..."
+    open -ga Docker
+    for _attempt in $(seq 1 90); do
+      if docker info >/dev/null 2>&1; then
+        echo "✓ Docker Desktop is ready"
+        return
+      fi
+      sleep 2
+    done
+  fi
+
+  echo "Docker daemon is unavailable. Start Docker Desktop and retry." >&2
+  return 1
+}
+
+select_pnpm() {
+  local installed_version=""
+  installed_version="$(pnpm --version 2>/dev/null || true)"
+  if [[ "${installed_version}" == 9.* ]]; then
+    PNPM_COMMAND=(pnpm)
+    return
+  fi
+  require_command npx
+  PNPM_COMMAND=(npx -y pnpm@9.15.9)
+  echo "Using project-pinned pnpm 9.15.9 (installed: ${installed_version:-none})"
+}
+
+wait_http() {
+  local name="$1"
+  local url="$2"
+  local attempts="${3:-90}"
+  local attempt=0
+
+  for attempt in $(seq 1 "${attempts}"); do
+    # --noproxy: 本地健康检查绝不走 HTTP(S)_PROXY，否则代理会把 127.0.0.1 请求变成 502。
+    if curl -fsS --noproxy '*' --max-time 2 "${url}" >/dev/null 2>&1; then
+      echo "✓ ${name} healthy (${url})"
+      return
+    fi
+    sleep 1
+  done
+  echo "${name} did not become healthy: ${url}" >&2
+  return 1
+}
+
+wait_postgres() {
+  local attempt=0
+  for attempt in $(seq 1 60); do
+    if "${COMPOSE[@]}" exec -T postgres pg_isready -U paperforge >/dev/null 2>&1; then
+      echo "✓ postgres healthy"
+      return
+    fi
+    sleep 1
+  done
+  echo "postgres did not become healthy" >&2
+  return 1
+}
+
+wait_redis() {
+  local attempt=0
+  for attempt in $(seq 1 60); do
+    if [ "$("${COMPOSE[@]}" exec -T redis redis-cli ping 2>/dev/null || true)" = "PONG" ]; then
+      echo "✓ redis healthy"
+      return
+    fi
+    sleep 1
+  done
+  echo "redis did not become healthy" >&2
+  return 1
+}
+
+show_recent_logs() {
+  set +e
+  echo
+  echo "Recent Docker logs:"
+  "${COMPOSE[@]}" logs --tail=40
+  for name in api worker web; do
+    if [ -f "${LOG_DIR}/${name}.log" ]; then
+      echo
+      echo "Recent ${name} log:"
+      tail -n 40 "${LOG_DIR}/${name}.log"
+    fi
+  done
+  set -e
+}
+
+up_failed() {
+  local exit_code=$?
+  trap - ERR
+  echo
+  echo "PaperForge startup failed; cleaning up started services." >&2
+  show_recent_logs
+  stop_host_processes
+  "${COMPOSE[@]}" down >/dev/null 2>&1 || true
+  exit "${exit_code}"
+}
+
+up() {
+  trap up_failed ERR
+  require_command docker
+  require_command curl
+  require_command uv
+  require_command pnpm
+  prepare_state
+  ensure_docker
+  select_pnpm
+
+  if [ ! -f "${ROOT_DIR}/.env" ]; then
+    cp "${ROOT_DIR}/.env.example" "${ROOT_DIR}/.env"
+    echo "✓ created .env from .env.example"
+  fi
+
+  echo "Installing locked dependencies..."
+  (
+    cd "${ROOT_DIR}"
+    uv sync --all-packages --frozen
+  )
+  (
+    cd "${ROOT_DIR}/apps/web"
+    CI=1 "${PNPM_COMMAND[@]}" install --frozen-lockfile
+  )
+
+  echo "Starting Docker services..."
+  "${COMPOSE[@]}" up -d --build
+
+  start_process api "${ROOT_DIR}" \
+    env \
+      API_HOST=127.0.0.1 \
+      API_PORT=8080 \
+      DATABASE_URL="postgresql+asyncpg://paperforge:paperforge@localhost:${POSTGRES_HOST_PORT}/paperforge" \
+      REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" \
+      MINIO_ENDPOINT="localhost:${MINIO_API_HOST_PORT}" \
+      uv run paperforge-api
+  start_process worker "${ROOT_DIR}" \
+    env REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" \
+      uv run arq paperforge_worker.worker.WorkerSettings
+  start_process web "${ROOT_DIR}/apps/web" \
+    "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port 3000
+
+  echo "Waiting for health checks..."
+  wait_postgres
+  wait_redis
+  wait_http minio "${MINIO_API_URL}/minio/health/live"
+  wait_http texd "${TEXD_URL}/healthz"
+  wait_http api "${API_URL}/healthz"
+  wait_http web "${WEB_URL}"
+  managed_process_is_running worker
+
+  trap - ERR
+  echo
+  echo "PaperForge is ready."
+  echo "Web:     ${WEB_URL}"
+  echo "API:     ${API_URL}"
+  echo "Metrics: ${API_URL}/metrics"
+  echo "MinIO:   ${MINIO_CONSOLE_URL}"
+  echo
+  echo "Stop everything with: ./scripts/dev down"
+  echo "Inspect status with:   ./scripts/dev status"
+
+  if [ "${PAPERFORGE_OPEN_BROWSER:-1}" != "0" ] && [ "$(uname -s)" = "Darwin" ]; then
+    open "${WEB_URL}"
+  fi
+}
+
+down() {
+  prepare_state
+  stop_host_processes
+  if docker info >/dev/null 2>&1; then
+    "${COMPOSE[@]}" down
+  else
+    echo "Docker daemon is unavailable; host services were stopped." >&2
+  fi
+}
+
+status() {
+  prepare_state
+  for name in api worker web; do
+    if managed_process_is_running "${name}"; then
+      echo "✓ ${name}: running"
+    else
+      echo "✗ ${name}: stopped"
+    fi
+  done
+  if docker info >/dev/null 2>&1; then
+    "${COMPOSE[@]}" ps
+  else
+    echo "✗ docker: unavailable"
+  fi
+  echo
+  echo "Web: ${WEB_URL}"
+  echo "API: ${API_URL}"
+}
+
+logs() {
+  prepare_state
+  show_recent_logs
+}
+
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  status) status ;;
+  logs) logs ;;
+  *) usage; exit 1 ;;
+esac

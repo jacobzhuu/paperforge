@@ -1,0 +1,34 @@
+%% PaperForge 生成的 LaTeX 工程（模板：IEEEtran）
+%% 导言区由模板锁定，LLM 不可修改（设计 §4.6）。
+\documentclass[conference]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{cite}
+{% if language == 'zh' %}\usepackage{ctex}{% endif %}
+
+\providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\begin{document}
+
+\title{ {{- title -}} }
+{% if authors %}\author{\IEEEauthorblockN{ {{- authors -}} }}{% endif %}
+\maketitle
+
+{% if abstract %}\begin{abstract}
+{{ abstract }}
+\end{abstract}{% endif %}
+{% if keywords %}\begin{IEEEkeywords}
+{{ keywords }}
+\end{IEEEkeywords}{% endif %}
+
+{{ body }}
+
+{% if has_bibliography %}\bibliographystyle{IEEEtran}
+\bibliography{refs}
+{% endif %}
+\end{document}

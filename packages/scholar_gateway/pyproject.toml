@@ -1,0 +1,13 @@
+[project]
+name = "scholar-gateway"
+version = "0.1.0"
+description = "PaperForge 学术检索网关：适配器/规范化/去重/雪球/OA 全文/缓存"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scholar_gateway"]

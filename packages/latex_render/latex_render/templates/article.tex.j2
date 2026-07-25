@@ -1,0 +1,38 @@
+%% PaperForge 生成的 LaTeX 工程（模板：article）
+%% 导言区由模板锁定，LLM 不可修改（设计 §4.6）。
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+{% if language == 'zh' %}\usepackage{ctex}{% endif %}
+
+%% 未补充实验数据的显式占位（学术诚信红线：不编造数据）。
+\providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\title{ {{- title -}} }
+{% if authors %}\author{ {{- authors -}} }{% else %}\author{}{% endif %}
+\date{}
+
+\begin{document}
+\maketitle
+
+{% if abstract %}\begin{abstract}
+{{ abstract }}
+\end{abstract}{% endif %}
+{% if keywords %}
+
+\noindent\textbf{ {{- keywords_label -}} } {{ keywords }}
+{% endif %}
+
+{{ body }}
+
+{% if has_bibliography %}\bibliographystyle{ {{- bibstyle -}} }
+\bibliography{refs}
+{% endif %}
+\end{document}
