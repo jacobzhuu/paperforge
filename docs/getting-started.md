@@ -26,6 +26,7 @@
 ```bash
 ./scripts/dev status   # 查看所有服务状态
 ./scripts/dev logs     # 查看最近日志
+./scripts/dev restart   # 改完代码用这个（up 会跳过已在运行的进程，不加载新代码）
 ./scripts/dev down     # 停止服务；保留数据库和对象存储 volume
 ```
 

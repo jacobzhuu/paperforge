@@ -27,6 +27,9 @@ Usage: ./scripts/dev <command>
 
 Commands:
   up       Install locked dependencies and start every local service
+  restart  Stop everything and start again (use this after changing code:
+           `up` skips processes that are already running, so it will NOT
+           pick up your edits)
   down     Stop PaperForge services (persistent database volumes are kept)
   status   Show service status and local URLs
   logs     Show recent application and Docker service logs
@@ -300,6 +303,13 @@ up() {
   fi
 }
 
+restart() {
+  # 改完代码必须走这里：up() 对已在运行的进程直接跳过，不会加载新代码。
+  echo "Restarting PaperForge..."
+  down
+  up
+}
+
 down() {
   prepare_state
   stop_host_processes
@@ -336,6 +346,7 @@ logs() {
 
 case "${1:-}" in
   up) up ;;
+  restart) restart ;;
   down) down ;;
   status) status ;;
   logs) logs ;;

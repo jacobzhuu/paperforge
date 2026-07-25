@@ -66,6 +66,7 @@ Tectonic、API、worker 和 Web。成功后会自动打开并打印：
 ```bash
 ./scripts/dev status
 ./scripts/dev logs
+./scripts/dev restart   # 改完代码用这个
 ./scripts/dev down
 ```
 
@@ -80,3 +81,24 @@ Tectonic、API、worker 和 Web。成功后会自动打开并打印：
 
 ## 迁移来源说明
 代码采用**拷贝式迁移**，新仓库不 import DeepSearch，无运行时依赖。两系统仅共享「人」不共享代码。
+
+## 生成产物在哪
+
+导出的 PDF / docx / LaTeX 工程 / Markdown / BibTeX 落在对象存储里，
+路径由 `.env` 的 `STORAGE_FS_ROOT` 决定（默认 `./data/objects`）：
+
+```
+data/objects/projects/<project_id>/exports/v<文稿版本>/
+  pdf-<hash>.pdf          docx-<hash>.docx
+  latex_zip-<hash>.zip    markdown-<hash>.md
+  bibtex-<hash>.bib       compile_log-<hash>.log
+```
+
+也可以从界面「导出中心」下载，或走 API：
+
+```bash
+curl -s localhost:8080/api/v1/projects/<id>/exports              # 列出产物
+curl -sO localhost:8080/api/v1/projects/<id>/exports/<aid>/download
+```
+
+`data/` 已在 `.gitignore` 中，产物不会进版本库。
