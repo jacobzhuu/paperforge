@@ -28,3 +28,17 @@ def test_worker_registers_m1_pipeline_functions():
         "run_cards_pipeline",
         "run_full_pipeline",
     } <= names
+
+
+async def test_library_pipeline_can_defer_finalization():
+    """run_full_pipeline 复用文献管线时不得提前收尾。
+
+    否则前端看到 succeeded 就停止轮询，而 outline/write/render 还在后台跑。
+    """
+    import inspect
+
+    signature = inspect.signature(worker.run_library_pipeline)
+    assert signature.parameters["finalize"].default is True
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    assert "finalize=False" in source

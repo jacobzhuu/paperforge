@@ -106,8 +106,13 @@ async def run_library_pipeline(
     *,
     providers: list[str] | None = None,
     regenerate_scope: bool = True,
+    finalize: bool = True,
 ) -> dict[str, Any]:
-    """M1 主管线：SCOPE → SEARCH → CURATE(bibtex keys) → CARDS。"""
+    """M1 主管线：SCOPE → SEARCH → CURATE(bibtex keys) → CARDS。
+
+    ``finalize=False`` 供 ``run_full_pipeline`` 复用：全管线还要继续跑
+    outline/write/render，此处提前把任务标成 succeeded 会让前端以为已经完成。
+    """
     settings: Settings = ctx.get("settings") or get_settings()
     project_uuid = uuid.UUID(project_id)
     job_uuid = uuid.UUID(job_id) if job_id else None
@@ -162,7 +167,8 @@ async def run_library_pipeline(
         )
 
         delivered = bool(search_outcome and search_outcome.persisted_entry_count)
-        await _finish(context, delivered=delivered)
+        if finalize:
+            await _finish(context, delivered=delivered)
         return {
             "project_id": project_id,
             "scope_generator": scope.get("generator"),
@@ -602,7 +608,8 @@ async def run_full_pipeline(ctx: dict, project_id: str, job_id: str | None = Non
     M1–M2 覆盖到 write；render 随 M3 接入本函数。
     """
     settings: Settings = ctx.get("settings") or get_settings()
-    library = await run_library_pipeline(ctx, project_id, job_id)
+    # finalize=False：文献阶段结束不收尾，任务状态要覆盖到 render 为止。
+    library = await run_library_pipeline(ctx, project_id, job_id, finalize=False)
     project_uuid = uuid.UUID(project_id)
     async with job_context(
         project_id=project_uuid,

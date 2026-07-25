@@ -225,3 +225,37 @@ M2 与 M4 的写作器共用同一 Section Writer。
 - **协作**（多人实时编辑、评论、权限）：需要用户体系与冲突合并，本轮只打了 `owner_id` 地基
 - **系统性综述插件**（把 §3.3 摈弃的 screening/PRISMA 作为可选插件回加）：远期项
 - 设置页目前是**只读**视图：改配置走 `.env` + 重启，避免把密钥写进数据库
+
+## 全流程实跑验收（真实 DeepSeek，2026-07-25）
+
+`POST /projects/{id}/generate` 一键跑完 scope→search→curate→cards→outline→write→render，
+用时约 24 分钟（含 31 篇检索入库 + 29 张卡片抽取 + 7 章写作 + Tectonic 编译）。
+
+| 阶段 | 结果 |
+|---|---|
+| scope | `llm:deepseek-v4-pro`，产出双语关键词矩阵与子主题 |
+| search | 163 条原始候选 → 142 条去重 → 自动选入 31 条 |
+| curate | 30 个 bibtex_key 持久化（R3） |
+| cards | LLM 抽取 12 张 + 缓存复用 17 张 + 回退 1 张 |
+| outline | `llm:deepseek-v4-pro`，7 章，孤儿文献 0 |
+| write | 7 章 / **5 516 字** / 26 个引用 / R2 重写 0 次 / 引用告警 0 |
+| render | `compile_ok=true`，模板 gbt7714，五格式齐全 |
+
+**引用与数字双红线实测**
+- 引用审计：白名单 30，已用 26，**幻觉引用 0**，被移除引用 0，29 条使用记录
+- 正文 10 个实义数值（0.84 / 0.8443 / 12% / 15% / 16 / 3.3 / 40% / 70 / 83.6% / 90.0%）
+  **全部可在被引文献的卡片或摘要中找到出处，0 个编造**
+- 质量报告：引用密度 5.3 条/千字、文献利用率 87%、近 5 年占比 100%
+
+**产物**：PDF 329 741 字节（GB/T 7714 中文排版、上标编号引用）、docx 22 184 字节、
+LaTeX 工程 zip（main.tex + 6 个章节文件 + refs.bib）、Markdown、BibTeX。
+
+### 本轮实跑暴露并修复的缺陷
+1. **全管线提前收尾**：`run_full_pipeline` 复用 `run_library_pipeline`，后者在文献阶段
+   就把任务标成 succeeded；前端看到「完成」时 outline/write/render 其实还在后台跑。
+   → 加 `finalize` 开关，全管线自己收尾。
+2. **推理型模型的预算陷阱**：`deepseek-v4-pro` 把思维链计入 `max_tokens`，预算耗尽时
+   返回 HTTP 200 但 `content` 为空，被误判为「响应结构非法」而直接降级——
+   大纲因此静默退回确定性分组（章节质量断崖式下降）。
+   → provider 区分出 `output_truncated`，runner 加倍预算重试一次（上限 8192），
+   大纲预算提到 6000；两条路径都有反例测试。

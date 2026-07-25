@@ -165,7 +165,9 @@ async def _body_sections(
             f"Allowed cite keys: {', '.join(sorted(allowed))}\n\n"
             f"Literature cards:\n" + "\n".join(lines)
         ),
-        max_output_tokens=3000,
+        # 推理型模型把思维链算进预算：大纲一次要吐完整章节树，给足额度，
+        # 否则每次都要先撞一次 output_truncated 再重试（白花一次调用）。
+        max_output_tokens=6000,
         temperature=0.2,
         # R2 的第一道防线就设在大纲：越权 key 直接剔除，不进入写作上下文。
         allowed_cite_keys=allowed,

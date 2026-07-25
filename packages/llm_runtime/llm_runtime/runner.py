@@ -23,6 +23,8 @@ from llm_runtime.providers import LLMProvider
 from llm_runtime.types import LLMError, LLMRequest, LLMResponse
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
+# 重试上限：与 providers.clamp_max_output_tokens 的保守上限一致。
+MAX_OUTPUT_TOKENS_CEILING = 8192
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,13 @@ class LLMRunner:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
         metadata: dict[str, Any] | None = None,
+        _retry_on_truncation: bool = True,
     ) -> LLMResponse | None:
-        """同步调用。失败返回 None 并记录一条带 error_code 的记账（draft-first）。"""
+        """同步调用。失败返回 None 并记录一条带 error_code 的记账（draft-first）。
+
+        推理型模型把思维链计入 max_tokens，预算不足会「零 content」返回；
+        这种情况加倍预算重试一次（上限 MAX_OUTPUT_TOKENS_CEILING），再失败才降级。
+        """
         model = self.model_for(role)
         request = LLMRequest(
             system_prompt=system_prompt,
@@ -119,6 +126,20 @@ class LLMRunner:
                 latency_ms=_elapsed_ms(started),
                 error_code=error.error_code,
             )
+            if (
+                error.error_code == "output_truncated"
+                and _retry_on_truncation
+                and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
+            ):
+                return self.generate(
+                    role,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_output_tokens=min(max_output_tokens * 2, MAX_OUTPUT_TOKENS_CEILING),
+                    temperature=temperature,
+                    metadata={**(metadata or {}), "retry": "output_truncated"},
+                    _retry_on_truncation=False,
+                )
             return None
         except Exception as error:  # noqa: BLE001 - 任何 provider 崩溃都降级
             self._record(

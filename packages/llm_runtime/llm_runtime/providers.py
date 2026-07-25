@@ -303,6 +303,24 @@ class OpenAICompatibleLLMProvider:
         message = first_choice.get("message")
         text = message.get("content") if isinstance(message, dict) else None
         if not isinstance(text, str) or not text.strip():
+            # 推理型模型（deepseek-v4-*、o 系列等）把思维链算进 max_tokens：
+            # 预算被推理吃光时 content 会是空的。这与「响应结构非法」是两回事——
+            # 前者加预算重试就能救，因此给出独立的 error_code。
+            finish_reason = first_choice.get("finish_reason")
+            reasoning = (
+                message.get("reasoning_content") if isinstance(message, dict) else None
+            )
+            if finish_reason == "length" or (isinstance(reasoning, str) and reasoning.strip()):
+                raise LLMError(
+                    provider=self.name,
+                    error_code="output_truncated",
+                    status_code=response.status_code,
+                    message=(
+                        "LLM produced no content before hitting max_tokens "
+                        "(reasoning models spend the same budget on thinking)."
+                    ),
+                    retryable=True,
+                )
             raise LLMError(
                 provider=self.name,
                 error_code="invalid_response",
