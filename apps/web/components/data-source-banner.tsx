@@ -20,7 +20,10 @@ export function DataSourceBanner({
       )}
     >
       <Info className="h-3.5 w-3.5 shrink-0" />
-      <span>示例数据预览：{note ?? '对应后端端点尚未实现'}。端点落地后将自动切换为真实数据。</span>
+      <span>
+        示例数据预览：{note ?? '后端不可用'}。当前展示的**不是**你的真实数据，
+        后端恢复后刷新即可。
+      </span>
     </div>
   );
 }

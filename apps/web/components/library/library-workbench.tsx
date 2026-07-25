@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import {
   ArrowUpDown,
@@ -62,7 +63,7 @@ const STATUS_TABS: { value: StatusFilter; label: string }[] = [
 
 export function LibraryWorkbench() {
   const params = useSearchParams();
-  const projectId = params.get('project') ?? 'demo-review-01';
+  const projectId = params.get('project') ?? '';
 
   const [project, setProject] = React.useState<Project | undefined>();
   const [entries, setEntries] = React.useState<LibraryEntry[]>([]);
@@ -88,6 +89,10 @@ export function LibraryWorkbench() {
   const [jobMessage, setJobMessage] = React.useState<string | null>(null);
 
   const reload = React.useCallback(async () => {
+    if (!projectId) {
+      setLoading(false);
+      return;
+    }
     const [proj, lib, sr, wl] = await Promise.all([
       getProject(projectId),
       listLibrary(projectId),
@@ -259,7 +264,17 @@ export function LibraryWorkbench() {
         </div>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-[1fr,20rem]">
+      {!projectId && (
+        <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
+          请先从
+          <Link href="/projects" className="mx-1 underline">
+            项目列表
+          </Link>
+          进入某个项目。
+        </div>
+      )}
+
+      <div className={cn('grid gap-6 lg:grid-cols-[1fr,20rem]', !projectId && 'hidden')}>
         <div className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <Tabs value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
@@ -310,7 +325,9 @@ export function LibraryWorkbench() {
                 ) : filtered.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                      无匹配文献
+                      {entries.length === 0
+                        ? '文献库为空。点右上角「触发检索」从五个学术源检索并入库。'
+                        : '当前筛选条件下无匹配文献'}
                     </TableCell>
                   </TableRow>
                 ) : (

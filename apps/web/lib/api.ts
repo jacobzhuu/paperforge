@@ -68,17 +68,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/**
+ * 只有在**后端确实不可用**时才回退到示例数据。
+ *
+ * 空结果是合法的真实数据，绝不用示例数据填充：本系统的立身之本是「引用必须真实」，
+ * 往界面里塞看起来一模一样的假文献，比空列表危险得多。空态由各页面自己呈现。
+ */
 async function withFallback<T>(
   live: () => Promise<T>,
   fallback: T,
-  emptyIsMock = false,
 ): Promise<ApiResult<T>> {
   try {
     const data = await live();
-    // 后端骨架期返回空数组时，用示例数据填充以便预览界面。
-    if (emptyIsMock && Array.isArray(data) && data.length === 0) {
-      return { data: fallback, source: 'mock', note: '后端返回空，展示示例数据' };
-    }
     return { data, source: 'live' };
   } catch (err) {
     if (err instanceof DegradeError) {
@@ -91,7 +92,7 @@ async function withFallback<T>(
 // ---- Projects ----
 
 export function listProjects(): Promise<ApiResult<Project[]>> {
-  return withFallback(() => request<Project[]>('/projects'), MOCK_PROJECTS, true);
+  return withFallback(() => request<Project[]>('/projects'), MOCK_PROJECTS);
 }
 
 export async function getProject(id: string): Promise<ApiResult<Project | undefined>> {
@@ -138,7 +139,6 @@ export function listLibrary(
   return withFallback(
     () => request<LibraryEntry[]>(`/projects/${projectId}/library${qs}`),
     MOCK_LIBRARY,
-    true,
   );
 }
 
@@ -146,7 +146,6 @@ export function listSearchRuns(projectId: string): Promise<ApiResult<SearchRun[]
   return withFallback(
     () => request<SearchRun[]>(`/projects/${projectId}/search/runs`),
     MOCK_SEARCH_RUNS,
-    true,
   );
 }
 
