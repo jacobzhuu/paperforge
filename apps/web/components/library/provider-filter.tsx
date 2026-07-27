@@ -56,7 +56,8 @@ export function ProviderFilter({
             <span className="text-xs text-muted-foreground">未选择检索源</span>
           ) : (
             providers.map((p) => (
-              <Badge key={p} variant="secondary" className="font-mono text-[10px]">
+              // 最小字号统一到 12px（text-xs）；此前这里是 text-[10px]。
+              <Badge key={p} variant="secondary" className="font-mono text-xs">
                 {p}
               </Badge>
             ))

@@ -1,12 +1,6 @@
-import { Suspense } from 'react';
 import { SettingsPage } from '@/components/settings/settings-page';
 
+/** 设置已去项目化，不再读 `?project=`，因此不需要 Suspense 边界。 */
 export default function Settings() {
-  return (
-    <Suspense
-      fallback={<div className="py-20 text-center text-sm text-muted-foreground">加载中…</div>}
-    >
-      <SettingsPage />
-    </Suspense>
-  );
+  return <SettingsPage />;
 }

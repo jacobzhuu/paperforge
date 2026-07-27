@@ -66,10 +66,16 @@ export function CiteKeyPicker({
         {filtered.map((key) => {
           const active = selectedSet.has(key);
           return (
-            <button key={key} type="button" onClick={() => toggle(key)}>
+            <button
+              key={key}
+              type="button"
+              onClick={() => toggle(key)}
+              aria-pressed={active}
+              className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
               <Badge
                 variant={active ? 'success' : 'outline'}
-                className={cn('cursor-pointer font-mono text-[11px]', active && 'pr-1.5')}
+                className={cn('cursor-pointer font-mono text-xs', active && 'pr-1.5')}
               >
                 {key}
                 {active && <Check className="ml-0.5 h-3 w-3" />}

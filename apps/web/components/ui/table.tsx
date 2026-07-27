@@ -26,7 +26,12 @@ const TableRow = React.forwardRef<HTMLTableRowElement, React.HTMLAttributes<HTML
   ({ className, ...props }, ref) => (
     <tr
       ref={ref}
-      className={cn('border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-accent', className)}
+      className={cn(
+        'border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-accent',
+        // 表格行常被做成可点击的（文献工作台），键盘用户需要看得见焦点。
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+        className,
+      )}
       {...props}
     />
   ),

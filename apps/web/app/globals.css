@@ -3,69 +3,119 @@
 @tailwind utilities;
 
 @layer base {
+  /*
+   * 暖色学术调（docs/ui-design.md §3.4）。
+   *
+   * 此前是冷调科技蓝（--background: 210 40% 98%）。换成暖白 + 炭灰 + 铜色点缀，
+   * 目标是「学术出版物 × 现代 AI」而不是通用 SaaS。
+   *
+   * 换色时全部对比度都**重算过**，不是照搬色板。下面每条 AA 注释里的比值都是
+   * 按 WCAG 相对亮度公式算出来的实测值；改这些数字前请重算，别凭感觉调。
+   */
   :root {
-    --background: 210 40% 98%;
-    --foreground: 222 47% 11%;
+    --background: 40 33% 97%; /* rgb(250,248,245) 暖白 */
+    --foreground: 30 12% 14%; /* rgb(40,36,31) 暖炭灰；压 --background 上 14.5:1 */
 
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
+    --card-foreground: 30 12% 14%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 222 47% 11%;
+    --popover-foreground: 30 12% 14%;
 
-    --primary: 222 47% 20%;
-    --primary-foreground: 210 40% 98%;
+    --primary: 25 15% 18%;
+    --primary-foreground: 40 33% 97%; /* 压 --primary 上 12.7:1 */
 
-    --secondary: 210 40% 94%;
-    --secondary-foreground: 222 47% 20%;
+    --secondary: 38 25% 91%;
+    --secondary-foreground: 30 12% 14%;
 
-    --muted: 210 40% 94%;
-    --muted-foreground: 215 16% 47%;
+    --muted: 40 20% 93%;
+    /*
+     * 约束不变，只是数值随底色重算：muted-foreground 必须同时过 --background、
+     * --muted、--secondary、--accent 四种底（未选中的 Tab、muted 徽章、
+     * 元数据行都压在这几种底上）。四者里 --accent 最亮，是绑定约束。
+     * 40% 在 --accent 上 4.75:1、--muted 上 4.87:1、--background 上 5.32:1。
+     * 暖色低饱和在同一 L 值下比原来的冷灰更暗，所以这里是 40% 而不是旧的 44%。
+     */
+    --muted-foreground: 30 8% 40%;
 
-    --accent: 214 95% 93%;
-    --accent-foreground: 222 47% 20%;
+    --accent: 28 45% 92%; /* 铜色浅调，用于选中态/hover */
+    --accent-foreground: 30 12% 14%;
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: 5 68% 48%;
+    --destructive-foreground: 40 33% 97%;
 
-    --success: 142 71% 36%;
-    --success-foreground: 210 40% 98%;
+    --success: 145 55% 34%;
+    --success-foreground: 40 33% 97%;
 
-    --warning: 38 92% 50%;
-    --warning-foreground: 222 47% 11%;
+    --warning: 32 85% 48%;
+    --warning-foreground: 30 12% 14%;
 
-    --border: 214 32% 88%;
-    --input: 214 32% 88%;
-    --ring: 222 47% 40%;
+    /* -strong 变体专供「彩色文字压在同色浅底上」的场景（如 warning 文字压
+       warning/10 底）。直接用 --warning 当文字色对浅底只有约 2:1，读不清。
+       三者压在 /10 浅底上分别为 6.8:1、6.3:1、6.2:1。 */
+    --success-strong: 148 60% 24%;
+    --warning-strong: 26 80% 31%;
+    --destructive-strong: 4 72% 40%;
+
+    --border: 35 20% 87%;
+    --input: 35 20% 87%;
+    --ring: 25 40% 40%; /* 铜色聚焦环，压 --background 上 5.1:1（焦点指示需 ≥3:1） */
 
     --radius: 0.6rem;
     --font-sans: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+    /*
+     * Georgia 排在中文衬线之前是刻意的：字体回退是**逐字符**解析的，
+     * 拉丁字符会用列表里第一个含该字形的字体。Songti SC 自带拉丁字形但质量平平，
+     * 排在前面会让 "PaperForge"、年份、DOI 全都用上它。这样排之后
+     * 拉丁走 Georgia、汉字回退到 Songti SC，中英混排才好看。
+     */
+    --font-serif: Georgia, 'Times New Roman', 'Songti SC', 'Source Han Serif SC',
+      'Noto Serif CJK SC', serif;
+
+    /* 长文正文的排印尺度。UI 用 14px，正文要更大更松——中英混排下
+       1.75 的行高对 CJK 是必要的，14px/1.5 读一节综述会很累。 */
+    --reading-font-size: 1.0625rem; /* 17px */
+    --reading-line-height: 1.75;
   }
 
+  /* 暗色同样走暖调（中性偏棕的深灰），不是把冷蓝直接调暗。 */
   .dark {
-    --background: 222 47% 8%;
-    --foreground: 210 40% 96%;
-    --card: 222 47% 11%;
-    --card-foreground: 210 40% 96%;
-    --popover: 222 47% 11%;
-    --popover-foreground: 210 40% 96%;
-    --primary: 210 40% 96%;
-    --primary-foreground: 222 47% 11%;
-    --secondary: 217 33% 18%;
-    --secondary-foreground: 210 40% 96%;
-    --muted: 217 33% 18%;
-    --muted-foreground: 215 20% 65%;
-    --accent: 217 33% 22%;
-    --accent-foreground: 210 40% 96%;
-    --destructive: 0 63% 45%;
-    --destructive-foreground: 210 40% 96%;
-    --success: 142 60% 45%;
-    --success-foreground: 222 47% 11%;
-    --warning: 38 92% 55%;
-    --warning-foreground: 222 47% 11%;
-    --border: 217 33% 22%;
-    --input: 217 33% 24%;
-    --ring: 213 27% 70%;
+    --background: 30 10% 9%; /* rgb(25,23,21) */
+    --foreground: 40 20% 94%; /* 压 --background 上 15.8:1 */
+    --card: 30 10% 12%;
+    --card-foreground: 40 20% 94%;
+    --popover: 30 10% 12%;
+    --popover-foreground: 40 20% 94%;
+    --primary: 40 20% 94%;
+    --primary-foreground: 30 10% 12%;
+    --secondary: 30 8% 19%;
+    --secondary-foreground: 40 20% 94%;
+    --muted: 30 8% 19%;
+    --muted-foreground: 35 12% 66%; /* 压 --muted 上 5.7:1 */
+    --accent: 28 14% 24%;
+    --accent-foreground: 40 20% 94%;
+    --destructive: 5 60% 47%;
+    --destructive-foreground: 40 20% 94%;
+    --success: 145 50% 44%;
+    --success-foreground: 30 10% 12%;
+    --warning: 35 88% 56%;
+    /*
+     * 注意这里和 --success-foreground / --destructive-foreground 的方向相反，
+     * 是**故意**的：那两个只用在实心填充上（如 destructive 按钮），所以要选
+     * 与填充色对比的颜色；而 --warning-foreground 全仓库 11 处用法**没有一处**
+     * 压在实心 bg-warning 上，全是 bg-warning/10~/20 的浅色调（降级提示条、
+     * warning 徽章、引用 chip）。它实际的语义是「warning 色调面上的可读文字」，
+     * 因此必须跟着主题走：浅色主题用深色，暗色主题用浅色。
+     * 暗色下压 bg-warning/10 上 11.9:1、压 /20 上 9.7:1。
+     */
+    --warning-foreground: 38 40% 88%;
+    /* 暗色下 -strong 是「亮色文字压深色浅调底」，方向与浅色相反：调亮而非调暗。 */
+    --success-strong: 145 58% 60%;
+    --warning-strong: 35 90% 66%;
+    --destructive-strong: 5 82% 70%;
+    --border: 30 9% 23%;
+    --input: 30 9% 25%;
+    --ring: 28 45% 62%;
   }
 
   * {
@@ -80,6 +130,94 @@
   }
 }
 
+@layer components {
+  /*
+   * 长文正文排版。
+   *
+   * 取代此前挂在编辑器上的 `prose prose-sm`——`@tailwindcss/typography` 从来
+   * 没有装过（tailwind.config.ts 的 plugins 是空数组），那两个类名一直是死代码。
+   * 与其补装一个插件再逐条覆盖它的默认值，不如直接写这一小段：
+   * 编辑器与预览共用，样式完全可控。
+   */
+  .pf-prose {
+    font-size: var(--reading-font-size);
+    line-height: var(--reading-line-height);
+    text-wrap: pretty;
+  }
+  .pf-prose p {
+    margin-bottom: 1.1em;
+  }
+  .pf-prose p:last-child {
+    margin-bottom: 0;
+  }
+  /* ProseMirror 的空段落会塌成 0 高，光标就没地方放。 */
+  .pf-prose p.is-empty::before {
+    content: attr(data-placeholder);
+    color: hsl(var(--muted-foreground));
+    float: left;
+    height: 0;
+    pointer-events: none;
+  }
+  .pf-prose .pf-cite {
+    /* chip 不参与正文的行高，避免每有一个引用就把该行撑开。 */
+    line-height: 1;
+  }
+  .pf-prose strong {
+    font-weight: 600;
+  }
+  .pf-prose em {
+    font-style: italic;
+  }
+  .pf-prose ul,
+  .pf-prose ol {
+    margin-bottom: 1.1em;
+    padding-left: 1.6em;
+  }
+  .pf-prose ul {
+    list-style: disc;
+  }
+  .pf-prose ol {
+    list-style: decimal;
+  }
+  .pf-prose li {
+    margin-bottom: 0.35em;
+  }
+  /* 列表项内部的段落不再另起间距，否则每个 item 之间会空出一行。 */
+  .pf-prose li > p {
+    margin-bottom: 0;
+  }
+
+  /*
+   * 论文阅读面（docs/ui-design.md §3.3）。
+   *
+   * 只加在**全文预览**上，不加在编辑器上。这个差异是有意的：预览应该长得像论文，
+   * 编辑器应该长得像工具，两个 Tab 之间的观感落差本身就在告诉用户"你现在在读还是在改"。
+   *
+   * 正文用 serif 但字号维持 17px：ui-design.md §4.3 的「≥18px 才用 serif」是对
+   * **界面文字**的约束（元数据、按钮、状态在小字号下中文衬线会糊）；正文是长文阅读，
+   * 1.75 的行高 + 72–78ch 的行长下 17px 衬线是舒适的。
+   */
+  .pf-paper {
+    font-family: var(--font-serif);
+  }
+  .pf-paper h1,
+  .pf-paper h2,
+  .pf-paper h3,
+  .pf-paper h4,
+  .pf-paper .pf-heading {
+    font-family: var(--font-serif);
+    letter-spacing: -0.01em;
+  }
+  /* 表格与代码/公式不跟着走衬线——数字与标识符用衬线既不好认也不好对齐。 */
+  .pf-paper table {
+    font-family: var(--font-sans);
+  }
+  .pf-paper code,
+  .pf-paper pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+}
+
 @layer utilities {
   .scrollbar-thin::-webkit-scrollbar {
     width: 8px;
@@ -88,5 +226,20 @@
   .scrollbar-thin::-webkit-scrollbar-thumb {
     background-color: hsl(var(--border));
     border-radius: 9999px;
+  }
+}
+
+/*
+ * 尊重系统的「减弱动态效果」偏好。此前 fade-in / slide-in-right / spin
+ * 一律强制播放，前庭敏感的用户没有退出方式。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

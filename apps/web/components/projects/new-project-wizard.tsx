@@ -19,6 +19,7 @@ import type {
   WritingMode,
 } from '@/lib/types';
 import { CITATION_STYLE_LABEL, LANGUAGE_LABEL, VENUE_TEMPLATES } from '@/lib/labels';
+import { describeError } from '@/lib/errors';
 
 const STEPS = ['类型', '主题 / 贡献点', '模板 / 语言', '模式'];
 
@@ -44,7 +45,16 @@ const INITIAL: FormState = {
   writing_mode: 'assisted',
 };
 
-export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function NewProjectWizard({
+  open,
+  onClose,
+  initialPaperType,
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** 从首次运行的两张引导卡进入时，类型已经选好，直接跳到第 2 步。 */
+  initialPaperType?: PaperType;
+}) {
   const router = useRouter();
   const [step, setStep] = React.useState(0);
   const [form, setForm] = React.useState<FormState>(INITIAL);
@@ -52,6 +62,18 @@ export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: ()
   const [error, setError] = React.useState<string | null>(null);
 
   const patch = (p: Partial<FormState>) => setForm((f) => ({ ...f, ...p }));
+
+  // 打开时套用预选类型（含该类型的默认引用样式）。
+  React.useEffect(() => {
+    if (!open) return;
+    if (!initialPaperType) return;
+    setForm((f) => ({
+      ...f,
+      paper_type: initialPaperType,
+      citation_style: initialPaperType === 'original' ? 'ieee' : 'gbt7714',
+    }));
+    setStep(1);
+  }, [open, initialPaperType]);
 
   const reset = () => {
     setStep(0);
@@ -88,11 +110,22 @@ export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: ()
     };
     try {
       const res = await createProject(body);
+      if (res.source === 'mock') {
+        // 降级时 createProject 返回的是本地乐观桩（id: local-…）。此前会直接导航过去，
+        // 用户进入一个并不存在的项目，还会看到 MOCK_LIBRARY 里 42 篇虚构文献。
+        setError(
+          `项目未创建：${res.note ?? '后端不可用'}。请确认 ./scripts/dev up 已启动后重试——` +
+            '这里不会为你保留一个假的项目。',
+        );
+        setSubmitting(false);
+        return;
+      }
       close();
-      // 真实创建后进入文献工作台；降级创建也导航以便预览流程。
-      router.push(`/library?project=${res.data.id}`);
+      // 落到项目概览而不是文献工作台：研究型论文的第一步是上传素材而非检索，
+      // 概览的「下一步」卡会按 paper_type 给出正确的入口。
+      router.push(`/projects/${res.data.id}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : '创建失败');
+      setError(describeError(e));
       setSubmitting(false);
     }
   };
@@ -118,7 +151,7 @@ export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: ()
           ) : (
             <Button onClick={submit} disabled={submitting}>
               {submitting && <Loader2 className="h-4 w-4 animate-spin" />}
-              创建并进入文献工作台
+              创建项目
             </Button>
           )}
         </>
@@ -127,7 +160,7 @@ export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: ()
       <Stepper step={step} />
 
       {error && (
-        <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive-strong">
           {error}
         </div>
       )}
@@ -248,7 +281,7 @@ export function NewProjectWizard({ open, onClose }: { open: boolean; onClose: ()
             <TypeCard
               active={form.writing_mode === 'auto'}
               title="全自动模式"
-              desc="top-K 自动入库并一键跑通全管线，任何阶段失败降级不阻断。"
+              desc="top-K 自动入库；在项目概览点「跑通全管线」一次跑到 PDF，任何阶段失败降级不阻断。"
               onClick={() => patch({ writing_mode: 'auto' })}
             />
           </div>

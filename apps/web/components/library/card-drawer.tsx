@@ -1,12 +1,12 @@
 'use client';
 
 import * as React from 'react';
-import { ExternalLink, ShieldCheck, ShieldAlert, KeyRound, FileText } from 'lucide-react';
+import { ExternalLink, ShieldCheck, ShieldAlert, KeyRound, FileText, Quote } from 'lucide-react';
 import { Drawer } from '@/components/ui/drawer';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import type { LibraryEntry } from '@/lib/types';
-import { ADDED_VIA_LABEL } from '@/lib/labels';
+import { ADDED_VIA_LABEL, LIBRARY_ACTION } from '@/lib/labels';
 
 function Section({ title, items }: { title: string; items?: string[] }) {
   if (!items || items.length === 0) return null;
@@ -25,11 +25,14 @@ function Section({ title, items }: { title: string; items?: string[] }) {
 export function CardDrawer({
   entry,
   open,
+  citedIn = [],
   onClose,
   onToggleSelect,
 }: {
   entry: LibraryEntry | null;
   open: boolean;
+  /** 引用这篇文献的章节标题，见 lib/citation-usage.ts。 */
+  citedIn?: string[];
   onClose: () => void;
   onToggleSelect: (entry: LibraryEntry) => void | Promise<void>;
 }) {
@@ -52,7 +55,9 @@ export function CardDrawer({
             variant={entry.status === 'selected' ? 'secondary' : 'default'}
             onClick={() => void onToggleSelect(entry)}
           >
-            {entry.status === 'selected' ? '移出文献库' : '圈选入库'}
+            {/* 「取消入库」只是把状态退回候选（可逆）；批量栏里的「移出文献库」
+                是真删除。此前两处都叫「移出文献库」，同名不同义。 */}
+            {entry.status === 'selected' ? LIBRARY_ACTION.deselect : LIBRARY_ACTION.select}
           </Button>
         </div>
       }
@@ -80,6 +85,19 @@ export function CardDrawer({
             <KeyRound className="h-4 w-4 text-muted-foreground" />
             <code className="font-mono text-xs">{entry.bibtex_key}</code>
             <span className="text-xs text-muted-foreground">· cite-key 持久化（R3）</span>
+          </div>
+        )}
+
+        {/*
+          「它已经在你的论文里的哪几章」排在排序理由之前：一旦文献真的被引用，
+          这就是关于它最有价值的一句话，比检索器当初为什么排上它更重要。
+        */}
+        {citedIn.length > 0 && (
+          <div className="flex items-start gap-2 rounded-md border-l-2 border-success/50 bg-success/10 px-3 py-2 text-sm">
+            <Quote className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success-strong" />
+            <span>
+              已被正文引用于 <span className="font-medium">{citedIn.join('、')}</span>
+            </span>
           </div>
         )}
 

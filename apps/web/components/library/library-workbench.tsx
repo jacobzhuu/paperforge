@@ -1,76 +1,75 @@
 'use client';
 
 import * as React from 'react';
-import Link from 'next/link';
-import { useSearchParams } from 'next/navigation';
 import {
   ArrowUpDown,
   Download,
   FileText,
   Loader2,
   Network,
+  Rocket,
   Search,
   Sparkles,
+  Trash2,
+  X,
 } from 'lucide-react';
-import { PageHeader } from '@/components/layout/page-header';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Progress } from '@/components/ui/progress';
-import { DataSourceBanner } from '@/components/data-source-banner';
+import { ActionMenu } from '@/components/ui/action-menu';
+import { Dialog } from '@/components/ui/dialog';
+import { useToast } from '@/components/ui/toast';
+import { LoadState } from '@/components/layout/load-state';
+import { WorkbenchHeader } from '@/components/project/workbench-header';
+import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
+import { useJobFinished, useProject } from '@/components/project/project-context';
 import { CardDrawer } from './card-drawer';
 import { ImportDialog } from './import-dialog';
 import { SearchStats } from './search-stats';
 import { ProviderFilter } from './provider-filter';
+import { EntryList } from './entry-list';
 import {
+  deleteLibraryEntry,
+  generateAll,
   generateCards,
-  getProject,
-  getWhitelist,
   importReferences,
   listLibrary,
   listSearchRuns,
+  listSections,
   selectEntries,
   startIngest,
   startSearch,
   startSnowball,
-  subscribeJobEvents,
 } from '@/lib/api';
-import type {
-  DataSource,
-  Job,
-  JobEvent,
-  LibraryEntry,
-  LibraryEntryStatus,
-  Project,
-  SearchRun,
-} from '@/lib/types';
+import type { Job, LibraryEntry, LibraryEntryStatus, SearchRun } from '@/lib/types';
+import { buildCiteKeyUsage, sectionsCiting, type CiteKeyUsage } from '@/lib/citation-usage';
 import type { SourceCapabilityId } from '@/lib/sourceCapabilities';
-import { ADDED_VIA_LABEL } from '@/lib/labels';
-import { cn } from '@/lib/utils';
+import { providersFromCapabilities } from '@/lib/sourceCapabilities';
+import { LIBRARY_ACTION } from '@/lib/labels';
+import { describeError } from '@/lib/errors';
 
-type StatusFilter = 'all' | LibraryEntryStatus;
+type StatusFilter = 'all' | 'cited' | LibraryEntryStatus;
 
 const STATUS_TABS: { value: StatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
-  { value: 'candidate', label: '候选' },
-  { value: 'selected', label: '已入库' },
-  { value: 'excluded', label: '已排除' },
+  { value: 'cited', label: '正文引用' },
+  { value: 'candidate', label: LIBRARY_ACTION.candidate },
+  { value: 'selected', label: LIBRARY_ACTION.selected },
+  { value: 'excluded', label: LIBRARY_ACTION.excluded },
 ];
 
 export function LibraryWorkbench() {
-  const params = useSearchParams();
-  const projectId = params.get('project') ?? '';
+  const { projectId, project, busy, startJob, reload: reloadProject } = useProject();
+  const { toast } = useToast();
 
-  const [project, setProject] = React.useState<Project | undefined>();
   const [entries, setEntries] = React.useState<LibraryEntry[]>([]);
   const [runs, setRuns] = React.useState<SearchRun[]>([]);
-  const [source, setSource] = React.useState<DataSource>('live');
-  const [note, setNote] = React.useState<string | undefined>();
+  /** cite-key → 引用它的章节，用于每行的「被引用于 …」（ui-design.md §3.6）。 */
+  const [usage, setUsage] = React.useState<CiteKeyUsage>(() => new Map());
   const [loading, setLoading] = React.useState(true);
+  const [loadError, setLoadError] = React.useState<string | null>(null);
 
   const [statusFilter, setStatusFilter] = React.useState<StatusFilter>('all');
   const [query, setQuery] = React.useState('');
@@ -83,88 +82,182 @@ export function LibraryWorkbench() {
 
   const [active, setActive] = React.useState<LibraryEntry | null>(null);
   const [importOpen, setImportOpen] = React.useState(false);
-  const [whitelist, setWhitelist] = React.useState<string[]>([]);
-  const [job, setJob] = React.useState<Job | null>(null);
-  const [jobStage, setJobStage] = React.useState<string | null>(null);
-  const [jobMessage, setJobMessage] = React.useState<string | null>(null);
+  const [checked, setChecked] = React.useState<Set<string>>(new Set());
+  const [lastIndex, setLastIndex] = React.useState<number | null>(null);
+  const [bulkBusy, setBulkBusy] = React.useState(false);
+  const [confirmDelete, setConfirmDelete] = React.useState(false);
 
   const reload = React.useCallback(async () => {
     if (!projectId) {
       setLoading(false);
       return;
     }
-    const [proj, lib, sr, wl] = await Promise.all([
-      getProject(projectId),
+    const [lib, sr, sections] = await Promise.all([
       listLibrary(projectId),
-      listSearchRuns(projectId),
-      getWhitelist(projectId),
+      // 检索统计属于右侧 Inspector；它失败时主列表仍应可用。
+      listSearchRuns(projectId).catch(() => null),
+      // 正文还没生成时这里是空数组，Provenance 会自动退回排序理由/来源，
+      // 所以不需要为「还没写正文」单独分支。章节反查只是增强信息：即使它
+      // 暂时 500，也不能把检索与分诊主界面一起打进错误态。
+      listSections(projectId).catch(() => null),
     ]);
-    setProject(proj.data);
     setEntries(lib.data);
-    setRuns(sr.data);
-    setWhitelist(wl.data);
-    setSource(lib.source);
-    setNote(lib.note);
+    setRuns(sr?.data ?? []);
+    setUsage(sections ? buildCiteKeyUsage(sections.data) : new Map());
+    setLoadError(null);
     setLoading(false);
   }, [projectId]);
 
-  React.useEffect(() => {
-    let alive = true;
-    reload().catch(() => {
-      if (alive) setLoading(false);
+  const runReload = React.useCallback(() => {
+    setLoadError(null);
+    reload().catch((err) => {
+      setLoadError(describeError(err));
+      setLoading(false);
     });
-    return () => {
-      alive = false;
-    };
   }, [reload]);
 
-  /** 订阅任务进度；任务结束后刷新数据。 */
-  const track = React.useCallback(
-    (started: Job | undefined, fallbackMessage: string) => {
-      if (!started) {
-        setJobMessage(fallbackMessage);
-        return;
-      }
-      setJob(started);
-      setJobStage(started.stage ?? '排队中');
-      setJobMessage(null);
-      const stop = subscribeJobEvents(projectId, started.id, {
-        onEvent: (event: JobEvent) => {
-          setJobStage(event.stage ?? event.type);
-          setJob((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  progress: event.progress ?? prev.progress,
-                  status: event.status ?? prev.status,
-                  stage: event.stage ?? prev.stage,
-                }
-              : prev,
-          );
-          if (event.type === 'search.completed' || event.type === 'cards.completed') {
-            void reload();
-          }
-        },
-        onClose: () => {
-          void reload();
-          setJob(null);
-          setJobStage(null);
-        },
-      });
-      return stop;
-    },
-    [projectId, reload],
+  React.useEffect(() => {
+    runReload();
+  }, [runReload]);
+  useJobFinished(runReload);
+
+  const filtered = React.useMemo(() => {
+    let list = entries;
+    if (statusFilter === 'cited') {
+      list = list.filter((entry) => sectionsCiting(usage, entry.bibtex_key).length > 0);
+    } else if (statusFilter !== 'all') {
+      list = list.filter((entry) => entry.status === statusFilter);
+    }
+    if (query.trim()) {
+      const q = query.toLowerCase();
+      list = list.filter(
+        (e) =>
+          e.work.canonical_title.toLowerCase().includes(q) ||
+          e.work.authors.some((a) => a.toLowerCase().includes(q)) ||
+          e.work.venue_name?.toLowerCase().includes(q) ||
+          sectionsCiting(usage, e.bibtex_key).some((title) => title.toLowerCase().includes(q)),
+      );
+    }
+    return [...list].sort((a, b) =>
+      sortDesc ? b.relevance_score - a.relevance_score : a.relevance_score - b.relevance_score,
+    );
+  }, [entries, statusFilter, query, sortDesc, usage]);
+
+  const selectedCount = entries.filter((e) => e.status === 'selected').length;
+  const citedCount = React.useMemo(
+    () => entries.filter((entry) => sectionsCiting(usage, entry.bibtex_key).length > 0).length,
+    [entries, usage],
   );
 
-  const toggleSelect = async (target: LibraryEntry) => {
-    const nextStatus: LibraryEntryStatus = target.status === 'selected' ? 'candidate' : 'selected';
-    // 乐观更新，随后以服务端返回为准（bibtex_key 由服务端在入库时分配）。
-    setEntries((prev) =>
-      prev.map((e) => (e.id === target.id ? { ...e, status: nextStatus } : e)),
-    );
-    setActive((a) => (a && a.id === target.id ? { ...a, status: nextStatus } : a));
-    const result = await selectEntries(projectId, [target.work.id], nextStatus);
-    if (result.source === 'live') void reload();
+  /** 局部更新，不再整表重拉。 */
+  const applyStatus = (ids: Set<string>, status: LibraryEntryStatus) => {
+    setEntries((prev) => prev.map((e) => (ids.has(e.id) ? { ...e, status } : e)));
+    setActive((a) => (a && ids.has(a.id) ? { ...a, status } : a));
+  };
+
+  /**
+   * 单条勾选。
+   *
+   * 此前每点一次都要 `runReload()` 重拉 4 个端点（含 330 条列表）并整表重渲染。
+   * 现在只做乐观更新 + 单次 POST，失败才回滚；白名单交给 provider 在任务/批量
+   * 提交后统一刷新。
+   */
+  const toggleOne = async (entry: LibraryEntry, index: number, shiftKey: boolean) => {
+    if (shiftKey && lastIndex !== null) {
+      const [from, to] = lastIndex < index ? [lastIndex, index] : [index, lastIndex];
+      const range = filtered.slice(from, to + 1).map((e) => e.id);
+      setChecked((prev) => {
+        const next = new Set(prev);
+        range.forEach((id) => next.add(id));
+        return next;
+      });
+      setLastIndex(index);
+      return;
+    }
+    setLastIndex(index);
+
+    const previousStatus = entry.status;
+    const nextStatus: LibraryEntryStatus = previousStatus === 'selected' ? 'candidate' : 'selected';
+    const ids = new Set([entry.id]);
+    applyStatus(ids, nextStatus);
+    try {
+      await selectEntries(projectId, [entry.work.id], nextStatus);
+      // 白名单变了（R1），项目层需要知道。
+      reloadProject();
+    } catch (err) {
+      // 这个勾选决定 R1 引用白名单，失败却不回滚等于让界面对文献库状态撒谎。
+      applyStatus(ids, previousStatus);
+      toast({ title: '入库状态未能保存', description: describeError(err), variant: 'error' });
+    }
+  };
+
+  /** 批量入库/排除：`selectEntries` 本来就收数组，一次请求即可。 */
+  const bulkStatus = async (status: LibraryEntryStatus) => {
+    const targets = filtered.filter((e) => checked.has(e.id));
+    if (targets.length === 0) return;
+    setBulkBusy(true);
+    const previous = new Map(targets.map((e) => [e.id, e.status]));
+    applyStatus(new Set(targets.map((e) => e.id)), status);
+    try {
+      await selectEntries(
+        projectId,
+        targets.map((e) => e.work.id),
+        status,
+      );
+      toast({
+        title: `${targets.length} 条已${status === 'selected' ? '入库' : status === 'excluded' ? '排除' : '设为候选'}`,
+        variant: 'success',
+      });
+      setChecked(new Set());
+      reloadProject();
+      runReload();
+    } catch (err) {
+      setEntries((prev) =>
+        prev.map((e) => (previous.has(e.id) ? { ...e, status: previous.get(e.id)! } : e)),
+      );
+      toast({ title: '批量操作失败', description: describeError(err), variant: 'error' });
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  /** 后端 DELETE /library/entries/{id} 一直存在，此前界面没有入口。 */
+  const bulkDelete = async () => {
+    setConfirmDelete(false);
+    const targets = filtered.filter((e) => checked.has(e.id));
+    if (targets.length === 0) return;
+    setBulkBusy(true);
+    let ok = 0;
+    const failures: string[] = [];
+    for (const entry of targets) {
+      try {
+        await deleteLibraryEntry(projectId, entry.id);
+        ok += 1;
+      } catch (err) {
+        failures.push(describeError(err));
+      }
+    }
+    setBulkBusy(false);
+    setChecked(new Set());
+    if (ok > 0) toast({ title: `已移除 ${ok} 条文献`, variant: 'success' });
+    if (failures.length > 0) {
+      toast({ title: `${failures.length} 条未能移除`, description: failures[0], variant: 'error' });
+    }
+    runReload();
+    reloadProject();
+  };
+
+  const runAction = async (
+    action: () => Promise<{ data: Job | undefined }>,
+    fallbackMessage: string,
+    failTitle: string,
+  ) => {
+    try {
+      const started = await action();
+      startJob(started.data, fallbackMessage);
+    } catch (err) {
+      toast({ title: failTitle, description: describeError(err), variant: 'error' });
+    }
   };
 
   const handleImport = async (kind: 'doi' | 'bibtex', payload: string) => {
@@ -172,217 +265,221 @@ export function LibraryWorkbench() {
       kind === 'doi'
         ? { dois: payload.split('\n').map((line) => line.trim()).filter(Boolean) }
         : { bibtex: payload };
-    const started = await importReferences(projectId, body);
-    track(started.data, '后端不可用：导入需要 R1 反查核验，未写入任何文献');
-  };
-
-  const triggerSearch = async () => {
-    const started = await startSearch(projectId, { regenerateScope: !project?.topic });
-    track(started.data, '后端不可用：无法触发检索');
-  };
-
-  const triggerCards = async () => {
-    const started = await generateCards(projectId);
-    track(started.data, '后端不可用：无法生成卡片');
-  };
-
-  const triggerSnowball = async () => {
-    const started = await startSnowball(projectId, 'both');
-    track(started.data, '后端不可用：无法执行雪球扩展');
-  };
-
-  const triggerIngest = async () => {
-    const started = await startIngest(projectId);
-    track(started.data, '后端不可用：无法获取 OA 全文');
-  };
-
-  const filtered = React.useMemo(() => {
-    let list = entries;
-    if (statusFilter !== 'all') list = list.filter((e) => e.status === statusFilter);
-    if (query.trim()) {
-      const q = query.toLowerCase();
-      list = list.filter(
-        (e) =>
-          e.work.canonical_title.toLowerCase().includes(q) ||
-          e.work.authors.some((a) => a.toLowerCase().includes(q)),
-      );
-    }
-    return [...list].sort((a, b) =>
-      sortDesc ? b.relevance_score - a.relevance_score : a.relevance_score - b.relevance_score,
+    await runAction(
+      () => importReferences(projectId, body),
+      '后端不可用：导入需要 R1 反查核验，未写入任何文献',
+      '导入未能启动',
     );
-  }, [entries, statusFilter, query, sortDesc]);
+  };
 
-  const selectedCount = entries.filter((e) => e.status === 'selected').length;
+  const triggerSearch = () =>
+    runAction(
+      () =>
+        startSearch(projectId, {
+          providers: providersFromCapabilities(capabilities),
+          regenerateScope: !project?.topic,
+        }),
+      '后端不可用：无法触发检索',
+      '检索未能启动',
+    );
+
+  const checkedInView = filtered.filter((e) => checked.has(e.id)).length;
+  const allChecked = filtered.length > 0 && checkedInView === filtered.length;
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="文献工作台"
-        description={project ? project.title : '检索、筛选、雪球扩展与入库核验'}
+    <div className="space-y-4">
+      <WorkbenchHeader
+        title={
+          <span className="inline-flex items-baseline gap-2">
+            文献
+            <span className="font-sans text-sm font-normal tabular-nums text-muted-foreground">
+              {entries.length}
+            </span>
+          </span>
+        }
+        description={
+          citedCount > 0
+            ? `${citedCount} 篇已进入正文；打开文献即可查看证据与详细元数据。`
+            : '从入选理由开始理解研究语境；正文生成后，这里会显示每篇文献支撑的章节。'
+        }
         actions={
           <>
-            <Button variant="outline" onClick={triggerSnowball} disabled={!!job}>
-              <Network className="h-4 w-4" /> 雪球扩展
-            </Button>
-            <Button variant="outline" onClick={triggerIngest} disabled={!!job}>
-              <FileText className="h-4 w-4" /> 获取 OA 全文
-            </Button>
-            <Button variant="outline" onClick={triggerCards} disabled={!!job}>
-              <Sparkles className="h-4 w-4" /> 生成卡片
-            </Button>
-            <Button variant="outline" onClick={() => setImportOpen(true)} disabled={!!job}>
-              <Download className="h-4 w-4" /> 导入
-            </Button>
-            <Button onClick={triggerSearch} disabled={!!job}>
-              {job ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-              触发检索
+            <ActionMenu
+              disabled={!projectId || busy}
+              items={[
+                {
+                  label: LIBRARY_ACTION.snowball,
+                  icon: Network,
+                  description: '沿引用与被引关系扩展候选文献',
+                  onSelect: () =>
+                    runAction(
+                      () => startSnowball(projectId, 'both'),
+                      '后端不可用：无法执行雪球扩展',
+                      '雪球扩展未能启动',
+                    ),
+                },
+                {
+                  label: LIBRARY_ACTION.fulltext,
+                  icon: FileText,
+                  description: '抓取开放获取全文并解析分块',
+                  onSelect: () =>
+                    runAction(
+                      () => startIngest(projectId),
+                      '后端不可用：无法获取 OA 全文',
+                      'OA 全文获取未能启动',
+                    ),
+                },
+                {
+                  label: LIBRARY_ACTION.cards,
+                  icon: Sparkles,
+                  description: '从全文抽取可写作的文献卡片',
+                  onSelect: () =>
+                    runAction(
+                      () => generateCards(projectId),
+                      '后端不可用：无法生成卡片',
+                      '卡片生成未能启动',
+                    ),
+                },
+                {
+                  label: LIBRARY_ACTION.import,
+                  icon: Download,
+                  description: '经 R1 反查核验后入库',
+                  onSelect: () => setImportOpen(true),
+                },
+                {
+                  label: LIBRARY_ACTION.runAll,
+                  icon: Rocket,
+                  description: '检索 → 大纲 → 写作 → 编译，失败降级不阻断',
+                  onSelect: () =>
+                    runAction(
+                      () => generateAll(projectId),
+                      '后端不可用：无法启动全管线',
+                      '全管线未能启动',
+                    ),
+                },
+              ]}
+            />
+            <Button onClick={triggerSearch} disabled={!projectId || busy}>
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+              {LIBRARY_ACTION.search}
             </Button>
           </>
         }
       />
 
-      <DataSourceBanner source={source} note={note} />
-
-      {job && (
-        <Card>
-          <CardContent className="flex items-center gap-3 py-3">
-            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-            <div className="flex-1">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-medium">{STAGE_LABEL[jobStage ?? ''] ?? jobStage ?? '进行中'}</span>
-                <span className="text-muted-foreground">{Math.round((job.progress ?? 0) * 100)}%</span>
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr),20rem]">
+        <div className="min-w-0 space-y-3">
+          {/* 筛选与批量操作常驻：此前它们随页面滚走，滚到第 200 行就再也够不到。 */}
+          <div className="space-y-3 border-b pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <Tabs
+                value={statusFilter}
+                onValueChange={(v) => {
+                  setStatusFilter(v as StatusFilter);
+                  setLastIndex(null);
+                }}
+              >
+                <TabsList>
+                  {STATUS_TABS.map((t) => (
+                    <TabsTrigger key={t.value} value={t.value}>
+                      {t.label}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">
+                  {LIBRARY_ACTION.selected} {selectedCount} / {entries.length}
+                </span>
+                <Button variant="ghost" size="sm" onClick={() => setSortDesc((s) => !s)}>
+                  <ArrowUpDown className="h-3.5 w-3.5" />
+                  相关性{sortDesc ? '降序' : '升序'}
+                </Button>
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="过滤标题 / 作者 / 章节"
+                  aria-label="过滤文献"
+                  className="h-8 w-48"
+                />
               </div>
-              <Progress value={Math.round((job.progress ?? 0) * 100)} className="mt-1.5" />
             </div>
-          </CardContent>
-        </Card>
-      )}
 
-      {jobMessage && (
-        <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
-          {jobMessage}
-        </div>
-      )}
-
-      {!projectId && (
-        <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-          请先从
-          <Link href="/projects" className="mx-1 underline">
-            项目列表
-          </Link>
-          进入某个项目。
-        </div>
-      )}
-
-      <div className={cn('grid gap-6 lg:grid-cols-[1fr,20rem]', !projectId && 'hidden')}>
-        <div className="space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <Tabs value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
-              <TabsList>
-                {STATUS_TABS.map((t) => (
-                  <TabsTrigger key={t.value} value={t.value}>
-                    {t.label}
-                  </TabsTrigger>
-                ))}
-              </TabsList>
-            </Tabs>
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">已入库 {selectedCount}</span>
-              <Input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="过滤标题 / 作者"
-                className="h-8 w-48"
-              />
+            <div className="flex flex-wrap items-center gap-2 border-t pt-2">
+              <label className="flex cursor-pointer items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={allChecked}
+                  onChange={(e) =>
+                    setChecked(e.target.checked ? new Set(filtered.map((x) => x.id)) : new Set())
+                  }
+                  // 外层 <label> 已经给了可访问名，但显式写出来更稳妥，
+                  // 也让审计工具不必依赖 label 包裹关系去推断。
+                  aria-label={`全选当前筛选结果（${filtered.length} 条）`}
+                  className="h-4 w-4 rounded border-input accent-primary"
+                />
+                全选当前筛选结果（{filtered.length}）
+              </label>
+              {checkedInView > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <Badge variant="secondary">已选 {checkedInView}</Badge>
+                  <Button
+                    size="sm"
+                    onClick={() => bulkStatus('selected')}
+                    disabled={bulkBusy}
+                  >
+                    {bulkBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    {LIBRARY_ACTION.bulkSelect}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => bulkStatus('excluded')}
+                    disabled={bulkBusy}
+                  >
+                    {LIBRARY_ACTION.bulkExclude}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setConfirmDelete(true)}
+                    disabled={bulkBusy}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" /> {LIBRARY_ACTION.remove}
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setChecked(new Set())}>
+                    <X className="h-3.5 w-3.5" /> 取消选择
+                  </Button>
+                </div>
+              )}
+              <span className="ml-auto text-xs text-muted-foreground">
+                按住 Shift 点选可连选一段
+              </span>
             </div>
           </div>
 
-          <Card>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10"></TableHead>
-                  <TableHead>文献</TableHead>
-                  <TableHead
-                    className="w-24 cursor-pointer select-none"
-                    onClick={() => setSortDesc((s) => !s)}
-                  >
-                    <span className="inline-flex items-center gap-1">
-                      相关性 <ArrowUpDown className="h-3 w-3" />
-                    </span>
-                  </TableHead>
-                  <TableHead className="w-24">来源</TableHead>
-                  <TableHead className="w-20">状态</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {loading ? (
-                  <TableRow>
-                    <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                      加载中…
-                    </TableCell>
-                  </TableRow>
-                ) : filtered.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={5} className="py-10 text-center text-sm text-muted-foreground">
-                      {entries.length === 0
-                        ? '文献库为空。点右上角「触发检索」从五个学术源检索并入库。'
-                        : '当前筛选条件下无匹配文献'}
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  filtered.map((e) => (
-                    <TableRow
-                      key={e.id}
-                      data-state={e.status === 'selected' ? 'selected' : undefined}
-                      className="cursor-pointer"
-                      onClick={() => setActive(e)}
-                    >
-                      <TableCell onClick={(ev) => ev.stopPropagation()}>
-                        <Checkbox
-                          checked={e.status === 'selected'}
-                          onCheckedChange={() => toggleSelect(e)}
-                          aria-label="入库"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <div className="max-w-md">
-                          <div className="flex items-center gap-2">
-                            <span className="line-clamp-1 font-medium">{e.work.canonical_title}</span>
-                            {e.work.is_retracted && (
-                              <Badge variant="destructive" className="shrink-0">
-                                撤稿
-                              </Badge>
-                            )}
-                          </div>
-                          <div className="line-clamp-1 text-xs text-muted-foreground">
-                            {e.work.authors.join(', ')} · {e.work.publication_year ?? '—'}
-                            {e.work.venue_name ? ` · ${e.work.venue_name}` : ''}
-                          </div>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <RelevanceBar score={e.relevance_score} />
-                      </TableCell>
-                      <TableCell>
-                        <span className="text-xs text-muted-foreground">
-                          {ADDED_VIA_LABEL[e.added_via]}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        <StatusChip status={e.status} verified={!!e.verified_at} />
-                      </TableCell>
-                    </TableRow>
-                  ))
-                )}
-              </TableBody>
-            </Table>
-          </Card>
+          <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-96">
+            <EntryList
+              entries={filtered}
+              selectedIds={checked}
+              activeId={active?.id}
+              usage={usage}
+              onToggleOne={toggleOne}
+              onOpen={setActive}
+              emptyHint={
+                entries.length === 0
+                  ? '文献库为空。点右上角「触发检索」从五个学术源检索并入库。'
+                  : statusFilter === 'cited'
+                    ? '正文尚未引用文献；生成或编辑章节后，这里会按引用位置自动汇总。'
+                  : '当前筛选条件下无匹配文献'
+              }
+            />
+          </LoadState>
         </div>
 
-        <aside className="space-y-4">
-          <ProviderFilter selected={capabilities} onChange={setCapabilities} />
+        <aside className="space-y-4 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto scrollbar-thin">
           <SearchStats runs={runs} />
+          <ProviderFilter selected={capabilities} onChange={setCapabilities} />
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm">引用真实性</CardTitle>
@@ -391,9 +488,6 @@ export function LibraryWorkbench() {
               <p>R1 入库核验：仅 selected + 已核验 + 有 key + 未撤稿进入写作白名单。</p>
               <p>R2 写作约束：cite-key 越权自动重写/移除。</p>
               <p>R3 参考文献确定性生成：key 入库时持久化，导出只消费。</p>
-              <p className="border-t pt-1.5 text-foreground">
-                当前写作白名单：<span className="tabular-nums">{whitelist.length}</span> 个 cite key
-              </p>
             </CardContent>
           </Card>
         </aside>
@@ -402,45 +496,30 @@ export function LibraryWorkbench() {
       <CardDrawer
         entry={active}
         open={!!active}
+        citedIn={sectionsCiting(usage, active?.bibtex_key)}
         onClose={() => setActive(null)}
-        onToggleSelect={toggleSelect}
+        onToggleSelect={(entry) => toggleOne(entry, -1, false)}
       />
       <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImport={handleImport} />
+
+      <Dialog
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title={`从文献库移除 ${checkedInView} 条？`}
+        description="条目会被彻底删除，不只是取消入库。已经引用了这些文献的正文会在下次引用审计里被标出。"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setConfirmDelete(false)}>
+              取消
+            </Button>
+            <Button variant="destructive" onClick={bulkDelete}>
+              移除
+            </Button>
+          </>
+        }
+      />
+
+      <WorkbenchFooterNav current="library" />
     </div>
   );
-}
-
-const STAGE_LABEL: Record<string, string> = {
-  scope: '生成研究范围',
-  search: '五源检索与去重',
-  curate: '分配引用 key',
-  cards: '抽取文献卡片',
-  import: '反查核验导入文献',
-  import_doi: '反查核验 DOI',
-  import_bibtex: '反查核验 BibTeX 条目',
-  snowball: '引文雪球扩展',
-  ingest: '获取并解析 OA 全文',
-  done: '完成',
-};
-
-function RelevanceBar({ score }: { score: number }) {
-  const pct = Math.round(score * 100);
-  return (
-    <div className="flex items-center gap-2">
-      <div className="h-1.5 w-10 overflow-hidden rounded-full bg-secondary">
-        <div
-          className={cn('h-full rounded-full', pct >= 80 ? 'bg-success' : pct >= 60 ? 'bg-primary' : 'bg-warning')}
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-      <span className="text-xs tabular-nums text-muted-foreground">{pct}</span>
-    </div>
-  );
-}
-
-function StatusChip({ status, verified }: { status: LibraryEntryStatus; verified: boolean }) {
-  if (status === 'selected')
-    return <Badge variant={verified ? 'success' : 'warning'}>{verified ? '已入库' : '待核验'}</Badge>;
-  if (status === 'excluded') return <Badge variant="muted">已排除</Badge>;
-  return <Badge variant="outline">候选</Badge>;
 }

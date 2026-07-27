@@ -1,14 +1,21 @@
 'use client';
 
 import * as React from 'react';
-import { EditorContent, useEditor } from '@tiptap/react';
+import { EditorContent, useEditor, type Editor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
-import { Loader2, Quote, Sparkles, X } from 'lucide-react';
-import { Badge } from '@/components/ui/badge';
+import { Bold, Image as ImageIcon, Italic, List, ListOrdered, Loader2, Quote, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CiteKeyPicker } from '@/components/writing/cite-key-picker';
-import { refineText } from '@/lib/api';
-import type { IRParagraph, IRRun, RefineAction, SectionIR, SoftCheckFinding } from '@/lib/types';
+import { CiteChip } from '@/components/writing/extensions/cite-chip';
+import {
+  FigureBlockNode,
+  FigureXref,
+  IrBlock,
+  MathInline,
+} from '@/components/writing/extensions/ir-block';
+import { irToTiptap, tiptapToIR, type TiptapDoc } from '@/lib/ir-serde';
+import type { RefineAction, SectionIR, SoftCheckFinding, VisualAsset } from '@/lib/types';
+import { cn } from '@/lib/utils';
 
 const REFINE_ACTIONS: { action: RefineAction; label: string }[] = [
   { action: 'polish', label: '润色' },
@@ -17,243 +24,354 @@ const REFINE_ACTIONS: { action: RefineAction; label: string }[] = [
   { action: 'academic_tone', label: '学术语气' },
 ];
 
+export interface RefineRequest {
+  action: RefineAction;
+  /** 选区纯文本；由调用方发给 refine 端点并回显 diff。 */
+  text: string;
+  /** 用户接受改写后写回选区。 */
+  apply: (replacement: string) => void;
+}
+
 /**
- * 章节编辑器：Tiptap 负责正文富文本，引用是**段落级原子 chip**。
+ * 章节编辑器：**整节一个** Tiptap 实例。
  *
- * 设计 §4.5：cite 是 IR 里的原子节点而非正文字符串——所以正文里根本没有
- * 可以手写引用的地方，chip 只能从白名单选（§4.4.3 R2 的前端保障）。
+ * 此前是每个段落一个独立实例、每段一张带边框的卡片、失焦时 `getText()` 把内容
+ * 压成纯文本；引用在段落下方的 chip 带里，保存时全部塞到段落末尾。结果是
+ * 既不能跨段落选中与通读，引用也和它支撑的句子脱钩。
+ *
+ * 现在正文是一份连续文档：引用是行内原子 chip（位置即语义位置），
+ * 公式/图/表/算法/todo 以只读块原样保留（见 extensions/ir-block.ts）。
+ *
+ * 加粗/斜体/列表由 PaperIR 的 `TextRun.marks` 与 `ListBlock` 结构化承载，
+ * 渲染器据此确定性展开 \textbf{} / \emph{} / itemize / enumerate——
+ * 强调是**标记**不是 LLM 写的 LaTeX，因此不触碰「自由 LaTeX 只允许出现在
+ * equation/algorithm」这条边界（设计 §4.5）。
+ *
+ * 仍然不提供标题：章节层级由大纲决定，正文里再开标题会和大纲打架。
  */
 export function SectionEditor({
   section,
   whitelist,
   onChange,
-  projectId,
   softChecks = [],
+  onRefine,
+  refining,
+  readOnly = false,
+  visuals = [],
 }: {
   section: SectionIR;
   whitelist: string[];
   onChange: (next: SectionIR) => void;
-  projectId?: string;
   softChecks?: SoftCheckFinding[];
+  onRefine?: (request: RefineRequest) => void;
+  refining?: RefineAction | null;
+  readOnly?: boolean;
+  visuals?: VisualAsset[];
 }) {
-  const paragraphs = React.useMemo(() => normalizeBlocks(section.blocks), [section.blocks]);
-  // 语义软校验只出徽章，不删引用（设计 §4.4.3 可选软校验）。
+  const [picking, setPicking] = React.useState(false);
+  const [pickingFigure, setPickingFigure] = React.useState(false);
+  const [selection, setSelection] = React.useState<{ top: number; left: number } | null>(null);
+
   const weakKeys = React.useMemo(
     () => new Set(softChecks.filter((f) => f.weak).map((f) => f.cite_key)),
     [softChecks],
   );
 
-  const updateParagraph = (index: number, patch: { text?: string; keys?: string[] }) => {
-    const next = paragraphs.map((p, i) =>
-      i === index ? { text: patch.text ?? p.text, keys: patch.keys ?? p.keys } : p,
-    );
-    onChange({ ...section, blocks: next.map(toIRParagraph) });
+  // section 换了才重建文档；否则每次按键都会重置光标。
+  const sectionKey = section.key;
+  const latestSection = React.useRef(section);
+  latestSection.current = section;
+
+  const editor = useEditor(
+    {
+      extensions: [
+        StarterKit.configure({
+          // 关掉 IR 无法表示的东西——留着就等于承诺一个保存时会丢的功能。
+          // bold / italic / bulletList / orderedList / listItem 现在 IR 有对应
+          // 结构（TextRun.marks 与 ListBlock），因此保留。
+          blockquote: false,
+          codeBlock: false,
+          code: false,
+          heading: false,
+          horizontalRule: false,
+          hardBreak: false,
+          strike: false,
+        }),
+        CiteChip.configure({ weakKeys }),
+        MathInline,
+        FigureXref,
+        FigureBlockNode.configure({
+          previewUrls: Object.fromEntries(
+            visuals
+              .filter((visual) => visual.renditions.png?.url)
+              .map((visual) => [visual.asset_ref, visual.renditions.png!.url]),
+          ),
+          aiAssetRefs: new Set(
+            visuals.filter((visual) => visual.kind === 'ai_image').map((visual) => visual.asset_ref),
+          ),
+        }),
+        IrBlock,
+      ],
+      content: irToTiptap(section),
+      editable: !readOnly,
+      editorProps: {
+        attributes: {
+          class: cn(
+            'pf-prose min-h-[40vh] focus:outline-none',
+            readOnly && 'opacity-80',
+          ),
+          'aria-label': `章节正文：${section.title}`,
+          role: 'textbox',
+          'aria-multiline': 'true',
+        },
+      },
+      immediatelyRender: false,
+      onUpdate: ({ editor: instance }) => {
+        const doc = instance.getJSON() as unknown as TiptapDoc;
+        onChange(tiptapToIR(doc, latestSection.current));
+      },
+      onSelectionUpdate: ({ editor: instance }) => {
+        setSelection(selectionAnchor(instance));
+      },
+      onBlur: () => setSelection(null),
+    },
+    [sectionKey, readOnly],
+  );
+
+  // 软校验结果晚于正文到达时刷新 chip 配色。
+  React.useEffect(() => {
+    if (!editor) return;
+    const ext = editor.extensionManager.extensions.find((e) => e.name === CiteChip.name);
+    if (ext) {
+      ext.options.weakKeys = weakKeys;
+      editor.view.dispatch(editor.state.tr);
+    }
+  }, [editor, weakKeys]);
+
+  const insertCitation = (keys: string[]) => {
+    if (!editor || keys.length === 0) return;
+    editor.chain().focus().insertContent({ type: CiteChip.name, attrs: { keys } }).run();
+    setPicking(false);
   };
 
-  const addParagraph = () => {
-    onChange({
-      ...section,
-      blocks: [...paragraphs, { text: '', keys: [] }].map(toIRParagraph),
-    });
+  const approvedVisuals = visuals.filter((visual) => visual.review_status === 'approved');
+
+  const insertFigureXref = (visual: VisualAsset) => {
+    if (!editor) return;
+    editor
+      .chain()
+      .focus()
+      .insertContent({ type: FigureXref.name, attrs: { target: visual.figure_label, kind: 'figure' } })
+      .run();
+    setPickingFigure(false);
   };
 
-  const removeParagraph = (index: number) => {
-    onChange({
-      ...section,
-      blocks: paragraphs.filter((_, i) => i !== index).map(toIRParagraph),
-    });
-  };
+  const selectedText = editor
+    ? editor.state.doc.textBetween(editor.state.selection.from, editor.state.selection.to, ' ')
+    : '';
+  const hasSelection = selectedText.trim().length > 0;
 
   return (
-    <div className="space-y-4">
+    <div className="relative space-y-3">
       {section.citation_warnings?.length > 0 && (
         <div className="space-y-1 rounded-md border border-warning/50 bg-warning/10 p-3 text-xs">
+          <p className="font-medium text-warning-foreground">
+            R2 二次校验移除了越权引用（正文其余部分未受影响）
+          </p>
           {section.citation_warnings.map((warning, index) => (
-            <p key={index}>
-              ⚠️ {warning.message}
+            <p key={index} className="text-muted-foreground">
+              {warning.message}
               <span className="ml-1 font-mono">{warning.rejected_keys.join(', ')}</span>
             </p>
           ))}
         </div>
       )}
 
-      {paragraphs.map((paragraph, index) => (
-        <ParagraphEditor
-          key={index}
-          index={index}
-          text={paragraph.text}
-          keys={paragraph.keys}
-          whitelist={whitelist}
-          weakKeys={weakKeys}
-          projectId={projectId}
-          sectionKey={section.key}
-          onTextChange={(text) => updateParagraph(index, { text })}
-          onKeysChange={(keys) => updateParagraph(index, { keys })}
-          onRemove={() => removeParagraph(index)}
-        />
-      ))}
+      <div className="flex flex-wrap items-center gap-1 border-b pb-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setPicking((v) => !v)}
+          disabled={readOnly}
+          aria-expanded={picking}
+        >
+          <Quote className="h-3.5 w-3.5" /> 插入引用
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setPickingFigure((value) => !value)}
+          disabled={readOnly || approvedVisuals.length === 0}
+          aria-expanded={pickingFigure}
+        >
+          <ImageIcon className="h-3.5 w-3.5" /> 插入图引用
+        </Button>
 
-      <Button variant="outline" size="sm" onClick={addParagraph}>
-        新增段落
-      </Button>
-    </div>
-  );
-}
+        <span aria-hidden className="mx-1 h-4 w-px bg-border" />
 
-function ParagraphEditor({
-  index,
-  text,
-  keys,
-  whitelist,
-  weakKeys,
-  projectId,
-  sectionKey,
-  onTextChange,
-  onKeysChange,
-  onRemove,
-}: {
-  index: number;
-  text: string;
-  keys: string[];
-  whitelist: string[];
-  weakKeys: Set<string>;
-  projectId?: string;
-  sectionKey: string;
-  onTextChange: (text: string) => void;
-  onKeysChange: (keys: string[]) => void;
-  onRemove: () => void;
-}) {
-  const [picking, setPicking] = React.useState(false);
-  const [refining, setRefining] = React.useState<RefineAction | null>(null);
-  const [refineNote, setRefineNote] = React.useState<string | null>(null);
-  const editor = useEditor({
-    extensions: [StarterKit.configure({ heading: false })],
-    content: `<p>${escapeHtml(text)}</p>`,
-    editorProps: {
-      attributes: {
-        class:
-          'prose prose-sm max-w-none min-h-[80px] rounded-md border bg-background px-3 py-2 ' +
-          'focus:outline-none focus:ring-1 focus:ring-ring',
-      },
-    },
-    immediatelyRender: false,
-    onBlur: ({ editor: instance }) => onTextChange(instance.getText().trim()),
-  });
+        <MarkButton
+          editor={editor}
+          disabled={readOnly}
+          active={editor?.isActive('bold') ?? false}
+          label="加粗"
+          onClick={() => editor?.chain().focus().toggleBold().run()}
+        >
+          <Bold className="h-3.5 w-3.5" />
+        </MarkButton>
+        <MarkButton
+          editor={editor}
+          disabled={readOnly}
+          active={editor?.isActive('italic') ?? false}
+          label="斜体"
+          onClick={() => editor?.chain().focus().toggleItalic().run()}
+        >
+          <Italic className="h-3.5 w-3.5" />
+        </MarkButton>
+        <MarkButton
+          editor={editor}
+          disabled={readOnly}
+          active={editor?.isActive('bulletList') ?? false}
+          label="无序列表"
+          onClick={() => editor?.chain().focus().toggleBulletList().run()}
+        >
+          <List className="h-3.5 w-3.5" />
+        </MarkButton>
+        <MarkButton
+          editor={editor}
+          disabled={readOnly}
+          active={editor?.isActive('orderedList') ?? false}
+          label="有序列表"
+          onClick={() => editor?.chain().focus().toggleOrderedList().run()}
+        >
+          <ListOrdered className="h-3.5 w-3.5" />
+        </MarkButton>
 
-  React.useEffect(() => {
-    if (editor && editor.getText().trim() !== text) {
-      editor.commands.setContent(`<p>${escapeHtml(text)}</p>`);
-    }
-    // 只在外部内容变化时同步，避免打断输入。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text]);
-
-  return (
-    <div className="space-y-2 rounded-lg border p-3">
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <span>段落 {index + 1}</span>
-        <button onClick={onRemove} className="hover:text-destructive" aria-label="删除段落">
-          <X className="h-3.5 w-3.5" />
-        </button>
+        <span className="ml-auto text-xs text-muted-foreground">
+          {hasSelection ? '选中文字后可用浮条改写' : '引用只能从写作白名单选择'}
+        </span>
       </div>
+
+      {picking && (
+        <div className="rounded-md border p-2">
+          <CiteKeyPicker whitelist={whitelist} selected={[]} onChange={insertCitation} compact />
+        </div>
+      )}
+
+      {pickingFigure && (
+        <div className="rounded-md border p-2">
+          <p className="mb-2 text-xs text-muted-foreground">选择已经批准并插入论文的图</p>
+          <div className="flex flex-wrap gap-1.5">
+            {approvedVisuals.map((visual) => (
+              <Button
+                key={visual.id}
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => insertFigureXref(visual)}
+              >
+                {visual.caption || visual.title || visual.figure_label}
+              </Button>
+            ))}
+          </div>
+        </div>
+      )}
 
       <EditorContent editor={editor} />
 
-      <div className="flex flex-wrap items-center gap-1.5">
-        {keys.map((key) => (
-          <Badge
-            key={key}
-            variant={weakKeys.has(key) ? 'warning' : 'success'}
-            className="font-mono text-[11px]"
-            title={weakKeys.has(key) ? '语义软校验：与该处论述相关性偏低' : undefined}
-          >
-            {key}
-            <button
-              className="ml-1"
-              aria-label={`移除引用 ${key}`}
-              onClick={() => onKeysChange(keys.filter((k) => k !== key))}
+      {/* 选区浮动工具条：取代此前钉在每个段落底部的四个按钮。 */}
+      {onRefine && hasSelection && selection && !readOnly && (
+        <div
+          className="absolute z-20 flex items-center gap-0.5 rounded-md border bg-popover p-1 shadow-lg animate-fade-in"
+          style={{ top: Math.max(0, selection.top - 44), left: selection.left }}
+          role="toolbar"
+          aria-label="改写选中文字"
+        >
+          {REFINE_ACTIONS.map(({ action, label }) => (
+            <Button
+              key={action}
+              variant="ghost"
+              size="sm"
+              disabled={!!refining}
+              // 同上：保住选区，否则拿不到用户实际选中的那段文字。
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() =>
+                onRefine({
+                  action,
+                  text: selectedText,
+                  apply: (replacement) => {
+                    if (!editor) return;
+                    editor
+                      .chain()
+                      .focus()
+                      .insertContentAt(
+                        { from: editor.state.selection.from, to: editor.state.selection.to },
+                        replacement,
+                      )
+                      .run();
+                  },
+                })
+              }
             >
-              <X className="h-3 w-3" />
-            </button>
-          </Badge>
-        ))}
-        <Button variant="ghost" size="sm" onClick={() => setPicking((v) => !v)}>
-          <Quote className="h-3.5 w-3.5" /> 插入引用
-        </Button>
-
-        {projectId && (
-          <span className="ml-auto flex items-center gap-1">
-            {REFINE_ACTIONS.map(({ action, label }) => (
-              <Button
-                key={action}
-                variant="ghost"
-                size="sm"
-                disabled={!!refining || !text.trim()}
-                onClick={async () => {
-                  setRefining(action);
-                  setRefineNote(null);
-                  const result = await refineText(projectId, sectionKey, action, text);
-                  setRefining(null);
-                  if (!result.data) {
-                    setRefineNote('后端不可用：润色未执行');
-                    return;
-                  }
-                  if (result.data.changed) onTextChange(result.data.refined);
-                  setRefineNote(result.data.note ?? null);
-                }}
-              >
-                {refining === action ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5" />
-                )}
-                {label}
-              </Button>
-            ))}
-          </span>
-        )}
-      </div>
-
-      {refineNote && <p className="text-xs text-warning">{refineNote}</p>}
-
-      {picking && (
-        <CiteKeyPicker
-          whitelist={whitelist}
-          selected={keys}
-          onChange={onKeysChange}
-          compact
-        />
+              {refining === action ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5" />
+              )}
+              {label}
+            </Button>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
-type SimpleParagraph = { text: string; keys: string[] };
-
-function normalizeBlocks(blocks: IRParagraph[] | undefined): SimpleParagraph[] {
-  if (!blocks || blocks.length === 0) return [{ text: '', keys: [] }];
-  return blocks.map((block) => {
-    const runs = block.runs ?? [];
-    const text = runs
-      .filter((run): run is Extract<IRRun, { t: 'text' }> => run.t === 'text')
-      .map((run) => run.v)
-      .join('');
-    const keys = runs
-      .filter((run): run is Extract<IRRun, { t: 'cite' }> => run.t === 'cite')
-      .flatMap((run) => run.keys);
-    return { text, keys };
-  });
+/** 排版按钮：按下态用 aria-pressed 暴露，读屏能听出「当前是否加粗」。 */
+function MarkButton({
+  editor,
+  active,
+  disabled,
+  label,
+  onClick,
+  children,
+}: {
+  editor: Editor | null;
+  active: boolean;
+  disabled?: boolean;
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      aria-label={label}
+      title={label}
+      aria-pressed={active}
+      disabled={disabled || !editor}
+      // 关键：不 preventDefault 的话，按下按钮会把焦点从编辑器抢走并**collapse 选区**，
+      // 于是「选中一段 → 点加粗」只会给下一个字符预置样式，选中的文字纹丝不动。
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+      className={cn('px-2', active && 'bg-accent text-accent-foreground')}
+    >
+      {children}
+    </Button>
+  );
 }
 
-function toIRParagraph(paragraph: SimpleParagraph): IRParagraph {
-  const runs: IRRun[] = [{ t: 'text', v: paragraph.text }];
-  if (paragraph.keys.length > 0) runs.push({ t: 'cite', keys: paragraph.keys });
-  return { type: 'paragraph', runs };
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+/** 选区起点相对编辑器容器的位置，用于摆放浮动工具条。 */
+function selectionAnchor(editor: Editor): { top: number; left: number } | null {
+  const { from, to } = editor.state.selection;
+  if (from === to) return null;
+  try {
+    const start = editor.view.coordsAtPos(from);
+    const box = editor.view.dom.getBoundingClientRect();
+    return { top: start.top - box.top, left: Math.max(0, start.left - box.left) };
+  } catch {
+    return null;
+  }
 }

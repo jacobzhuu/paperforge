@@ -43,6 +43,26 @@ export interface CreateProjectRequest {
   contribution_points?: string[];
 }
 
+/**
+ * 项目元数据的局部更新（PATCH /projects/{id}）。
+ *
+ * 语义与后端 `UpdateProjectRequest` 一致：**字段缺席 = 不改**，显式 `null` = 清空。
+ * 因此调用方只传真正要改的键，不要为了凑齐类型把当前值全带上——那会把并发的
+ * 其他修改覆盖掉。
+ *
+ * 没有 `paper_type`：论文类型决定管线形状、大纲结构与是否做数字一致性 lint，
+ * 换类型等于新建项目（详见后端同名 schema 的注释）。
+ */
+export interface UpdateProjectRequest {
+  title?: string;
+  topic?: string | null;
+  venue_template?: string | null;
+  language?: Language;
+  citation_style?: CitationStyle;
+  writing_mode?: WritingMode;
+  contribution_points?: string[];
+}
+
 export type LibraryEntryStatus = 'candidate' | 'selected' | 'excluded';
 export type AddedVia =
   | 'search'
@@ -132,7 +152,15 @@ export interface ScopePayload {
 
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
-export type JobKind = 'search' | 'ingest' | 'cards' | 'outline' | 'write' | 'compile' | 'full';
+export type JobKind =
+  | 'search'
+  | 'ingest'
+  | 'cards'
+  | 'outline'
+  | 'write'
+  | 'compile'
+  | 'visual'
+  | 'full';
 export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface Job {
@@ -157,29 +185,32 @@ export interface JobEvent {
   status?: JobStatus | null;
 }
 
-/** SSE 具名事件类型（后端 worker 发出的阶段事件）。 */
-export const JOB_EVENT_TYPES = [
-  'scope.started',
-  'scope.completed',
-  'scope.failed',
-  'search.started',
-  'search.deduped',
-  'search.completed',
-  'search.failed',
-  'curate.started',
-  'curate.completed',
-  'curate.failed',
-  'cards.started',
-  'cards.progress',
-  'cards.completed',
-  'cards.failed',
-  'import.started',
-  'import.verified',
-  'import.rejected',
-  'import.completed',
-  'import.failed',
-  'job.finished',
+/**
+ * worker 的阶段名（services/worker/paperforge_worker/worker.py::_STAGE_PROGRESS）。
+ * 仅用于把后端阶段翻成中文标签，**不再**用作 SSE 事件白名单——
+ * 事件全部走无名 message 通道，前端不需要预先知道事件名。
+ */
+export const JOB_STAGES = [
+  'scope',
+  'search',
+  'curate',
+  'ingest',
+  'snowball',
+  'cards',
+  'quality',
+  'outline',
+  'write',
+  'citecheck',
+  'visual_plan',
+  'visual_generate',
+  'render',
+  'import',
+  'import_doi',
+  'import_bibtex',
+  'done',
 ] as const;
+
+export type JobStage = (typeof JOB_STAGES)[number];
 
 export interface ProjectCost {
   project_id: string;
@@ -221,16 +252,100 @@ export interface OutlinePayload {
   tree: OutlineTree;
 }
 
+/**
+ * 行内强调。**结构化标记**而非 LLM 写的自由 LaTeX：渲染器据此确定性展开
+ * `\textbf{}` / `\emph{}`，正文照常转义（设计 §4.5）。
+ */
+export type IRTextMark = 'bold' | 'italic';
+
 /** PaperIR 行内 run（设计 §4.5：cite 是原子节点，不是正文里的字符串）。 */
 export type IRRun =
-  | { t: 'text'; v: string }
+  | { t: 'text'; v: string; marks?: IRTextMark[] }
   | { t: 'cite'; keys: string[] }
-  | { t: 'math_inline'; v: string };
+  | { t: 'math_inline'; v: string }
+  | { t: 'xref'; target: string; kind: 'figure' };
 
 export interface IRParagraph {
   type: 'paragraph';
   runs: IRRun[];
 }
+
+export interface IRListItem {
+  runs: IRRun[];
+}
+
+/** 无序 / 有序列表；渲染为 itemize / enumerate。 */
+export interface IRList {
+  type: 'list';
+  ordered: boolean;
+  items: IRListItem[];
+}
+
+/**
+ * 块级元素，逐字段对齐 packages/paper_ir/paper_ir/schema.py 的 `Block` 联合。
+ *
+ * 前端此前只声明了 `IRParagraph`，编辑器因此在保存时把公式/图/表/算法/todo
+ * 全部抹成空段落。写作器目前只产出 paragraph，但 IR 与 LaTeX 渲染器都已支持
+ * 全部六种——序列化层必须能无损往返，否则后端一开始产出结构化块就会静默丢数据。
+ */
+export interface IREquation {
+  type: 'equation';
+  latex: string;
+  label?: string | null;
+}
+
+export interface IRFigure {
+  type: 'figure';
+  asset_ref: string;
+  caption?: string;
+  alt_text?: string;
+  label?: string | null;
+  width?: 'column' | 'full';
+}
+
+export interface IRTableSource {
+  kind: 'user_asset' | 'inline';
+  ref?: string | null;
+}
+
+export interface IRTable {
+  type: 'table';
+  source: IRTableSource;
+  caption?: string;
+  label?: string | null;
+}
+
+export interface IRAlgorithm {
+  type: 'algorithm';
+  latex: string;
+  label?: string | null;
+}
+
+/** 实验结果占位（纯生成模式）：不编造数据，正文明确标注待补充。 */
+export interface IRTodo {
+  type: 'todo';
+  text: string;
+}
+
+export type IRBlock =
+  | IRParagraph
+  | IRList
+  | IREquation
+  | IRFigure
+  | IRTable
+  | IRAlgorithm
+  | IRTodo;
+
+/** 非段落块的类型名，编辑器按此渲染只读块视图。 */
+export const IR_STRUCTURED_BLOCK_TYPES = [
+  'equation',
+  'figure',
+  'table',
+  'algorithm',
+  'todo',
+] as const;
+
+export type IRStructuredBlockType = (typeof IR_STRUCTURED_BLOCK_TYPES)[number];
 
 export interface IRCitationWarning {
   path: string;
@@ -242,7 +357,7 @@ export interface SectionIR {
   key: string;
   level: number;
   title: string;
-  blocks: IRParagraph[];
+  blocks: IRBlock[];
   citation_warnings: IRCitationWarning[];
 }
 
@@ -286,7 +401,22 @@ export interface MarkdownPreview {
 
 // ---- 导出产物（设计 §4.3 export_artifact） ----
 
-export type ExportFormat = 'pdf' | 'latex_zip' | 'markdown' | 'bibtex' | 'docx';
+/**
+ * `compile_log` 是编译的**副产物**而非用户请求的格式：它不出现在
+ * `ExportRequest.formats` 里，但会作为产物登记以便下载——PDF 编译失败时
+ * 它是用户唯一能拿到的诊断材料。
+ */
+export type ExportFormat =
+  | 'pdf'
+  | 'latex_zip'
+  | 'markdown'
+  | 'markdown_bundle'
+  | 'bibtex'
+  | 'docx'
+  | 'compile_log';
+
+/** 用户可主动勾选的导出格式（不含 compile_log）。 */
+export type RequestableExportFormat = Exclude<ExportFormat, 'compile_log'>;
 
 export interface ExportArtifact {
   id: string;
@@ -317,6 +447,54 @@ export interface UserAsset {
   warnings: string[];
   /** 大纲/章节引用素材用的 ref（渲染期确定性展开为 booktabs / includegraphics）。 */
   asset_ref?: string | null;
+}
+
+export type VisualKind = 'chart' | 'diagram' | 'ai_image';
+export type VisualGenerationStatus = 'proposed' | 'queued' | 'running' | 'ready' | 'failed';
+export type VisualReviewStatus = 'pending' | 'approved' | 'rejected';
+
+export interface VisualRendition {
+  object_key: string;
+  sha256: string;
+  media_type: string;
+  width?: number | null;
+  height?: number | null;
+  url: string;
+}
+
+export interface VisualAsset {
+  id: string;
+  asset_ref: string;
+  kind: VisualKind;
+  generation_status: VisualGenerationStatus;
+  review_status: VisualReviewStatus;
+  title?: string | null;
+  caption: string;
+  caption_hint?: string | null;
+  alt_text: string;
+  target_section_key?: string | null;
+  suggested_block_index?: number | null;
+  figure_label: string;
+  spec: Record<string, unknown>;
+  provider?: string | null;
+  model?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  renditions: Partial<Record<'svg' | 'pdf' | 'png', VisualRendition>>;
+  input_hash: string;
+  content_hash?: string | null;
+  version: number;
+  supersedes_id?: string | null;
+  created_at?: string | null;
+}
+
+export interface CreateVisualRequest {
+  spec: Record<string, unknown>;
+  title?: string | null;
+  caption?: string;
+  alt_text?: string;
+  target_section_key?: string | null;
+  suggested_block_index?: number | null;
 }
 
 export interface NumLintFinding {
@@ -393,15 +571,26 @@ export interface RoleModel {
 
 export interface RuntimeSettings {
   llm_provider: string;
-  llm_base_url: string;
   /** 密钥永不回传，只报告是否已配置。 */
   llm_api_key_configured: boolean;
   llm_enabled: boolean;
   roles: RoleModel[];
-  scholar_contact_email?: string | null;
+  scholar_contact_email_configured: boolean;
   semantic_scholar_key_configured: boolean;
   storage_backend: string;
-  texd_url: string;
+  visuals_enabled: boolean;
+  ai_images_enabled: boolean;
+  image_provider: string;
+  image_model: string;
+  image_api_key_configured: boolean;
+  image_provider_configured: boolean;
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name?: string | null;
+  email_verified: boolean;
 }
 
 export interface CostByRole {
@@ -419,6 +608,20 @@ export interface CostDetail {
   project_id: string;
   totals: ProjectCost;
   by_role: CostByRole[];
+  images?: {
+    call_count: number;
+    failed_call_count: number;
+    cost_estimate: number;
+    by_size?: Array<{
+      provider: string;
+      model?: string | null;
+      width?: number | null;
+      height?: number | null;
+      call_count: number;
+      failed_call_count: number;
+      cost_estimate: number;
+    }>;
+  };
 }
 
 export interface DocumentVersion {

@@ -1,6 +1,9 @@
 import type { ReactNode } from 'react';
 import './globals.css';
-import { Sidebar } from '@/components/layout/sidebar';
+import { AppShell } from '@/components/auth/app-shell';
+import { AuthProvider } from '@/components/auth/auth-provider';
+import { ThemeProvider, THEME_INIT_SCRIPT } from '@/components/theme-provider';
+import { ToastProvider } from '@/components/ui/toast';
 
 export const metadata = {
   title: 'PaperForge',
@@ -10,13 +13,18 @@ export const metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="zh" suppressHydrationWarning>
+      <head>
+        {/* hydration 前打好 dark class，避免深色偏好下先闪一屏白。 */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body>
-        <div className="flex min-h-screen">
-          <Sidebar />
-          <main className="flex-1 overflow-x-hidden">
-            <div className="mx-auto max-w-6xl px-8 py-8">{children}</div>
-          </main>
-        </div>
+        <ThemeProvider>
+          <ToastProvider>
+            <AuthProvider>
+              <AppShell>{children}</AppShell>
+            </AuthProvider>
+          </ToastProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

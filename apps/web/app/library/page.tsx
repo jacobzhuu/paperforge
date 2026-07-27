@@ -1,10 +1,10 @@
-import { Suspense } from 'react';
-import { LibraryWorkbench } from '@/components/library/library-workbench';
+import { redirectLegacyRoute } from '@/lib/legacy-redirect';
 
-export default function LibraryPage() {
-  return (
-    <Suspense fallback={<div className="py-20 text-center text-sm text-muted-foreground">加载中…</div>}>
-      <LibraryWorkbench />
-    </Suspense>
-  );
+/** 旧扁平路由 → /projects/[id]/library。 */
+export default async function LegacylibraryPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  await redirectLegacyRoute(searchParams, 'library');
 }

@@ -1,12 +1,10 @@
-import { Suspense } from 'react';
-import { OutlineEditor } from '@/components/outline/outline-editor';
+import { redirectLegacyRoute } from '@/lib/legacy-redirect';
 
-export default function OutlinePage() {
-  return (
-    <Suspense
-      fallback={<div className="py-20 text-center text-sm text-muted-foreground">加载中…</div>}
-    >
-      <OutlineEditor />
-    </Suspense>
-  );
+/** 旧扁平路由 → /projects/[id]/outline。 */
+export default async function LegacyoutlinePage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  await redirectLegacyRoute(searchParams, 'outline');
 }

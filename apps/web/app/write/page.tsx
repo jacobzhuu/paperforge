@@ -1,12 +1,10 @@
-import { Suspense } from 'react';
-import { WritingWorkbench } from '@/components/writing/writing-workbench';
+import { redirectLegacyRoute } from '@/lib/legacy-redirect';
 
-export default function WritePage() {
-  return (
-    <Suspense
-      fallback={<div className="py-20 text-center text-sm text-muted-foreground">加载中…</div>}
-    >
-      <WritingWorkbench />
-    </Suspense>
-  );
+/** 旧扁平路由 → /projects/[id]/write。 */
+export default async function LegacywritePage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  await redirectLegacyRoute(searchParams, 'write');
 }
