@@ -5,12 +5,18 @@ import { AlertTriangle, CheckCircle2, Sparkles } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Select } from '@/components/ui/select';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { useProject } from '@/components/project/project-context';
+import { getClaimEvidence, reviewClaimEvidence } from '@/lib/api';
 import type {
+  ClaimEvidence,
   CitationAudit,
   NumLintReport,
   PaperSection,
   QualityReport,
+  QualityProfile,
+  ReviewStyle,
   SectionIR,
 } from '@/lib/types';
 import { collectCiteKeys } from '@/lib/ir-serde';
@@ -44,7 +50,7 @@ export function ValidationPanel({
   quality: QualityReport | undefined;
   numlint: NumLintReport | undefined;
   showNumbers: boolean;
-  onGenerateQuality: () => void;
+  onGenerateQuality: (qualityProfile: QualityProfile, reviewStyle: ReviewStyle) => void;
   busy: boolean;
   onJumpToSection: (sectionKey: string) => void;
 }) {
@@ -278,20 +284,79 @@ function QualityTab({
   disabled,
 }: {
   report: QualityReport | undefined;
-  onGenerate: () => void;
+  onGenerate: (qualityProfile: QualityProfile, reviewStyle: ReviewStyle) => void;
   disabled: boolean;
 }) {
-  if (!report)
+  const { projectId } = useProject();
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>(
+    report?.quality_profile ?? 'draft',
+  );
+  const [reviewStyle, setReviewStyle] = React.useState<ReviewStyle>(
+    report?.review_style ?? 'narrative',
+  );
+  const [evidence, setEvidence] = React.useState<ClaimEvidence[]>([]);
+
+  React.useEffect(() => {
+    if (!report?.report_id) {
+      setEvidence([]);
+      return;
+    }
+    void getClaimEvidence(projectId, report.report_id, true).then((result) => {
+      setEvidence(result.data);
+    });
+  }, [projectId, report?.report_id]);
+
+  const reviewEvidence = async (
+    anchor: ClaimEvidence,
+    manualStatus: ClaimEvidence['manual_status'],
+  ) => {
+    const updated = await reviewClaimEvidence(projectId, anchor.id, manualStatus);
+    setEvidence((rows) => rows.map((row) => (row.id === updated.id ? updated : row)));
+  };
+
+  const controls = (
+    <div className="grid gap-2 sm:grid-cols-2">
+      <label className="space-y-1 text-xs text-muted-foreground">
+        质量模式
+        <Select
+          value={qualityProfile}
+          onChange={(event) => setQualityProfile(event.target.value as QualityProfile)}
+        >
+          <option value="draft">快速草稿</option>
+          <option value="submission">严格投稿</option>
+        </Select>
+      </label>
+      <label className="space-y-1 text-xs text-muted-foreground">
+        综述方式
+        <Select
+          value={reviewStyle}
+          onChange={(event) => setReviewStyle(event.target.value as ReviewStyle)}
+        >
+          <option value="narrative">叙述性综述</option>
+          <option value="systematic">系统综述</option>
+        </Select>
+      </label>
+    </div>
+  );
+
+  if (!report) {
     return (
-      <div className="flex flex-col items-center gap-3 rounded-md border border-dashed p-4 text-center">
+      <div className="flex flex-col gap-3 rounded-md border border-dashed p-4">
+        {controls}
         <p className="text-xs text-muted-foreground">
-          还没有质量报告。它只做提示、不设门槛，不会阻断出稿。
+          快速草稿只给提示；严格投稿会阻断占位符、未定位全文证据、未审批章节和版面错误。
         </p>
-        <Button variant="outline" size="sm" onClick={onGenerate} disabled={disabled}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => onGenerate(qualityProfile, reviewStyle)}
+          disabled={disabled}
+        >
           <Sparkles className="h-4 w-4" /> 生成质量报告
         </Button>
       </div>
     );
+  }
 
   const metrics = [
     { label: '总字数', value: report.word_count.toLocaleString() },
@@ -300,10 +365,60 @@ function QualityTab({
     { label: '文献利用率', value: `${Math.round(report.library_coverage * 100)}%` },
     { label: '近 5 年占比', value: `${Math.round(report.recent_ratio * 100)}%` },
     { label: '全文卡片覆盖', value: `${Math.round(report.fulltext_coverage * 100)}%` },
+    {
+      label: '核心论断全文覆盖',
+      value: `${Math.round(report.core_claim_fulltext_coverage * 100)}%`,
+    },
   ];
 
   return (
     <div className="space-y-3">
+      {controls}
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge
+          variant={
+            report.readiness_status === 'submission_ready' ||
+            report.readiness_status === 'preflight_ready'
+              ? 'success'
+              : report.readiness_status === 'needs_revision'
+                ? 'destructive'
+                : 'muted'
+          }
+        >
+          {report.readiness_status === 'submission_ready'
+            ? '可提交'
+            : report.readiness_status === 'preflight_ready'
+              ? '内容预检通过，待 PDF 验收'
+              : report.readiness_status === 'needs_revision'
+                ? '需要修订'
+                : '草稿'}
+        </Badge>
+        {report.stale && <Badge variant="warning">报告已过期，请重新生成</Badge>}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => onGenerate(qualityProfile, reviewStyle)}
+          disabled={disabled}
+        >
+          重新检查
+        </Button>
+      </div>
+
+      {report.blockers.length > 0 && (
+        <Card className="border-destructive/40">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-destructive-strong">
+              投稿阻断项（{report.blockers.length}）
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-1 text-xs">
+            {report.blockers.map((blocker) => (
+              <p key={blocker.code}>· {blocker.message}</p>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader className="pb-2">
           <CardTitle className="text-sm">质量评分（仅提示，不设门槛）</CardTitle>
@@ -344,6 +459,48 @@ function QualityTab({
                 </Badge>
                 {finding.reason}
               </p>
+            ))}
+          </CardContent>
+        </Card>
+      )}
+
+      {evidence.length > 0 && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">核心论断证据（{evidence.length}）</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-xs">
+            {evidence.slice(0, 10).map((anchor) => (
+              <div key={anchor.id} className="space-y-1 border-b pb-2 last:border-0">
+                <p className="font-medium">{anchor.claim_text}</p>
+                <p className="text-muted-foreground">
+                  {anchor.cite_key ?? '无引用'} · {anchor.source_kind}
+                  {anchor.source_page ? ` · 第 ${anchor.source_page} 页` : ''}
+                  {anchor.source_section ? ` · ${anchor.source_section}` : ''} ·{' '}
+                  {anchor.support_status}
+                </p>
+                {anchor.evidence_excerpt && (
+                  <p className="line-clamp-3 rounded bg-muted/50 p-2 text-muted-foreground">
+                    {anchor.evidence_excerpt}
+                  </p>
+                )}
+                <div className="flex gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void reviewEvidence(anchor, 'confirmed')}
+                  >
+                    确认证据
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void reviewEvidence(anchor, 'rejected')}
+                  >
+                    标记不支持
+                  </Button>
+                </div>
+              </div>
             ))}
           </CardContent>
         </Card>

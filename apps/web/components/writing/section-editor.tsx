@@ -14,6 +14,7 @@ import {
   MathInline,
 } from '@/components/writing/extensions/ir-block';
 import { irToTiptap, tiptapToIR, type TiptapDoc } from '@/lib/ir-serde';
+import { EMPTY_NUMBERING, type FigureNumbering } from '@/lib/figure-numbering';
 import type { RefineAction, SectionIR, SoftCheckFinding, VisualAsset } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -58,6 +59,8 @@ export function SectionEditor({
   refining,
   readOnly = false,
   visuals = [],
+  numbering = EMPTY_NUMBERING,
+  onReplaceFigure,
 }: {
   section: SectionIR;
   whitelist: string[];
@@ -67,6 +70,10 @@ export function SectionEditor({
   refining?: RefineAction | null;
   readOnly?: boolean;
   visuals?: VisualAsset[];
+  /** 全文图编号（显示用；保存的仍是稳定 label）。 */
+  numbering?: FigureNumbering;
+  /** 正文里点「替换」时打开共用的视觉编辑器。 */
+  onReplaceFigure?: (assetRef: string) => void;
 }) {
   const [picking, setPicking] = React.useState(false);
   const [pickingFigure, setPickingFigure] = React.useState(false);
@@ -81,6 +88,24 @@ export function SectionEditor({
   const sectionKey = section.key;
   const latestSection = React.useRef(section);
   latestSection.current = section;
+
+  const figureOptions = React.useMemo(
+    () => ({
+      previewUrls: Object.fromEntries(
+        visuals
+          .filter((visual) => visual.renditions.png?.url)
+          .map((visual) => [visual.asset_ref, visual.renditions.png!.url]),
+      ),
+      aiAssetRefs: new Set(
+        visuals.filter((visual) => visual.kind === 'ai_image').map((visual) => visual.asset_ref),
+      ),
+    }),
+    [visuals],
+  );
+
+  // NodeView 里的「插入引用」要用到 editor，而 editor 又要用到这个回调。
+  // 用 ref 打破这个循环，同时避免回调变化触发编辑器重建。
+  const insertXrefRef = React.useRef<(label: string) => void>(() => {});
 
   const editor = useEditor(
     {
@@ -99,16 +124,14 @@ export function SectionEditor({
         }),
         CiteChip.configure({ weakKeys }),
         MathInline,
-        FigureXref,
+        FigureXref.configure({ numbering }),
         FigureBlockNode.configure({
-          previewUrls: Object.fromEntries(
-            visuals
-              .filter((visual) => visual.renditions.png?.url)
-              .map((visual) => [visual.asset_ref, visual.renditions.png!.url]),
-          ),
-          aiAssetRefs: new Set(
-            visuals.filter((visual) => visual.kind === 'ai_image').map((visual) => visual.asset_ref),
-          ),
+          previewUrls: figureOptions.previewUrls,
+          aiAssetRefs: figureOptions.aiAssetRefs,
+          numbering,
+          readOnly,
+          onReplace: onReplaceFigure,
+          onInsertXref: (label: string) => insertXrefRef.current(label),
         }),
         IrBlock,
       ],
@@ -148,6 +171,28 @@ export function SectionEditor({
     }
   }, [editor, weakKeys]);
 
+  /**
+   * 视觉列表刷新后就地更新图片映射与编号。
+   *
+   * 关键是**不重挂载编辑器**：批准一张图会让视觉列表刷新，如果靠重挂载来让图
+   * 显示出来，正在写字的人会丢光标、丢滚动位置，还可能触发一次「已恢复未保存
+   * 的草稿」提示。这里只改扩展 options 再派发一个空事务重绘。
+   */
+  React.useEffect(() => {
+    if (!editor) return;
+    const figure = editor.extensionManager.extensions.find((e) => e.name === FigureBlockNode.name);
+    if (figure) {
+      figure.options.previewUrls = figureOptions.previewUrls;
+      figure.options.aiAssetRefs = figureOptions.aiAssetRefs;
+      figure.options.numbering = numbering;
+      figure.options.readOnly = readOnly;
+      figure.options.onReplace = onReplaceFigure;
+    }
+    const xref = editor.extensionManager.extensions.find((e) => e.name === FigureXref.name);
+    if (xref) xref.options.numbering = numbering;
+    editor.view.dispatch(editor.state.tr);
+  }, [editor, figureOptions, numbering, readOnly, onReplaceFigure]);
+
   const insertCitation = (keys: string[]) => {
     if (!editor || keys.length === 0) return;
     editor.chain().focus().insertContent({ type: CiteChip.name, attrs: { keys } }).run();
@@ -156,15 +201,21 @@ export function SectionEditor({
 
   const approvedVisuals = visuals.filter((visual) => visual.review_status === 'approved');
 
-  const insertFigureXref = (visual: VisualAsset) => {
-    if (!editor) return;
-    editor
-      .chain()
-      .focus()
-      .insertContent({ type: FigureXref.name, attrs: { target: visual.figure_label, kind: 'figure' } })
-      .run();
-    setPickingFigure(false);
-  };
+  const insertXrefByLabel = React.useCallback(
+    (label: string) => {
+      if (!editor || !label) return;
+      editor
+        .chain()
+        .focus()
+        .insertContent({ type: FigureXref.name, attrs: { target: label, kind: 'figure' } })
+        .run();
+      setPickingFigure(false);
+    },
+    [editor],
+  );
+  insertXrefRef.current = insertXrefByLabel;
+
+  const insertFigureXref = (visual: VisualAsset) => insertXrefByLabel(visual.figure_label);
 
   const selectedText = editor
     ? editor.state.doc.textBetween(editor.state.selection.from, editor.state.selection.to, ' ')

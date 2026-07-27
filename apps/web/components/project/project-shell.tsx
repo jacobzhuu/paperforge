@@ -23,6 +23,18 @@ import { ProjectPipelineNav } from './project-pipeline-nav';
 import { ProjectProvider, useProject } from './project-context';
 import { stepForStage, stepFromPathname } from '@/lib/pipeline';
 import { stepCompletion } from '@/lib/useProjectProgress';
+import type { VisualSummary } from '@/lib/types';
+
+/** 导航 tooltip：把四个状态一次说清，省得用户点进去才知道有没有事要做。 */
+function describeVisualBadge(summary: VisualSummary): string {
+  const parts: string[] = [];
+  if (summary.pending > 0) parts.push(`${summary.pending} 条待生成`);
+  if (summary.generating > 0) parts.push(`${summary.generating} 张生成中`);
+  if (summary.ready > 0) parts.push(`${summary.ready} 张可批准`);
+  if (summary.failed > 0) parts.push(`${summary.failed} 张生成失败`);
+  if (summary.approved > 0) parts.push(`${summary.approved} 张已插入`);
+  return parts.length > 0 ? parts.join('，') : '图表、示意图与 AI 插图';
+}
 
 /** 项目工作区外壳：项目头 + 管线导航 + 跨页任务条。所有工作台共用。 */
 export function ProjectShell({
@@ -53,6 +65,7 @@ function ShellBody({ children }: { children: React.ReactNode }) {
     tracked,
     jobMessage,
     startJob,
+    skipPolish,
   } = useProject();
   const { toast } = useToast();
   const pathname = usePathname() ?? '';
@@ -85,6 +98,22 @@ function ShellBody({ children }: { children: React.ReactNode }) {
   };
   const runningStep = stepForStage(tracked?.job.stage);
 
+  /**
+   * 视觉步骤的导航状态：待处理条数 + 失败告警。
+   *
+   * 数据来自专门的 summary 接口，不是完整视觉列表——导航上的一个数字不该
+   * 让浏览器把每张图的 spec 和 rendition 元数据都下载一遍。
+   */
+  const visualSummary = progress.visuals;
+  const actionableVisuals = visualSummary.pending + visualSummary.ready;
+  const badges = {
+    visuals: {
+      count: actionableVisuals || undefined,
+      alert: visualSummary.failed > 0,
+      title: describeVisualBadge(visualSummary),
+    },
+  };
+
   // 写作台自行接管全宽布局；其余页面维持居中阅读宽度。
   const wide = current === 'write' || current === 'library';
 
@@ -102,12 +131,19 @@ function ShellBody({ children }: { children: React.ReactNode }) {
           current={current}
           completion={completion}
           running={runningStep}
+          badges={badges}
         />
 
         <DataSourceBanner source={source} note={note} />
 
         {/* 任务条挂在 shell 上：切换工作台时进度、计时与已收集的降级警告都不丢。 */}
-        {tracked && <JobProgressCard tracked={tracked} onRetryStage={retryStage} />}
+        {tracked && (
+          <JobProgressCard
+            tracked={tracked}
+            onRetryStage={retryStage}
+            onSkipPolish={() => void skipPolish(tracked.job.id)}
+          />
+        )}
 
         {jobMessage && (
           <div

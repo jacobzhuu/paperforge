@@ -9,12 +9,14 @@ import {
   Download,
   FileDown,
   FileText,
+  Image as ImageIcon,
   Loader2,
 } from 'lucide-react';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Select } from '@/components/ui/select';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
@@ -22,13 +24,23 @@ import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobEvent, useJobFinished, useProject } from '@/components/project/project-context';
 import {
   ALL_EXPORT_FORMATS,
+  ApiError,
   exportDownloadUrl,
   exportPreviewUrl,
   listExports,
   listJobs,
+  getQuality,
   startExport,
 } from '@/lib/api';
-import type { ExportArtifact, ExportFormat, RequestableExportFormat } from '@/lib/types';
+import type {
+  ExportArtifact,
+  ExportFormat,
+  QualityIssue,
+  QualityProfile,
+  QualityReport,
+  RequestableExportFormat,
+  VisualSummary,
+} from '@/lib/types';
 import { describeError } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
 import { cn, formatDate } from '@/lib/utils';
@@ -85,6 +97,9 @@ export function ExportCenter() {
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [result, setResult] = React.useState<Record<string, unknown> | null>(null);
   const [formats, setFormats] = React.useState<RequestableExportFormat[]>(ALL_EXPORT_FORMATS);
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
+  const [quality, setQuality] = React.useState<QualityReport | undefined>();
+  const [gateBlockers, setGateBlockers] = React.useState<QualityIssue[]>([]);
 
   const reload = React.useCallback(async () => {
     if (!projectId) {
@@ -93,8 +108,13 @@ export function ExportCenter() {
     }
     // 诊断此前只来自 SSE，刷新一次页面就没了——而「书目走了兜底排版」这类降级
     // 恰恰是用户投稿前必须知道的事。编译任务的 checkpoint 里存着同一份 payload。
-    const [rows, jobs] = await Promise.all([listExports(projectId), listJobs(projectId)]);
+    const [rows, jobs, qualityResult] = await Promise.all([
+      listExports(projectId),
+      listJobs(projectId),
+      getQuality(projectId, qualityProfile),
+    ]);
     setArtifacts(rows.data);
+    setQuality(qualityResult.data);
     // 一键全管线（kind=full）同样会产出 render 段，按「最近一个带 render 的任务」取。
     const render = jobs.data.find(
       (job) => job.status === 'succeeded' && job.checkpoint?.render,
@@ -102,7 +122,7 @@ export function ExportCenter() {
     if (render && typeof render === 'object') setResult(render as Record<string, unknown>);
     setLoadError(null);
     setLoading(false);
-  }, [projectId]);
+  }, [projectId, qualityProfile]);
 
   const runReload = React.useCallback(() => {
     setLoadError(null);
@@ -122,14 +142,19 @@ export function ExportCenter() {
 
   const run = async () => {
     setResult(null);
+    setGateBlockers([]);
     if (formats.length === 0) {
       toast({ title: '请至少选择一种格式', variant: 'error' });
       return;
     }
     try {
-      const started = await startExport(projectId, formats);
+      const started = await startExport(projectId, formats, qualityProfile);
       startJob(started.data, '后端不可用：无法触发导出');
     } catch (err) {
+      if (err instanceof ApiError && err.code === 'submission_quality_gate_failed') {
+        const detail = err.detail as { blockers?: QualityIssue[] } | undefined;
+        setGateBlockers(detail?.blockers ?? []);
+      }
       toast({ title: '导出未能启动', description: describeError(err), variant: 'error' });
     }
   };
@@ -153,6 +178,19 @@ export function ExportCenter() {
       />
 
       <FormatSelector formats={formats} onChange={setFormats} />
+
+      <SubmissionExportMode
+        profile={qualityProfile}
+        onChange={setQualityProfile}
+        quality={quality}
+        blockers={gateBlockers}
+      />
+
+      <VisualExportSummary
+        projectId={projectId}
+        summary={progress.visuals}
+        latestRunAt={runs[0]?.at}
+      />
 
       {result && (
         <CompileDiagnostics
@@ -224,6 +262,139 @@ export function ExportCenter() {
   );
 }
 
+/**
+ * 导出前的视觉完整性提示。
+ *
+ * 视觉**不是硬门槛**：用户可以忽略所有建议直接导出一份纯文本论文。这里只回答
+ * 三个会影响判断的问题——正文里有几张图、有多少建议这次不会包含、上次导出是不是
+ * 已经早于最近一次插图。批准新图不会自动重编译，也不会自动产生费用，因此
+ * 「需要重新导出」必须显式说出来，而不是让用户拿到一份缺图的 PDF 才发现。
+ */
+function VisualExportSummary({
+  projectId,
+  summary,
+  latestRunAt,
+}: {
+  projectId: string;
+  summary: VisualSummary;
+  /** 最近一次导出运行的时间戳（毫秒）。 */
+  latestRunAt?: number;
+}) {
+  const unhandled = summary.pending + summary.ready;
+  const approvedAt = summary.latest_approved_at
+    ? Date.parse(summary.latest_approved_at)
+    : undefined;
+  const outdated = Boolean(latestRunAt && approvedAt && approvedAt > latestRunAt);
+
+  if (summary.approved === 0 && unhandled === 0 && summary.failed === 0) return null;
+
+  return (
+    <section
+      className="space-y-1.5 rounded-md border bg-muted/30 px-3 py-2 text-sm"
+      aria-label="视觉完整性"
+    >
+      <p className="flex items-center gap-2 font-medium">
+        <ImageIcon className="h-4 w-4 text-muted-foreground" /> 视觉
+      </p>
+      <ul className="space-y-0.5 text-xs text-muted-foreground">
+        {summary.approved > 0 && (
+          <li>
+            已插入 {summary.approved} 张——PDF、DOCX、LaTeX ZIP 与 Markdown Bundle 都会包含它们。
+          </li>
+        )}
+        {unhandled > 0 && (
+          <li className="text-warning-foreground">
+            {unhandled} 条建议尚未处理，本次导出<b>不会</b>包含。
+          </li>
+        )}
+        {summary.failed > 0 && (
+          <li className="text-destructive-strong">{summary.failed} 张生成失败。</li>
+        )}
+        {outdated && (
+          <li className="text-warning-foreground">
+            当前导出产物早于最近一次图片插入，需要重新导出才能把新图带进去。
+          </li>
+        )}
+      </ul>
+      {(unhandled > 0 || summary.failed > 0 || outdated) && (
+        <Link
+          href={projectHref(projectId, 'visuals')}
+          className="inline-block text-xs underline underline-offset-2"
+        >
+          去视觉工作台处理 →
+        </Link>
+      )}
+    </section>
+  );
+}
+
+function SubmissionExportMode({
+  profile,
+  onChange,
+  quality,
+  blockers,
+}: {
+  profile: QualityProfile;
+  onChange: (profile: QualityProfile) => void;
+  quality: QualityReport | undefined;
+  blockers: QualityIssue[];
+}) {
+  const ready = quality?.readiness_status;
+  return (
+    <Card>
+      <CardContent className="space-y-3 py-3">
+        <div className="grid gap-3 sm:grid-cols-[12rem,1fr] sm:items-end">
+          <label className="space-y-1 text-xs font-medium text-muted-foreground">
+            产物用途
+            <Select
+              value={profile}
+              onChange={(event) => onChange(event.target.value as QualityProfile)}
+            >
+              <option value="draft">内部草稿</option>
+              <option value="submission">投稿候选稿</option>
+            </Select>
+          </label>
+          <p className="text-xs text-muted-foreground">
+            {profile === 'draft'
+              ? '保留兼容模式：质量问题会提示，但仍可生成产物。'
+              : '严格模式：先通过内容质量门，再由最终 PDF 完成缺字、题注和图片位置验收。'}
+          </p>
+        </div>
+        {profile === 'submission' && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <Badge
+              variant={
+                ready === 'submission_ready' || ready === 'preflight_ready'
+                  ? 'success'
+                  : 'destructive'
+              }
+            >
+              {ready === 'submission_ready'
+                ? '最终 PDF 已通过'
+                : ready === 'preflight_ready'
+                  ? '内容预检已通过'
+                  : '尚未通过投稿质量门'}
+            </Badge>
+            {quality?.stale && <Badge variant="warning">质量报告已过期</Badge>}
+            <span className="text-muted-foreground">
+              核心论断全文覆盖{' '}
+              {Math.round((quality?.core_claim_fulltext_coverage ?? 0) * 100)}%
+            </span>
+          </div>
+        )}
+        {blockers.length > 0 && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
+            <p className="mb-1 font-medium text-destructive-strong">本次导出被质量门阻断：</p>
+            {blockers.map((blocker) => (
+              <p key={blocker.code}>· {blocker.message}</p>
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 function FormatSelector({
   formats,
   onChange,
@@ -291,11 +462,21 @@ function ArtifactRow({
   artifact: ExportArtifact;
 }) {
   const isLog = artifact.format === 'compile_log';
+  const isPdf = artifact.format === 'pdf';
+  const ready = artifact.readiness_status === 'submission_ready';
+  const needsRevision = artifact.readiness_status === 'needs_revision';
   return (
     <div className="flex items-center justify-between gap-3 px-3 py-2">
-      <Badge variant={artifact.format === 'pdf' ? 'success' : isLog ? 'muted' : 'outline'}>
-        {FORMAT_LABEL[artifact.format] ?? artifact.format}
-      </Badge>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Badge variant={isPdf && ready ? 'success' : isLog ? 'muted' : 'outline'}>
+          {FORMAT_LABEL[artifact.format] ?? artifact.format}
+        </Badge>
+        {artifact.quality_profile === 'submission' && (
+          <Badge variant={ready ? 'success' : needsRevision ? 'destructive' : 'warning'}>
+            {ready ? '可提交' : needsRevision ? '需修订' : '未评估'}
+          </Badge>
+        )}
+      </div>
       <a
         // 日志是纯文本，直接在新标签打开比下载更顺手——但那要求 inline 直链，
         // 否则 target=_blank 也只是「开一个空标签 + 下载一个 .log」。

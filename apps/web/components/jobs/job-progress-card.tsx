@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { AlertTriangle, Check, ChevronDown, Loader2, RotateCw, WifiOff } from 'lucide-react';
+import { AlertTriangle, Check, ChevronDown, Loader2, RotateCw, SkipForward, WifiOff } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Button } from '@/components/ui/button';
@@ -33,6 +33,9 @@ const FULL_PIPELINE_STAGES = [
   'cards',
   'outline',
   'write',
+  'polish',
+  'quality',
+  'visual_plan',
   'render',
 ];
 
@@ -63,10 +66,12 @@ export function JobProgressCard({
   tracked,
   className,
   onRetryStage,
+  onSkipPolish,
 }: {
   tracked: TrackedJob;
   className?: string;
   onRetryStage?: (stage: RetryableStage) => void;
+  onSkipPolish?: () => void;
 }) {
   const [showDetail, setShowDetail] = React.useState(false);
   const elapsed = useElapsed(tracked.startedAt);
@@ -77,6 +82,8 @@ export function JobProgressCard({
   const currentStage = tracked.job.stage ?? '';
   const failedStages = new Set(warnings.map((w) => w.stage));
   const currentIndex = FULL_PIPELINE_STAGES.indexOf(currentStage);
+  // 润色是唯一「稿子已经完整、只是在打磨」的阶段，所以也是唯一可以随时喊停的。
+  const polishing = currentStage === 'polish' && Boolean(onSkipPolish);
 
   return (
     <Card className={className}>
@@ -96,8 +103,22 @@ export function JobProgressCard({
                   <span className="ml-1.5 text-muted-foreground">{tracked.detail}</span>
                 )}
               </span>
-              <span className="shrink-0 tabular-nums text-muted-foreground">
-                {elapsed} · {percent}%
+              <span className="flex shrink-0 items-center gap-2">
+                {polishing && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-xs"
+                    disabled={tracked.polishSkipRequested}
+                    onClick={onSkipPolish}
+                  >
+                    <SkipForward className="h-3 w-3" />
+                    {tracked.polishSkipRequested ? '本节后停止' : '跳过润色'}
+                  </Button>
+                )}
+                <span className="tabular-nums text-muted-foreground">
+                  {elapsed} · {percent}%
+                </span>
               </span>
             </div>
             <Progress
@@ -118,6 +139,16 @@ export function JobProgressCard({
             </button>
           )}
         </div>
+
+        {/* 润色期间所有章节都已「已生成」，不解释一句就会被当成卡死。 */}
+        {polishing && !reconnecting && (
+          <p className="mt-2 text-xs text-muted-foreground">
+            正文各节已生成并保存，正在逐节做连贯性润色
+            {tracked.polishSkipRequested
+              ? '——已请求跳过，当前这节写完即停。'
+              : '；不想等可以跳过，剩余章节直接交付初稿。'}
+          </p>
+        )}
 
         {reconnecting && (
           <p className="mt-2 text-xs text-warning-foreground" role="status">

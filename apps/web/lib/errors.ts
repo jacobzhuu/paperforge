@@ -16,6 +16,17 @@ export function describeError(err: unknown): string {
   return '发生了未知错误。';
 }
 
+/**
+ * 是否是章节乐观并发冲突（后端 409 `section_changed`）。
+ *
+ * 这类失败与「保存挂了」性质完全不同：草稿完好无损，用户需要的是先看服务端的
+ * 新版本再合并，而不是重试。界面必须区分这两种，否则用户会反复点保存，最终
+ * 把别处刚插入的图覆盖掉。
+ */
+export function isSectionChanged(err: unknown): boolean {
+  return err instanceof Error && /^API 409:/.test(err.message) && err.message.includes('section_changed');
+}
+
 const HTTP_HINT: Record<number, string> = {
   400: '请求参数有误',
   401: '未授权',

@@ -9,6 +9,10 @@ import type { PaperType } from './types';
  * 等于让作者写完正文才被邀请上传那些本该为正文数字接地的数据。
  *
  * 这里改为按 paper_type 返回不同序列，并让综述论文根本不出现素材步骤。
+ *
+ * 「视觉」是**两类论文共有**的一步。此前视觉能力被藏在素材中心内部，于是
+ * 综述论文虽然支持建议/生图/审核/导出，却没有任何正常入口——功能存在，
+ * 流程里却不存在。视觉是正文完成后的独立可选阶段，与素材是否存在无关。
  */
 export type PipelineStepId =
   | 'overview'
@@ -17,6 +21,7 @@ export type PipelineStepId =
   | 'library'
   | 'outline'
   | 'write'
+  | 'visuals'
   | 'export';
 
 export interface PipelineStep {
@@ -38,10 +43,19 @@ const STEP: Record<PipelineStepId, PipelineStep> = {
   library: { id: 'library', segment: 'library', label: '文献工作台', hint: '检索、分诊、入库核验' },
   outline: { id: 'outline', segment: 'outline', label: '大纲编辑器', hint: '章节结构与文献分配' },
   write: { id: 'write', segment: 'write', label: '写作工作台', hint: '正文起草与修订' },
+  visuals: { id: 'visuals', segment: 'visuals', label: '视觉工作台', hint: '图表、示意图与 AI 插图的生成、审核与插入' },
   export: { id: 'export', segment: 'export', label: '导出中心', hint: 'LaTeX / PDF / docx 产物' },
 };
 
-const REVIEW_FLOW: PipelineStepId[] = ['overview', 'scope', 'library', 'outline', 'write', 'export'];
+const REVIEW_FLOW: PipelineStepId[] = [
+  'overview',
+  'scope',
+  'library',
+  'outline',
+  'write',
+  'visuals',
+  'export',
+];
 
 // 研究型论文：素材先行（设计 §4.4.2 INPUT 是第一步）。
 const ORIGINAL_FLOW: PipelineStepId[] = [
@@ -51,6 +65,7 @@ const ORIGINAL_FLOW: PipelineStepId[] = [
   'library',
   'outline',
   'write',
+  'visuals',
   'export',
 ];
 
@@ -97,8 +112,14 @@ const STAGE_TO_STEP: Record<string, PipelineStepId> = {
   import_bibtex: 'library',
   outline: 'outline',
   write: 'write',
+  // 润色是写作步骤的收尾工序，导航上仍属「写作」——但进度条上是独立阶段名，
+  // 否则一屏「已生成」的章节配着不动的「分节写作」，只能被理解成卡死。
+  polish: 'write',
   citecheck: 'write',
   quality: 'write',
+  // 视觉阶段此前不在这张表里：视觉任务在跑时导航上没有任何一步会亮起。
+  visual_plan: 'visuals',
+  visual_generate: 'visuals',
   render: 'export',
 };
 

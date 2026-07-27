@@ -4,6 +4,8 @@ export type PaperType = 'review' | 'original';
 export type WritingMode = 'auto' | 'assisted';
 export type Language = 'zh' | 'en';
 export type CitationStyle = 'author_year' | 'gbt7714' | 'ieee' | 'apa';
+export type QualityProfile = 'draft' | 'submission';
+export type ReviewStyle = 'narrative' | 'systematic';
 
 export type ProjectStatus =
   | 'draft'
@@ -26,6 +28,10 @@ export interface Project {
   citation_style?: CitationStyle;
   topic?: string | null;
   contribution_points?: string[];
+  publication_title?: string | null;
+  authors?: string[];
+  keywords?: string[];
+  metadata_confirmed?: boolean;
   library_count?: number;
   section_count?: number;
   created_at?: string;
@@ -41,6 +47,9 @@ export interface CreateProjectRequest {
   venue_template?: string;
   citation_style: CitationStyle;
   contribution_points?: string[];
+  publication_title?: string;
+  authors?: string[];
+  keywords?: string[];
 }
 
 /**
@@ -61,6 +70,10 @@ export interface UpdateProjectRequest {
   citation_style?: CitationStyle;
   writing_mode?: WritingMode;
   contribution_points?: string[];
+  publication_title?: string | null;
+  authors?: string[];
+  keywords?: string[];
+  metadata_confirmed?: boolean;
 }
 
 export type LibraryEntryStatus = 'candidate' | 'selected' | 'excluded';
@@ -104,7 +117,15 @@ export interface LiteratureCard {
   methods: string[];
   results: string[];
   limitations: string[];
-  quotable_points: string[];
+  quotable_points: Array<
+    | string
+    | {
+        text: string;
+        page?: number | null;
+        section?: string | null;
+        paragraph?: number | null;
+      }
+  >;
   fulltext_used: boolean;
   extraction_model?: string;
 }
@@ -200,6 +221,7 @@ export const JOB_STAGES = [
   'quality',
   'outline',
   'write',
+  'polish',
   'citecheck',
   'visual_plan',
   'visual_generate',
@@ -306,6 +328,10 @@ export interface IRFigure {
 export interface IRTableSource {
   kind: 'user_asset' | 'inline';
   ref?: string | null;
+  data?: {
+    headers?: unknown[];
+    rows?: unknown[][];
+  } | null;
 }
 
 export interface IRTable {
@@ -426,6 +452,10 @@ export interface ExportArtifact {
   content_hash?: string | null;
   created_at?: string | null;
   download_url?: string | null;
+  quality_report_id?: string | null;
+  quality_profile?: QualityProfile;
+  readiness_status?: string;
+  paper_snapshot_hash?: string | null;
 }
 
 // ---- 用户素材与数字 lint（设计 §4.3 user_asset / §4.4.2 NUMLINT） ----
@@ -462,6 +492,37 @@ export interface VisualRendition {
   url: string;
 }
 
+/**
+ * 统一错误词表（`packages/visuals/visuals/errors.py`）。
+ *
+ * 后端在读侧把历史值（`auth`、`moderation`、甚至裸的 `ValueError`）映射到这里，
+ * 因此界面只需要认识这一套。
+ */
+export type VisualErrorCode =
+  | 'provider_not_configured'
+  | 'authentication_failed'
+  | 'content_rejected'
+  | 'invalid_request'
+  | 'rate_limited'
+  | 'provider_unavailable'
+  | 'network_timeout'
+  | 'invalid_image'
+  | 'normalization_failed'
+  | 'visuald_unavailable'
+  | 'source_unresolved'
+  | 'internal_error';
+
+export interface VisualError {
+  code: VisualErrorCode;
+  /** 可执行的中文提示，直接展示。 */
+  message: string;
+  /** 决定给「重试」还是给「先改提示词」。 */
+  retryable: boolean;
+  request_id?: string | null;
+  /** 脱敏的技术细节，折叠展示。 */
+  detail?: string | null;
+}
+
 export interface VisualAsset {
   id: string;
   asset_ref: string;
@@ -478,14 +539,50 @@ export interface VisualAsset {
   spec: Record<string, unknown>;
   provider?: string | null;
   model?: string | null;
+  /** @deprecated 用 `error`；平铺字段只为过渡期兼容保留。 */
   error_code?: string | null;
+  /** @deprecated 用 `error`。 */
   error_message?: string | null;
+  error?: VisualError | null;
   renditions: Partial<Record<'svg' | 'pdf' | 'png', VisualRendition>>;
   input_hash: string;
   content_hash?: string | null;
   version: number;
   supersedes_id?: string | null;
+  /** 实际输出尺寸——用户要看的是真拿到了什么，不是当初选了什么。 */
+  output_width?: number | null;
+  output_height?: number | null;
+  /** AI 插图实际会发给图像服务商的那一句，确认框展示它。 */
+  resolved_prompt?: string | null;
+  paper_snapshot_hash?: string | null;
+  suggestion_reason?: string | null;
+  source_section_keys?: string[];
+  /** 建议基于旧版正文。只提示，不自动删除。 */
+  stale?: boolean;
   created_at?: string | null;
+}
+
+/** 模型补全出来的视觉草稿；用户确认后才变成真正的资产。 */
+export interface VisualDraft {
+  title: string;
+  caption: string;
+  alt_text: string;
+  spec: Record<string, unknown>;
+  /** `llm:<model>` 或 `deterministic`。 */
+  generator: string;
+}
+
+export interface VisualSummary {
+  project_id: string;
+  pending: number;
+  generating: number;
+  ready: number;
+  approved: number;
+  failed: number;
+  rejected: number;
+  stale: number;
+  /** 最近一次批准插入的时间；导出中心据此判断产物是否已过期。 */
+  latest_approved_at?: string | null;
 }
 
 export interface CreateVisualRequest {
@@ -548,6 +645,52 @@ export interface QualityReport {
   soft_check: SoftCheckFinding[];
   hints: QualityHint[];
   generated_at?: string | null;
+  report_id?: string | null;
+  document_version?: number | null;
+  paper_snapshot_hash?: string | null;
+  quality_profile: QualityProfile;
+  review_style: ReviewStyle;
+  readiness_status:
+    | 'unassessed'
+    | 'draft'
+    | 'needs_revision'
+    | 'preflight_ready'
+    | 'submission_ready';
+  stale: boolean;
+  blockers: QualityIssue[];
+  warnings: QualityIssue[];
+  scores: Record<string, number>;
+  core_claim_count: number;
+  core_claim_fulltext_count: number;
+  core_claim_fulltext_coverage: number;
+  layout_checks: Record<string, unknown>;
+}
+
+export interface QualityIssue {
+  code: string;
+  message: string;
+  section_keys?: string[];
+  count?: number;
+  [key: string]: unknown;
+}
+
+export interface ClaimEvidence {
+  id: string;
+  report_id: string;
+  section_key: string;
+  claim_text: string;
+  claim_kind: string;
+  is_core: boolean;
+  cite_key?: string | null;
+  source_kind: string;
+  source_page?: number | null;
+  source_section?: string | null;
+  source_paragraph?: number | null;
+  evidence_excerpt?: string | null;
+  evidence_hash?: string | null;
+  support_status: string;
+  support_score?: number | null;
+  manual_status: 'unreviewed' | 'confirmed' | 'rejected';
 }
 
 export type RefineAction = 'polish' | 'expand' | 'shorten' | 'academic_tone';
@@ -569,6 +712,26 @@ export interface RoleModel {
   description: string;
 }
 
+/**
+ * 图像提供商**真正**支持的能力。
+ *
+ * 界面按它渲染表单：`supported_sizes` 为空时必须显示「尺寸由提供商决定」，
+ * 而不是给一个不会生效的比例下拉框（Cloudflare FLUX 只接受 prompt 与 steps）。
+ */
+export interface ImageProviderCapabilities {
+  provider: string;
+  model: string;
+  supported_sizes: string[];
+  supported_aspect_ratios: string[];
+  quality_modes: string[];
+  prompt_max_length: number;
+  supports_negative_prompt: boolean;
+  supports_seed: boolean;
+  fixed_output_size?: string | null;
+  cost_estimate_available: boolean;
+  note?: string | null;
+}
+
 export interface RuntimeSettings {
   llm_provider: string;
   /** 密钥永不回传，只报告是否已配置。 */
@@ -584,6 +747,7 @@ export interface RuntimeSettings {
   image_model: string;
   image_api_key_configured: boolean;
   image_provider_configured: boolean;
+  image_capabilities?: ImageProviderCapabilities | null;
 }
 
 export interface AuthUser {

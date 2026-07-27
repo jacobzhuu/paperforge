@@ -22,6 +22,42 @@ function Section({ title, items }: { title: string; items?: string[] }) {
   );
 }
 
+function QuotableSection({
+  items,
+}: {
+  items?: Array<
+    | string
+    | { text: string; page?: number | null; section?: string | null; paragraph?: number | null }
+  >;
+}) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="space-y-1.5">
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        可引要点
+      </h4>
+      <ul className="list-disc space-y-1 pl-4 text-sm">
+        {items.map((item, index) => {
+          const point = typeof item === 'string' ? { text: item } : item;
+          const locator = [
+            point.page ? `第 ${point.page} 页` : '',
+            point.section ?? '',
+            point.paragraph ? `第 ${point.paragraph} 段` : '',
+          ].filter(Boolean);
+          return (
+            <li key={index}>
+              {point.text}
+              {locator.length > 0 && (
+                <span className="ml-1 text-xs text-muted-foreground">（{locator.join(' · ')}）</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function CardDrawer({
   entry,
   open,
@@ -155,7 +191,7 @@ export function CardDrawer({
               <Section title="方法" items={entry.card.methods} />
               <Section title="结果" items={entry.card.results} />
               <Section title="局限" items={entry.card.limitations} />
-              <Section title="可引要点" items={entry.card.quotable_points} />
+              <QuotableSection items={entry.card.quotable_points} />
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">

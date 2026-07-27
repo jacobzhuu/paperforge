@@ -17,12 +17,13 @@ import {
   X,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { Button, buttonVariants } from '@/components/ui/button';
 import { Dialog } from '@/components/ui/dialog';
 import { Drawer } from '@/components/ui/drawer';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
+import { ModuleError } from '@/components/layout/module-error';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobEvent, useJobFinished, useProject } from '@/components/project/project-context';
@@ -30,6 +31,15 @@ import { SectionEditor, type RefineRequest } from '@/components/writing/section-
 import { DiffPreviewDialog } from '@/components/writing/diff-preview-dialog';
 import { ValidationPanel } from '@/components/writing/validation-panel';
 import { MarkdownPreview } from '@/components/writing/markdown-preview';
+// 视觉能力全部来自共用模块：写作台不再维护第二套卡片与编辑器。
+import { AIGenerationDialog } from '@/components/visuals/ai-generation-dialog';
+import { VisualCard } from '@/components/visuals/visual-card';
+import { VisualEditorDrawer } from '@/components/visuals/visual-editor-drawer';
+import {
+  groupVisualsByLineage,
+  useVisuals,
+  type VisualsController,
+} from '@/components/visuals/use-visuals';
 import {
   generateQuality,
   generateSections,
@@ -39,28 +49,27 @@ import {
   getQuality,
   listSections,
   refineText,
-  listVisuals,
   suggestVisuals,
-  generateVisual,
-  approveVisual,
-  rejectVisual,
-  regenerateVisual,
-  getRuntimeSettings,
+  updateSection,
 } from '@/lib/api';
 import type {
   CitationAudit,
+  CreateVisualRequest,
   MarkdownPreview as MarkdownPreviewData,
   NumLintReport,
   PaperSection,
   QualityReport,
+  QualityProfile,
+  ReviewStyle,
   RefineAction,
   SectionIR,
   VisualAsset,
 } from '@/lib/types';
+import { buildFigureNumbering } from '@/lib/figure-numbering';
 import { countWords, normalizeSectionIR } from '@/lib/ir-serde';
-import { describeError } from '@/lib/errors';
+import { describeError, isSectionChanged } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
-import { updateSection } from '@/lib/api';
+import { useAsyncModule } from '@/lib/useAsyncModule';
 import { cn } from '@/lib/utils';
 
 type View = 'editor' | 'preview';
@@ -92,15 +101,8 @@ export function WritingWorkbench() {
 
   const [sections, setSections] = React.useState<PaperSection[]>([]);
   const [activeKey, setActiveKey] = React.useState<string | null>(null);
-  const [audit, setAudit] = React.useState<CitationAudit | undefined>();
-  const [preview, setPreview] = React.useState<MarkdownPreviewData | undefined>();
-  const [quality, setQuality] = React.useState<QualityReport | undefined>();
-  const [numlint, setNumlint] = React.useState<NumLintReport | undefined>();
-  const [visuals, setVisuals] = React.useState<VisualAsset[]>([]);
-  const [aiGenerationAvailable, setAiGenerationAvailable] = React.useState(false);
   const [view, setView] = React.useState<View>('editor');
-  const [loading, setLoading] = React.useState(true);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
 
   const [draft, setDraft] = React.useState<SectionIR | null>(null);
   const [pristine, setPristine] = React.useState<string>('');
@@ -110,6 +112,9 @@ export function WritingWorkbench() {
   const [confirmRegenerate, setConfirmRegenerate] = React.useState(false);
   const [focusMode, setFocusMode] = React.useState(false);
   const [panelOpen, setPanelOpen] = React.useState(false);
+  /** 共用的视觉编辑抽屉与生成确认框——点「调整」不再被迫跳去别的页面。 */
+  const [editingVisual, setEditingVisual] = React.useState<VisualAsset | null>(null);
+  const [confirmingVisual, setConfirmingVisual] = React.useState<VisualAsset | null>(null);
   /** 递增即强制 Tiptap 重挂载（放弃草稿、服务端回填后用）。 */
   const [editorRevision, setEditorRevision] = React.useState(0);
 
@@ -121,46 +126,87 @@ export function WritingWorkbench() {
     apply: (text: string) => void;
   } | null>(null);
 
-  const reload = React.useCallback(async () => {
-    if (!projectId) {
-      setLoading(false);
-      return;
-    }
-    const [rows, auditResult, previewResult, qualityResult, lintResult, visualResult, runtime] = await Promise.all([
-      listSections(projectId),
-      getCitationAudit(projectId),
-      getMarkdownPreview(projectId),
-      getQuality(projectId),
-      paperType === 'original' ? getNumLint(projectId) : Promise.resolve({ data: undefined }),
-      listVisuals(projectId),
-      getRuntimeSettings(),
-    ]);
-    setSections(rows.data);
-    setAudit(auditResult.data);
-    setPreview(previewResult.data);
-    setQuality(qualityResult.data);
-    setNumlint(lintResult.data as NumLintReport | undefined);
-    setVisuals(visualResult.data);
-    setAiGenerationAvailable(Boolean(
-      runtime.data?.ai_images_enabled && runtime.data?.image_provider_configured,
-    ));
-    setActiveKey((current) => current ?? rows.data[0]?.section_key ?? null);
-    setLoadError(null);
-    setLoading(false);
-  }, [projectId, paperType]);
-
-  const runReload = React.useCallback(() => {
-    setLoadError(null);
-    reload().catch((err) => {
-      setLoadError(describeError(err));
-      setLoading(false);
-    });
-  }, [reload]);
+  /*
+   * 七个请求此前挤在同一个 `Promise.all` 里：`listVisuals` 或 `getRuntimeSettings`
+   * 任意一个 500，整页进入 loadError——正文编辑器一起打不开，哪怕 `listSections`
+   * 早就成功返回了。现在章节是唯一的硬依赖，其余六项各自独立降级。
+   */
+  const [sectionsLoading, setSectionsLoading] = React.useState(true);
+  const [sectionsError, setSectionsError] = React.useState<string | null>(null);
+  const [sectionsToken, setSectionsToken] = React.useState(0);
+  const reloadSections = React.useCallback(() => setSectionsToken((t) => t + 1), []);
 
   React.useEffect(() => {
-    runReload();
-  }, [runReload]);
-  useJobFinished(runReload);
+    if (!projectId) {
+      setSectionsLoading(false);
+      return;
+    }
+    let alive = true;
+    setSectionsError(null);
+    setSectionsLoading(true);
+    listSections(projectId)
+      .then(({ data }) => {
+        if (!alive) return;
+        setSections(data);
+        setActiveKey((current) => current ?? data[0]?.section_key ?? null);
+        setSectionsLoading(false);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setSectionsError(describeError(err));
+        setSectionsLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [projectId, sectionsToken]);
+
+  const auditModule = useAsyncModule<CitationAudit | undefined>(
+    () => getCitationAudit(projectId).then((r) => r.data),
+    undefined,
+    [projectId],
+  );
+  const previewModule = useAsyncModule<MarkdownPreviewData | undefined>(
+    () => getMarkdownPreview(projectId).then((r) => r.data),
+    undefined,
+    [projectId],
+  );
+  const qualityModule = useAsyncModule<QualityReport | undefined>(
+    () => getQuality(projectId, qualityProfile).then((r) => r.data),
+    undefined,
+    [projectId, qualityProfile],
+  );
+  const numlintModule = useAsyncModule<NumLintReport | undefined>(
+    () =>
+      paperType === 'original'
+        ? getNumLint(projectId).then((r) => r.data)
+        : Promise.resolve(undefined),
+    undefined,
+    [projectId, paperType],
+  );
+
+  const audit = auditModule.data;
+  const preview = previewModule.data;
+  const quality = qualityModule.data;
+  const numlint = numlintModule.data;
+
+  const visualsModule = useVisuals(projectId);
+  const { visuals } = visualsModule;
+
+  const runReload = React.useCallback(() => {
+    reloadSections();
+    auditModule.reload();
+    previewModule.reload();
+    qualityModule.reload();
+    numlintModule.reload();
+    visualsModule.reload();
+  }, [reloadSections, auditModule, previewModule, qualityModule, numlintModule, visualsModule]);
+
+  const runReloadRef = React.useRef(runReload);
+  React.useEffect(() => {
+    runReloadRef.current = runReload;
+  });
+  useJobFinished(React.useCallback(() => runReloadRef.current(), []));
 
   const active = sections.find((s) => s.section_key === activeKey);
   const dirtyRef = React.useRef(false);
@@ -192,7 +238,7 @@ export function WritingWorkbench() {
         });
         // 首节到达时正文区还是空态，把它选中，用户立刻有东西可读。
         setActiveKey((current) => current ?? data[0]?.section_key ?? null);
-        setLoading(false);
+        setSectionsLoading(false);
       })
       .catch(() => {
         /* 增量刷新失败不影响任务本身，收尾时 runReload 会兜底 */
@@ -277,11 +323,20 @@ export function WritingWorkbench() {
     setActiveKey(key);
   };
 
-  const save = async () => {
-    if (!draft || !active || !projectId) return;
+  /** 返回是否保存成功——批准插图前要先确认草稿已落盘。 */
+  const save = async (): Promise<boolean> => {
+    if (!draft || !active || !projectId) return false;
     setSaving(true);
     try {
-      const result = await updateSection(projectId, active.section_key, draft, draft.title);
+      const result = await updateSection(
+        projectId,
+        active.section_key,
+        draft,
+        draft.title,
+        // 乐观并发的基础版本：服务端已变化时返回 409，而不是让这次保存
+        // 把别处（典型是视觉批准）刚写进来的内容盖掉。
+        active.updated_at ?? null,
+      );
       if (result.data) {
         // 服务端会再过一次白名单（R2 兜底），以返回值为准。
         setSections((prev) =>
@@ -304,17 +359,28 @@ export function WritingWorkbench() {
         toast({ title: '本节已保存', variant: 'success' });
         runReload();
         reloadProject();
-      } else {
+        return true;
+      }
+      toast({
+        title: '本节未保存',
+        description: '后端不可用。修改已留在本地草稿里，恢复后再点保存。',
+        variant: 'error',
+      });
+      return false;
+    } catch (err) {
+      // 409 是「有人先改了」，不是普通失败：草稿完好，用户需要的是先看新版本。
+      if (isSectionChanged(err)) {
         toast({
-          title: '本节未保存',
-          description: '后端不可用。修改已留在本地草稿里，恢复后再点保存。',
+          title: '本节已在别处更新',
+          description: '这一节在服务端有更新（比如刚插入了一张图）。请点「重新载入本节」查看最新内容后再合并你的修改。',
           variant: 'error',
         });
+        return false;
       }
-    } catch (err) {
       // finally 是关键：写在 await 之后时，一次 500 会让保存按钮永久禁用，
       // 用户再也没有办法把稿子存下来。
       toast({ title: '本节未能保存', description: describeError(err), variant: 'error' });
+      return false;
     } finally {
       setSaving(false);
     }
@@ -340,9 +406,16 @@ export function WritingWorkbench() {
     }
   };
 
-  const runQuality = async () => {
+  const runQuality = async (
+    selectedProfile: QualityProfile,
+    reviewStyle: ReviewStyle,
+  ) => {
+    setQualityProfile(selectedProfile);
     try {
-      const started = await generateQuality(projectId);
+      const started = await generateQuality(projectId, {
+        quality_profile: selectedProfile,
+        review_style: reviewStyle,
+      });
       startJob(started.data, '后端不可用：无法生成质量报告');
     } catch (err) {
       toast({ title: '质量报告未能启动', description: describeError(err), variant: 'error' });
@@ -358,55 +431,57 @@ export function WritingWorkbench() {
     }
   };
 
-  const startVisualGeneration = async (visual: VisualAsset) => {
-    try {
-      const started = await generateVisual(projectId, visual.id);
-      startJob(started.data, '后端不可用：无法生成预览');
-    } catch (err) {
-      toast({ title: '预览未能生成', description: describeError(err), variant: 'error' });
-    }
+  /** AI 生图必须先过确认框；确定性图表没有外部调用也不计费，直接生成。 */
+  const requestVisualGeneration = (visual: VisualAsset) => {
+    if (visual.kind === 'ai_image') setConfirmingVisual(visual);
+    else void visualsModule.generate(visual);
   };
 
+  /**
+   * 批准并插入。
+   *
+   * 三件事必须按这个顺序做，少一步就会把刚插入的图弄丢：
+   *
+   * 1. 先保存当前章节的未保存草稿——否则它就是一份「插图之前」的正文；
+   * 2. 带上章节的 `updated_at` 做乐观并发，服务端已变化时返回 409 而不是覆盖；
+   * 3. 成功后**用服务端的新 IR 重写本地草稿**。这一步最容易被漏掉：草稿恢复
+   *    effect 以 `active.updated_at` 为依赖，批准后的 reload 必然触发它；
+   *    localStorage 里那份不含 FigureBlock 的草稿会被当成「未保存修改」回填，
+   *    下一次保存就把图删了。
+   */
   const approveVisualIntoPaper = async (
     visual: VisualAsset,
     sectionKey: string,
     blockIndex: number,
   ) => {
+    if (dirty && active?.section_key === sectionKey) {
+      const saved = await save();
+      if (!saved) {
+        toast({
+          title: '未插入图片',
+          description: '本节还有未保存的修改且保存失败。先处理保存冲突，再批准插图。',
+          variant: 'error',
+        });
+        return;
+      }
+    }
     const section = sections.find((item) => item.section_key === sectionKey);
     const body = section?.body_ir as SectionIR | undefined;
     try {
-      await approveVisual(
-        projectId,
-        visual.id,
+      await visualsModule.approve(
+        visual,
         sectionKey,
         Math.max(0, Math.min(blockIndex, body?.blocks?.length ?? 0)),
+        section?.updated_at ?? null,
       );
+      // 本地草稿必须先失效，再让 reload 触发草稿恢复 effect。
+      window.localStorage.removeItem(draftKey(projectId, sectionKey));
       toast({ title: '图片已插入论文', variant: 'success' });
-      await reload();
+      reloadSections();
+      previewModule.reload();
       setEditorRevision((revision) => revision + 1);
     } catch (err) {
       toast({ title: '图片未能插入', description: describeError(err), variant: 'error' });
-    }
-  };
-
-  const rejectVisualSuggestion = async (visual: VisualAsset) => {
-    try {
-      await rejectVisual(projectId, visual.id);
-      runReload();
-    } catch (err) {
-      toast({ title: '建议未能拒绝', description: describeError(err), variant: 'error' });
-    }
-  };
-
-  const regenerateVisualPreview = async (visual: VisualAsset) => {
-    try {
-      const revision = await regenerateVisual(projectId, visual.id);
-      if (revision.data) {
-        const started = await generateVisual(projectId, revision.data.id);
-        startJob(started.data, '后端不可用：无法重新生成预览');
-      }
-    } catch (err) {
-      toast({ title: '重新生成失败', description: describeError(err), variant: 'error' });
     }
   };
 
@@ -434,6 +509,24 @@ export function WritingWorkbench() {
 
   const totalWords = sections.reduce((sum, s) => sum + s.word_count, 0);
   const liveWords = draft ? countWords(draft) : 0;
+
+  /** 全文图编号由所有章节按顺序算出——单节编辑器自己看不到全文顺序。 */
+  const figureNumbering = React.useMemo(() => buildFigureNumbering(sections), [sections]);
+
+  /** 正文里点「替换」→ 打开共用编辑器，改完自动生成新版本。 */
+  const replaceFigure = React.useCallback(
+    (assetRef: string) => {
+      const target = visuals.find((visual) => visual.asset_ref === assetRef);
+      if (target) setEditingVisual(target);
+      else
+        toast({
+          title: '找不到这张图的视觉资产',
+          description: '它可能已被删除。可以直接删掉正文里的图块。',
+          variant: 'error',
+        });
+    },
+    [visuals, toast],
+  );
 
   // 需要用户处理的信任告警数，用于窄屏「校验」按钮上的角标。
   const trustAlerts =
@@ -471,7 +564,7 @@ export function WritingWorkbench() {
                 放弃草稿
               </Button>
             )}
-            <Button variant="outline" onClick={save} disabled={!draft || saving || !dirty}>
+            <Button variant="outline" onClick={() => void save()} disabled={!draft || saving || !dirty}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
               保存本节
             </Button>
@@ -483,22 +576,36 @@ export function WritingWorkbench() {
         }
       />
 
+      {/* 视觉列表失败不能让正文编辑器消失：它只是正文旁边的一条辅助信息。 */}
       {!focusMode && (
-        <VisualSuggestions
-          visuals={visuals}
-          sections={sections}
-          activeSectionKey={activeKey}
-          busy={busy}
-          aiGenerationAvailable={aiGenerationAvailable}
-          onSuggest={startVisualSuggestions}
-          onGenerate={startVisualGeneration}
-          onApprove={approveVisualIntoPaper}
-          onReject={rejectVisualSuggestion}
-          onRegenerate={regenerateVisualPreview}
-        />
+        <>
+          <ModuleError
+            label="视觉建议"
+            error={visualsModule.error}
+            onRetry={visualsModule.reload}
+          />
+          {!visualsModule.error && (
+            <VisualSuggestionsPanel
+              projectId={projectId}
+              controller={visualsModule}
+              sections={sections}
+              activeSectionKey={activeKey}
+              busy={busy}
+              onSuggest={startVisualSuggestions}
+              onApprove={approveVisualIntoPaper}
+              onEdit={setEditingVisual}
+              onRequestGenerate={requestVisualGeneration}
+            />
+          )}
+        </>
       )}
 
-      <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-96">
+      <LoadState
+        loading={sectionsLoading}
+        error={sectionsError}
+        onRetry={reloadSections}
+        skeletonClassName="h-96"
+      >
         {sections.length === 0 ? (
           <EmptyState projectId={projectId} writing={writing} />
         ) : (
@@ -595,6 +702,8 @@ export function WritingWorkbench() {
                     onRefine={onRefine}
                     refining={refining}
                     visuals={visuals}
+                    numbering={figureNumbering}
+                    onReplaceFigure={replaceFigure}
                   />
                 </div>
               )}
@@ -704,35 +813,75 @@ export function WritingWorkbench() {
         }}
       />
 
+      {/* 与视觉工作台同一个编辑器：在写作台点「调整」直接就地改，不用跳页。 */}
+      <VisualEditorDrawer
+        open={editingVisual !== null}
+        onClose={() => setEditingVisual(null)}
+        projectId={projectId}
+        visual={editingVisual}
+        assets={[]}
+        aiGenerationAvailable={visualsModule.aiGenerationAvailable}
+        targetSectionKey={activeKey}
+        capabilities={visualsModule.capabilities}
+        onSubmit={(payload: Partial<CreateVisualRequest>) => {
+          if (editingVisual) void visualsModule.edit(editingVisual, payload);
+        }}
+      />
+
+      <AIGenerationDialog
+        visual={confirmingVisual}
+        capabilities={visualsModule.capabilities}
+        onCancel={() => setConfirmingVisual(null)}
+        onConfirm={(visual) => {
+          setConfirmingVisual(null);
+          void visualsModule.generate(visual);
+        }}
+      />
+
       <WorkbenchFooterNav current="write" />
     </div>
   );
 }
 
-function VisualSuggestions({
-  visuals,
+/**
+ * 写作台的视觉入口——**轻量**。
+ *
+ * 写作台不再维护第二套视觉业务组件：卡片、编辑器、动作全部来自
+ * `components/visuals/`，与视觉工作台是同一份实现。这里只回答两个问题：
+ * 「还有几条待处理」和「当前这一节有什么建议」，其余交给工作台。
+ */
+function VisualSuggestionsPanel({
+  projectId,
+  controller,
   sections,
   activeSectionKey,
   busy,
-  aiGenerationAvailable,
   onSuggest,
-  onGenerate,
   onApprove,
-  onReject,
-  onRegenerate,
+  onEdit,
+  onRequestGenerate,
 }: {
-  visuals: VisualAsset[];
+  projectId: string;
+  controller: VisualsController;
   sections: PaperSection[];
   activeSectionKey: string | null;
   busy: boolean;
-  aiGenerationAvailable: boolean;
   onSuggest: () => void;
-  onGenerate: (visual: VisualAsset) => void;
   onApprove: (visual: VisualAsset, sectionKey: string, blockIndex: number) => void;
-  onReject: (visual: VisualAsset) => void;
-  onRegenerate: (visual: VisualAsset) => void;
+  onEdit: (visual: VisualAsset) => void;
+  onRequestGenerate: (visual: VisualAsset) => void;
 }) {
-  const pending = visuals.filter((visual) => visual.review_status === 'pending');
+  const groups = React.useMemo(
+    () => groupVisualsByLineage(controller.visuals),
+    [controller.visuals],
+  );
+  const pending = groups.filter((group) => group.latest.review_status === 'pending');
+  // 当前这一节的建议排在前面：写到哪一节，就先看哪一节的图。
+  const relevant = pending
+    .filter((group) => group.latest.target_section_key === activeSectionKey)
+    .slice(0, 2);
+  const shown = relevant.length > 0 ? relevant : pending.slice(0, 2);
+
   return (
     <section className="rounded-xl border bg-card/60 p-3" aria-label="视觉建议">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -742,144 +891,52 @@ function VisualSuggestions({
             {pending.length > 0 && <Badge variant="secondary">{pending.length}</Badge>}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            建议不会自动插入论文；AI 插图也只在你点击生成后调用外部服务。
+            建议不会自动插入论文；AI 插图也只在你确认后才调用外部服务。
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={onSuggest} disabled={busy}>
-          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-          分析全文
-        </Button>
+        <div className="flex items-center gap-2">
+          <Link
+            href={projectHref(projectId, 'visuals')}
+            className={buttonVariants({ variant: 'ghost', size: 'sm' })}
+          >
+            打开视觉工作台 →
+          </Link>
+          <Button variant="outline" size="sm" onClick={onSuggest} disabled={busy}>
+            {busy ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            分析全文
+          </Button>
+        </div>
       </div>
-      {pending.length > 0 && (
+      {shown.length > 0 && (
         <div className="mt-3 grid gap-3 xl:grid-cols-2">
-          {pending.map((visual) => (
-            <VisualSuggestionCard
-              key={visual.id}
-              visual={visual}
+          {shown.map((group) => (
+            <VisualCard
+              key={group.rootId}
+              group={group}
+              projectId={projectId}
               sections={sections}
-              defaultSection={visual.target_section_key || activeSectionKey || sections[0]?.section_key || ''}
-              aiGenerationAvailable={aiGenerationAvailable}
-              onGenerate={onGenerate}
-              onApprove={onApprove}
-              onReject={onReject}
-              onRegenerate={onRegenerate}
+              activeSectionKey={activeSectionKey}
+              job={controller.jobFor(group.latest.id)}
+              aiGenerationAvailable={controller.aiGenerationAvailable}
+              aiJobRunning={controller.aiJobRunning}
+                  deterministicSlotsFull={controller.deterministicSlotsFull}
+              compact
+              actions={{
+                onEdit,
+                onGenerate: onRequestGenerate,
+                onRevision: (visual) => void controller.createRevision(visual),
+                onApprove,
+                onReject: (visual) => void controller.reject(visual),
+              }}
             />
           ))}
         </div>
       )}
     </section>
-  );
-}
-
-function VisualSuggestionCard({
-  visual,
-  sections,
-  defaultSection,
-  aiGenerationAvailable,
-  onGenerate,
-  onApprove,
-  onReject,
-  onRegenerate,
-}: {
-  visual: VisualAsset;
-  sections: PaperSection[];
-  defaultSection: string;
-  aiGenerationAvailable: boolean;
-  onGenerate: (visual: VisualAsset) => void;
-  onApprove: (visual: VisualAsset, sectionKey: string, blockIndex: number) => void;
-  onReject: (visual: VisualAsset) => void;
-  onRegenerate: (visual: VisualAsset) => void;
-}) {
-  const [sectionKey, setSectionKey] = React.useState(defaultSection);
-  const selectedSection = sections.find((section) => section.section_key === sectionKey);
-  const maxBlockIndex = ((selectedSection?.body_ir as SectionIR | undefined)?.blocks ?? []).length;
-  const [blockIndex, setBlockIndex] = React.useState(
-    Math.min(visual.suggested_block_index ?? maxBlockIndex, maxBlockIndex),
-  );
-  const preview = visual.renditions.png?.url || visual.renditions.svg?.url;
-  const generating = visual.generation_status === 'queued' || visual.generation_status === 'running';
-  return (
-    <article className="overflow-hidden rounded-lg border bg-background">
-      {preview ? (
-        // eslint-disable-next-line @next/next/no-img-element -- authenticated API rendition URL
-        <img src={preview} alt={visual.alt_text || visual.caption} className="h-44 w-full bg-white object-contain" />
-      ) : (
-        <div className="flex h-28 items-center justify-center bg-muted/50 text-xs text-muted-foreground">
-          {generating ? <Loader2 className="h-5 w-5 animate-spin" /> : '尚未生成预览'}
-        </div>
-      )}
-      <div className="space-y-2 p-3">
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <p className="text-sm font-medium">{visual.title || visual.caption || '未命名视觉'}</p>
-            <p className="text-xs text-muted-foreground">
-              {visual.kind === 'chart' ? '数据图表' : visual.kind === 'diagram' ? '学术示意图' : 'AI 概念插图'}
-              {' · '}v{visual.version}
-            </p>
-          </div>
-          {visual.kind === 'ai_image' && <Badge variant="warning">外部 AI</Badge>}
-        </div>
-        {visual.error_message && <p className="text-xs text-destructive-strong">{visual.error_message}</p>}
-        {visual.caption_hint && <p className="text-xs text-warning-foreground">{visual.caption_hint}</p>}
-        {visual.generation_status === 'ready' && (
-          <div className="grid gap-2 sm:grid-cols-[1fr,8rem]">
-            <select
-              value={sectionKey}
-              onChange={(event) => {
-                const next = event.target.value;
-                setSectionKey(next);
-                const section = sections.find((item) => item.section_key === next);
-                setBlockIndex(((section?.body_ir as SectionIR | undefined)?.blocks ?? []).length);
-              }}
-              className="h-9 w-full rounded-md border bg-background px-2 text-sm"
-              aria-label="插入章节"
-            >
-              {sections.map((section) => (
-                <option key={section.section_key} value={section.section_key}>{section.title}</option>
-              ))}
-            </select>
-            <label className="flex items-center gap-1 text-xs text-muted-foreground">
-              位置
-              <input
-                type="number"
-                min={0}
-                max={maxBlockIndex}
-                value={blockIndex}
-                onChange={(event) => setBlockIndex(Number(event.target.value))}
-                className="h-9 min-w-0 flex-1 rounded-md border bg-background px-2 text-sm text-foreground"
-                aria-label="插入 block 位置"
-              />
-            </label>
-          </div>
-        )}
-        <div className="flex flex-wrap gap-1.5">
-          {visual.generation_status !== 'ready' && (
-            <Button
-              size="sm"
-              onClick={() => onGenerate(visual)}
-              disabled={generating || (visual.kind === 'ai_image' && !aiGenerationAvailable)}
-              title={visual.kind === 'ai_image' && !aiGenerationAvailable ? 'AI 图像生成未启用或未配置密钥' : undefined}
-            >
-              {generating && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-              {visual.kind === 'ai_image' ? '生成预览（可能计费）' : '生成预览'}
-            </Button>
-          )}
-          {visual.generation_status === 'ready' && (
-            <>
-              <Button size="sm" onClick={() => onApprove(visual, sectionKey, blockIndex)} disabled={!sectionKey}>
-                <Check className="h-3.5 w-3.5" /> 批准并插入
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => onRegenerate(visual)}>
-                <RefreshCw className="h-3.5 w-3.5" /> 重新生成
-              </Button>
-            </>
-          )}
-          <Button variant="ghost" size="sm" onClick={() => onReject(visual)}>
-            <X className="h-3.5 w-3.5" /> 拒绝
-          </Button>
-        </div>
-      </div>
-    </article>
   );
 }
 

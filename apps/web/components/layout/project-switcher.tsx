@@ -85,10 +85,15 @@ export function ProjectSwitcher() {
                 aria-selected={p.id === projectId}
                 onClick={() => {
                   setOpen(false);
-                  // 停在同一个工作台，只换项目——比把用户扔回列表页少两次点击。
-                  // 素材中心只存在于研究型论文，切到综述项目时退回项目概览。
-                  const keep = segment === 'assets' && p.paper_type !== 'original' ? '' : segment;
-                  router.push(`/projects/${p.id}${keep ? `/${keep}` : ''}`);
+                  /*
+                   * 停在同一个工作台，只换项目——比把用户扔回列表页少两次点击。
+                   *
+                   * 这里**不再**为 paper_type 开特例。以前有一条「综述项目 + assets
+                   * ⇒ 退回项目概览」的分支，因为综述论文没有素材中心；现在素材页
+                   * 自己会把综述项目送去视觉工作台，特例是多余的第二套机制——
+                   * 两处各判一次，早晚会判得不一致。
+                   */
+                  router.push(`/projects/${p.id}${segment ? `/${segment}` : ''}`);
                 }}
                 className={cn(
                   'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',

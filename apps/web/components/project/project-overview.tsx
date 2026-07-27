@@ -2,8 +2,20 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import { AlertTriangle, ArrowRight, CheckCircle2, Download, Rocket } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  Download,
+  Loader2,
+  RotateCcw,
+  Rocket,
+} from 'lucide-react';
 import { Button, buttonVariants } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
+import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToast } from '@/components/ui/toast';
 import { useJobFinished, useProject } from './project-context';
@@ -16,10 +28,12 @@ import {
   getVersionHistory,
   listExports,
   listJobs,
+  updateProject,
 } from '@/lib/api';
 import { describeError } from '@/lib/errors';
 import { stageLabel } from '@/lib/labels';
 import { nextAction } from '@/lib/useProjectProgress';
+import type { TrackedJob } from '@/lib/useJobTracker';
 import { projectHref } from '@/lib/pipeline';
 import type {
   CitationAudit,
@@ -27,11 +41,32 @@ import type {
   ExportArtifact,
   Job,
   NumLintReport,
+  Project,
+  QualityProfile,
+  ReviewStyle,
   VersionHistory,
 } from '@/lib/types';
 import { formatDate } from '@/lib/utils';
 
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
+
+/** 下拉选项与收起后那行摘要读同一份数据，避免两处文案各写各的。 */
+const QUALITY_OPTIONS: { value: QualityProfile; label: string }[] = [
+  { value: 'draft', label: '快速草稿' },
+  { value: 'submission', label: '严格投稿' },
+];
+
+const REVIEW_STYLE_OPTIONS: { value: ReviewStyle; label: string }[] = [
+  { value: 'narrative', label: '叙述性综述' },
+  { value: 'systematic', label: '系统综述' },
+];
+
+function optionLabel<T extends string>(
+  options: { value: T; label: string }[],
+  value: T,
+): string {
+  return options.find((option) => option.value === value)?.label ?? value;
+}
 
 /**
  * 项目概览。
@@ -45,7 +80,7 @@ const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
  * 需要一个能被眼睛先抓到的锚点。
  */
 export function ProjectOverview() {
-  const { projectId, paperType, progress, busy, startJob } = useProject();
+  const { projectId, project, paperType, progress, busy, tracked, startJob, reload } = useProject();
   const { toast } = useToast();
 
   const [audit, setAudit] = React.useState<CitationAudit | undefined>();
@@ -54,6 +89,12 @@ export function ProjectOverview() {
   const [cost, setCost] = React.useState<CostDetail | undefined>();
   const [versions, setVersions] = React.useState<VersionHistory | undefined>();
   const [exports, setExports] = React.useState<ExportArtifact[]>([]);
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
+  const [reviewStyle, setReviewStyle] = React.useState<ReviewStyle>('narrative');
+  /** 点击到 busy 置位之间有一次网络往返，不自己置位就能连点两下起两条管线。 */
+  const [starting, setStarting] = React.useState(false);
+  /** 原则 06：质量模式 / 综述方式是高级参数，默认收起，只留一行当前取值。 */
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
 
   const load = React.useCallback(() => {
     if (!projectId) return;
@@ -85,13 +126,39 @@ export function ProjectOverview() {
   const latestPdf = exports.find((a) => a.format === 'pdf');
 
   const runAll = async () => {
+    if (starting || busy) return;
+    setStarting(true);
     try {
-      const started = await generateAll(projectId);
+      const started = await generateAll(projectId, {
+        quality_profile: qualityProfile,
+        review_style: reviewStyle,
+      });
       startJob(started.data, '后端不可用：无法启动全管线');
     } catch (err) {
       toast({ title: '全管线未能启动', description: describeError(err), variant: 'error' });
+    } finally {
+      setStarting(false);
     }
   };
+
+  const runAllState = runAllButton({
+    starting,
+    busy,
+    // busy 对**任一**项目级任务都为真（单跑检索也会）。只有 kind=full 才是「全管线在跑」，
+    // 否则单跑一次检索也会让按钮谎称全管线正在运行。
+    running: tracked?.job.kind === 'full' ? tracked : null,
+    // 「跑完」不看 project.status（它永远是 draft），看实际产物：有正文且有导出产物。
+    done: progress.sectionCount > 0 && progress.exportCount > 0,
+    submission: qualityProfile === 'submission',
+  });
+  const RunAllIcon = runAllState.Icon;
+  // 收起状态下的一行摘要：不展开也知道下一次会按什么模式跑。
+  const runConfigSummary = [
+    optionLabel(QUALITY_OPTIONS, qualityProfile),
+    paperType === 'review' ? optionLabel(REVIEW_STYLE_OPTIONS, reviewStyle) : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   if (progress.loading) {
     return (
@@ -106,24 +173,107 @@ export function ProjectOverview() {
   return (
     <div className="space-y-10">
       {/* 下一步：全页唯一的行动召唤，也是唯一保留边框的块。 */}
-      <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-primary/25 bg-accent/40 px-5 py-4">
-        <div className="min-w-0 space-y-1">
-          <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-            下一步
-          </p>
-          <p className="font-serif text-xl font-semibold tracking-tight">{action.label}</p>
-          <p className="max-w-2xl text-sm text-muted-foreground">{action.reason}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button variant="ghost" onClick={runAll} disabled={busy}>
-            <Rocket className="h-4 w-4" /> 跑通全管线
-          </Button>
+      <div className="space-y-4 rounded-lg border border-primary/25 bg-accent/40 px-5 py-4">
+        {/*
+         * 主行只放「下一步」和它自己的那一个按钮。
+         *
+         * 此前全管线的两个下拉和运行按钮跟主 CTA 挤在同一排，于是「下一步：处理
+         * 视觉建议」旁边就并排立着「质量模式 / 综述方式 / 重跑全管线」——那两个
+         * 下拉其实一条也不作用于「处理视觉建议」，但位置让人以为它们是这一步的参数。
+         */}
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="min-w-0 space-y-1">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+              下一步
+            </p>
+            <p className="font-serif text-xl font-semibold tracking-tight">{action.label}</p>
+            <p className="max-w-2xl text-sm text-muted-foreground">{action.reason}</p>
+          </div>
           <Link
             href={projectHref(projectId, action.step === 'overview' ? '' : action.step)}
-            className={buttonVariants()}
+            className={buttonVariants({ className: 'shrink-0' })}
           >
             {action.label} <ArrowRight className="h-4 w-4" />
           </Link>
+        </div>
+
+        {/*
+         * 全管线是**另一条路径**（一次跑完），不是「下一步」的参数，所以用一条细线
+         * 隔开、字号降一档：看得见、够得到，但不跟主 CTA 抢。
+         */}
+        <div className="space-y-2 border-t border-primary/15 pt-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="min-w-0 text-xs text-muted-foreground">
+              {runAllState.hint}
+              <Sep />
+              <span className="text-foreground">{runConfigSummary}</span>
+              <button
+                type="button"
+                onClick={() => setSettingsOpen((open) => !open)}
+                aria-expanded={settingsOpen}
+                className="ml-2 underline underline-offset-4 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {settingsOpen ? '收起' : '调整'}
+              </button>
+            </p>
+            <Button
+              variant={runAllState.variant}
+              size="sm"
+              onClick={runAll}
+              disabled={runAllState.disabled}
+              title={runAllState.title}
+              aria-busy={runAllState.spinning}
+              className="shrink-0"
+            >
+              {runAllState.spinning ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RunAllIcon className="h-4 w-4" />
+              )}
+              {runAllState.label}
+            </Button>
+          </div>
+
+          {/* 展开后才出现的高级参数。两个下拉只对**下一次**运行生效，跑的过程中禁用。 */}
+          {settingsOpen && (
+            <div className="flex flex-wrap items-end gap-2 pt-1">
+              <label className="space-y-1 text-xs text-muted-foreground">
+                质量模式
+                <Select
+                  value={qualityProfile}
+                  onChange={(event) => setQualityProfile(event.target.value as QualityProfile)}
+                  disabled={runAllState.disabled}
+                  className="w-28"
+                >
+                  {QUALITY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </Select>
+              </label>
+              {paperType === 'review' && (
+                <label className="space-y-1 text-xs text-muted-foreground">
+                  综述方式
+                  <Select
+                    value={reviewStyle}
+                    onChange={(event) => setReviewStyle(event.target.value as ReviewStyle)}
+                    disabled={runAllState.disabled}
+                    className="w-32"
+                  >
+                    {REVIEW_STYLE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+              )}
+              <p className="basis-full text-xs text-muted-foreground">
+                只影响下一次全管线运行，不改变已经生成的内容。
+              </p>
+            </div>
+          )}
         </div>
       </div>
 
@@ -181,6 +331,8 @@ export function ProjectOverview() {
         )}
       </section>
 
+      {project && <PublicationMetadata project={project} onSaved={reload} />}
+
       <div className="grid gap-10 md:grid-cols-2">
         <RecentJobs jobs={jobs} />
         <div className="space-y-10">
@@ -189,6 +341,170 @@ export function ProjectOverview() {
         </div>
       </div>
     </div>
+  );
+}
+
+interface RunAllButtonState {
+  label: string;
+  /** 按钮左边那行小字：说清全管线此刻是什么处境，按钮本身只承担动作。 */
+  hint: string;
+  title: string;
+  Icon: LucideIcon;
+  variant: 'ghost' | 'outline';
+  disabled: boolean;
+  spinning: boolean;
+}
+
+/**
+ * 「跑通全管线」按钮的四态。
+ *
+ * 此前只有 `disabled={busy}` 一条逻辑，文案在三种状态下完全一样：跑的时候、
+ * 跑完之后、和一次都没跑过，按钮都写着「跑通全管线」。ghost 变体禁用后只是
+ * 淡一档，跟普通的次要按钮长得几乎一样——用户看不出到底跑没跑、能不能点，
+ * 这正是最容易误导的地方。文案现在必须自己说清当前处于哪一态。
+ */
+function runAllButton({
+  starting,
+  busy,
+  running,
+  done,
+  submission,
+}: {
+  starting: boolean;
+  busy: boolean;
+  running: TrackedJob | null;
+  done: boolean;
+  submission: boolean;
+}): RunAllButtonState {
+  const idleLabel = submission ? '生成投稿候选稿' : '跑通全管线';
+
+  if (starting) {
+    return {
+      label: '正在启动…',
+      hint: '正在提交任务',
+      title: '正在提交全管线任务',
+      Icon: Rocket,
+      variant: 'ghost',
+      disabled: true,
+      spinning: true,
+    };
+  }
+  if (running) {
+    // 阶段名比一个干瘪的「运行中」有用得多：全管线要跑十几分钟，用户需要知道跑到哪了。
+    return {
+      label: `全管线运行中 · ${running.label}`,
+      hint: '详细进度见上方任务条',
+      title: '全管线正在运行，完成后可再次触发；详细进度见上方任务条',
+      Icon: Rocket,
+      variant: 'ghost',
+      disabled: true,
+      spinning: true,
+    };
+  }
+  if (busy) {
+    // 单阶段任务（检索 / 大纲 / 导出）也占着 worker，此时起全管线会和它抢同一批产物。
+    return {
+      label: '等待当前任务结束',
+      hint: '有其他任务在跑，结束后可启动全管线',
+      title: '有其他任务正在运行，结束后才能启动全管线',
+      Icon: Rocket,
+      variant: 'ghost',
+      disabled: true,
+      spinning: false,
+    };
+  }
+  if (done) {
+    return {
+      label: submission ? '重跑投稿候选稿' : '重跑全管线',
+      hint: '已跑通过一次全流程',
+      title: '已经跑过一次：再跑会重新生成大纲与正文并重新编译，旧版本保留在版本记录里',
+      Icon: RotateCcw,
+      variant: 'outline',
+      disabled: false,
+      spinning: false,
+    };
+  }
+  return {
+    label: idleLabel,
+    hint: '也可以不逐步来，一次跑到 PDF',
+    title: '检索 → 大纲 → 写作 → 编译，一次跑到 PDF；阶段失败降级不阻断',
+    Icon: Rocket,
+    variant: 'ghost',
+    disabled: false,
+    spinning: false,
+  };
+}
+
+function PublicationMetadata({ project, onSaved }: { project: Project; onSaved: () => void }) {
+  const { toast } = useToast();
+  const [title, setTitle] = React.useState(project.publication_title ?? '');
+  const [authors, setAuthors] = React.useState((project.authors ?? []).join('; '));
+  const [keywords, setKeywords] = React.useState((project.keywords ?? []).join('; '));
+  const [confirmed, setConfirmed] = React.useState(project.metadata_confirmed ?? false);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    setTitle(project.publication_title ?? '');
+    setAuthors((project.authors ?? []).join('; '));
+    setKeywords((project.keywords ?? []).join('; '));
+    setConfirmed(project.metadata_confirmed ?? false);
+  }, [project]);
+
+  const split = (value: string) => value.split(/[;,，；\n]/).map((item) => item.trim()).filter(Boolean);
+  const save = async () => {
+    const authorList = split(authors);
+    const keywordList = split(keywords);
+    if (!title.trim() || authorList.length === 0 || keywordList.length === 0) {
+      toast({ title: '请完整填写发表题名、作者和关键词', variant: 'error' });
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateProject(project.id, {
+        publication_title: title.trim(),
+        authors: authorList,
+        keywords: keywordList,
+        metadata_confirmed: confirmed,
+      });
+      onSaved();
+      toast({ title: confirmed ? '投稿元数据已确认' : '投稿元数据已保存', variant: 'success' });
+    } catch (err) {
+      toast({ title: '投稿元数据未保存', description: describeError(err), variant: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="space-y-3 border-t pt-8">
+      <SectionTitle>投稿元数据</SectionTitle>
+      <p className="text-sm text-muted-foreground">
+        项目内部名称不会再自动充当发表题名；投稿模式会检查题名、作者、关键词和语言脚本是否已确认。
+      </p>
+      <div className="grid gap-3 md:grid-cols-3">
+        <label className="space-y-1 text-xs text-muted-foreground">
+          发表题名
+          <Input value={title} onChange={(event) => { setTitle(event.target.value); setConfirmed(false); }} />
+        </label>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          作者（分号分隔）
+          <Input value={authors} onChange={(event) => { setAuthors(event.target.value); setConfirmed(false); }} />
+        </label>
+        <label className="space-y-1 text-xs text-muted-foreground">
+          关键词（分号分隔）
+          <Input value={keywords} onChange={(event) => { setKeywords(event.target.value); setConfirmed(false); }} />
+        </label>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <label className="flex items-center gap-2 text-sm">
+          <Checkbox checked={confirmed} onCheckedChange={setConfirmed} />
+          已核对题名、作者、关键词与当前论文语言
+        </label>
+        <Button variant="outline" onClick={() => void save()} disabled={saving}>
+          {saving ? '保存中…' : '保存投稿元数据'}
+        </Button>
+      </div>
+    </section>
   );
 }
 

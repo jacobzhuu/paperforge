@@ -68,6 +68,7 @@ export const STAGE_LABEL: Record<string, string> = {
   quality: '生成质量报告',
   outline: '生成大纲',
   write: '分节写作',
+  polish: '连贯性润色',
   citecheck: '引用越权校验',
   visual_plan: '生成视觉建议',
   visual_generate: '生成图表与插图',

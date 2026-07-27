@@ -1,5 +1,8 @@
 import { Node, mergeAttributes } from '@tiptap/core';
+import { ReactNodeViewRenderer } from '@tiptap/react';
 import { FIGURE_NODE, IR_BLOCK_NODE, MATH_NODE, XREF_NODE } from '@/lib/ir-serde';
+import { EMPTY_NUMBERING, type FigureNumbering } from '@/lib/figure-numbering';
+import { FigureNodeView } from './figure-node-view';
 
 interface BlockPayload {
   type?: string;
@@ -16,18 +19,38 @@ interface BlockPayload {
 export const FigureBlockNode = Node.create<{
   previewUrls: Record<string, string>;
   aiAssetRefs: Set<string>;
+  numbering: FigureNumbering;
+  readOnly: boolean;
+  onReplace?: (assetRef: string) => void;
+  onInsertXref?: (label: string) => void;
 }>({
   name: FIGURE_NODE,
   group: 'block',
+  // atom:false + React NodeView：图注可以就地编辑，图本身仍是不可分割的一块。
   atom: true,
   selectable: true,
 
   addOptions() {
-    return { previewUrls: {}, aiAssetRefs: new Set<string>() };
+    return {
+      previewUrls: {},
+      aiAssetRefs: new Set<string>(),
+      numbering: EMPTY_NUMBERING,
+      readOnly: false,
+    };
   },
 
   addAttributes() {
     return { payload: { default: null, rendered: false } };
+  },
+
+  /**
+   * React NodeView：图片、图注、宽度、替换、删除、插入引用都在图旁边完成。
+   *
+   * renderHTML 仍然保留——粘贴与 HTML 序列化路径走它，NodeView 只负责编辑器内
+   * 的呈现。
+   */
+  addNodeView() {
+    return ReactNodeViewRenderer(FigureNodeView);
   },
 
   parseHTML() {
@@ -73,11 +96,25 @@ export const FigureBlockNode = Node.create<{
   },
 });
 
-export const FigureXref = Node.create({
+/**
+ * 图引用芯片。
+ *
+ * 显示「图 1」，但**保存的仍然只是稳定 label**（`fig:va_xxx`）。编号会随插入、
+ * 删除、调序不断变化，写死进正文就意味着每插一张图都要手工改一遍全文；
+ * 编号只活在显示层，由 `numbering` 表按全文顺序算出来。
+ *
+ * 编号缺失（引用了一张还没插进正文的图）时退回显示 label，而不是显示「图 undefined」
+ * ——那会让人以为引用坏了，其实只是目标还没插入。
+ */
+export const FigureXref = Node.create<{ numbering: FigureNumbering }>({
   name: XREF_NODE,
   group: 'inline',
   inline: true,
   atom: true,
+
+  addOptions() {
+    return { numbering: EMPTY_NUMBERING };
+  },
 
   addAttributes() {
     return {
@@ -92,15 +129,18 @@ export const FigureXref = Node.create({
 
   renderHTML({ node, HTMLAttributes }) {
     const target = String(node.attrs.target ?? '');
+    const numbering = this.options.numbering ?? EMPTY_NUMBERING;
+    const number = numbering.byLabel[target];
+    const caption = numbering.captions[target];
     return [
       'span',
       mergeAttributes(HTMLAttributes, {
         'data-type': XREF_NODE,
         contenteditable: 'false',
         class: 'mx-0.5 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs text-primary',
-        title: target,
+        title: caption ? `${target} — ${caption}` : target,
       }),
-      `图引用 · ${target}`,
+      number ? `图 ${number}` : `图引用 · ${target}`,
     ];
   },
 });

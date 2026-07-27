@@ -36,6 +36,7 @@ export function ProjectPipelineNav({
   current,
   completion,
   running,
+  badges,
 }: {
   projectId: string;
   paperType: PaperType;
@@ -44,6 +45,8 @@ export function ProjectPipelineNav({
   completion: PipelineProgressMap;
   /** 正在跑的阶段所属步骤，用于脉冲提示。 */
   running?: PipelineStepId | null;
+  /** 步骤上的待办角标（视觉：待处理条数）与告警（生成失败）。 */
+  badges?: Partial<Record<PipelineStepId, { count?: number; alert?: boolean; title?: string }>>;
 }) {
   const steps = pipelineSteps(paperType);
   const [open, setOpen] = React.useState(false);
@@ -61,6 +64,7 @@ export function ProjectPipelineNav({
             active={step.id === current}
             done={completion[step.id]}
             running={running === step.id}
+            badge={badges?.[step.id]}
           />
         </li>
       ))}
@@ -102,18 +106,20 @@ function StepLink({
   active,
   done,
   running,
+  badge,
 }: {
   step: PipelineStep;
   projectId: string;
   active: boolean;
   done: boolean;
   running: boolean;
+  badge?: { count?: number; alert?: boolean; title?: string };
 }) {
   return (
     <Link
       href={projectHref(projectId, step.segment)}
       aria-current={active ? 'page' : undefined}
-      title={step.hint}
+      title={badge?.title ?? step.hint}
       className={cn(
         'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
@@ -124,6 +130,21 @@ function StepLink({
     >
       <StepDot done={done} active={active} running={running} />
       <span className="whitespace-nowrap">{step.label}</span>
+      {/*
+        待办角标只在真有待办时出现。它与完成态的小圆点是两回事：圆点说
+        「这一步有产物了」，角标说「这里还有事等你做」。
+      */}
+      {badge?.count ? (
+        <span className="rounded-full bg-muted px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+          {badge.count}
+        </span>
+      ) : null}
+      {badge?.alert && (
+        <span
+          className="h-1.5 w-1.5 shrink-0 rounded-full bg-destructive"
+          aria-label="有失败项"
+        />
+      )}
     </Link>
   );
 }

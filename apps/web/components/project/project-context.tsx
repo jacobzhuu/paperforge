@@ -23,11 +23,16 @@ interface ProjectContextValue {
   progress: ProjectProgress;
   /** 项目级任务追踪：跨工作台存活，切页不丢进度与已收集的降级警告。 */
   tracked: TrackedJob | null;
+  /** 全部在跑的任务，按 job id 索引。视觉卡片按自己的 job id 取自己的进度。 */
+  jobs: Record<string, TrackedJob>;
   busy: boolean;
   jobMessage: string | null;
-  startJob: (started: Job | undefined, fallbackMessage: string) => void;
+  /** 返回 job id（后端不可用时为 null），供卡片级 `visual_id → job_id` 映射使用。 */
+  startJob: (started: Job | undefined, fallbackMessage: string) => string | null;
+  /** 跳过剩余的连贯性润色：已润色的保留，剩下的直接交付初稿。 */
+  skipPolish: (jobId: string) => Promise<void>;
   /** 任务结束后想额外刷新自身数据的页面在此登记。 */
-  onJobFinished: (handler: () => void) => () => void;
+  onJobFinished: (handler: (job: Job) => void) => () => void;
   /** 需要读具体事件负载的页面（如导出中心的 render.completed）在此登记。 */
   onJobEvent: (handler: (event: JobEvent) => void) => () => void;
 }
@@ -50,10 +55,10 @@ export function ProjectProvider({
   const [token, setToken] = React.useState(0);
 
   // 订阅者集合：各工作台在任务结束后按需自行 reload，避免 Provider 反向依赖页面。
-  const finishHandlers = React.useRef(new Set<() => void>());
+  const finishHandlers = React.useRef(new Set<(job: Job) => void>());
   const eventHandlers = React.useRef(new Set<(event: JobEvent) => void>());
 
-  const onJobFinished = React.useCallback((handler: () => void) => {
+  const onJobFinished = React.useCallback((handler: (job: Job) => void) => {
     finishHandlers.current.add(handler);
     return () => {
       finishHandlers.current.delete(handler);
@@ -100,13 +105,16 @@ export function ProjectProvider({
     };
   }, [projectId, token]);
 
-  const handleFinished = React.useCallback(() => {
-    // 项目自身的计数（library_count / section_count）也会变，一并刷新。
-    reload();
-    finishHandlers.current.forEach((fn) => fn());
-  }, [reload]);
+  const handleFinished = React.useCallback(
+    (job: Job) => {
+      // 项目自身的计数（library_count / section_count）也会变，一并刷新。
+      reload();
+      finishHandlers.current.forEach((fn) => fn(job));
+    },
+    [reload],
+  );
 
-  const { tracked, busy, message, start } = useJobTracker(projectId, {
+  const { tracked, jobs, busy, message, start, skipPolish } = useJobTracker(projectId, {
     onFinished: handleFinished,
     onEvent: handleEvent,
   });
@@ -128,9 +136,11 @@ export function ProjectProvider({
       reload,
       progress,
       tracked,
+      jobs,
       busy,
       jobMessage: message,
       startJob: start,
+      skipPolish,
       onJobFinished,
       onJobEvent,
     }),
@@ -146,9 +156,11 @@ export function ProjectProvider({
       reload,
       progress,
       tracked,
+      jobs,
       busy,
       message,
       start,
+      skipPolish,
       onJobFinished,
       onJobEvent,
     ],
@@ -169,13 +181,13 @@ export function useProject(): ProjectContextValue {
  * 取代各工作台自建 useJobTracker 的写法——那样每切一次页面就重开一次 EventSource，
  * 计时归零、已收集的降级警告全部丢失。
  */
-export function useJobFinished(handler: () => void): void {
+export function useJobFinished(handler: (job: Job) => void): void {
   const { onJobFinished } = useProject();
   const ref = React.useRef(handler);
   React.useEffect(() => {
     ref.current = handler;
   });
-  React.useEffect(() => onJobFinished(() => ref.current()), [onJobFinished]);
+  React.useEffect(() => onJobFinished((job) => ref.current(job)), [onJobFinished]);
 }
 
 /** 订阅具体的任务事件（导出中心要从 `render.completed` 的负载里读编译结果）。 */

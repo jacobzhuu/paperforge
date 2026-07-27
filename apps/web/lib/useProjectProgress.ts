@@ -1,7 +1,8 @@
 'use client';
 
 import * as React from 'react';
-import { getScope, listAssets, listExports, listSections } from './api';
+import { getScope, getVisualSummary, listAssets, listExports, listSections } from './api';
+import type { VisualSummary } from './types';
 import type { PaperType } from './types';
 import type { PipelineProgressMap, PipelineStepId } from './pipeline';
 
@@ -23,8 +24,26 @@ export interface ProjectProgress {
   wordCount: number;
   exportCount: number;
   hasPdf: boolean;
+  /**
+   * 视觉状态计数。走专门的 summary 接口而不是拉完整视觉列表——导航上的一个
+   * 状态点不该让浏览器把每张图的 spec 与 rendition 元数据都下载一遍。
+   */
+  visuals: VisualSummary;
+  approvedVisualCount: number;
   loading: boolean;
 }
+
+const EMPTY_VISUALS: VisualSummary = {
+  project_id: '',
+  pending: 0,
+  generating: 0,
+  ready: 0,
+  approved: 0,
+  failed: 0,
+  rejected: 0,
+  stale: 0,
+  latest_approved_at: null,
+};
 
 export const EMPTY_PROGRESS: ProjectProgress = {
   hasScope: false,
@@ -35,6 +54,8 @@ export const EMPTY_PROGRESS: ProjectProgress = {
   wordCount: 0,
   exportCount: 0,
   hasPdf: false,
+  visuals: EMPTY_VISUALS,
+  approvedVisualCount: 0,
   loading: true,
 };
 
@@ -53,25 +74,39 @@ export function useProjectProgress(
     }
     let alive = true;
     const wantAssets = paperType === 'original';
-    Promise.all([
+    /*
+     * allSettled 而不是 all：这里是**导航状态点**的数据源。一个接口 500 不该让
+     * 整条管线的进度点全部熄灭——那会让用户以为自己什么都还没做。
+     * 单项失败就按「这一项没有产物」处理，其余照常显示。
+     */
+    Promise.allSettled([
       getScope(projectId),
       listSections(projectId),
       listExports(projectId),
       wantAssets ? listAssets(projectId) : Promise.resolve({ data: [] as unknown[] }),
+      getVisualSummary(projectId),
     ])
-      .then(([scope, sections, exports, assets]) => {
+      .then(([scope, sections, exports, assets, visuals]) => {
         if (!alive) return;
-        const scopeData = scope.data;
+        const scopeData = scope.status === 'fulfilled' ? scope.value.data : undefined;
+        const sectionRows = sections.status === 'fulfilled' ? sections.value.data : [];
+        const exportRows = exports.status === 'fulfilled' ? exports.value.data : [];
+        const assetRows =
+          assets.status === 'fulfilled' ? (assets.value.data as unknown[]) : [];
+        const visualSummary =
+          visuals.status === 'fulfilled' ? visuals.value.data : EMPTY_VISUALS;
         const generator = String(scopeData?.generator ?? '');
         setProgress({
           hasScope: Boolean(scopeData && Object.keys(scopeData).length > 0),
           scopeIsFallback: generator.startsWith('deterministic'),
-          assetCount: (assets.data as unknown[]).length,
+          assetCount: assetRows.length,
           libraryCount,
-          sectionCount: sections.data.length,
-          wordCount: sections.data.reduce((sum, s) => sum + (s.word_count ?? 0), 0),
-          exportCount: exports.data.length,
-          hasPdf: exports.data.some((a) => a.format === 'pdf'),
+          sectionCount: sectionRows.length,
+          wordCount: sectionRows.reduce((sum, s) => sum + (s.word_count ?? 0), 0),
+          exportCount: exportRows.length,
+          hasPdf: exportRows.some((a) => a.format === 'pdf'),
+          visuals: visualSummary,
+          approvedVisualCount: visualSummary.approved,
           loading: false,
         });
       })
@@ -96,6 +131,8 @@ export function stepCompletion(progress: ProjectProgress): PipelineProgressMap {
     library: progress.libraryCount > 0,
     outline: progress.sectionCount > 0 || progress.libraryCount > 0,
     write: progress.sectionCount > 0,
+    // 「有产物」= 至少插了一张图。有待处理建议不算完成——那正是需要用户去做的事。
+    visuals: progress.approvedVisualCount > 0,
     export: progress.exportCount > 0,
   };
 }
@@ -131,6 +168,15 @@ export function nextAction(
       step: 'outline',
       label: '生成大纲',
       reason: `已有 ${progress.libraryCount} 篇入库文献，可以按卡片聚类出章节树了。`,
+    };
+  }
+  // 视觉是可选阶段：只有确实有待处理建议时才推荐它，绝不把它变成导出前的闸门。
+  if (progress.visuals.ready > 0 || progress.visuals.pending > 0) {
+    const actionable = progress.visuals.ready + progress.visuals.pending;
+    return {
+      step: 'visuals',
+      label: '处理视觉建议',
+      reason: `有 ${actionable} 条视觉建议待处理。可以逐条批准插入，也可以全部忽略直接导出——它不阻塞任何后续步骤。`,
     };
   }
   if (progress.exportCount === 0) {

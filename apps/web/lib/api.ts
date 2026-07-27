@@ -17,6 +17,9 @@ import type {
   PaperSection,
   ProjectCost,
   QualityReport,
+  QualityProfile,
+  ReviewStyle,
+  ClaimEvidence,
   RefineAction,
   RefineResult,
   ScopePayload,
@@ -27,6 +30,8 @@ import type {
   UserAsset,
   VersionHistory,
   VisualAsset,
+  VisualDraft,
+  VisualSummary,
   CreateVisualRequest,
   AuthUser,
 } from './types';
@@ -54,6 +59,7 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     message: string,
+    public detail?: unknown,
   ) {
     super(message);
   }
@@ -97,7 +103,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       typeof detail === 'object'
         ? detail.message ?? code
         : detail ?? res.statusText ?? `API ${res.status}`;
-    throw new ApiError(res.status, code, message);
+    throw new ApiError(res.status, code, message, detail);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -342,7 +348,15 @@ export function listJobs(projectId: string): Promise<ApiResult<Job[]>> {
   return withFallback(() => request<Job[]>(`/projects/${projectId}/jobs`), []);
 }
 
-/** 重连退避（毫秒）；耗尽后转入 getJob 轮询。 */
+/**
+ * 跳过剩余的连贯性润色。不走 withFallback：这是用户的一次明确指令，
+ * 后端不可用时必须报错，而不是静悄悄地"看起来成功了"。
+ */
+export function skipPolish(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/polish/skip`, { method: 'POST' });
+}
+
+/** 重连退避（毫秒）；任务运行期间另有 getJob 周期校准兜底。 */
 const SSE_RETRY_DELAYS = [1000, 2000, 4000, 8000];
 const JOB_POLL_INTERVAL = 3000;
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
@@ -356,13 +370,17 @@ export interface JobStreamHandlers {
 }
 
 /**
- * 订阅任务进度（SSE），断线自动重连，重连耗尽后回落到 getJob 轮询。返回取消函数。
+ * 订阅任务进度（SSE），断线自动重连，并用 getJob 周期校准。返回取消函数。
  *
  * 后端以无名事件下发（见 services/api/.../events.py::_format_event），因此这里只需
  * onmessage 一个入口——不再有「白名单漏了某个阶段 ⇒ 进度整段静默丢失」的可能。
  *
  * onerror 绝不能等同于 onClose：休眠、代理空闲超时、CORS 抖动都会触发 onerror，
  * 而任务在服务端仍在跑。把它当成功收尾会让十分钟的检索「看起来完成了」。
+ *
+ * 轮询不能只在 onerror 后才启动：Safari / 代理可能把 SSE 留在“连接已打开、消息却不再
+ * 下发”的半断开状态，此时 onerror 永远不来。任务运行期间固定校准一次 job 状态，
+ * SSE 负责细粒度事件，轮询负责保证阶段、百分比和终态最终一定能追上服务端。
  */
 export function subscribeJobEvents(
   projectId: string,
@@ -375,6 +393,7 @@ export function subscribeJobEvents(
   let source: EventSource | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollInFlight = false;
   let attempt = 0;
   let lastSeq = 0;
   let stopped = false;
@@ -395,28 +414,39 @@ export function subscribeJobEvents(
     pollTimer = null;
   };
 
-  /** 重连耗尽后的兜底：轮询任务本身，直到终态。 */
-  const startPolling = () => {
-    if (pollTimer || stopped) return;
-    handlers.onConnectionChange?.({ reconnecting: true, degradedToPolling: true });
-    pollTimer = setInterval(() => {
-      void getJob(projectId, jobId)
-        .then(({ data }) => {
-          if (stopped || !data) return;
-          handlers.onEvent?.({
-            seq: lastSeq,
-            type: 'job.polled',
-            payload: {},
-            stage: data.stage,
-            progress: data.progress,
-            status: data.status,
-          });
-          if (data.status && TERMINAL_JOB_STATUSES.has(data.status)) finish();
-        })
-        .catch(() => {
-          /* 轮询失败继续下一轮 */
-        });
-    }, JOB_POLL_INTERVAL);
+  /**
+   * SSE 的安全网：即使流连接“假在线”，也会在一个轮询周期内校准到数据库状态。
+   * 防止慢请求重叠；单次失败留给下一周期，不影响 SSE 本身。
+   */
+  const pollJob = async () => {
+    if (stopped || pollInFlight) return;
+    pollInFlight = true;
+    try {
+      const { data } = await getJob(projectId, jobId);
+      if (stopped || !data) return;
+      handlers.onEvent?.({
+        seq: lastSeq,
+        type: 'job.polled',
+        payload: {},
+        stage: data.stage,
+        progress: data.progress,
+        status: data.status,
+      });
+      if (data.status && TERMINAL_JOB_STATUSES.has(data.status)) finish();
+    } catch {
+      /* 校准失败留给下一周期；实时流可能仍然正常。 */
+    } finally {
+      pollInFlight = false;
+    }
+  };
+
+  const startPolling = (degraded = false) => {
+    if (stopped) return;
+    if (degraded) {
+      handlers.onConnectionChange?.({ reconnecting: true, degradedToPolling: true });
+    }
+    if (pollTimer) return;
+    pollTimer = setInterval(() => void pollJob(), JOB_POLL_INTERVAL);
   };
 
   const connect = () => {
@@ -426,7 +456,6 @@ export function subscribeJobEvents(
     source = es;
 
     es.onopen = () => {
-      attempt = 0;
       handlers.onConnectionChange?.({ reconnecting: false, degradedToPolling: false });
     };
 
@@ -438,6 +467,8 @@ export function subscribeJobEvents(
         return; // 单条事件解析失败不应打断进度流
       }
       if (typeof event.seq === 'number' && event.seq > lastSeq) lastSeq = event.seq;
+      // 真正收到一条消息才说明这条连接可以传输数据；仅 onopen 不足以证明。
+      attempt = 0;
       handlers.onEvent?.(event);
       if (event.type === 'job.closed') finish();
     };
@@ -452,12 +483,13 @@ export function subscribeJobEvents(
         retryTimer = setTimeout(connect, SSE_RETRY_DELAYS[attempt]);
         attempt += 1;
       } else {
-        startPolling();
+        startPolling(true);
       }
     };
   };
 
   connect();
+  startPolling();
 
   return () => {
     stopped = true;
@@ -548,9 +580,16 @@ export function generateSections(
   );
 }
 
-export function generateAll(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function generateAll(
+  projectId: string,
+  options: { quality_profile?: QualityProfile; review_style?: ReviewStyle } = {},
+): Promise<ApiResult<Job | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/generate`, { method: 'POST' }),
+    () =>
+      request<Job>(`/projects/${projectId}/generate`, {
+        method: 'POST',
+        body: JSON.stringify(options),
+      }),
     undefined,
   );
 }
@@ -559,17 +598,29 @@ export function listSections(projectId: string): Promise<ApiResult<PaperSection[
   return withFallback(() => request<PaperSection[]>(`/projects/${projectId}/sections`), []);
 }
 
+/**
+ * 保存章节。
+ *
+ * `expectedUpdatedAt` 是乐观并发的基础版本：带上它，服务端发现章节已被别处
+ * 改动（最典型的是视觉批准刚把 FigureBlock 写进这一节）就返回 409
+ * `section_changed`，而不是让这次保存把插图静默删掉。
+ */
 export function updateSection(
   projectId: string,
   sectionKey: string,
   bodyIr: SectionIR,
   title?: string,
+  expectedUpdatedAt?: string | null,
 ): Promise<ApiResult<PaperSection | undefined>> {
   return withFallback(
     () =>
       request<PaperSection>(`/projects/${projectId}/sections/${sectionKey}`, {
         method: 'PUT',
-        body: JSON.stringify({ body_ir: bodyIr, title }),
+        body: JSON.stringify({
+          body_ir: bodyIr,
+          title,
+          expected_updated_at: expectedUpdatedAt ?? undefined,
+        }),
       }),
     undefined,
   );
@@ -608,12 +659,16 @@ export const ALL_EXPORT_FORMATS: RequestableExportFormat[] = [
 export function startExport(
   projectId: string,
   formats?: RequestableExportFormat[],
+  qualityProfile: QualityProfile = 'draft',
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
       request<Job>(`/projects/${projectId}/exports`, {
         method: 'POST',
-        body: JSON.stringify({ formats: formats ?? ALL_EXPORT_FORMATS }),
+        body: JSON.stringify({
+          formats: formats ?? ALL_EXPORT_FORMATS,
+          quality_profile: qualityProfile,
+        }),
       }),
     undefined,
   );
@@ -711,9 +766,51 @@ export function listVisuals(projectId: string): Promise<ApiResult<VisualAsset[]>
   );
 }
 
+/**
+ * 视觉状态计数。
+ *
+ * 导航状态点、项目概览与导出提醒只要这几个数字；让它们各自拉一遍完整视觉
+ * 列表（含 spec 与 renditions）纯属浪费。降级值全 0——摘要拿不到不该让导航消失。
+ */
+export function getVisualSummary(projectId: string): Promise<ApiResult<VisualSummary>> {
+  return withFallback(
+    () => request<VisualSummary>(`/projects/${projectId}/visuals/summary`),
+    {
+      project_id: projectId,
+      pending: 0,
+      generating: 0,
+      ready: 0,
+      approved: 0,
+      failed: 0,
+      rejected: 0,
+      stale: 0,
+      latest_approved_at: null,
+    },
+  );
+}
+
 export function suggestVisuals(projectId: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () => request<Job>(`/projects/${projectId}/visuals/suggest`, { method: 'POST' }),
+    undefined,
+  );
+}
+
+/**
+ * 让模型把「一句话想法」补成完整规格。
+ *
+ * 只回草稿：不落库、不排任务、不调用图像服务。用户看过再点创建。
+ */
+export function draftVisual(
+  projectId: string,
+  payload: { kind: 'diagram' | 'ai_image'; intent: string; target_section_key?: string | null },
+): Promise<ApiResult<VisualDraft | undefined>> {
+  return withFallback(
+    () =>
+      request<VisualDraft>(`/projects/${projectId}/visuals/draft`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }),
     undefined,
   );
 }
@@ -760,17 +857,28 @@ export function generateVisual(
   );
 }
 
+/**
+ * 批准并插入。
+ *
+ * 与 `updateSection` 共用同一套乐观并发协议：`expectedSectionUpdatedAt` 让
+ * 服务端在目标章节已被改动时返回 409，而不是把插图写进一份过期的 IR。
+ */
 export function approveVisual(
   projectId: string,
   visualId: string,
   sectionKey: string,
   blockIndex: number,
+  expectedSectionUpdatedAt?: string | null,
 ): Promise<ApiResult<VisualAsset | undefined>> {
   return withFallback(
     () =>
       request<VisualAsset>(`/projects/${projectId}/visuals/${visualId}/approve`, {
         method: 'POST',
-        body: JSON.stringify({ section_key: sectionKey, block_index: blockIndex }),
+        body: JSON.stringify({
+          section_key: sectionKey,
+          block_index: blockIndex,
+          expected_section_updated_at: expectedSectionUpdatedAt ?? undefined,
+        }),
       }),
     undefined,
   );
@@ -843,15 +951,57 @@ export function startIngest(projectId: string): Promise<ApiResult<Job | undefine
   );
 }
 
-export function getQuality(projectId: string): Promise<ApiResult<QualityReport | undefined>> {
-  return withFallback(() => request<QualityReport>(`/projects/${projectId}/quality`), undefined);
-}
-
-export function generateQuality(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function getQuality(
+  projectId: string,
+  qualityProfile: QualityProfile = 'draft',
+): Promise<ApiResult<QualityReport | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/quality/generate`, { method: 'POST' }),
+    () =>
+      request<QualityReport>(
+        `/projects/${projectId}/quality?quality_profile=${qualityProfile}`,
+      ),
     undefined,
   );
+}
+
+export function generateQuality(
+  projectId: string,
+  options: { quality_profile?: QualityProfile; review_style?: ReviewStyle } = {},
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/quality/generate`, {
+        method: 'POST',
+        body: JSON.stringify(options),
+      }),
+    undefined,
+  );
+}
+
+export function getClaimEvidence(
+  projectId: string,
+  reportId?: string,
+  coreOnly = false,
+): Promise<ApiResult<ClaimEvidence[]>> {
+  const params = new URLSearchParams();
+  if (reportId) params.set('report_id', reportId);
+  if (coreOnly) params.set('core_only', 'true');
+  const query = params.size ? `?${params.toString()}` : '';
+  return withFallback(
+    () => request<ClaimEvidence[]>(`/projects/${projectId}/quality/evidence${query}`),
+    [],
+  );
+}
+
+export function reviewClaimEvidence(
+  projectId: string,
+  anchorId: string,
+  manualStatus: ClaimEvidence['manual_status'],
+): Promise<ClaimEvidence> {
+  return request<ClaimEvidence>(`/projects/${projectId}/quality/evidence/${anchorId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ manual_status: manualStatus }),
+  });
 }
 
 /** 润色浮条：绝不新增引用、绝不改动数字（服务端二次把关）。 */
