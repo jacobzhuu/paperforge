@@ -28,9 +28,12 @@ def _uuid() -> uuid.UUID:
 
 class PaperProject(Base, TimestampMixin):
     __tablename__ = "paper_project"
+    __table_args__ = (Index("ix_paper_project_owner_created", "owner_id", "created_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    owner_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     paper_type: Mapped[str] = mapped_column(String(16), nullable=False)  # review|original
     writing_mode: Mapped[str] = mapped_column(String(16), nullable=False)  # auto|assisted
@@ -48,7 +51,7 @@ class GenerationJob(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
     )
-    # kind: search|ingest|cards|outline|write|compile|full
+    # kind: search|ingest|cards|outline|write|compile|visual|full
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     # status: queued|running|succeeded|failed|cancelled（Draft-first：无「拒绝产出」终态）
     status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)
@@ -97,6 +100,82 @@ class UserAsset(Base, TimestampMixin):
     object_key: Mapped[str | None] = mapped_column(String(512))
     # 确定性解析结果（数字硬规则的注入来源；不编造数据）。
     parsed_json: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class VisualAsset(Base, TimestampMixin):
+    """版本化视觉资产；每次重生成都创建新行，禁止原地覆盖 rendition。"""
+
+    __tablename__ = "visual_asset"
+    __table_args__ = (
+        Index("ix_visual_asset_project_kind_status", "project_id", "kind", "generation_status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    generation_status: Mapped[str] = mapped_column(String(16), default="proposed", nullable=False)
+    review_status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    caption: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    alt_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    target_section_key: Mapped[str | None] = mapped_column(String(64))
+    suggested_block_index: Mapped[int | None] = mapped_column(Integer)
+    figure_label: Mapped[str] = mapped_column(String(128), nullable=False)
+    spec_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(64))
+    model: Mapped[str | None] = mapped_column(String(128))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    renditions_json: Mapped[dict | None] = mapped_column(JSONB)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    document_version: Mapped[int | None] = mapped_column(Integer)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("visual_asset.id", ondelete="SET NULL"), index=True
+    )
+
+
+class VisualSourceAsset(Base):
+    __tablename__ = "visual_source_asset"
+    __table_args__ = (
+        UniqueConstraint("visual_id", "user_asset_id", name="uq_visual_source_dependency"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    visual_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("visual_asset.id", ondelete="CASCADE"), index=True
+    )
+    user_asset_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("user_asset.id", ondelete="RESTRICT"), index=True
+    )
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class VisualGenerationAttempt(Base):
+    __tablename__ = "visual_generation_attempt"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    visual_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("visual_asset.id", ondelete="CASCADE"), index=True
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128))
+    request_id: Mapped[str | None] = mapped_column(String(128))
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    output_width: Mapped[int | None] = mapped_column(Integer)
+    output_height: Mapped[int | None] = mapped_column(Integer)
+    usage_json: Mapped[dict | None] = mapped_column(JSONB)
+    cost_estimate: Mapped[float | None] = mapped_column(Float)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Outline(Base, TimestampMixin):
@@ -152,9 +231,7 @@ class CitationUsage(Base):
     section_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("paper_section.id", ondelete="CASCADE")
     )
-    work_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("scholarly_work.id", ondelete="RESTRICT")
-    )
+    work_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("scholarly_work.id", ondelete="RESTRICT"))
     cite_key: Mapped[str] = mapped_column(String(128), nullable=False)
     context_snippet: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
@@ -191,7 +268,7 @@ class ExportArtifact(Base):
         ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
     )
     document_version: Mapped[int | None] = mapped_column(Integer)
-    # format: latex_zip|pdf|docx|bibtex|markdown
+    # format: latex_zip|pdf|docx|bibtex|markdown|markdown_bundle|compile_log
     format: Mapped[str] = mapped_column(String(16), nullable=False)
     object_key: Mapped[str | None] = mapped_column(String(512))
     compile_log_key: Mapped[str | None] = mapped_column(String(512))
