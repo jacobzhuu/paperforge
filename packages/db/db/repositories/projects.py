@@ -42,6 +42,7 @@ async def create_project(
     contribution_points: list[str] | None = None,
     publication_title: str | None = None,
     authors: list[str] | None = None,
+    author_details: list[dict[str, Any]] | None = None,
     keywords: list[str] | None = None,
     owner_id: uuid.UUID,
 ) -> PaperProject:
@@ -74,7 +75,17 @@ async def create_project(
         scope_json=scope_json or None,
         owner_id=owner_id,
         publication_title=(publication_title or "").strip() or None,
-        authors_json=[item.strip() for item in (authors or []) if item.strip()] or None,
+        authors_json=(
+            [
+                str(item.get("name") or "").strip()
+                for item in (author_details or [])
+                if str(item.get("name") or "").strip()
+            ]
+            if author_details is not None
+            else [item.strip() for item in (authors or []) if item.strip()]
+        )
+        or None,
+        author_details_json=_clean_author_details(author_details),
         keywords_json=[item.strip() for item in (keywords or []) if item.strip()] or None,
     )
     session.add(project)
@@ -84,6 +95,33 @@ async def create_project(
 
 async def get_project(session: AsyncSession, project_id: uuid.UUID) -> PaperProject | None:
     return await session.get(PaperProject, project_id)
+
+
+async def apply_generated_publication_metadata(
+    session: AsyncSession,
+    project: PaperProject,
+    *,
+    title: str,
+    keywords: list[str],
+) -> tuple[bool, bool]:
+    """只补齐空白投稿字段，绝不覆盖用户已经编辑过的题名或关键词。"""
+    title_added = False
+    keywords_added = False
+    if not (project.publication_title or "").strip() and title.strip():
+        project.publication_title = title.strip()
+        title_added = True
+    if not (project.keywords_json or []):
+        cleaned = [item.strip() for item in keywords if item.strip()]
+        if cleaned:
+            project.keywords_json = list(dict.fromkeys(cleaned))
+            keywords_added = True
+    if title_added or keywords_added:
+        project.metadata_confirmed_at = None
+        from db.repositories.quality import invalidate_quality_reports_for_project
+
+        await invalidate_quality_reports_for_project(session, project.id)
+        await session.flush()
+    return title_added, keywords_added
 
 
 async def get_owned_project(
@@ -126,6 +164,7 @@ async def update_project(
     contribution_points: list[str] | None = _UNSET,
     publication_title: str | None = _UNSET,
     authors: list[str] | None = _UNSET,
+    author_details: list[dict[str, Any]] | None = _UNSET,
     keywords: list[str] | None = _UNSET,
     metadata_confirmed: bool | None = _UNSET,
 ) -> PaperProject:
@@ -162,7 +201,7 @@ async def update_project(
     if venue_template is not _UNSET:
         project.venue_template = venue_template
     publication_metadata_changed = any(
-        value is not _UNSET for value in (publication_title, authors, keywords)
+        value is not _UNSET for value in (publication_title, authors, author_details, keywords)
     )
     if publication_title is not _UNSET:
         project.publication_title = (
@@ -170,6 +209,11 @@ async def update_project(
         ) or None
     if authors is not _UNSET:
         project.authors_json = [item.strip() for item in (authors or []) if item.strip()] or None
+        project.author_details_json = None
+    if author_details is not _UNSET:
+        cleaned = _clean_author_details(author_details)
+        project.author_details_json = cleaned
+        project.authors_json = [item["name"] for item in (cleaned or [])] or None
     if keywords is not _UNSET:
         project.keywords_json = [item.strip() for item in (keywords or []) if item.strip()] or None
     if metadata_confirmed is not _UNSET:
@@ -221,6 +265,35 @@ async def update_project_scope(
     project.scope_json = scope
     await session.flush()
     return project
+
+
+def _clean_author_details(values: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if not values:
+        return None
+    cleaned: list[dict[str, Any]] = []
+    for index, raw in enumerate(values):
+        name = " ".join(str(raw.get("name") or "").split())
+        if not name:
+            continue
+        affiliations = []
+        seen: set[str] = set()
+        for value in raw.get("affiliations") or []:
+            item = " ".join(str(value).split())[:240]
+            key = item.casefold()
+            if item and key not in seen:
+                seen.add(key)
+                affiliations.append(item)
+        cleaned.append(
+            {
+                "id": str(raw.get("id") or f"author-{index + 1}"),
+                "name": name,
+                "affiliations": affiliations,
+                "email": str(raw.get("email")) if raw.get("email") else None,
+                "orcid": str(raw.get("orcid")) if raw.get("orcid") else None,
+                "corresponding": bool(raw.get("corresponding", False)),
+            }
+        )
+    return cleaned or None
 
 
 async def set_project_status(

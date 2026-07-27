@@ -40,6 +40,8 @@ class PaperProject(Base, TimestampMixin):
     # 项目内部名称与发表题名分离。历史项目保持为空，渲染时回退到 title。
     publication_title: Mapped[str | None] = mapped_column(Text)
     authors_json: Mapped[list | None] = mapped_column(JSONB)
+    # 投稿署名的结构化快照；authors_json 继续作为旧客户端兼容投影。
+    author_details_json: Mapped[list | None] = mapped_column(JSONB)
     keywords_json: Mapped[list | None] = mapped_column(JSONB)
     metadata_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paper_type: Mapped[str] = mapped_column(String(16), nullable=False)  # review|original
@@ -388,9 +390,7 @@ class ExportArtifact(Base):
         ForeignKey("quality_report.id", ondelete="SET NULL"), index=True
     )
     quality_profile: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
-    readiness_status: Mapped[str] = mapped_column(
-        String(32), default="unassessed", nullable=False
-    )
+    readiness_status: Mapped[str] = mapped_column(String(32), default="unassessed", nullable=False)
     paper_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

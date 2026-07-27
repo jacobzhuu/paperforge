@@ -1,16 +1,22 @@
 'use client';
 
 import * as React from 'react';
-import { CheckCircle2, Cpu, XCircle } from 'lucide-react';
+import { CheckCircle2, Cpu, UserRound, XCircle } from 'lucide-react';
 import { PageContainer } from '@/components/layout/page-container';
 import { PageHeader } from '@/components/layout/page-header';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Textarea } from '@/components/ui/textarea';
+import { useToast } from '@/components/ui/toast';
 import { DataSourceBanner } from '@/components/data-source-banner';
 import { LoadState } from '@/components/layout/load-state';
-import { getRuntimeSettings } from '@/lib/api';
-import type { DataSource, RuntimeSettings } from '@/lib/types';
+import { getAcademicProfile, getRuntimeSettings, updateAcademicProfile } from '@/lib/api';
+import type { AuthorDetail, DataSource, RuntimeSettings } from '@/lib/types';
 import { describeError } from '@/lib/errors';
 
 /**
@@ -21,6 +27,7 @@ import { describeError } from '@/lib/errors';
  * 这里只留真正全局的运行时配置。
  */
 export function SettingsPage() {
+  const { toast } = useToast();
   const [settings, setSettings] = React.useState<RuntimeSettings | undefined>();
   const [source, setSource] = React.useState<DataSource>('live');
   const [note, setNote] = React.useState<string | undefined>();
@@ -60,6 +67,8 @@ export function SettingsPage() {
         <PageHeader title="设置" description="LLM 运行时与模型角色路由" />
 
         <DataSourceBanner source={source} note={note} />
+
+        <AcademicProfileCard toast={toast} />
 
         <LoadState
           loading={loading}
@@ -190,6 +199,140 @@ export function SettingsPage() {
         </LoadState>
       </div>
     </PageContainer>
+  );
+}
+
+function AcademicProfileCard({
+  toast,
+}: {
+  toast: (input: { title: string; description?: string; variant?: 'success' | 'error' | 'info' }) => void;
+}) {
+  const [profile, setProfile] = React.useState<AuthorDetail>({
+    id: 'my-academic-profile',
+    name: '',
+    affiliations: [],
+    email: null,
+    orcid: null,
+    corresponding: false,
+  });
+  const [affiliations, setAffiliations] = React.useState('');
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    let alive = true;
+    getAcademicProfile()
+      .then(({ profile: stored }) => {
+        if (!alive || !stored) return;
+        setProfile(stored);
+        setAffiliations(stored.affiliations.join('\n'));
+      })
+      .catch(() => {
+        // 身份档案是独立能力；运行时设置仍应继续显示。
+      })
+      .finally(() => alive && setLoading(false));
+    return () => { alive = false; };
+  }, []);
+
+  const save = async () => {
+    if (!profile.name.trim()) {
+      toast({ title: '请填写用于论文署名的姓名', variant: 'error' });
+      return;
+    }
+    if (profile.corresponding && !profile.email) {
+      toast({ title: '通讯作者需要填写邮箱', variant: 'error' });
+      return;
+    }
+    setSaving(true);
+    try {
+      const result = await updateAcademicProfile({
+        ...profile,
+        name: profile.name.trim(),
+        affiliations: affiliations.split('\n').map((item) => item.trim()).filter(Boolean),
+      });
+      if (result.profile) {
+        setProfile(result.profile);
+        setAffiliations(result.profile.affiliations.join('\n'));
+      }
+      toast({ title: '学术身份已保存', description: '以后可在项目署名中一键添加本人。', variant: 'success' });
+    } catch (error) {
+      toast({ title: '学术身份未保存', description: describeError(error), variant: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center gap-1.5 text-sm">
+          <UserRound className="h-4 w-4" /> 我的学术身份
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-muted-foreground">
+          填写一次即可在每个项目中复用；项目会保存独立快照，之后修改这里不会改写旧论文署名。
+        </p>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="profile-name">姓名</Label>
+            <Input
+              id="profile-name"
+              value={profile.name}
+              onChange={(event) => setProfile((current) => ({ ...current, name: event.target.value }))}
+              disabled={loading}
+              className="h-11"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="profile-email">邮箱</Label>
+            <Input
+              id="profile-email"
+              type="email"
+              value={profile.email ?? ''}
+              onChange={(event) => setProfile((current) => ({ ...current, email: event.target.value || null }))}
+              disabled={loading}
+              className="h-11"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="profile-affiliations">单位</Label>
+            <Textarea
+              id="profile-affiliations"
+              value={affiliations}
+              onChange={(event) => setAffiliations(event.target.value)}
+              placeholder="每行一个单位"
+              disabled={loading}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="profile-orcid">ORCID</Label>
+            <Input
+              id="profile-orcid"
+              value={profile.orcid ?? ''}
+              onChange={(event) => setProfile((current) => ({ ...current, orcid: event.target.value || null }))}
+              placeholder="0000-0002-1825-0097"
+              disabled={loading}
+              className="h-11"
+            />
+          </div>
+        </div>
+        <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+          <label className="flex min-h-11 items-center gap-3 text-sm">
+            <Checkbox
+              checked={profile.corresponding}
+              onCheckedChange={(corresponding) => setProfile((current) => ({ ...current, corresponding }))}
+              disabled={loading}
+              aria-label="默认作为通讯作者"
+            />
+            默认作为通讯作者
+          </label>
+          <Button className="h-11" onClick={() => void save()} disabled={loading || saving}>
+            {saving ? '正在保存…' : '保存学术身份'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 

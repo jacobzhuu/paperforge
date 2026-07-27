@@ -64,6 +64,7 @@ from db.repositories.library import (
     writing_whitelist_stmt,
 )
 from db.repositories.projects import (
+    apply_generated_publication_metadata,
     create_project,
     get_owned_project,
     get_project,
@@ -137,6 +138,7 @@ __all__ = [
     "create_outline",
     "create_document",
     "append_job_event",
+    "apply_generated_publication_metadata",
     "assign_bibtex_key",
     "create_job",
     "create_project",

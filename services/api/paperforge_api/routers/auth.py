@@ -35,6 +35,8 @@ from paperforge_api.config import Settings, get_settings
 from paperforge_api.deps import CurrentAuthDep, get_queue, get_session
 from paperforge_api.mailer import send_auth_email
 from paperforge_api.schemas import (
+    AcademicProfileRequest,
+    AcademicProfileResponse,
     AuthMessageResponse,
     ChangePasswordRequest,
     ForgotPasswordRequest,
@@ -139,11 +141,7 @@ async def login(
         user = await get_user_by_email(session, account)
         usable_hash = user.password_hash if user is not None and user.status == "active" else None
         password_matches = verify_login_password(usable_hash, body.password)
-    if (
-        user is None
-        or user.status != "active"
-        or not password_matches
-    ):
+    if user is None or user.status != "active" or not password_matches:
         raise HTTPException(status_code=401, detail={"code": "invalid_credentials"})
     if user.email_verified_at is None:
         raise HTTPException(status_code=403, detail={"code": "email_verification_required"})
@@ -204,6 +202,24 @@ def _clear_session_cookie(response: Response, settings: Settings) -> None:
 @router.get("/me", response_model=UserResponse)
 async def me(auth: CurrentAuthDep) -> UserResponse:
     return _user_response(auth.user)
+
+
+@router.get("/me/academic-profile", response_model=AcademicProfileResponse)
+async def get_academic_profile(auth: CurrentAuthDep) -> AcademicProfileResponse:
+    return AcademicProfileResponse(profile=auth.user.academic_profile_json)
+
+
+@router.patch("/me/academic-profile", response_model=AcademicProfileResponse)
+async def update_academic_profile(
+    body: AcademicProfileRequest,
+    auth: CurrentAuthDep,
+    session: SessionDep,
+) -> AcademicProfileResponse:
+    auth.user.academic_profile_json = (
+        body.profile.model_dump(mode="json") if body.profile is not None else None
+    )
+    await session.flush()
+    return AcademicProfileResponse(profile=auth.user.academic_profile_json)
 
 
 @router.post(
@@ -331,8 +347,6 @@ async def _rate_limit(
             if count == 1:
                 await queue.expire(key, window)
     except Exception as error:  # noqa: BLE001 - security control fails closed
-        raise HTTPException(
-            status_code=503, detail={"code": "rate_limiter_unavailable"}
-        ) from error
+        raise HTTPException(status_code=503, detail={"code": "rate_limiter_unavailable"}) from error
     if any(count > limit for count in attempts):
         raise HTTPException(status_code=429, detail={"code": "too_many_attempts"})
