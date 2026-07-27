@@ -1,4 +1,4 @@
-# PaperForge 实施路线图（M0–M9）
+# PaperForge 实施路线图（M0–M11）
 
 源自 docs/design.md §6。关键依赖：M0 → M1 → M2 → M3；M4 依赖 M3（渲染）；
 M2 与 M4 的写作器共用同一 Section Writer。
@@ -16,6 +16,7 @@ M2 与 M4 的写作器共用同一 Section Writer。
 | **M8 图片与图表生成** | 视觉资产、确定性 visuald、ImageProvider、审核插入与全格式含图导出 | 表格→图表→批准→正文→PDF/DOCX/ZIP/Markdown Bundle；自动建议不付费 | ✅ 完成 |
 | **M9 账号与多租户隔离** | opaque session、项目 owner、统一授权、用户级对象键、存量认领 | 匿名 401、跨租户 404、生产无 mock/公开 bucket/前端令牌 | ✅ 代码完成，待维护窗口迁移 |
 | **M10 Cloudflare AI 生图适配** | 可注册 ImageProvider、Workers AI REST、FLUX.1-schnell、占位配置 | mock 契约通过；缺 Token/Account ID 不发请求且不影响其他功能 | ✅ 完成 |
+| **M11 投稿质量闭环** | 全文论断证据、双模式质量门、快照失效、投稿元数据、活动视觉槽位与 PDF 后验 QA | 内容预检与最终 PDF 均通过才标记 `submission_ready` | ✅ 完成 |
 
 ## M0 当前进度（本次脚手架）
 已完成：

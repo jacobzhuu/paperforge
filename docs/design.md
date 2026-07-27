@@ -11,7 +11,9 @@
 
 DeepSearch 现有文献综述子系统(`literature_review/` 约 2.4 万行 + 29 张专属表)是一个**以可审计溯源为最高目标**的 PRISMA 级系统:形式化完成(formal completion)要求锁定检索源全部穷尽、筛选裁决全部落库、每个 finding 通过语义支持验证、每个实质段落可回溯到 claim→finding→chunk→snapshot 五级链路。这套契约对"系统性综述的可复现性"是正确的,但对"高质量论文成稿"是巨大的负担:大量算力和流程花在证据审计上,而真正决定论文质量的写作、结构、行文连贯性反而被 id-grounded 逐段绑定约束得难以展开。
 
-新系统的定位反转为:**成稿优先(draft-first)、引用真实(citation-authentic)、流程宽松(gate-free)**。
+新系统的定位反转为:**成稿优先(draft-first)、引用真实(citation-authentic)、默认流程宽松**。
+M11 在不破坏这一默认值的前提下增加可选的严格投稿质量门；任务执行成功与论文投稿就绪
+是两个独立状态。
 
 - 保留并迁移的核心资产:五大学术检索适配器(OpenAlex/Crossref/Semantic Scholar/arXiv/EuropePMC,含限速/熔断/缓存)、标识符规范化、确定性去重、引文雪球扩展、OA 全文获取、PDF/文档解析、section 感知切块、引用格式化、LLM Provider 抽象、主题聚类与结构化写作的 JSON-schema 校验模式、PostgreSQL/Alembic/对象存储基建约定。
 - 明确摈弃:PRISMA 流程守恒、多阶段筛选裁决、finding 语义验证、synthesis claim 类型规则、研究质量评估(study appraisal)、效应量/分类学机器、检索 lane 穷尽账目、语料冻结、formal/diagnostic/insufficient-evidence 状态机、通用 OSINT 管线(claims/research_quality/slides 等约 9 万行)。
@@ -68,7 +70,10 @@ review_protocol -> review_search_strategy -> scholarly_result_occurrence -> scho
 3. **确定性代码管格式,LLM 管内容**:BibTeX、编号、图表渲染、模板、数字一致性由代码保证;论证与行文由 LLM 生成(这一分工原则继承自旧系统,是其最有价值的架构遗产)。
 4. **人机协作节点显式化**:检索圈选、大纲确认、章节改写是产品交互点,不是流程裁决点;全部可跳过(全自动模式)。
 5. **合规获取**:全文仅经 OA/官方 API 渠道获取,不绕 paywall/robots(继承旧系统合规策略)。
-6. **不伪造数据**:实验数值只能来自用户素材的确定性解析,或显式占位。
+6. **不伪造数据**:原创研究的实验数值只能来自用户素材的确定性解析或显式占位；综述中的
+   文献数值必须来自可定位全文证据，摘要只能支持背景陈述。
+7. **双模式就绪语义**:`draft` 永远交付当前最好草稿；`submission` 要求核心论断全文定位、
+   元数据确认、章节审批和最终 PDF 版面检查全部通过。
 
 ---
 
@@ -173,7 +178,7 @@ PostgreSQL 16 + Alembic、MinIO/文件系统对象存储、OpenSearch(新系统�
 | formal completion 12 项硬门槛 | 质量评分报告(引用密度/覆盖度/新旧文献比/连贯性),仅提示 |
 | 多阶段 screening + 仲裁 | 相关性排序 + 前端一键圈选(全自动模式取 top-K) |
 | PRISMA 流程图 | 检索统计面板(每源命中/去重/入库数),可选导出为附录 |
-| evidence matrix 硬校验 | literature_card 写作上下文 + 可选"文献对比表"直接进论文 |
+| evidence matrix 硬校验 | 句级论断—全文证据矩阵 + 自动生成的跨研究比较/局限/冲突章节与文献对比表 |
 | INSUFFICIENT_EVIDENCE 终态 | 低覆盖警告 + 照常产出草稿 |
 | 语料冻结版本 | 文献库工作集 + 导出时快照 bibliography 版本 |
 
@@ -291,7 +296,9 @@ CURATE   协作模式:用户圈选入库;全自动:top-K 入库。对种子文�
 INGEST   OA 全文获取 → 解析 → section 感知切块;无全文则摘要级降级          [oa_fulltext/ingest/section_chunks]
 CARDS    每篇入库文献抽取 literature_card(贡献/方法/结果/局限/可引要点)      [llm_extraction 模式]
 OUTLINE  卡片主题聚类 → 章节树(每章分配文献集合+论证要点),用户可调整        [llm_synthesis ThemeBundle 改造]
-WRITE    逐章节结构化生成(§4.4.3 引用约束)→ 摘要/引言/结论后写 → 全文连贯性 pass
+WRITE    逐章节结构化生成(§4.4.3 引用约束)→ 摘要/引言/结论后写;每写完一节立刻落库
+POLISH   全文连贯性 pass(独立阶段,逐节报进度)。默认开启,用户可中途跳过:
+         已润色的章节保留,剩余章节按初稿交付
 CITECHK  确定性引用审计 + 可选语义相关性软检查(仅出提示)
 VISUAL_PLAN 全文完成后最多生成 6 条视觉建议；不调用付费生图、不改 PaperIR、不阻断管线
 RENDER   PaperIR → LaTeX 工程 + BibTeX → Tectonic 编译 → PDF(有界自动修复)
@@ -399,7 +406,11 @@ POST   /projects/{id}/sections/{key}/generate     单章节(重)生成    PUT /s
 POST   /projects/{id}/sections/{key}/refine       润色/扩写/缩写/改语气
 GET    /projects/{id}/citations/audit             引用审计报告(R2 结果+软校验徽章)
 POST   /projects/{id}/exports {format}            触发导出          GET /exports
+POST   /projects/{id}/quality/generate            生成快照质量报告
+GET    /projects/{id}/quality/evidence            句级论断—证据明细
+PATCH  /projects/{id}/quality/evidence/{anchor}   人工确认/驳回证据
 GET    /projects/{id}/jobs/{job_id}/events        SSE 进度流
+POST   /projects/{id}/jobs/{job_id}/polish/skip   跳过剩余连贯性润色(幂等)
 ```
 
 ### 4.8 前端信息架构
@@ -474,6 +485,7 @@ GET    /projects/{id}/jobs/{job_id}/events        SSE 进度流
 | **M8 图片与图表生成** | A 基础闭环：视觉资产/PaperIR/texd 二进制；B 确定性图表/示意图；C 自动建议/ImageProvider；D 成本、进度、降级与视觉 QA | CSV/XLSX → 图表 → 批准 → 引用 → PDF/DOCX/LaTeX ZIP/Markdown Bundle 四格式含图；建议不付费、不改正文、不阻塞无图导出 |
 | **M9 账号与多租户隔离** | 邮箱密码、opaque session、项目 owner、统一授权、用户级对象键、存量认领 | 匿名 401；跨租户项目/素材/视觉/导出/SSE 404；生产无 mock、公开 bucket 或前端可读令牌 |
 | **M10 Cloudflare AI 生图适配** | provider registry/factory、Workers AI REST、FLUX.1-schnell、占位配置与无密钥降级 | 不使用真实 Token 的 mock 契约通过；新增厂商无需改 worker/视觉资产/导出链路 |
+| **M11 投稿质量闭环** | draft/submission 双模式、论断—全文证据矩阵、快照报告、系统综述真实检索日志、活动视觉槽位与 PDF 后验 QA | 投稿失败结构化阻断且不产出“可提交”文件；最终 PDF 通过后标记 `submission_ready` |
 
 关键依赖顺序:M0 → M1 → M2 → M3;M4 依赖 M3(渲染);M2 与 M4 的写作器共用同一 Section Writer。
 

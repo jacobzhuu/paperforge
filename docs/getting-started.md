@@ -1,6 +1,6 @@
 # PaperForge 启动指南（Getting Started）
 
-> 适用阶段：M0–M9。本文中标注 **[已实测]** 的步骤已在本仓库对应交付中执行验证。
+> 适用阶段：M0–M11。本文中标注 **[已实测]** 的步骤已在本仓库对应交付中执行验证。
 > 初始代码审阅报告中的 P1/P2/P3 问题已在本仓库当前版本修复。
 
 ## 0. 一键启动 [已实测]
@@ -196,8 +196,14 @@ uv run arq paperforge_worker.worker.WorkerSettings
 
 - 连上 Redis 后进入空转，等待任务队列；无 Redis 时每秒重试 5 次后退出（实测确认）。
 - `WorkerSettings.redis_settings` 由 `REDIS_URL` 构建；可连接非默认主机、端口和 DB。
-- `run_full_pipeline` 已实现检索、入库、卡片、大纲、分节写作、视觉建议和渲染。
-  `visual_plan` 在 write 后执行，仅建议不生成付费 AI 图，失败时不阻断正文与导出。
+- `run_full_pipeline` 已实现检索、全文卡片、大纲、分节写作、证据检查、质量报告、
+  视觉建议、导出预检与渲染。默认 `draft+narrative` 保持快速草稿行为；
+  `submission` 在内容质量门失败时任务仍可技术成功，但不会进入视觉与投稿导出。
+- 综述大纲会加入跨研究比较、方法局限与证据冲突综合章节，并生成可直接进入 PDF 的
+  文献方法/证据基础矩阵；正文引用按句绑定，避免段末堆积整段引用。
+- `visual_plan` 只建议、不自动生成付费 AI 图。视觉生成结果会预检内容包围盒、留白、
+  最低字号和宽高比；短综述不会在降级路径强塞泛化结构图或装饰性插图。最终 PDF 再检查
+  真实图片坐标、题注、缺字、引用和书目后置图。
 
 ## 7. apps/web 启动 [已实测]
 
@@ -210,6 +216,25 @@ pnpm dev
 新建论文，进入文献库、大纲、写作台、素材中心和导出中心。前端默认只请求同源
 `/api/v1`，Next 由 `PAPERFORGE_API_INTERNAL_BASE` 转发到 FastAPI。
 `pnpm build` 亦可用于生产构建检查。
+
+### 7.1 草稿与投稿模式
+
+- 项目概览的“一键全管线”可选择 `draft/submission` 与 `narrative/systematic`。
+- 投稿前在概览填写并确认独立的发表题名、作者和关键词；项目内部名称不会再代替论文题名。
+- 写作台“质量”页签展示快照版本、过期状态、结构化阻断项及句级论断—证据锚点；
+  全文证据可人工确认或驳回，确认后需重新生成质量报告。
+- 导出中心选择“投稿候选稿”时，只接受当前快照上 `preflight_ready` 的报告；PDF 通过最终
+  视觉检查后，产物和报告才标记为 `submission_ready`。历史产物显示为“未评估”。
+
+公共请求示例：
+
+```json
+POST /api/v1/projects/{id}/generate
+{"quality_profile":"submission","review_style":"systematic"}
+
+POST /api/v1/projects/{id}/exports
+{"formats":["pdf","latex_zip"],"quality_profile":"submission"}
+```
 
 ## 8. .env 变量说明
 
@@ -259,7 +284,7 @@ curl -fsS http://localhost:3000
 
 ## 10. 当前边界
 
-- 一键全管线、五种文本产物、M8 图文链路与 M9 个人账号数据隔离已实现；开发环境可以在
+- 一键全管线、双模式质量门、五种文本产物、M8 图文链路与 M9 个人账号数据隔离已实现；开发环境可以在
   `IMAGE_API_KEY` 为空时完整验证图表、示意图和无图导出。
 - 真实 Cloudflare 图像冒烟需要手动补齐 `IMAGE_ACCOUNT_ID`、`IMAGE_API_KEY` 并开启
   `AI_IMAGES_ENABLED`；系统不会在自动建议、启动检查或缺配置时触发外部调用。
