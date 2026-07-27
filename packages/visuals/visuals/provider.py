@@ -10,8 +10,46 @@ from urllib.parse import quote
 
 import httpx
 
+from visuals.errors import (
+    AUTHENTICATION_FAILED,
+    CONTENT_REJECTED,
+    INVALID_IMAGE,
+    INVALID_REQUEST,
+    NETWORK_TIMEOUT,
+    PROVIDER_NOT_CONFIGURED,
+    PROVIDER_UNAVAILABLE,
+    RATE_LIMITED,
+)
+
 MAX_PROVIDER_IMAGE_BYTES = 32 * 1024 * 1024
 _CLOUDFLARE_ACCOUNT_ID = re.compile(r"^[a-fA-F0-9]{32}$")
+
+
+@dataclass(frozen=True)
+class ImageProviderCapabilities:
+    """提供商**真正**支持的能力。
+
+    界面不能假设所有提供商能力相同：Cloudflare FLUX.1-schnell 的请求体只有
+    `prompt` 与 `steps`，`size` 根本不会被发送——此前界面却提供「横向 3:2 /
+    方形 1:1 / 竖向 2:3」三选一，用户选了横向仍然拿到 1024×1024。
+
+    工作台按这份声明渲染表单，因此新增提供商不需要在 UI 里加厂商分支。
+    """
+
+    provider: str
+    model: str
+    #: 可请求的精确尺寸。空表示尺寸由提供商决定，界面不得给出尺寸承诺。
+    supported_sizes: tuple[str, ...] = ()
+    supported_aspect_ratios: tuple[str, ...] = ()
+    quality_modes: tuple[str, ...] = ("low", "medium", "high")
+    prompt_max_length: int = 4000
+    supports_negative_prompt: bool = False
+    supports_seed: bool = False
+    #: 输出尺寸固定时填这里（如 Cloudflare 的方形输出），界面据此显示「固定」。
+    fixed_output_size: str | None = None
+    cost_estimate_available: bool = False
+    #: 一句话解释这个提供商的取舍，直接展示在生成确认框里。
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,15 +84,43 @@ class ImageProviderConfig:
 
 
 class ImageProviderError(RuntimeError):
-    def __init__(self, message: str, *, code: str, retryable: bool) -> None:
+    """`code` 取自 `visuals.errors` 的统一词表。
+
+    `request_id` 此前只在**成功**路径上被读取（`ImageResult.request_id`），失败时
+    恒为 None——排查一次 Cloudflare 拒绝时拿不到 cf-ray，用户只能反复试提示词。
+    现在失败路径也带上它。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        retryable: bool,
+        request_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.request_id = request_id
+
+
+def _request_id_of(response: httpx.Response | None) -> str | None:
+    if response is None:
+        return None
+    return (
+        response.headers.get("cf-ray")
+        or response.headers.get("x-request-id")
+        or response.headers.get("x-amzn-requestid")
+    )
 
 
 class ImageProvider(Protocol):
     @property
     def configured(self) -> bool: ...
+
+    @property
+    def capabilities(self) -> ImageProviderCapabilities: ...
 
     def generate(self, request: ImageRequest) -> ImageResult: ...
 
@@ -87,6 +153,19 @@ class OpenAIImageProvider:
         return bool(self.api_key.strip())
 
     @property
+    def capabilities(self) -> ImageProviderCapabilities:
+        return ImageProviderCapabilities(
+            provider="openai",
+            model=self.model,
+            supported_sizes=("1024x1024", "1536x1024", "1024x1536"),
+            supported_aspect_ratios=("1:1", "3:2", "2:3"),
+            quality_modes=("low", "medium", "high"),
+            prompt_max_length=4000,
+            cost_estimate_available=False,
+            note="尺寸与质量都会真实下发到 OpenAI Image API。",
+        )
+
+    @property
     def client(self) -> httpx.Client:
         if self._client is None:
             self._client = httpx.Client(timeout=self.timeout_seconds)
@@ -100,7 +179,9 @@ class OpenAIImageProvider:
     def generate(self, request: ImageRequest) -> ImageResult:
         if not self.api_key:
             raise ImageProviderError(
-                "image API key is not configured", code="auth", retryable=False
+                "image API key is not configured",
+                code=PROVIDER_NOT_CONFIGURED,
+                retryable=False,
             )
         payload = {
             "model": self.model,
@@ -122,64 +203,85 @@ class OpenAIImageProvider:
             except (httpx.TimeoutException, httpx.NetworkError) as error:
                 if attempt >= self.max_retries:
                     raise ImageProviderError(
-                        type(error).__name__, code="network", retryable=True
+                        type(error).__name__, code=NETWORK_TIMEOUT, retryable=True
                     ) from error
                 time.sleep(0.25 * (2**attempt))
                 continue
+            request_id = _request_id_of(response)
             if response.status_code in {401, 403}:
                 raise ImageProviderError(
-                    "image provider authentication failed", code="auth", retryable=False
+                    "image provider authentication failed",
+                    code=AUTHENTICATION_FAILED,
+                    retryable=False,
+                    request_id=request_id,
                 )
             if response.status_code in {400, 422}:
                 body = response.text.lower()
                 code = (
-                    "moderation" if "moderation" in body or "safety" in body else "invalid_request"
+                    CONTENT_REJECTED
+                    if "moderation" in body or "safety" in body
+                    else INVALID_REQUEST
                 )
-                raise ImageProviderError("image request rejected", code=code, retryable=False)
+                raise ImageProviderError(
+                    "image request rejected",
+                    code=code,
+                    retryable=False,
+                    request_id=request_id,
+                )
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < self.max_retries:
                     time.sleep(0.25 * (2**attempt))
                     continue
                 raise ImageProviderError(
                     f"image provider HTTP {response.status_code}",
-                    code="rate_limit" if response.status_code == 429 else "provider_5xx",
+                    code=RATE_LIMITED if response.status_code == 429 else PROVIDER_UNAVAILABLE,
                     retryable=True,
+                    request_id=request_id,
                 )
             if response.status_code != 200:
                 raise ImageProviderError(
                     f"image provider HTTP {response.status_code}",
-                    code="provider_error",
+                    code=PROVIDER_UNAVAILABLE,
                     retryable=False,
+                    request_id=request_id,
                 )
             break
         if response is None:
             raise ImageProviderError(
-                "image provider returned no response", code="network", retryable=True
+                "image provider returned no response", code=NETWORK_TIMEOUT, retryable=True
             )
+        request_id = _request_id_of(response)
         try:
             body = response.json()
             encoded = body["data"][0]["b64_json"]
             data = base64.b64decode(encoded, validate=True)
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ImageProviderError(
-                "invalid image provider payload", code="invalid_base64", retryable=False
+                "invalid image provider payload",
+                code=INVALID_IMAGE,
+                retryable=False,
+                request_id=request_id,
             ) from error
         if not data or len(data) > MAX_PROVIDER_IMAGE_BYTES:
             raise ImageProviderError(
-                "provider image exceeds size limit", code="image_too_large", retryable=False
+                "provider image exceeds size limit",
+                code=INVALID_IMAGE,
+                retryable=False,
+                request_id=request_id,
             )
         if request.output_format == "png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
             raise ImageProviderError(
                 "provider returned a non-PNG payload",
-                code="invalid_image_type",
+                code=INVALID_IMAGE,
                 retryable=False,
+                request_id=request_id,
             )
         return ImageResult(
             data=data,
             media_type="image/png",
             provider="openai",
             model=self.model,
-            request_id=response.headers.get("x-request-id"),
+            request_id=request_id,
             usage=body.get("usage") if isinstance(body.get("usage"), dict) else {},
         )
 
@@ -217,6 +319,29 @@ class CloudflareWorkersAIImageProvider:
         )
 
     @property
+    def capabilities(self) -> ImageProviderCapabilities:
+        """FLUX.1-schnell 的请求体只有 `prompt` 与 `steps`。
+
+        因此这里**不声明任何可选尺寸**：界面据此显示「输出尺寸由提供商决定」，
+        而不是给出一个不会生效的 3:2 / 1:1 / 2:3 下拉框。质量三档是真实的——
+        它映射到 4 / 6 / 8 步。
+        """
+        return ImageProviderCapabilities(
+            provider="cloudflare",
+            model=self.model,
+            supported_sizes=(),
+            supported_aspect_ratios=(),
+            quality_modes=("low", "medium", "high"),
+            prompt_max_length=2048,
+            fixed_output_size=None,
+            cost_estimate_available=False,
+            note=(
+                "Cloudflare Workers AI 只接受提示词与步数；"
+                "输出尺寸由模型决定，生成后会显示实际尺寸。"
+            ),
+        )
+
+    @property
     def client(self) -> httpx.Client:
         if self._client is None:
             self._client = httpx.Client(timeout=self.timeout_seconds)
@@ -230,24 +355,26 @@ class CloudflareWorkersAIImageProvider:
     def generate(self, request: ImageRequest) -> ImageResult:
         if not self.api_key.strip():
             raise ImageProviderError(
-                "Cloudflare API token is not configured", code="auth", retryable=False
+                "Cloudflare API token is not configured",
+                code=PROVIDER_NOT_CONFIGURED,
+                retryable=False,
             )
         if not _CLOUDFLARE_ACCOUNT_ID.fullmatch(self.account_id):
             raise ImageProviderError(
                 "Cloudflare Account ID is not configured",
-                code="provider_not_configured",
+                code=PROVIDER_NOT_CONFIGURED,
                 retryable=False,
             )
         if len(request.prompt) > 2048:
             raise ImageProviderError(
                 "Cloudflare FLUX prompt exceeds 2048 characters",
-                code="invalid_request",
+                code=INVALID_REQUEST,
                 retryable=False,
             )
         if not self.model:
             raise ImageProviderError(
                 "Cloudflare image model is not configured",
-                code="provider_not_configured",
+                code=PROVIDER_NOT_CONFIGURED,
                 retryable=False,
             )
 
@@ -268,23 +395,31 @@ class CloudflareWorkersAIImageProvider:
             except (httpx.TimeoutException, httpx.NetworkError) as error:
                 if attempt >= self.max_retries:
                     raise ImageProviderError(
-                        type(error).__name__, code="network", retryable=True
+                        type(error).__name__, code=NETWORK_TIMEOUT, retryable=True
                     ) from error
                 time.sleep(0.25 * (2**attempt))
                 continue
+            # cf-ray 此前只在成功路径上被读取，排查一次拒绝时拿不到任何追踪 ID。
+            request_id = _request_id_of(response)
             if response.status_code in {401, 403}:
                 raise ImageProviderError(
-                    "Cloudflare authentication failed", code="auth", retryable=False
+                    "Cloudflare authentication failed",
+                    code=AUTHENTICATION_FAILED,
+                    retryable=False,
+                    request_id=request_id,
                 )
             if response.status_code in {400, 422}:
                 body = response.text.lower()
                 code = (
-                    "moderation"
+                    CONTENT_REJECTED
                     if "moderation" in body or "safety" in body or "content policy" in body
-                    else "invalid_request"
+                    else INVALID_REQUEST
                 )
                 raise ImageProviderError(
-                    "Cloudflare image request rejected", code=code, retryable=False
+                    "Cloudflare image request rejected",
+                    code=code,
+                    retryable=False,
+                    request_id=request_id,
                 )
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < self.max_retries:
@@ -292,36 +427,44 @@ class CloudflareWorkersAIImageProvider:
                     continue
                 raise ImageProviderError(
                     f"Cloudflare Workers AI HTTP {response.status_code}",
-                    code="rate_limit" if response.status_code == 429 else "provider_5xx",
+                    code=RATE_LIMITED if response.status_code == 429 else PROVIDER_UNAVAILABLE,
                     retryable=True,
+                    request_id=request_id,
                 )
             if response.status_code != 200:
                 raise ImageProviderError(
                     f"Cloudflare Workers AI HTTP {response.status_code}",
-                    code="provider_error",
+                    code=PROVIDER_UNAVAILABLE,
                     retryable=False,
+                    request_id=request_id,
                 )
             break
 
         if response is None:
             raise ImageProviderError(
-                "Cloudflare returned no response", code="network", retryable=True
+                "Cloudflare returned no response", code=NETWORK_TIMEOUT, retryable=True
             )
-        data, api_usage = _cloudflare_image_data(response)
+        request_id = _request_id_of(response)
+        data, api_usage = _cloudflare_image_data(response, request_id)
         if not data or len(data) > MAX_PROVIDER_IMAGE_BYTES:
             raise ImageProviderError(
-                "provider image exceeds size limit", code="image_too_large", retryable=False
+                "provider image exceeds size limit",
+                code=INVALID_IMAGE,
+                retryable=False,
+                request_id=request_id,
             )
         media_type = _image_media_type(data)
         if media_type is None:
             raise ImageProviderError(
                 "Cloudflare returned an unsupported image payload",
-                code="invalid_image_type",
+                code=INVALID_IMAGE,
                 retryable=False,
+                request_id=request_id,
             )
         usage = {
             "steps": steps,
             "requested_quality": request.quality,
+            # 请求里的 size 从未下发给 Cloudflare，只作为「用户当时想要什么」留档。
             "requested_size": request.size,
             **api_usage,
         }
@@ -330,12 +473,14 @@ class CloudflareWorkersAIImageProvider:
             media_type=media_type,
             provider="cloudflare",
             model=self.model,
-            request_id=response.headers.get("cf-ray") or response.headers.get("x-request-id"),
+            request_id=request_id,
             usage=usage,
         )
 
 
-def _cloudflare_image_data(response: httpx.Response) -> tuple[bytes, dict[str, Any]]:
+def _cloudflare_image_data(
+    response: httpx.Response, request_id: str | None = None
+) -> tuple[bytes, dict[str, Any]]:
     content_type = response.headers.get("content-type", "").partition(";")[0].lower()
     if _image_media_type(response.content) is not None:
         return response.content, {}
@@ -346,8 +491,9 @@ def _cloudflare_image_data(response: httpx.Response) -> tuple[bytes, dict[str, A
         if isinstance(body, dict) and body.get("success") is False:
             raise ImageProviderError(
                 "Cloudflare returned an unsuccessful response",
-                code="provider_error",
+                code=PROVIDER_UNAVAILABLE,
                 retryable=False,
+                request_id=request_id,
             )
         result = body.get("result", body)
         if isinstance(result, dict):
@@ -365,7 +511,10 @@ def _cloudflare_image_data(response: httpx.Response) -> tuple[bytes, dict[str, A
         raise
     except (TypeError, ValueError, httpx.DecodingError) as error:
         raise ImageProviderError(
-            "invalid Cloudflare image payload", code="invalid_base64", retryable=False
+            "invalid Cloudflare image payload",
+            code=INVALID_IMAGE,
+            retryable=False,
+            request_id=request_id,
         ) from error
 
 
@@ -403,7 +552,7 @@ def create_image_provider(
     if factory is None:
         raise ImageProviderError(
             f"unsupported image provider: {name or '<empty>'}",
-            code="provider_not_configured",
+            code=PROVIDER_NOT_CONFIGURED,
             retryable=False,
         )
     return factory(config, client)
@@ -416,6 +565,21 @@ def image_provider_configured(config: ImageProviderConfig) -> bool:
         return False
     try:
         return provider.configured
+    finally:
+        provider.close()
+
+
+def image_provider_capabilities(config: ImageProviderConfig) -> ImageProviderCapabilities | None:
+    """未配置或不支持的 provider 返回 None——界面据此完全隐藏 AI 生图表单。
+
+    **不接触任何凭据**：返回值里只有能力，没有 Token / Account ID / Base URL。
+    """
+    try:
+        provider = create_image_provider(config)
+    except ImageProviderError:
+        return None
+    try:
+        return provider.capabilities
     finally:
         provider.close()
 

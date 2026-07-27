@@ -1,9 +1,21 @@
 """PaperForge 视觉生成的受信任数据契约。"""
 
 from visuals.client import RenderResult, Rendition, VisualdClient, VisualdError
+from visuals.errors import (
+    ERROR_MESSAGES,
+    LEGACY_CODE_ALIASES,
+    RETRYABLE_CODES,
+    VISUAL_ERROR_CODES,
+    VisualErrorInfo,
+    classify_visual_error,
+    is_retryable,
+    message_for,
+    normalize_code,
+)
 from visuals.provider import (
     CloudflareWorkersAIImageProvider,
     ImageProvider,
+    ImageProviderCapabilities,
     ImageProviderConfig,
     ImageProviderError,
     ImageRequest,
@@ -11,10 +23,12 @@ from visuals.provider import (
     OpenAIImageProvider,
     available_image_providers,
     create_image_provider,
+    image_provider_capabilities,
     image_provider_configured,
     register_image_provider,
 )
 from visuals.specs import (
+    AIImageSemantics,
     AIImageSpec,
     ChartFilter,
     ChartSpec,
@@ -27,6 +41,7 @@ from visuals.specs import (
 )
 
 __all__ = [
+    "AIImageSemantics",
     "AIImageSpec",
     "ChartFilter",
     "ChartSpec",
@@ -35,20 +50,31 @@ __all__ = [
     "DiagramNode",
     "DiagramSpec",
     "CloudflareWorkersAIImageProvider",
+    "ERROR_MESSAGES",
     "ImageProvider",
+    "ImageProviderCapabilities",
     "ImageProviderConfig",
     "ImageProviderError",
     "ImageRequest",
     "ImageResult",
+    "LEGACY_CODE_ALIASES",
     "OpenAIImageProvider",
+    "RETRYABLE_CODES",
     "Rendition",
     "RenderResult",
+    "VISUAL_ERROR_CODES",
+    "VisualErrorInfo",
     "VisualSpec",
     "VisualdClient",
     "VisualdError",
     "available_image_providers",
+    "classify_visual_error",
     "create_image_provider",
+    "image_provider_capabilities",
     "image_provider_configured",
+    "is_retryable",
+    "message_for",
+    "normalize_code",
     "parse_visual_spec",
     "register_image_provider",
 ]

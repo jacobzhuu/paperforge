@@ -7,15 +7,20 @@ from typing import Annotated, Any, Literal
 
 from arq.connections import ArqRedis
 from db import (
+    activate_visual,
+    active_visual_for_slot,
     add_visual_source,
     create_job,
     create_visual,
+    document_snapshot_hash,
     get_section,
     get_visual,
     latest_document,
     list_assets,
     list_sections,
     list_visuals,
+    logical_visual_slot,
+    sanitize_figure_caption,
     upsert_section,
     visual_input_hash,
 )
@@ -24,8 +29,9 @@ from paper_ir import FigureBlock, PaperIR, PaperMeta
 from paper_ir.schema import Section as IRSection
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
-from visuals import ChartSpec, parse_visual_spec
+from visuals import ChartSpec, is_retryable, message_for, normalize_code, parse_visual_spec
 
+from paperforge_api.concurrency import require_section_unchanged
 from paperforge_api.config import get_settings
 from paperforge_api.deps import (
     authorize_project_request,
@@ -36,10 +42,14 @@ from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.schemas import (
     ApproveVisualRequest,
     CreateVisualRequest,
+    DraftVisualRequest,
+    DraftVisualResponse,
     JobResponse,
     RegenerateVisualRequest,
     UpdateVisualRequest,
+    VisualErrorResponse,
     VisualResponse,
+    VisualSummaryResponse,
 )
 
 router = APIRouter(
@@ -81,7 +91,179 @@ async def get_visuals(
         generation_status=generation_status,
         review_status=review_status,
     )
-    return [_visual_response(project.id, row) for row in rows]
+    snapshot = await _current_snapshot_hash(session, project.id)
+    return [_visual_response(project.id, row, snapshot) for row in rows]
+
+
+@router.get("/projects/{project_id}/visuals/summary", response_model=VisualSummaryResponse)
+async def visuals_summary(project_id: str, session: SessionDep) -> VisualSummaryResponse:
+    """视觉状态计数。
+
+    导航状态点、项目概览与导出提醒此前各自拉一遍完整视觉列表（含 spec 与
+    renditions）才能显示一个数字。这里只回计数。
+
+    计数在 Python 里做而不是发六条 COUNT 查询：单个项目的视觉资产是几十条量级，
+    一次全表取回比六次往返更快，也让「待处理 / 可批准」这类跨两个状态字段的
+    定义留在一处。
+    """
+    project = await _require_project(session, project_id)
+    rows = await list_visuals(session, project.id)
+    snapshot = await _current_snapshot_hash(session, project.id)
+
+    summary = VisualSummaryResponse(project_id=str(project.id))
+    for row in rows:
+        if row.review_status == "approved":
+            summary.approved += 1
+            # `updated_at` 在批准那一刻被 TimestampMixin 刷新，比 created_at
+            # 更接近「这张图什么时候进的正文」。
+            stamp = getattr(row, "updated_at", None) or row.created_at
+            if stamp and (summary.latest_approved_at is None or stamp > summary.latest_approved_at):
+                summary.latest_approved_at = stamp
+            if _is_stale(row, snapshot):
+                summary.stale += 1
+            continue
+        if row.review_status == "rejected":
+            summary.rejected += 1
+        elif row.generation_status in {"queued", "running"}:
+            summary.generating += 1
+        elif row.generation_status == "failed":
+            summary.failed += 1
+        elif row.generation_status == "ready":
+            # 已出预览、等着人点「批准并插入」。
+            summary.ready += 1
+        else:
+            summary.pending += 1
+        if _is_stale(row, snapshot):
+            summary.stale += 1
+    return summary
+
+
+_DRAFT_PROMPT = """You draft ONE figure specification for an academic paper.
+Output JSON only:
+{
+  "title": "short figure title",
+  "caption": "figure caption in the paper's language",
+  "alt_text": "accessibility description in the paper's language",
+  "diagram": {"direction":"LR","nodes":[{"id":"n1","label":"..."}],
+              "edges":[{"source":"n1","target":"n2"}]},
+  "ai_image": {"subject":"...","composition":"...","elements":["...","..."]}
+}
+Rules:
+- Fill ONLY the object matching the requested kind; omit the other one.
+- caption and alt_text must be written in the same language as the paper title.
+- For "ai_image": describe shapes, layout and relations — never words to render;
+  generated text is always garbled. Avoid security-sensitive word combinations
+  (attack, poison, malicious, damage) that trip image-service content filters;
+  express the mechanism abstractly instead.
+- For "diagram": 3-7 nodes, every edge must reference existing node ids."""
+
+
+@router.post("/projects/{project_id}/visuals/draft", response_model=DraftVisualResponse)
+async def draft_visual(
+    project_id: str,
+    request: DraftVisualRequest,
+    session: SessionDep,
+) -> DraftVisualResponse:
+    """把一句话意图补成完整规格（图注 / 替代文本 / 构图）。
+
+    只产出**草稿**：不落库、不排任务、更不会调用图像服务。用户还要看一眼、
+    点「创建」，AI 插图之后还有一次生成确认。
+    """
+    project = await _require_project(session, project_id)
+    _require_visuals_enabled()
+
+    from llm_runtime import LLMRunner
+
+    from paperforge_api.config import get_settings as api_settings
+
+    document = await latest_document(session, project.id)
+    rows = await list_sections(session, document.id) if document else []
+    context = "\n".join(f"- [{row.section_key}] {row.title}" for row in rows[:12])
+    intent = request.intent.strip() or "a figure that helps the reader follow this paper"
+
+    runner = LLMRunner(api_settings().llm_config())
+    if runner.enabled:
+        result = await runner.agenerate_json(
+            "planner",
+            system_prompt=_DRAFT_PROMPT,
+            user_prompt=(
+                f"Paper title: {project.title}\n"
+                f"Requested kind: {request.kind}\n"
+                f"Target section: {request.target_section_key or 'unspecified'}\n"
+                f"Sections:\n{context}\n\n"
+                f"What the author wants to show: {intent}"
+            ),
+            max_output_tokens=1200,
+            temperature=0.3,
+            metadata={"stage": "visual_draft"},
+        )
+        if result.ok and isinstance(result.value, dict):
+            drafted = _draft_from(result.value, request.kind)
+            if drafted is not None:
+                drafted.generator = f"llm:{result.model}"
+                return drafted
+
+    # 模型不可用时仍然给一份能提交的草稿——用户的意图原样落进描述里，
+    # 而不是把他弹回一张空表单。
+    return _deterministic_draft(request.kind, intent)
+
+
+def _draft_from(payload: dict[str, Any], kind: str) -> DraftVisualResponse | None:
+    from paperforge_worker.pipelines.visual_planner import _ai_image_spec, _diagram_spec
+
+    caption = str(payload.get("caption") or "").strip()
+    alt_text = str(payload.get("alt_text") or "").strip() or caption
+    if not caption:
+        return None
+    spec = _ai_image_spec(payload.get("ai_image")) if kind == "ai_image" else _diagram_spec(
+        payload.get("diagram")
+    )
+    if spec is None:
+        return None
+    return DraftVisualResponse(
+        title=str(payload.get("title") or caption)[:120],
+        caption=caption,
+        alt_text=alt_text,
+        spec=spec,
+    )
+
+
+def _deterministic_draft(kind: str, intent: str) -> DraftVisualResponse:
+    from visuals import AIImageSemantics, AIImageSpec, DiagramSpec
+
+    if kind == "diagram":
+        spec = DiagramSpec(
+            direction="LR",
+            nodes=[{"id": "n1", "label": "输入"}, {"id": "n2", "label": "处理"},
+                   {"id": "n3", "label": "输出"}],
+            edges=[{"source": "n1", "target": "n2"}, {"source": "n2", "target": "n3"}],
+        ).model_dump(mode="json")
+        return DraftVisualResponse(
+            title=intent[:60],
+            caption=intent[:200],
+            alt_text=f"{intent[:150]}的示意图",
+            spec=spec,
+        )
+    try:
+        spec = AIImageSpec(
+            prompt=f"{intent}. abstract academic conceptual illustration"[:4000],
+            semantics=AIImageSemantics(subject=intent[:200], text_policy="none"),
+        ).model_dump(mode="json")
+    except ValueError:
+        # 用户的意图可能落在 AI 图禁区（含量化表述）。退回一句安全的通用描述，
+        # 而不是把错误甩回界面。
+        spec = AIImageSpec(
+            prompt=(
+                "A clean abstract academic illustration of scientific inquiry, "
+                "organic geometric forms, no text"
+            )
+        ).model_dump(mode="json")
+    return DraftVisualResponse(
+        title=intent[:60],
+        caption=intent[:200],
+        alt_text=f"{intent[:150]}的概念插图",
+        spec=spec,
+    )
 
 
 @router.post(
@@ -162,7 +344,10 @@ async def update_visual_endpoint(
         "suggested_block_index",
     ):
         if field in sent:
-            setattr(visual, field, getattr(request, field))
+            value = getattr(request, field)
+            if field == "caption" and value is not None:
+                value = sanitize_figure_caption(value)
+            setattr(visual, field, value)
     await session.flush()
     return _visual_response(project.id, visual)
 
@@ -221,18 +406,37 @@ async def approve(
     target = await get_section(session, document_id=document.id, section_key=request.section_key)
     if target is None:
         raise HTTPException(status_code=404, detail="target section not found")
+    require_section_unchanged(target, request.expected_section_updated_at)
 
     sections = [IRSection(**row.body_ir_json) for row in rows if row.body_ir_json]
     asset_ref = f"va_{str(visual.id)[:8]}"
+    slot_key = logical_visual_slot(request.section_key, request.block_index, visual.figure_label)
+    active_in_slot = await active_visual_for_slot(
+        session,
+        project_id=project.id,
+        logical_slot_key=slot_key,
+    )
     if any(
         isinstance(block, FigureBlock) and block.asset_ref == asset_ref
         for section in sections
         for block in section.blocks
     ):
         visual.review_status = "approved"
+        visual.caption = sanitize_figure_caption(visual.caption)
+        await activate_visual(
+            session,
+            visual,
+            section_key=request.section_key,
+            block_index=request.block_index,
+        )
         return _visual_response(project.id, visual)
 
-    replacement_ref = f"va_{str(visual.supersedes_id)[:8]}" if visual.supersedes_id else None
+    replacement_id = (
+        active_in_slot.id
+        if active_in_slot is not None and active_in_slot.id != visual.id
+        else visual.supersedes_id
+    )
+    replacement_ref = f"va_{str(replacement_id)[:8]}" if replacement_id else None
     target_ir = next((section for section in sections if section.key == target.section_key), None)
     if target_ir is None:
         raise HTTPException(status_code=422, detail="target section has invalid or missing IR")
@@ -272,10 +476,16 @@ async def approve(
         status="edited",
         model=target.model,
     )
+    visual.caption = sanitize_figure_caption(visual.caption)
     visual.review_status = "approved"
     visual.target_section_key = target.section_key
     visual.suggested_block_index = request.block_index
-    await session.flush()
+    await activate_visual(
+        session,
+        visual,
+        section_key=target.section_key,
+        block_index=request.block_index,
+    )
     return _visual_response(project.id, visual)
 
 
@@ -401,7 +611,91 @@ async def _resolve_chart_source(
     return asset, hashlib.sha256(source).hexdigest()
 
 
-def _visual_response(project_id: uuid.UUID, visual: Any) -> VisualResponse:
+async def _current_snapshot_hash(session: AsyncSession, project_id: uuid.UUID) -> str | None:
+    """当前正文指纹。没有文稿时返回 None——此时任何建议都谈不上「过期」。"""
+    document = await latest_document(session, project_id)
+    if document is None:
+        return None
+    return document_snapshot_hash(await list_sections(session, document.id))
+
+
+def _is_stale(visual: Any, snapshot: str | None) -> bool:
+    """建议是否基于旧版正文。
+
+    只有两边都有指纹才判定。历史行没有 `paper_snapshot_hash`，它们一律**不**被
+    标为过期——把「无从判断」显示成「已过期」会让用户去重做一批其实没问题的图。
+    """
+    recorded = getattr(visual, "paper_snapshot_hash", None)
+    if not recorded or not snapshot:
+        return False
+    return recorded != snapshot
+
+
+def _visual_error(visual: Any) -> VisualErrorResponse | None:
+    """把落库的 code 翻成统一词表 + 可执行提示。
+
+    历史行里存的是旧词表（`auth` / `moderation` / 甚至裸的 `ValueError`），
+    `normalize_code` 在读侧统一映射，界面因此只需要认识一套 code。
+    """
+    if not visual.error_code:
+        return None
+    code = normalize_code(visual.error_code)
+    stored = (visual.error_message or "").strip()
+    canonical = message_for(code)
+    return VisualErrorResponse(
+        code=code,
+        message=canonical,
+        retryable=is_retryable(code),
+        request_id=_latest_request_id(visual),
+        # 落库的 message 已是「可执行提示（技术细节）」格式；与规范文案相同时
+        # 不重复展示。
+        detail=stored if stored and stored != canonical else None,
+    )
+
+
+def _latest_request_id(visual: Any) -> str | None:
+    """最近一次尝试的 request id。
+
+    `renditions_json['_provenance']` 是成功路径留下的；失败路径的 request id
+    落在 `visual_generation_attempt` 上，列表接口不做联表，这里只取 provenance。
+    """
+    provenance = (visual.renditions_json or {}).get("_provenance")
+    if isinstance(provenance, dict):
+        value = provenance.get("request_id")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _output_size(visual: Any) -> tuple[int | None, int | None]:
+    """实际输出尺寸。
+
+    Cloudflare 根本不接受尺寸参数，用户需要看到的是**真实拿到了什么**，
+    而不是他当初在下拉框里选了什么。优先取 png，其次任意一个有尺寸的 rendition。
+    """
+    renditions = visual.renditions_json or {}
+    for key in ("png", "svg", "pdf"):
+        item = renditions.get(key)
+        if isinstance(item, dict) and item.get("width") and item.get("height"):
+            return int(item["width"]), int(item["height"])
+    return None, None
+
+
+def _resolved_prompt(spec: dict[str, Any]) -> str | None:
+    """AI 插图最终下发的提示词。非 AI 图或 spec 不合法时返回 None。"""
+    if spec.get("kind") != "ai_image":
+        return None
+    try:
+        parsed = parse_visual_spec(spec)
+    except Exception:  # noqa: BLE001 - 展示用途，解析失败不应让整个列表 500
+        return None
+    render = getattr(parsed, "render_prompt", None)
+    return render() if callable(render) else None
+
+
+def _visual_response(
+    project_id: uuid.UUID, visual: Any, snapshot: str | None = None
+) -> VisualResponse:
     renditions = {}
     for fmt, item in (visual.renditions_json or {}).items():
         if fmt not in {"svg", "pdf", "png"} or not isinstance(item, dict):
@@ -410,6 +704,7 @@ def _visual_response(project_id: uuid.UUID, visual: Any) -> VisualResponse:
             **item,
             "url": f"/api/v1/projects/{project_id}/visuals/{visual.id}/renditions/{fmt}",
         }
+    width, height = _output_size(visual)
     return VisualResponse(
         id=str(visual.id),
         asset_ref=f"va_{str(visual.id)[:8]}",
@@ -428,11 +723,19 @@ def _visual_response(project_id: uuid.UUID, visual: Any) -> VisualResponse:
         model=visual.model,
         error_code=visual.error_code,
         error_message=visual.error_message,
+        error=_visual_error(visual),
         renditions=renditions,
         input_hash=visual.input_hash,
         content_hash=visual.content_hash,
         version=visual.version,
         supersedes_id=str(visual.supersedes_id) if visual.supersedes_id else None,
+        output_width=width,
+        output_height=height,
+        resolved_prompt=_resolved_prompt(visual.spec_json),
+        paper_snapshot_hash=getattr(visual, "paper_snapshot_hash", None),
+        suggestion_reason=getattr(visual, "suggestion_reason", None),
+        source_section_keys=list(getattr(visual, "source_section_keys", None) or []),
+        stale=_is_stale(visual, snapshot),
         created_at=visual.created_at,
     )
 

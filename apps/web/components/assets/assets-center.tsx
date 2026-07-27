@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -14,21 +15,20 @@ import {
   Upload,
 } from 'lucide-react';
 import { Button, buttonVariants } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Dialog } from '@/components/ui/dialog';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
+import { ModuleError } from '@/components/layout/module-error';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobFinished, useProject } from '@/components/project/project-context';
-import { VisualsGallery } from '@/components/assets/visuals-gallery';
-import { assetDownloadUrl, deleteAsset, getNumLint, getRuntimeSettings, listAssets, listVisuals, uploadAsset } from '@/lib/api';
-import type { AssetKind, NumLintReport, UserAsset, VisualAsset } from '@/lib/types';
+import { assetDownloadUrl, deleteAsset, getNumLint, listAssets, uploadAsset } from '@/lib/api';
+import type { AssetKind, NumLintReport, UserAsset } from '@/lib/types';
 import { describeError } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
+import { useAsyncModule } from '@/lib/useAsyncModule';
 import { cn } from '@/lib/utils';
 
 const KIND_LABEL: Record<AssetKind, string> = {
@@ -40,55 +40,58 @@ const KIND_LABEL: Record<AssetKind, string> = {
   bib: 'BibTeX',
 };
 
+/**
+ * 素材中心：**只**负责原始数据、结果表格、方法笔记与 NUMLINT。
+ *
+ * 「图表与插图」已拆到独立的 `/projects/{id}/visuals`。此前它是本页的一个页签，
+ * 于是视觉能力被绑死在「原创论文才有的素材中心」上——综述论文支持完整的视觉
+ * 建议、生图、审核与导出，却没有任何正常入口。
+ *
+ * 两个模块（素材、NUMLINT）各自独立加载：NUMLINT 超时不会让素材列表跟着消失。
+ */
 export function AssetsCenter() {
-  const { projectId, reload: reloadProject } = useProject();
+  const { projectId, paperType, reload: reloadProject } = useProject();
   const { toast } = useToast();
+  const router = useRouter();
 
-  const [assets, setAssets] = React.useState<UserAsset[]>([]);
-  const [lint, setLint] = React.useState<NumLintReport | undefined>();
-  const [visuals, setVisuals] = React.useState<VisualAsset[]>([]);
-  const [aiGenerationAvailable, setAiGenerationAvailable] = React.useState(false);
-  const [tab, setTab] = React.useState('raw');
-  const [loading, setLoading] = React.useState(true);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [uploading, setUploading] = React.useState(false);
   const [dragOver, setDragOver] = React.useState(false);
   const [pendingDelete, setPendingDelete] = React.useState<UserAsset | null>(null);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  const reload = React.useCallback(async () => {
-    if (!projectId) {
-      setLoading(false);
-      return;
-    }
-    const [rows, report, visualRows, runtime] = await Promise.all([
-      listAssets(projectId),
-      getNumLint(projectId),
-      listVisuals(projectId),
-      getRuntimeSettings(),
-    ]);
-    setAssets(rows.data);
-    setLint(report.data);
-    setVisuals(visualRows.data);
-    setAiGenerationAvailable(Boolean(
-      runtime.data?.ai_images_enabled && runtime.data?.image_provider_configured,
-    ));
-    setLoadError(null);
-    setLoading(false);
-  }, [projectId]);
-
-  const runReload = React.useCallback(() => {
-    setLoadError(null);
-    reload().catch((err) => {
-      setLoadError(describeError(err));
-      setLoading(false);
-    });
-  }, [reload]);
-
+  /**
+   * 综述论文没有素材步骤（`lib/pipeline.ts` 的 REVIEW_FLOW）。旧书签、旧链接
+   * 落到这里时送去视觉工作台——那才是它们真正要找的东西——而不是渲染一个
+   * 对综述论文毫无意义的上传页。
+   */
+  const shouldRedirect = Boolean(projectId) && paperType !== 'original';
   React.useEffect(() => {
-    runReload();
-  }, [runReload]);
-  useJobFinished(runReload);
+    if (shouldRedirect) router.replace(projectHref(projectId, 'visuals'));
+  }, [shouldRedirect, projectId, router]);
+
+  const assetsModule = useAsyncModule<UserAsset[]>(
+    () => listAssets(projectId).then((res) => res.data),
+    [],
+    [projectId],
+  );
+  const lintModule = useAsyncModule<NumLintReport | undefined>(
+    () => getNumLint(projectId).then((res) => res.data),
+    undefined,
+    [projectId],
+  );
+
+  const assets = assetsModule.data;
+
+  const reloadAll = React.useCallback(() => {
+    assetsModule.reload();
+    lintModule.reload();
+  }, [assetsModule, lintModule]);
+
+  const reloadRef = React.useRef(reloadAll);
+  React.useEffect(() => {
+    reloadRef.current = reloadAll;
+  });
+  useJobFinished(React.useCallback(() => reloadRef.current(), []));
 
   const onUpload = async (files: FileList | File[] | null) => {
     const list = files ? Array.from(files) : [];
@@ -124,7 +127,7 @@ export function AssetsCenter() {
         variant: 'error',
       });
     }
-    runReload();
+    reloadAll();
   };
 
   const confirmRemove = async () => {
@@ -138,11 +141,17 @@ export function AssetsCenter() {
     } catch (err) {
       toast({ title: '素材未能删除', description: describeError(err), variant: 'error' });
     }
-    runReload();
+    reloadAll();
   };
 
+  if (shouldRedirect) {
+    return (
+      <p className="text-sm text-muted-foreground">综述论文没有素材步骤，正在转到视觉工作台…</p>
+    );
+  }
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" data-testid="assets-center">
       <WorkbenchHeader
         title="素材中心"
         description="结果表格 / 图 / 方法笔记 / 代码 / BibTeX —— 确定性解析后作为正文数字的唯一出处"
@@ -167,17 +176,18 @@ export function AssetsCenter() {
         }
       />
 
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList>
-          <TabsTrigger value="raw">原始素材</TabsTrigger>
-          <TabsTrigger value="visuals">图表与插图 {visuals.length > 0 ? `(${visuals.length})` : ''}</TabsTrigger>
-        </TabsList>
+      {/* NUMLINT 是辅助信息：它挂掉时只显示这一条，素材列表照常渲染。 */}
+      <ModuleError label="数字一致性报告" error={lintModule.error} onRetry={lintModule.reload} />
+      {!lintModule.error && <NumLintSummary report={lintModule.data} projectId={projectId} />}
 
-        <TabsContent value="raw">
-          {/* NUMLINT 摘要留在这里，明细已移到写作台的校验面板。 */}
-          <NumLintSummary report={lint} projectId={projectId} />
+      <VisualsEntry projectId={projectId} />
 
-          <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-40">
+      <LoadState
+        loading={assetsModule.loading && !assetsModule.ready}
+        error={assetsModule.error}
+        onRetry={assetsModule.reload}
+        skeletonClassName="h-40"
+      >
         <div
           onDragOver={(e) => {
             e.preventDefault();
@@ -207,21 +217,7 @@ export function AssetsCenter() {
             ))
           )}
         </div>
-          </LoadState>
-        </TabsContent>
-
-        <TabsContent value="visuals">
-          <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-40">
-            <VisualsGallery
-              projectId={projectId}
-              assets={assets}
-              visuals={visuals}
-              aiGenerationAvailable={aiGenerationAvailable}
-              onChanged={runReload}
-            />
-          </LoadState>
-        </TabsContent>
-      </Tabs>
+      </LoadState>
 
       <Dialog
         open={pendingDelete !== null}
@@ -245,6 +241,24 @@ export function AssetsCenter() {
       />
 
       <WorkbenchFooterNav current="assets" />
+    </div>
+  );
+}
+
+/** 旧用户在这里找过「图表与插图」页签，给一条明确的去向而不是让它凭空消失。 */
+function VisualsEntry({ projectId }: { projectId: string }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border bg-muted/30 px-3 py-2 text-sm">
+      <span className="flex items-center gap-2 text-muted-foreground">
+        <ImageIcon className="h-4 w-4 shrink-0" />
+        图表与插图已移到独立的视觉工作台，两类论文都能访问。
+      </span>
+      <Link
+        href={projectHref(projectId, 'visuals')}
+        className={buttonVariants({ variant: 'outline', size: 'sm' })}
+      >
+        打开视觉工作台 →
+      </Link>
     </div>
   );
 }

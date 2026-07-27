@@ -156,6 +156,38 @@ class DiagramSpec(StrictModel):
         return self
 
 
+class AIImageSemantics(StrictModel):
+    """提供商无关的语义描述。
+
+    业务层保存「要画什么」，各 ImageProvider 适配器负责转成厂商请求。这样接入
+    GPT Image / Gemini / ComfyUI 时，视觉工作台、PaperIR 与审核流程都不用改。
+
+    全部可选：不填时 `AIImageSpec` 退回纯 `prompt`，历史 spec_json 原样可解析。
+    `input_hash` 走语义投影（`db.repositories.visuals.semantic_projection`），
+    未设定的字段不参与哈希，因此加这一层不会让旧建议被重复提出。
+    """
+
+    subject: str | None = Field(default=None, max_length=200)
+    composition: str | None = Field(default=None, max_length=200)
+    elements: list[str] = Field(default_factory=list, max_length=8)
+    #: 学术插图里的文字几乎必然是伪中文/伪英文，默认一个字都不要。
+    text_policy: Literal["none", "minimal"] = "none"
+    aspect_ratio: str | None = Field(default=None, max_length=16)
+
+    @field_validator("subject", "composition")
+    @classmethod
+    def conceptual_only_text(cls, value: str | None) -> str | None:
+        return _reject_non_conceptual(value)
+
+    @field_validator("elements")
+    @classmethod
+    def conceptual_only_elements(cls, value: list[str]) -> list[str]:
+        # 校验必须覆盖新字段：否则 elements 就是一条绕过 AI 图禁区的旁路。
+        for item in value:
+            _reject_non_conceptual(item)
+        return value
+
+
 class AIImageSpec(StrictModel):
     kind: Literal["ai_image"] = "ai_image"
     prompt: str = Field(min_length=10, max_length=4000)
@@ -163,15 +195,45 @@ class AIImageSpec(StrictModel):
     quality: Literal["low", "medium", "high"] = "medium"
     style: str = Field(default="clean academic conceptual illustration", max_length=160)
     width: FigureWidth = "full"
+    semantics: AIImageSemantics | None = None
 
     @field_validator("prompt", "style")
     @classmethod
     def conceptual_only(cls, value: str) -> str:
-        if _REMOTE_OR_CODE.search(value):
-            raise ValueError("AI image prompts cannot contain URLs or executable content")
-        if _AI_FORBIDDEN.search(value):
-            raise ValueError("AI images are limited to conceptual illustrations")
-        return value
+        result = _reject_non_conceptual(value)
+        assert result is not None  # noqa: S101 - 非空输入必得非空输出
+        return result
+
+    def render_prompt(self) -> str:
+        """**实际会发送给图像服务商的那一句**。
+
+        生成确认框展示的就是这个返回值——不能让界面自己再拼一遍，否则用户
+        确认的文本和真正发出去的文本会悄悄分叉。
+        """
+        parts: list[str] = []
+        semantics = self.semantics
+        if semantics is not None and semantics.subject:
+            parts.append(semantics.subject)
+            if semantics.composition:
+                parts.append(f"composition: {semantics.composition}")
+            if semantics.elements:
+                parts.append(f"elements: {', '.join(semantics.elements)}")
+        else:
+            parts.append(self.prompt)
+        parts.append(f"Style: {self.style}")
+        if semantics is None or semantics.text_policy == "none":
+            parts.append("no text, no labels, no numerals")
+        return ". ".join(part.strip().rstrip(".") for part in parts if part.strip()) + "."
+
+
+def _reject_non_conceptual(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if _REMOTE_OR_CODE.search(value):
+        raise ValueError("AI image prompts cannot contain URLs or executable content")
+    if _AI_FORBIDDEN.search(value):
+        raise ValueError("AI images are limited to conceptual illustrations")
+    return value
 
 
 VisualSpec = Annotated[ChartSpec | DiagramSpec | AIImageSpec, Field(discriminator="kind")]

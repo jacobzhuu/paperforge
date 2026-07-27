@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
-from PIL import Image, UnidentifiedImageError  # noqa: E402
+from PIL import Image, ImageChops, UnidentifiedImageError  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 from visuals import ChartSpec, DiagramSpec  # noqa: E402
 
@@ -75,7 +75,13 @@ def render_chart(request: ChartRenderRequest) -> dict[str, Any]:
         renditions = chart_renditions(request.spec, prepared)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return {"renditions": renditions, "provenance": {"points": trace}}
+    return {
+        "renditions": renditions,
+        "provenance": {
+            "points": trace,
+            "visual_qa": visual_qa(renditions, minimum_font_pt=8, check_outer_margin=True),
+        },
+    }
 
 
 @app.post("/render/diagram")
@@ -84,7 +90,13 @@ def render_diagram(request: DiagramRenderRequest) -> dict[str, Any]:
         renditions = diagram_renditions(request.spec)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return {"renditions": renditions, "provenance": {"layout": "graphviz-dot"}}
+    return {
+        "renditions": renditions,
+        "provenance": {
+            "layout": "graphviz-dot",
+            "visual_qa": visual_qa(renditions, minimum_font_pt=8, check_outer_margin=True),
+        },
+    }
 
 
 @app.post("/normalize")
@@ -106,11 +118,20 @@ def normalize(request: NormalizeRequest) -> dict[str, Any]:
             clean.paste(rgba, mask=rgba.getchannel("A"))
             output = io.BytesIO()
             clean.save(output, format="PNG", optimize=True, dpi=(300, 300))
+            renditions = [
+                _rendition("png", "image/png", output.getvalue(), clean.width, clean.height)
+            ]
             return {
-                "renditions": [
-                    _rendition("png", "image/png", output.getvalue(), clean.width, clean.height)
-                ],
-                "provenance": {"normalized": True, "metadata_removed": True},
+                "renditions": renditions,
+                "provenance": {
+                    "normalized": True,
+                    "metadata_removed": True,
+                    "visual_qa": visual_qa(
+                        renditions,
+                        minimum_font_pt=None,
+                        check_outer_margin=False,
+                    ),
+                },
             }
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
         raise HTTPException(status_code=422, detail="unsupported or corrupt image") from error
@@ -221,7 +242,7 @@ def chart_renditions(spec: ChartSpec, records: list[dict[str, Any]]) -> list[dic
         # 只有 _plot_series 那条路径才会产出带 label 的 artist；box/heatmap 自己
         # 就把类别画在坐标轴上，对它们调 legend() 只会画空图例并抛 UserWarning。
         if spec.chart_type not in {"box", "heatmap"} and (len(spec.y) > 1 or spec.series):
-            ax.legend(frameon=False, fontsize=7)
+            ax.legend(frameon=False, fontsize=8)
         return _save_figure(fig)
     finally:
         plt.close(fig)
@@ -354,6 +375,61 @@ def diagram_renditions(spec: DiagramSpec) -> list[dict[str, Any]]:
                     width, height = image.size
             renditions.append(_rendition(fmt, media_type, target.read_bytes(), width, height))
     return renditions
+
+
+def visual_qa(
+    renditions: list[dict[str, Any]],
+    *,
+    minimum_font_pt: int | None,
+    check_outer_margin: bool,
+) -> dict[str, Any]:
+    """Preflight dimensions, aspect ratio, content bounds, whitespace and font floor."""
+    issues: list[dict[str, Any]] = []
+    png = next((item for item in renditions if item.get("format") == "png"), None)
+    metrics: dict[str, Any] = {"minimum_font_pt": minimum_font_pt}
+    if png is None:
+        issues.append({"code": "png_rendition_missing", "message": "缺少 PNG 预检版本"})
+    else:
+        raw = base64.b64decode(str(png["data_base64"]), validate=True)
+        with Image.open(io.BytesIO(raw)) as image:
+            rgb = image.convert("RGB")
+            width, height = rgb.size
+            metrics.update({"width": width, "height": height})
+            aspect_ratio = width / max(1, height)
+            metrics["aspect_ratio"] = round(aspect_ratio, 4)
+            if width < 240 or height < 160:
+                issues.append(
+                    {"code": "visual_resolution_too_small", "message": "视觉分辨率过低"}
+                )
+            if not 0.25 <= aspect_ratio <= 4.0:
+                issues.append(
+                    {"code": "visual_aspect_ratio_extreme", "message": "视觉宽高比异常"}
+                )
+            white = Image.new("RGB", rgb.size, "white")
+            bbox = ImageChops.difference(rgb, white).getbbox()
+            if bbox is None:
+                issues.append({"code": "visual_content_empty", "message": "视觉内容为空"})
+            else:
+                x0, y0, x1, y1 = bbox
+                content_area = max(0, x1 - x0) * max(0, y1 - y0)
+                outer_whitespace = 1 - content_area / max(1, width * height)
+                margins = [x0, y0, width - x1, height - y1]
+                metrics.update(
+                    {
+                        "content_bbox": [x0, y0, x1, y1],
+                        "outer_whitespace_ratio": round(outer_whitespace, 4),
+                        "minimum_outer_margin_px": min(margins),
+                    }
+                )
+                if outer_whitespace > 0.75:
+                    issues.append(
+                        {"code": "visual_excessive_whitespace", "message": "视觉外围留白过多"}
+                    )
+                if check_outer_margin and min(margins) < 2:
+                    issues.append(
+                        {"code": "visual_content_clipped", "message": "视觉内容触及画布边缘"}
+                    )
+    return {"passed": not issues, "issues": issues, "metrics": metrics}
 
 
 def _diagram_dot(spec: DiagramSpec) -> str:

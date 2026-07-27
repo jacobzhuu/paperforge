@@ -35,6 +35,8 @@ def test_chart_renders_three_formats_with_cell_trace() -> None:
     body = response.json()
     assert {item["format"] for item in body["renditions"]} == {"svg", "pdf", "png"}
     assert body["provenance"]["points"][0]["source_cells"] == ["A2", "B2"]
+    assert body["provenance"]["visual_qa"]["passed"] is True
+    assert body["provenance"]["visual_qa"]["metrics"]["minimum_font_pt"] == 8
     assert base64.b64decode(
         next(item["data_base64"] for item in body["renditions"] if item["format"] == "png")
     ).startswith(b"\x89PNG")
@@ -118,6 +120,7 @@ def test_normalize_removes_metadata_and_returns_png() -> None:
     item = response.json()["renditions"][0]
     assert item["format"] == "png"
     assert (item["width"], item["height"]) == (4, 3)
+    assert response.json()["provenance"]["visual_qa"]["passed"] is False
 
 
 def test_normalize_rejects_invalid_base64_corrupt_and_oversize(monkeypatch) -> None:

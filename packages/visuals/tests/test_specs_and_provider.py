@@ -169,7 +169,7 @@ def test_network_timeout_is_retryable_and_bounded(monkeypatch) -> None:
     )
     with pytest.raises(ImageProviderError) as captured:
         provider.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "network"
+    assert captured.value.code == "network_timeout"
     assert captured.value.retryable
     assert calls == 3
 
@@ -190,12 +190,12 @@ def test_provider_rejects_oversize_and_forged_png(monkeypatch) -> None:
     oversized = OpenAIImageProvider(api_key="secret", client=response_for(b"x" * 13))
     with pytest.raises(ImageProviderError) as captured:
         oversized.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "image_too_large"
+    assert captured.value.code == "invalid_image"
 
     forged = OpenAIImageProvider(api_key="secret", client=response_for(b"%PDF-1.7"))
     with pytest.raises(ImageProviderError) as captured:
         forged.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "invalid_image_type"
+    assert captured.value.code == "invalid_image"
 
 
 def test_cloudflare_flux_provider_uses_official_rest_contract() -> None:
@@ -293,7 +293,7 @@ def test_cloudflare_provider_requires_token_and_account_without_network() -> Non
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     for account_id, api_key, code in (
-        ("0123456789abcdef0123456789abcdef", "", "auth"),
+        ("0123456789abcdef0123456789abcdef", "", "provider_not_configured"),
         ("", "cf-secret", "provider_not_configured"),
     ):
         provider = CloudflareWorkersAIImageProvider(
@@ -373,7 +373,7 @@ def test_cloudflare_network_timeout_is_retryable_and_bounded(monkeypatch) -> Non
     )
     with pytest.raises(ImageProviderError) as captured:
         provider.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "network"
+    assert captured.value.code == "network_timeout"
     assert captured.value.retryable
     assert calls == 3
 
@@ -390,7 +390,7 @@ def test_cloudflare_rejects_invalid_payload_and_long_prompt() -> None:
     )
     with pytest.raises(ImageProviderError) as captured:
         provider.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "invalid_base64"
+    assert captured.value.code == "invalid_image"
     with pytest.raises(ImageProviderError) as captured:
         provider.generate(ImageRequest(prompt="x" * 2049))
     assert captured.value.code == "invalid_request"
@@ -409,7 +409,7 @@ def test_cloudflare_rejects_invalid_payload_and_long_prompt() -> None:
     )
     with pytest.raises(ImageProviderError) as captured:
         unsuccessful.generate(ImageRequest(prompt="A conceptual scientific illustration"))
-    assert captured.value.code == "provider_error"
+    assert captured.value.code == "provider_unavailable"
 
 
 def test_image_provider_factory_is_extensible_without_worker_changes() -> None:

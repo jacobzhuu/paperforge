@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from typing import Any
 
@@ -21,9 +22,54 @@ VISUAL_KINDS = frozenset({"chart", "diagram", "ai_image"})
 GENERATION_STATUSES = frozenset({"proposed", "queued", "running", "ready", "failed"})
 REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
 
+_CAPTION_NUMBER_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:图|表)\s*[一二三四五六七八九十百0-9]+|(?:figure|fig\.?|table)\s*[A-Z]?\d+)\s*[.:：、\-—]?\s*",
+    re.IGNORECASE,
+)
+
+
+def sanitize_figure_caption(caption: str) -> str:
+    """题注只保存语义文本，图号由渲染模板统一生成。"""
+    return _CAPTION_NUMBER_PREFIX_RE.sub("", " ".join((caption or "").split())).strip()
+
+
+def logical_visual_slot(section_key: str, block_index: int, figure_label: str) -> str:
+    return f"{section_key}:{block_index if block_index >= 0 else figure_label}"
+
+
+def semantic_projection(value: Any) -> Any:
+    """去掉「未设置」的字段，得到 spec 的语义投影。
+
+    `input_hash` 用来判断「这条建议是不是已经提过了」。若直接对整个 spec 求哈希，
+    **给 spec 增加一个可选字段就会让所有历史资产的哈希失效**——下一次 visual_plan
+    会把已有建议原样再提一遍。规格是会长的（语义层 prompt、比例、negative prompt
+    都要加），所以哈希必须只看真正被设定的内容：
+
+      - None 与空集合视作「未设置」，不参与哈希；
+      - 因此新增可选字段在未填写时，哈希与老版本完全一致。
+    """
+    if isinstance(value, dict):
+        projected = {}
+        for key, item in value.items():
+            reduced = semantic_projection(item)
+            if reduced is None:
+                continue
+            projected[key] = reduced
+        return projected or None
+    if isinstance(value, (list, tuple)):
+        projected_list = [semantic_projection(item) for item in value]
+        projected_list = [item for item in projected_list if item is not None]
+        return projected_list or None
+    if value is None or value == "":
+        return None
+    return value
+
 
 def visual_input_hash(spec: dict[str, Any]) -> str:
-    encoded = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    projected = semantic_projection(spec) or {}
+    encoded = json.dumps(
+        projected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -43,6 +89,9 @@ async def create_visual(
     supersedes_id: uuid.UUID | None = None,
     generation_status: str = "proposed",
     figure_label: str | None = None,
+    paper_snapshot_hash: str | None = None,
+    suggestion_reason: str | None = None,
+    source_section_keys: list[str] | None = None,
 ) -> VisualAsset:
     if kind not in VISUAL_KINDS:
         raise ValueError(f"unsupported visual kind: {kind}")
@@ -54,7 +103,7 @@ async def create_visual(
         generation_status=generation_status,
         review_status="pending",
         title=title,
-        caption=caption,
+        caption=sanitize_figure_caption(caption),
         alt_text=alt_text,
         target_section_key=target_section_key,
         suggested_block_index=suggested_block_index,
@@ -64,6 +113,18 @@ async def create_visual(
         document_version=document_version,
         version=version,
         supersedes_id=supersedes_id,
+        paper_snapshot_hash=paper_snapshot_hash,
+        suggestion_reason=suggestion_reason,
+        source_section_keys=list(source_section_keys) if source_section_keys else None,
+        logical_slot_key=(
+            logical_visual_slot(
+                target_section_key,
+                suggested_block_index,
+                figure_label or "pending",
+            )
+            if target_section_key is not None and suggested_block_index is not None
+            else None
+        ),
     )
     session.add(visual)
     await session.flush()
@@ -71,6 +132,23 @@ async def create_visual(
         visual.figure_label = f"fig:va_{str(visual.id)[:8]}"
         await session.flush()
     return visual
+
+
+def document_snapshot_hash(sections: list[Any]) -> str:
+    """当前正文的内容指纹，用于判断视觉建议是否已过期。
+
+    只看 `section_key` 与正文 IR：改标题、改段落、增删章节都会让指纹变化，
+    而重新保存一份内容相同的章节不会。规划器把它写进 `paper_snapshot_hash`，
+    读侧比对后给出「建议基于旧版正文」的提示——**只提示，不自动删除**任何
+    已经生成好的资产。
+    """
+    payload = [
+        {"key": getattr(row, "section_key", ""), "body": getattr(row, "body_ir_json", None) or {}}
+        for row in sections
+    ]
+    payload.sort(key=lambda item: item["key"])
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 async def get_visual(session: AsyncSession, visual_id: uuid.UUID) -> VisualAsset | None:
@@ -84,6 +162,7 @@ async def list_visuals(
     kind: str | None = None,
     generation_status: str | None = None,
     review_status: str | None = None,
+    active_only: bool = False,
 ) -> list[VisualAsset]:
     stmt = select(VisualAsset).where(VisualAsset.project_id == project_id)
     if kind:
@@ -92,7 +171,47 @@ async def list_visuals(
         stmt = stmt.where(VisualAsset.generation_status == generation_status)
     if review_status:
         stmt = stmt.where(VisualAsset.review_status == review_status)
+    if active_only:
+        stmt = stmt.where(VisualAsset.is_active.is_(True))
     return list((await session.scalars(stmt.order_by(VisualAsset.created_at.desc()))).all())
+
+
+async def active_visual_for_slot(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    logical_slot_key: str,
+) -> VisualAsset | None:
+    return await session.scalar(
+        select(VisualAsset).where(
+            VisualAsset.project_id == project_id,
+            VisualAsset.logical_slot_key == logical_slot_key,
+            VisualAsset.is_active.is_(True),
+        )
+    )
+
+
+async def activate_visual(
+    session: AsyncSession,
+    visual: VisualAsset,
+    *,
+    section_key: str,
+    block_index: int,
+) -> VisualAsset | None:
+    """原子化切换同一逻辑槽位的活动版本，返回被替换的旧版本。"""
+    slot = logical_visual_slot(section_key, block_index, visual.figure_label)
+    previous = await active_visual_for_slot(
+        session,
+        project_id=visual.project_id,
+        logical_slot_key=slot,
+    )
+    if previous is not None and previous.id != visual.id:
+        previous.is_active = False
+        await session.flush()
+    visual.logical_slot_key = slot
+    visual.is_active = True
+    await session.flush()
+    return previous if previous is not None and previous.id != visual.id else None
 
 
 async def add_visual_source(
