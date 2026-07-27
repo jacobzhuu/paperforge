@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Any
 
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
+from db import get_active_session_by_hash, get_owned_project, revoke_session
+from db.models.auth import AppUser, UserSession
+from db.models.paper import PaperProject
 from db.session import make_engine, make_session_factory
-from fastapi import Request
+from fastapi import Cookie, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from paperforge_api.config import Settings, get_settings
@@ -54,3 +61,101 @@ async def get_queue(request: Request) -> ArqRedis | None:
 
 async def create_arq_pool(settings: Settings) -> Any:
     return await create_pool(RedisSettings.from_dsn(settings.redis_url))
+
+
+@dataclass(frozen=True)
+class AuthContext:
+    user: AppUser
+    session: UserSession
+
+
+def _session_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def get_current_auth(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    session_token: Annotated[str | None, Cookie(alias="paperforge_session")] = None,
+    secure_session_token: Annotated[
+        str | None, Cookie(alias="__Host-paperforge_session")
+    ] = None,
+) -> AuthContext:
+    token = secure_session_token if settings.auth_cookie_secure else session_token
+    if not token:
+        raise HTTPException(status_code=401, detail={"code": "authentication_required"})
+    pair = await get_active_session_by_hash(session, _session_hash(token))
+    if pair is None:
+        raise HTTPException(status_code=401, detail={"code": "session_invalid"})
+    auth_session, user = pair
+    now = datetime.now(UTC)
+    if auth_session.last_seen_at <= now - timedelta(days=settings.auth_idle_days):
+        await revoke_session(session, auth_session.id)
+        raise HTTPException(status_code=401, detail={"code": "session_expired"})
+    # Bound write amplification while retaining an accurate idle timeout.
+    if auth_session.last_seen_at <= now - timedelta(hours=1):
+        auth_session.last_seen_at = now
+    return AuthContext(user=user, session=auth_session)
+
+
+async def get_current_user(
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+) -> AppUser:
+    return auth.user
+
+
+async def require_owned_project(
+    project_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+) -> PaperProject:
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="project not found") from error
+    project = await get_owned_project(session, project_uuid, auth.user.id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
+
+
+async def authorize_project_request(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+) -> AuthContext:
+    """Authenticate a router and enforce ownership whenever its route has project_id."""
+    project_id = request.path_params.get("project_id")
+    if project_id is None:
+        return auth
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="project not found") from error
+    project = await get_owned_project(session, project_uuid, auth.user.id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    request.state.owned_project = project
+    session.info["paperforge_owned_project"] = project
+    return auth
+
+
+async def get_authorized_project(session: AsyncSession, project_id: str) -> PaperProject:
+    """Return only the project already authorized for this request.
+
+    Business routers deliberately cannot fall back to a project-id-only database lookup.
+    The router dependency above is the sole place that resolves ownership.
+    """
+    try:
+        project_uuid = uuid.UUID(project_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="project not found") from error
+    project = session.info.get("paperforge_owned_project")
+    if not isinstance(project, PaperProject) or project.id != project_uuid:
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
+
+
+CurrentAuthDep = Annotated[AuthContext, Depends(get_current_auth)]
+CurrentUserDep = Annotated[AppUser, Depends(get_current_user)]
+OwnedProjectDep = Annotated[PaperProject, Depends(require_owned_project)]
