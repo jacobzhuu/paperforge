@@ -1,0 +1,41 @@
+[
+  {
+    "name": "2026-07-26-zh-review",
+    "artifact": "data/objects/projects/fd9579ed-9b73-411c-b803-60f2d505683b/exports/v2/pdf-c8ffd7b2029a.pdf",
+    "sha256": "c8ffd7b2029acaad6945f772ef203a9a249e3dbb3c8878c09b2c8e427b7a3c60",
+    "compile_log": "data/objects/projects/fd9579ed-9b73-411c-b803-60f2d505683b/exports/v2/compile_log-76e719a9081b.log",
+    "expected_figure_count": 0,
+    "expected_pdf_blockers": [],
+    "observed_readiness_score": 55,
+    "observed_pages": 8,
+    "expected_blockers": ["core_claim_fulltext_missing", "systematic_search_incomplete"]
+  },
+  {
+    "name": "2026-07-27-en-review",
+    "artifact": "data/objects/users/00000000-0000-4000-8000-000000000001/projects/dc38fc4f-3191-47f2-98e9-0a363d20dda5/exports/v1/pdf-d3ecae0e2ce5.pdf",
+    "sha256": "d3ecae0e2ce51f75e7de8eeb60f3a654df903e83620922cf0e19a0a998dffa9e",
+    "compile_log": "data/objects/users/00000000-0000-4000-8000-000000000001/projects/dc38fc4f-3191-47f2-98e9-0a363d20dda5/exports/v1/compile_log-e23c73f33ab8.log",
+    "expected_figure_count": 0,
+    "expected_pdf_blockers": ["missing_glyphs"],
+    "observed_readiness_score": 33,
+    "observed_pages": 3,
+    "expected_blockers": ["missing_glyphs", "publication_title_missing", "short_manuscript"]
+  },
+  {
+    "name": "2026-07-27-root-injury-review",
+    "artifact": "data/objects/users/00000000-0000-4000-8000-000000000001/projects/958e9e5a-b763-4b3a-a658-c0585117f29e/exports/v1/pdf-86f4ba47e651.pdf",
+    "sha256": "86f4ba47e65102b7610a5289b3718e317ff4d73b8752d5f466c34b7c686ca8bf",
+    "compile_log": "data/objects/users/00000000-0000-4000-8000-000000000001/projects/958e9e5a-b763-4b3a-a658-c0585117f29e/exports/v1/compile_log-f3e929408783.log",
+    "expected_figure_count": 3,
+    "expected_pdf_blockers": ["figure_caption_count_mismatch"],
+    "observed_readiness_score": 42,
+    "observed_pages": 9,
+    "expected_blockers": [
+      "placeholders_present",
+      "core_claim_fulltext_missing",
+      "sections_unapproved",
+      "figures_after_references",
+      "figure_caption_count_mismatch"
+    ]
+  }
+]
