@@ -21,6 +21,28 @@ DEFAULT_TEST_DATABASE_URL = (
     "postgresql+asyncpg://paperforge:paperforge@localhost:15432/paperforge_test"
 )
 
+# 部署态环境变量必须与开发者本机隔离。这些变量改的是**应用行为**而非测试数据：
+# 本机 .env 一旦切到生产配置（AUTH_COOKIE_SECURE=true + SMTP + HTTPS PUBLIC_APP_URL），
+# create_app() 会在夹具里直接抛 RuntimeError，一次打挂 70 多个用例；填了真实
+# provider 凭据则让 *_configured 断言翻车。CI 没有 .env，所以这类问题在 CI 上
+# 永远不会暴露，只砸本地。需要验证生产配置的用例自己 monkeypatch 覆盖即可。
+_DEPLOYMENT_ENV_DEFAULTS = {
+    "AUTH_COOKIE_SECURE": "false",
+    "AUTH_DEV_LOGIN_ENABLED": "true",
+    "AUTH_EMAIL_MODE": "file",
+    "PUBLIC_APP_URL": "http://localhost:3000",
+    "LLM_DEFAULT_PROVIDER": "noop",
+    "LLM_OPENAI_API_KEY": "",
+    "IMAGE_API_KEY": "",
+    "IMAGE_ACCOUNT_ID": "",
+}
+
+
+@pytest.fixture(autouse=True)
+def isolate_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in _DEPLOYMENT_ENV_DEFAULTS.items():
+        monkeypatch.setenv(name, value)
+
 
 def test_database_url() -> str:
     return os.environ.get("PAPERFORGE_TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
