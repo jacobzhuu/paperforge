@@ -193,7 +193,9 @@ PostgreSQL 16 + Alembic、MinIO/文件系统对象存储、OpenSearch(新系统�
 | 编辑器 | **Tiptap(章节富文本,自定义 citation 节点)+ Monaco(LaTeX 源码视图)+ KaTeX(公式预览)** | 引用作为原子 chip 节点插入正文,是引用白名单校验的前端保障 |
 | 实时进度 | **SSE**(Server-Sent Events) | 单向进度流足够,免 WebSocket 复杂度 |
 | LaTeX 编译 | **Tectonic**(独立容器,无网络、只读模板、资源限额) | 自包含、可沙箱、可缓存包;比完整 TeXLive 轻一个量级 |
+| 视觉渲染 | **Matplotlib + Graphviz + Pillow**（独立 `visuald`） | 只接收结构化规格和服务端解析数据；固定字体/配色，无外网，不执行 LLM 代码 |
 | LLM | **OpenAI-compatible 多 provider**(迁移自旧 `llm/`) | DeepSeek/GPT/Claude/本地 vLLM 即插即用;按角色路由(§4.9) |
+| 图像生成 | **独立 `ImageProvider` seam + registry/factory** | 与文本模型密钥/端点隔离；默认 Cloudflare Workers AI `FLUX.1-schnell`，保留 OpenAI 适配器；只生成概念性位图 |
 | 仓库形态 | **独立新仓库 `paper-forge/`,monorepo(uv workspace + pnpm)** | 与 DeepSearch 完全解耦,拷贝式迁移代码与测试,不产生运行时依赖 |
 
 ### 4.2 系统拓扑
@@ -204,17 +206,19 @@ paper-forge/
 ├── services/api              # FastAPI:项目/文献库/大纲/章节/导出 REST + SSE
 ├── services/worker           # ARQ:检索、摄取、卡片、大纲、写作、编译各管线任务
 ├── services/texd             # Tectonic 编译沙箱(HTTP 微服务,无外网)
+├── services/visuald          # 图表/示意图渲染与 AI 位图规范化(无外网)
 ├── packages/scholar_gateway  # 检索适配器/规范化/去重/雪球/OA 全文/缓存(迁移)
 ├── packages/ingest           # PDF/文档解析、section 切块(迁移)
 ├── packages/llm_runtime      # provider seam、角色路由、JSON 校验、成本记账(迁移+扩展)
 ├── packages/paper_ir         # PaperIR schema、引用样式、BibTeX、i18n(迁移+新写)
 ├── packages/latex_render     # PaperIR -> LaTeX 工程渲染、模板库、编译修复
+├── packages/visuals          # Chart/Diagram/AIImage 规格、visuald 客户端与 ImageProvider
 ├── packages/db               # 模型/仓储/迁移(约定迁移,模型新写)
 ├── packages/observability    # JSON 日志/指标(迁移)
-└── infra/                    # postgres + redis + minio + texd compose
+└── infra/                    # postgres + redis + minio + texd + visuald compose
 ```
 
-运行时数据流:`web → api → (db/redis) → worker → [scholar_gateway | ingest | llm_runtime | latex_render → texd] → db/minio → SSE → web`。
+运行时数据流:`web → api → (db/redis) → worker → [scholar_gateway | ingest | llm_runtime | visuals → visuald | latex_render → texd] → db/minio → SSE → web`。
 
 ### 4.3 核心域模型(Schema 草案,首个迁移)
 
@@ -222,7 +226,7 @@ paper-forge/
 -- 项目与任务
 paper_project(id, owner_id, title, paper_type{review|original}, writing_mode{auto|assisted},
               language{zh|en}, venue_template, citation_style, status, scope_json, created_at, updated_at)
-generation_job(id, project_id, kind{search|ingest|cards|outline|write|compile|full},
+generation_job(id, project_id, kind{search|ingest|cards|outline|write|compile|visual|full},
                status{queued|running|succeeded|failed|cancelled}, progress, stage,
                checkpoint_json, error_json, created_at, finished_at)
 job_event(id, job_id, seq, event_type, payload_json, created_at)          -- SSE 源,借鉴 task_event
@@ -246,6 +250,13 @@ document_file(id, work_id, kind{oa_pdf|html|xml}, object_key, mime, bytes, fetch
 -- 用户素材(研究型论文)
 user_asset(id, project_id, kind{dataset|result_table|figure|method_note|code|bib},
            title, description, object_key, parsed_json, created_at)
+visual_asset(id, project_id, kind{chart|diagram|ai_image}, generation_status, review_status,
+             title, caption, alt_text, target_section_key, insertion_hint_json, figure_label,
+             spec_json, provider, model, error_json, renditions_json, content_hash, input_hash,
+             document_version, version, supersedes_id, created_at, updated_at)
+visual_source_asset(visual_asset_id, user_asset_id, source_hash)            -- RESTRICT 删除保护
+visual_generation_attempt(id, visual_asset_id, provider, model, request_id, latency_ms,
+                          output_width, output_height, usage_json, cost_estimate, error_code, created_at)
 
 -- 论文结构
 outline(id, project_id, version, tree_json, status{draft|confirmed}, created_at)
@@ -260,13 +271,13 @@ search_run(id, project_id, provider, query_text, filters_json, hit_count,
            retrieved_count, status, error, executed_at)
 
 -- 产物与成本
-export_artifact(id, project_id, document_version, format{latex_zip|pdf|docx|bibtex|markdown},
+export_artifact(id, project_id, document_version, format{latex_zip|pdf|docx|bibtex|markdown|markdown_bundle},
                 object_key, compile_log_key, content_hash, created_at)
 llm_call_log(id, project_id, job_id, role, model, input_tokens, output_tokens,
              cost_estimate, latency_ms, created_at)                        -- 简化自旧 token_ledger 设计
 ```
 
-对比旧系统:29 张综述表 → 保留 5 张(scholarly_work 系 + 缓存),新增 14 张,共 19 张;删除的 24 张全部属于筛选裁决/守恒账本/质量评估/效应量域。
+对比旧系统:29 张综述表 → M0 保留 5 张(scholarly_work 系 + 缓存)、新增 14 张，共 19 张；M8 再新增 3 张视觉表，共 22 张。删除的 24 张全部属于筛选裁决/守恒账本/质量评估/效应量域。
 
 ### 4.4 论文生成管线
 
@@ -282,6 +293,7 @@ CARDS    每篇入库文献抽取 literature_card(贡献/方法/结果/局限/�
 OUTLINE  卡片主题聚类 → 章节树(每章分配文献集合+论证要点),用户可调整        [llm_synthesis ThemeBundle 改造]
 WRITE    逐章节结构化生成(§4.4.3 引用约束)→ 摘要/引言/结论后写 → 全文连贯性 pass
 CITECHK  确定性引用审计 + 可选语义相关性软检查(仅出提示)
+VISUAL_PLAN 全文完成后最多生成 6 条视觉建议；不调用付费生图、不改 PaperIR、不阻断管线
 RENDER   PaperIR → LaTeX 工程 + BibTeX → Tectonic 编译 → PDF(有界自动修复)
 REVIEW   编辑器内人工修改/局部重生成/润色 → 再导出
 ```
@@ -298,7 +310,8 @@ SEARCH+  相关工作定向检索(基线方法、同题工作、背景文献),�
 OUTLINE  IMRaD 模板实例化:Abstract/Intro/Related Work/Method/Experiments/Results/Discussion/Conclusion
 WRITE    Related Work ← 文献库;Method/Experiments ← user_asset;
          数值硬规则:正文数字必须来自 parsed_json 的确定性注入(模板槽位),LLM 不得改写数字;
-         表格由代码从 parsed_json 渲染为 booktabs,图由用户文件直接 \includegraphics,LLM 只写 caption 与分析
+         表格由代码从 parsed_json 渲染为 booktabs；上传图直接 \includegraphics；
+         数据图仅由 ChartSpec + parsed_json 确定性生成，LLM 只能建议规格、caption 与分析
 NUMLINT  数字一致性 lint:扫描正文数值 vs 素材解析值,失配即标记
 CITECHK / RENDER / REVIEW  同综述管线
 ```
@@ -326,7 +339,10 @@ CITECHK / RENDER / REVIEW  同综述管线
         { "type": "paragraph", "runs": [ {"t":"text","v":"..."}, {"t":"cite","keys":["wang2023survey"]},
                                           {"t":"math_inline","v":"O(n\\log n)"} ] },
         { "type": "equation", "latex": "...", "label": "eq:loss" },
-        { "type": "figure", "asset_ref": "ua_12", "caption": "...", "label": "fig:arch" },
+        { "type": "figure", "asset_ref": "va_a1b2c3d4", "caption": "...", "alt_text": "...",
+          "label": "fig:va_a1b2c3d4", "width": "column" },
+        { "type": "paragraph", "runs": [ {"t":"text","v":"如"},
+          {"t":"xref","target":"fig:va_a1b2c3d4","kind":"figure"}, {"t":"text","v":"所示"} ] },
         { "type": "table", "source": {"kind":"user_asset","ref":"ua_7"}, "caption": "...", "label": "tab:results" },
         { "type": "algorithm", "latex": "..." },
         { "type": "todo", "text": "待补充实验数据" }
@@ -336,14 +352,25 @@ CITECHK / RENDER / REVIEW  同综述管线
 }
 ```
 
-要点:cite 是原子节点而非正文字符串,R2 校验与编辑器 chip 都建立在此之上;table/figure 通过 ref 指向素材,渲染期确定性展开;LLM 生成的自由 LaTeX 仅允许出现在 equation/algorithm 块且过白名单环境校验(防注入与编译失败)。
+要点:cite/xref 是原子节点而非正文字符串；figure 同时支持旧 `ua_*` 上传图和新 `va_*` 生成图。
+LaTeX 使用不变 label + `\\ref`，Markdown/DOCX 按 PaperIR 遍历顺序确定性编号。服务端保存章节时
+重新计算 `asset_refs_json`并校验 label 全文唯一，不信任客户端派生字段。LLM 生成的自由 LaTeX
+仅允许出现在 equation/algorithm 块且过白名单环境校验。
 
 ### 4.6 LaTeX 渲染与模板体系
 
 - 模板库 V1:IEEEtran、acmart、Elsevier(elsarticle)、Springer(llncs)、通用中文学位论文/学报模板、无格式 article。模板 = 主 `.tex` 骨架 + 环境白名单 + 宏包锁定清单,LLM 不可修改导言区。
-- 渲染:`paper_ir → jinja2 模板 → LaTeX 工程(main.tex + sections/ + figures/ + refs.bib)→ texd(Tectonic)编译 → PDF + 编译日志`。
-- 编译失败自动修复(有界 ≤2 轮):确定性修复优先(转义特殊字符、去未定义环境、降级缺失宏包),其后才允许 LLM 针对报错行做最小修补;仍失败则交付 LaTeX 工程 + Markdown 预览并展示日志(draft-first)。
-- 次要导出:pandoc → docx(国内投稿场景)、Markdown、纯 BibTeX。
+- 视觉渲染：`ChartSpec/DiagramSpec → visuald → SVG/PDF/PNG`；AI 图先经独立 `ImageProvider`，再由 visuald
+  校验、去元数据并统一为 PNG。文件按内容哈希存储，每次重生成建新版本，不原地覆盖。
+- AI 图业务管线只调用 `create_image_provider(ImageProviderConfig)` 与统一 `generate/close` 协议；
+  Cloudflare、OpenAI 以及未来 Gemini/ComfyUI 仅在 provider 层实现请求、响应和就绪判定，worker、
+  VisualAsset、审核插入、来源记录与导出层不含厂商分支。缺少厂商必填配置时只关闭 AI 生成入口。
+- 渲染:`paper_ir → jinja2 模板 → LatexProject(text_files + binary_files) → texd(Tectonic) → PDF + 编译日志`。
+  texd 对 base64 二进制文件校验相对路径、扩展名、magic bytes、单文件 16 MiB、最多 32 个图/总计 64 MiB。
+- 编译失败自动修复(有界 ≤2 轮):修复轮只可改文本，二进制图始终原样携带；仍失败则交付 LaTeX 工程 +
+  Markdown 预览并展示日志(draft-first)。
+- 导出：PDF/LaTeX ZIP 确定性图优先 PDF 矢量版、AI 图用 PNG；DOCX 在 Pandoc 临时目录写入图片并真正嵌入，上传 PDF 图先将首页确定性转换为 300 DPI PNG；
+  `markdown_bundle` 打包 Markdown、`figures/` 和 `visual-provenance.json`。
 
 ### 4.7 API 草案(REST + SSE,`/api/v1`)
 
@@ -357,6 +384,15 @@ POST   /projects/{id}/library/entries             圈选入库 | DOI/BibTeX 导�
 DELETE /projects/{id}/library/entries/{eid}
 POST   /projects/{id}/snowball                    雪球扩展
 POST   /projects/{id}/assets                      上传素材(multipart)   GET /assets
+POST   /projects/{id}/visuals/suggest             全文视觉建议（异步，不调用 AI 生图）
+GET    /projects/{id}/visuals                     列出视觉资产/版本/rendition
+POST   /projects/{id}/visuals                     手动创建 ChartSpec/DiagramSpec/AIImageSpec
+PATCH  /projects/{id}/visuals/{vid}               修改待批准规格与文案
+POST   /projects/{id}/visuals/{vid}/generate      异步渲染；AI 图到此才调 provider
+POST   /projects/{id}/visuals/{vid}/approve       事务性插入/替换 FigureBlock
+POST   /projects/{id}/visuals/{vid}/reject        拒绝建议
+POST   /projects/{id}/visuals/{vid}/regenerate    创建下一版本，旧图保持可用
+GET    /projects/{id}/visuals/{vid}/renditions/{format}  受权限保护的 SVG/PDF/PNG
 POST   /projects/{id}/outline/generate            生成大纲          PUT /projects/{id}/outline
 POST   /projects/{id}/generate                    全管线一键生成(kind=full)
 POST   /projects/{id}/sections/{key}/generate     单章节(重)生成    PUT /sections/{key}(人工编辑)
@@ -368,15 +404,19 @@ GET    /projects/{id}/jobs/{job_id}/events        SSE 进度流
 
 ### 4.8 前端信息架构
 
+> 本节是页面级的模块清单。前端的**设计原则、视觉语言与改造计划**见
+> `docs/ui-design.md`——其中 §2「已成事实」记录了若干已落实且不应回退的决策，
+> §4「明确不做」记录了被驳回的改动及理由。动前端前先读那份。
+
 | 页面 | 内容 | 参考旧组件 |
 |---|---|---|
 | 项目列表 + 新建向导 | 类型(综述/研究型)→ 主题/贡献点 → 模板/语言 → 模式 | `LiteratureReviewCreateForm`、`ProtocolBuilderCards` 交互 |
 | 文献工作台 | 检索结果表(相关性排序、勾选入库)、卡片详情抽屉、雪球推荐区、DOI/BibTeX 导入、检索统计面板 | `EvidenceMatrixView` 表格模式、`sourceCapabilities` |
 | 大纲编辑器 | 树形拖拽、每章文献分配、论证要点编辑 | 新写 |
-| 写作工作台 | 左:章节树+进度;中:Tiptap 编辑器(引用 chip、公式、AI 重写/扩写/润色浮条);右:本章文献卡片、引用审计面板 | 新写(核心页面) |
-| 素材中心(研究型) | 上传、表格解析预览、图管理、贡献点编辑 | 新写 |
-| 导出中心 | 模板切换、编译日志、PDF 预览、LaTeX 工程/docx/bib 下载 | `ArtifactCenter` 思想 |
-| 设置 | LLM provider/模型角色映射、引用样式、成本面板 | 新写 |
+| 写作工作台 | 左:章节树+进度;中:Tiptap 编辑器(引用/figure xref chip、专用 Figure NodeView、公式、AI 润色浮条);右:视觉建议、文献卡片、引用审计 | 新写(核心页面) |
+| 素材中心(研究型) | “原始素材 / 图表与插图”双页签；表格解析、图表/示意图/AI 插图非代码向导、预览与版本 | 新写 |
+| 导出中心 | 模板切换、编译日志、PDF 预览、LaTeX 工程/docx/bib/Markdown Bundle 下载 | `ArtifactCenter` 思想 |
+| 设置 | 文本/图像 provider 状态、引用样式、LLM 与图像调用成本面板；密钥永不回传 | 新写 |
 
 ### 4.9 LLM 层设计(角色路由)
 
@@ -390,6 +430,19 @@ GET    /projects/{id}/jobs/{job_id}/events        SSE 进度流
 | verifier | 引用语义软校验、数字 lint 辅助 | 便宜 | 仅产出提示 |
 
 全部经 `llm_runtime` 单一 seam(迁移自旧 `llm/providers.py`),配置为 `role → provider+model` 映射;`llm_call_log` 记账,项目页展示成本。
+
+### 4.10 账号与租户边界
+
+- 采用共享 PostgreSQL + 项目级行隔离。`app_user` 是租户主体，`paper_project.owner_id`
+  为非空 UUID 外键；文献选择、卡片、素材、任务/事件、大纲、正文、引用、视觉、成本和导出
+  都沿项目继承私有归属。`scholarly_work`、作者/标识符、HTTP cache 与合法 OA 全文保持共享。
+- FastAPI 是唯一认证权威。密码用 Argon2id；随机 opaque session 只以 SHA-256 入库并通过
+  Secure/HttpOnly/SameSite=Lax cookie 传递。业务路由只能读取统一授权依赖已按
+  `(project_id, owner_id)` 命中的项目；匿名返回 401，外租户与不存在统一返回 404。
+- 私有对象键为 `users/{user_id}/projects/{project_id}/{assets|visuals|exports}/...`，公共 OA
+  为 `shared/oa/...`。bucket 不公开，预览、下载与 SSE 都经过认证 API。
+- 浏览器只走同源 `/api/v1`；危险方法校验 Origin。注册、登录、找回按 IP 与邮箱 Redis
+  限流并失败关闭。生产禁用示例数据，设置接口只报告能力/模型/密钥是否配置，不返回内部地址。
 
 ---
 
@@ -418,6 +471,9 @@ GET    /projects/{id}/jobs/{job_id}/events        SSE 进度流
 | **M4 研究型论文管线**(2–3 周) | 素材上传/解析、IMRaD 大纲、素材接地写作、数字一致性 lint、纯生成模式占位符策略 | 用户给定结果表格后,正文数字与表格 100% 一致;无素材时 0 虚构数值 |
 | **M5 全文与质量增强**(2 周) | OA 全文卡片、雪球推荐 UI、语义引用软校验、覆盖建议器、质量评分报告、写作台润色浮条 | 全文卡片覆盖率报告;软校验徽章上线 |
 | **M6 打磨与扩展**(持续) | docx 导出、多模型路由配置页、成本面板、章节版本历史、协作;远期:系统性综述模式(把 §3.3 摈弃的 screening/PRISMA 作为可选插件回加) | — |
+| **M8 图片与图表生成** | A 基础闭环：视觉资产/PaperIR/texd 二进制；B 确定性图表/示意图；C 自动建议/ImageProvider；D 成本、进度、降级与视觉 QA | CSV/XLSX → 图表 → 批准 → 引用 → PDF/DOCX/LaTeX ZIP/Markdown Bundle 四格式含图；建议不付费、不改正文、不阻塞无图导出 |
+| **M9 账号与多租户隔离** | 邮箱密码、opaque session、项目 owner、统一授权、用户级对象键、存量认领 | 匿名 401；跨租户项目/素材/视觉/导出/SSE 404；生产无 mock、公开 bucket 或前端可读令牌 |
+| **M10 Cloudflare AI 生图适配** | provider registry/factory、Workers AI REST、FLUX.1-schnell、占位配置与无密钥降级 | 不使用真实 Token 的 mock 契约通过；新增厂商无需改 worker/视觉资产/导出链路 |
 
 关键依赖顺序:M0 → M1 → M2 → M3;M4 依赖 M3(渲染);M2 与 M4 的写作器共用同一 Section Writer。
 

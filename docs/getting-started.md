@@ -1,6 +1,6 @@
 # PaperForge 启动指南（Getting Started）
 
-> 适用阶段：M0（脚手架 + 资产迁移）。本文中标注 **[已实测]** 的步骤在 2026-07-24 实际执行验证过。
+> 适用阶段：M0–M9。本文中标注 **[已实测]** 的步骤已在本仓库对应交付中执行验证。
 > 初始代码审阅报告中的 P1/P2/P3 问题已在本仓库当前版本修复。
 
 ## 0. 一键启动 [已实测]
@@ -11,7 +11,7 @@
 ./scripts/dev up
 ```
 
-脚本会自动安装锁定依赖、按需启动 Docker Desktop，并启动全部七个本地服务。健康检查
+脚本会自动安装锁定依赖、按需启动 Docker Desktop，并启动全部八个本地服务。健康检查
 全部通过后，会自动打开 Web 页面并打印以下地址：
 
 | 服务 | 地址 |
@@ -20,6 +20,7 @@
 | API | http://localhost:8080 |
 | Prometheus metrics | http://localhost:8080/metrics |
 | MinIO 控制台 | http://localhost:19001 |
+| visuald | http://localhost:8082/healthz |
 
 管理命令：
 
@@ -51,7 +52,8 @@
 uv sync --all-packages
 ```
 
-- 会创建根 `.venv` 并以可编辑方式安装 7 个 packages + 3 个 services（uv workspace）。
+- 会创建根 `.venv` 并以可编辑方式安装所有 workspace packages/services，包括
+  `packages/visuals` 和 `services/visuald`。
 - 验证安装成果：
 
 ```bash
@@ -76,8 +78,8 @@ pnpm install            # 实测 pnpm 9.15：约 15s，无 peer 冲突
 docker compose -f infra/docker-compose.yml up -d --build
 ```
 
-起四个服务：postgres:16、redis:7、minio、texd（texd 需要本地构建，首次较慢，
-构建期会预热 Tectonic 宏包缓存）。
+起五个服务：postgres:16、redis:7、minio、texd 和 visuald（后两者需本地构建；
+texd 构建期会预热 Tectonic 宏包缓存）。
 
 ### 各服务健康检查
 
@@ -116,6 +118,32 @@ curl -sf http://127.0.0.1:8081/healthz
 
 texd 服务进程本身（FastAPI /healthz、/compile 的降级路径）已在无容器环境直跑验证过 [已实测]。
 
+**visuald**（宿主回环端口 8082）
+
+visuald 与 texd 一样使用无出站网络、只读根文件系统和资源限额；只接受结构化规格和
+服务端内联的已解析数据，不执行 Python/DOT/Mermaid 源码、不读取远程 URL。
+
+```bash
+curl -sf http://127.0.0.1:8082/healthz
+# 预期：{"status":"ok"}
+```
+
+**Tectonic 包缓存必须可写**（`texdcache` 命名卷）。容器根文件系统是 `read_only`，
+而 Tectonic 在缓存**未命中**时要先在缓存目录建临时文件——建不了就直接失败。
+最坏的表现不是编译报错，而是「编译成功但引用全是 `[?]`」：BibTeX 打不开 `.bst`，
+Tectonic 把它降级成一行 warning 后照常产出 PDF。命名卷首次挂载会用镜像里构建期
+预热好的缓存做种，所以既保住预热成果，又让未命中不再是硬失败。
+
+改过 compose 之后要重建容器才会挂上卷：
+
+```bash
+docker compose -f infra/docker-compose.yml up -d texd
+```
+
+代码侧还有一层兜底：`.bst` 仍然取不到时，导出会把 `\bibliography{refs}` 换成
+由库内元数据确定性生成的内联 `thebibliography` 重编一次，并在导出中心标注降级
+（见 `latex_render.compile.compile_with_repair` 的 `inline_bibliography`）。
+
 ## 5. services/api 本地启动 [已实测]
 
 ```bash
@@ -125,24 +153,38 @@ uv run paperforge-api
 
 必须从**仓库根目录**启动：`Settings` 的 `env_file=".env"` 按当前工作目录解析。
 
-验证（均为实测输出）：
+健康检查不需要登录；业务 API 需要先完成 §5.1 的账号初始化或页面注册：
 
 ```bash
 curl -s http://localhost:8080/healthz
 # {"status":"ok"}
 
 curl -s http://localhost:8080/api/v1/projects
-# []
-
-curl -s -X POST http://localhost:8080/api/v1/projects \
-  -H 'Content-Type: application/json' \
-  -d '{"title":"t","paper_type":"review"}'
-# 501 {"detail":"M1 未实现：项目创建将在文献库 MVP 落地"}   ← 预期行为，路由是 M1 前的契约占位
+# 401 {"detail":{"code":"authentication_required"}}
 
 curl -s http://localhost:8080/metrics | head    # Prometheus 文本格式
 ```
 
-M0 阶段 API 不连数据库（项目路由未接线），所以即使 postgres 未启动，以上命令也全部可用。
+### 5.1 首次建库或从匿名项目升级
+
+已有数据升级前必须备份数据库和对象存储。应用迁移后，匿名项目先由禁用占位账户持有，
+不会在管理员认领前暴露给新注册用户：
+
+```bash
+uv run alembic upgrade head
+uv run paperforge-admin migrate-objects --dry-run
+uv run paperforge-admin bootstrap-admin \
+  --email admin@example.com \
+  --claim-legacy \
+  --migrate-objects
+```
+
+`bootstrap-admin` 通过安全交互读取密码。如果需要把存量项目拆给多个已创建账户，可传入
+UTF-8 CSV：`--project-map project-owners.csv`，列名为 `project_id,email`。对象迁移不会删除
+旧路径；新路径通过大小与 SHA-256 校验并切换数据库键后，旧对象至少保留七天。
+
+本地注册/重置邮件保存在 `data/auth-outbox/` 的权限受限文件里。生产环境禁止此模式，必须
+配置 HTTPS、`AUTH_COOKIE_SECURE=true`、`AUTH_EMAIL_MODE=smtp` 和 SMTP 参数。
 
 ## 6. services/worker（ARQ）启动 [已实测]
 
@@ -154,10 +196,8 @@ uv run arq paperforge_worker.worker.WorkerSettings
 
 - 连上 Redis 后进入空转，等待任务队列；无 Redis 时每秒重试 5 次后退出（实测确认）。
 - `WorkerSettings.redis_settings` 由 `REDIS_URL` 构建；可连接非默认主机、端口和 DB。
-- 当前 6 个 pipeline 阶段（scope/ranking/cards/outline/writing/coverage_hints）与编排入口
-  `run_full_pipeline` 全部是 **stub**：函数签名即契约，函数体 `raise NotImplementedError`。
-  因此现在向队列投递 `run_full_pipeline` 会立即得到一个 failed job —— 这是 M0 的预期状态，
-  实现随 M1–M4 落地。
+- `run_full_pipeline` 已实现检索、入库、卡片、大纲、分节写作、视觉建议和渲染。
+  `visual_plan` 在 write 后执行，仅建议不生成付费 AI 图，失败时不阻断正文与导出。
 
 ## 7. apps/web 启动 [已实测]
 
@@ -166,7 +206,9 @@ cd apps/web
 pnpm dev
 ```
 
-访问 http://localhost:3000 —— 实测首页 200，渲染 M0 占位页（项目定位 + 三硬规则说明）。
+访问 http://localhost:3000 —— 未登录会转到登录页。注册并验证邮箱后，可从 Prompt Canvas
+新建论文，进入文献库、大纲、写作台、素材中心和导出中心。前端默认只请求同源
+`/api/v1`，Next 由 `PAPERFORGE_API_INTERNAL_BASE` 转发到 FastAPI。
 `pnpm build` 亦可用于生产构建检查。
 
 ## 8. .env 变量说明
@@ -184,9 +226,24 @@ pnpm dev
 | `LLM_ROLE_MODELS` | JSON：角色→模型映射（planner/extractor/reranker/writer/polisher/verifier） | 可留空 `{}`，回退 DEFAULT_ROLE_MODELS |
 | `SCHOLAR_CONTACT_EMAIL` / `SCHOLAR_USER_AGENT` | OpenAlex/Crossref polite pool 礼貌标头 | M0 可留空（providers 尚未迁移）；M1 检索前务必填真实邮箱 |
 | `SEMANTIC_SCHOLAR_API_KEY` | S2 配额提升 | 可留空 |
-| `TEXD_URL` / `TEXD_TIMEOUT_SECONDS` | 编译沙箱地址 | M0–M2 可留默认（尚无调用方） |
+| `TEXD_URL` / `TEXD_TIMEOUT_SECONDS` | 编译沙箱地址 | PDF/LaTeX 导出必需，默认 `http://localhost:8081` |
+| `VISUALS_ENABLED` | 视觉资产/API/自动建议总开关 | 默认 `true` |
+| `VISUALD_URL` / `VISUALD_TIMEOUT_SECONDS` | 确定性图表/示意图渲染与位图规范化服务 | 开启 visuals 时需要，默认 `http://localhost:8082` |
+| `AI_IMAGES_ENABLED` | AI 概念插图功能开关 | 默认 `false`，不影响图表/示意图 |
+| `IMAGE_PROVIDER` / `IMAGE_BASE_URL` / `IMAGE_MODEL` | 独立图像 provider 选择/端点/模型 | 默认 `cloudflare` + `https://api.cloudflare.com/client/v4` + `@cf/black-forest-labs/flux-1-schnell` |
+| `IMAGE_ACCOUNT_ID` | Cloudflare Account ID（不是 Token） | Cloudflare 生图时与 Token 一起必填；占位留空时 AI 按钮保持禁用 |
+| `IMAGE_API_KEY` | 图像 provider 密钥；Cloudflare 中填写 Workers AI API Token，不复用文本 LLM 密钥 | 真实 AI 生图时必填；接口不返回密钥、Account ID 或内部端点 |
+| `IMAGE_TIMEOUT_SECONDS` / `IMAGE_MAX_RETRIES` | 图像调用超时与有界重试次数 | 默认 `180` 秒、`2` 次；鉴权/审核/参数错误不会重试 |
 | `CORS_ALLOW_ORIGINS` | API CORS 白名单，逗号分隔 | 默认 `http://localhost:3000` 即可 |
 | `API_HOST` / `API_PORT` | `paperforge-api` 启动命令监听地址与端口 | 可留默认 |
+| `AUTH_COOKIE_SECURE` | 使用 `__Host-paperforge_session` 安全 cookie；生产必须为 `true` | 本地 HTTP 为 `false` |
+| `AUTH_SESSION_DAYS` / `AUTH_IDLE_DAYS` | 会话绝对过期 / 空闲过期，默认 30 / 7 天 | 可留默认 |
+| `AUTH_RATE_LIMIT_ENABLED` | 登录、注册、找回密码 Redis 限流；不可用时失败关闭 | 应保持 `true` |
+| `PUBLIC_APP_URL` | 验证与重置链接的站点根地址 | 生产必须为 HTTPS |
+| `AUTH_EMAIL_MODE` / `AUTH_EMAIL_OUTBOX_DIR` | 本地权限受限投递箱或生产 SMTP | 本地 `file`，生产 `smtp` |
+| `SMTP_*` | 认证邮件发件配置 | 生产必填 |
+| `PAPERFORGE_API_INTERNAL_BASE` | Next 服务端同源代理的 FastAPI 内部地址 | 本地默认 `http://localhost:8080` |
+| `NEXT_PUBLIC_DEMO_MODE` | 显式开发演示数据开关；生产构建强制关闭 | 默认 `false` |
 
 ## 9. 推荐冒烟顺序
 
@@ -195,15 +252,16 @@ pnpm dev
 ./scripts/dev status
 curl -fsS http://localhost:8080/healthz
 curl -fsS http://localhost:8081/healthz
+curl -fsS http://localhost:8082/healthz
 curl -fsS http://localhost:19000/minio/health/live
 curl -fsS http://localhost:3000
 ```
 
-## 10. 当前边界（M0）
+## 10. 当前边界
 
-- 数据库表虽已建模（19 张），但 **alembic 初始迁移尚未生成**，`uv run alembic ...` 流程见
-  `packages/db/migrations/README.md`（M0 剩余工作）。
-- 五源检索适配器 / snowball / OA 全文 / 重型文档抽取器未迁移（见
-  `packages/scholar_gateway/providers/README.md` 与 `packages/ingest/EXTRACTORS_MIGRATION.md`）。
-- 端到端"题目→论文"链路自 M2 起才可用；当前可验证的是：单测、API 契约、worker 骨架、
-  前端骨架与四件基建。
+- 一键全管线、五种文本产物、M8 图文链路与 M9 个人账号数据隔离已实现；开发环境可以在
+  `IMAGE_API_KEY` 为空时完整验证图表、示意图和无图导出。
+- 真实 Cloudflare 图像冒烟需要手动补齐 `IMAGE_ACCOUNT_ID`、`IMAGE_API_KEY` 并开启
+  `AI_IMAGES_ENABLED`；系统不会在自动建议、启动检查或缺配置时触发外部调用。
+- worker 只依赖统一的 `ImageProvider` 协议。现有 Cloudflare/OpenAI 适配器均通过注册表装配；
+  未来接入 GPT Image、Gemini 或本地 ComfyUI 时，只需新增适配器并注册，无需修改视觉业务管线。

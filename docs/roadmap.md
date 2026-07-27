@@ -1,4 +1,4 @@
-# PaperForge 实施路线图（M0–M6）
+# PaperForge 实施路线图（M0–M9）
 
 源自 docs/design.md §6。关键依赖：M0 → M1 → M2 → M3；M4 依赖 M3（渲染）；
 M2 与 M4 的写作器共用同一 Section Writer。
@@ -12,6 +12,10 @@ M2 与 M4 的写作器共用同一 Section Writer。
 | **M4 研究型论文管线**（2–3 周） | 素材上传/解析、IMRaD 大纲、素材接地写作、数字一致性 lint、纯生成占位符策略 | 正文数字与表格 100% 一致；无素材时 0 虚构数值 | ✅ 完成 |
 | **M5 全文与质量增强**（2 周） | OA 全文卡片、雪球推荐 UI、语义引用软校验、覆盖建议器、质量评分、润色浮条 | 全文卡片覆盖率报告；软校验徽章上线 | ✅ 完成 |
 | **M6 打磨与扩展**（持续） | docx 导出、多模型路由配置、成本面板、章节版本历史、协作；远期系统性综述插件 | — | ✅ 首轮完成 |
+| **M7 前端设计升级**（1–2 周） | 见 `docs/ui-design.md` §5：一期气质（serif + 暖色 + 去卡片化）、二期核心心智（`write.section` 增量浮现 + 导航按写作模式分叉）、三期入口（`PATCH /projects/{id}` + 首页 Prompt Canvas）、四期差异化（文献库 Research Context） | 写作期间章节逐节浮现；概览页 Card 数降至 0；首页从意图输入起步；文献可反查引用章节 | ✅ 完成 |
+| **M8 图片与图表生成** | 视觉资产、确定性 visuald、ImageProvider、审核插入与全格式含图导出 | 表格→图表→批准→正文→PDF/DOCX/ZIP/Markdown Bundle；自动建议不付费 | ✅ 完成 |
+| **M9 账号与多租户隔离** | opaque session、项目 owner、统一授权、用户级对象键、存量认领 | 匿名 401、跨租户 404、生产无 mock/公开 bucket/前端令牌 | ✅ 代码完成，待维护窗口迁移 |
+| **M10 Cloudflare AI 生图适配** | 可注册 ImageProvider、Workers AI REST、FLUX.1-schnell、占位配置 | mock 契约通过；缺 Token/Account ID 不发请求且不影响其他功能 | ✅ 完成 |
 
 ## M0 当前进度（本次脚手架）
 已完成：
@@ -146,6 +150,20 @@ M2 与 M4 的写作器共用同一 Section Writer。
 - 图片资产（`\includegraphics`）随 M4 素材中心接入，当前只登记引用路径
 - docx 导出（pandoc）属 M6
 
+### 后续修复（2026-07-26）
+- **「编译成功但全文引用是 `[?]`」**：texd 容器 `read_only`，Tectonic 缓存未命中时
+  连临时文件都建不了，BibTeX 打不开 `.bst`；Tectonic 把它降级为一行 warning 后照常
+  产出 PDF——最坏的一种失败：看起来交付了。三处收口：
+  compose 给缓存挂命名卷（镜像预热内容做种）；构建期按 `BIBSTYLE_BY_CITATION_STYLE`
+  逐个跑 BibTeX 烤进全部 `.bst`；`compile_with_repair` 识别书目失败后换成确定性生成的
+  内联 `thebibliography` 重编一次，并在导出中心标注降级
+- **`cn_thesis` 模板别名缺失**：界面「中文学位论文/学报」发的取值不在 `TEMPLATES` 里，
+  静默退回 article + unsrt——GB/T 7714 的上标顺序编号一次也没生效过。补齐别名，
+  并对确实没实现的模板（acmart/elsarticle/llncs）显式回报降级而不是装作没降级
+- **产物下载/预览**：`GET .../download` 增加 `?disposition=inline`。此前预览用的是
+  attachment 直链，于是「打开导出中心」等于凭空下载一个文件，而预览框永远空白；
+  文件名从 `paperforge-v1.pdf` 改为 `标题-v2-20260726.pdf`（RFC 5987，中文走 `filename*`）
+
 ## M4 完成情况（2026-07-25）
 
 ### 交付
@@ -172,9 +190,9 @@ M2 与 M4 的写作器共用同一 Section Writer。
 - `uv run pytest`：258 passed（新增 29 条 M4 测试，含编造数值、无素材、精度保持等反例）
 - `uv run ruff check .` / `pnpm lint` / `pnpm build`：全绿
 
-### 已知限制
-- 图片二进制尚未随 LaTeX 工程投递给 texd（工程里已生成正确的 `\includegraphics` 路径），
-  完整图文编译随 M5 一并接入
+### 已解决的历史限制
+- M8 已将上传图和生成图以 base64 二进制文件投递给 texd，并补齐 PDF、
+  LaTeX ZIP、DOCX 和 Markdown Bundle 的图文闭环；路径、扩展名、magic bytes 和容量上限均由 texd 二次校验。
 
 ## M5 完成情况（2026-07-25）
 
@@ -259,3 +277,269 @@ LaTeX 工程 zip（main.tex + 6 个章节文件 + refs.bib）、Markdown、BibTe
    大纲因此静默退回确定性分组（章节质量断崖式下降）。
    → provider 区分出 `output_truncated`，runner 加倍预算重试一次（上限 8192），
    大纲预算提到 6000；两条路径都有反例测试。
+
+---
+
+## M7 一期 / 二期完成情况（2026-07-26）
+
+设计依据 `docs/ui-design.md`。本节记录一期与二期；三期与四期交付见后续小节。
+
+### 一期：气质（纯前端）
+- **暖色系配色**（`app/globals.css`）：冷调科技蓝 → 暖白 + 炭灰 + 铜色点缀，明暗两套。
+  全部对比度按 WCAG 相对亮度公式重算并写进注释，未照搬任何外部色板。
+- **接上 serif**：`--font-serif` 此前定义了但全仓库 `.tsx` 零引用。现按「≥18px 才用衬线」
+  接到品牌字、页面标题、论文题目、工作台标题、项目卡题目；新增 `.pf-paper` 用于全文预览。
+  字体栈把 Georgia 提到中文衬线之前（回退是逐字符的，否则拉丁字符会落到 Songti SC）。
+- **概览页去卡片化**：`project-overview.tsx` 五张 Card → 0 张，改用「小写标题 + 留白 +
+  分隔线」分层；只有「下一步」保留边框（全页唯一的行动召唤）。近期任务的彩色 Badge
+  改为固定宽状态词 + 小圆点。写作台空态同步去卡片化。
+
+### 二期：核心心智（纯前端）
+- **章节逐节浮现**（`writing-workbench.tsx`）：订阅 `write.section` 事件增量重取章节列表。
+  后端本来就写完一节存一节并逐节 emit（`pipelines/document.py::write_document`），
+  此前前端只拿它拼了一句状态文案，于是 18 分钟的写作全程只有一根进度条。
+  正在编辑的脏章节保留本地行，避免弹出「已恢复未保存的草稿」打断打字。
+  写作中的空态从「还没有正文，先去生成大纲」改为「正在写第一节」。
+- **导航按写作模式分叉**（`project-pipeline-nav.tsx`）：assisted 保留可点步骤但降到最低
+  视觉权重（去连接线、完成态由绿底对勾徽章改为小实心点）；auto 收成一行
+  「概览 · 第 1 / 6 步 ⌄」，点开才展开。**没有**照搬「把管线整体弱化成一行」的建议——
+  协作模式的定义就是用户要介入，收起导航等于拿走方向盘（理由见 ui-design.md §4.1）。
+
+### 验收证据（2026-07-26）
+- `tsc --noEmit` 通过；`next build` 全量通过（11/11 静态页）。
+- 浏览器实测浅色 / 暗色两套主题：项目列表、项目概览（assisted）、项目概览（auto，
+  含展开/收起）、写作工作台空态。
+- **增量浮现实测**：以一个逐节推送 `write.section` 的 mock SSE 服务驱动前端，
+  观察到章节树从 0 → 3 →（含「正在写作，章节会陆续出现」脉冲提示）→ 5 节、
+  字数 0 → 2,511 → 4,370 递增，任务结束后提示消失、进度条撤走。
+
+### 本轮引入并修复的缺陷
+1. **暗色 warning 文字不可读**：换色时把暗色的 `--warning-foreground` 也设成了深色，
+   照「实心填充上的前景色」理解。但全仓库 11 处 `text-warning-foreground`
+   **没有一处**压在实心 `bg-warning` 上，全是 `bg-warning/10~/20` 的浅色调
+   （降级提示条、warning 徽章、引用 chip），实际语义是「warning 色调面上的可读文字」，
+   必须跟随主题。→ 暗色改回浅色（压 /10 上 11.9:1），并在变量旁注明它与
+   `--success-foreground` / `--destructive-foreground` 方向相反的原因。
+
+---
+
+## M7 三期完成情况（2026-07-26）
+
+设计依据 `docs/ui-design.md` §3.2。四期（文献库 Research Context）见下一节。
+
+### 后端：`PATCH /projects/{id}`
+- `db.update_project`（`packages/db/db/repositories/projects.py`）+ `UpdateProjectRequest`
+  + 路由。语义：**字段缺席 = 不改，显式 `null` = 清空**，靠 pydantic 的
+  `model_fields_set` 区分，不能用 `None` 当哨兵（`topic=None` 是合法的清空）。
+- topic / contribution_points 落在 `scope_json` 里，走**合并**而非整体替换——
+  否则改一次主题就会把 SCOPE 生成的关键词矩阵一起抹掉。
+- **不允许改 `paper_type`**：论文类型决定管线形状（REVIEW_FLOW / ORIGINAL_FLOW）、
+  大纲结构与是否做数字一致性 lint。有了文献/大纲/正文之后换类型只会得到自相矛盾的
+  稿子，那是「新建项目」不是「改字段」。
+- 新增 6 个契约测试（局部更新、scope 保全、null 语义、枚举校验、paper_type 不可改、404）。
+
+### 前端
+- **首页 Prompt Canvas**（`components/home/prompt-canvas.tsx`）：`app/page.tsx` 从
+  `redirect('/projects')` 改为意图输入。类型选择降级为输入框内的下拉；
+  模板/语言/引用样式/写作模式收进「更多设置」折叠区。⌘/Ctrl+Enter 提交。
+- **文件拖拽分流**：拖入文件自动切到研究型论文（ORIGINAL_FLOW 的第一步是素材，
+  文本框对这条管线是结构性错配）；用户手动选过类型后不再自动改写。
+  文件在浏览器内暂存，建项目后再补传（uploadAsset 需要 projectId）；
+  补传失败不回滚项目，而是把用户送到素材中心重传。
+- **就地改名**（`components/project/project-title.tsx`）：项目头的题目可直接编辑，
+  Enter 保存 / Esc 取消。`updateProject` **刻意不给降级桩**——改名要么真落库，
+  要么明确报错，不能让用户看到改好了、刷新后没存。
+- 侧栏新增「新论文」入口并置顶；`/projects` 保留为完整列表页，不再是首页。
+
+### 验收证据（2026-07-26）
+- `pytest services/ packages/` 320 passed；`tsc --noEmit` 通过；`next build` 11/11。
+- 对**真实 API + 真实 Postgres**（非 mock）实测 PATCH 五种行为：只改 title 时
+  topic/language/citation_style/writing_mode 全部保持；空白 title → 422；
+  `paper_type` 被忽略；改 topic 后 `keyword_groups` 仍在；非法枚举 → 422。
+- 浏览器实测：首页输入意图 → 创建项目 → 落到概览（题目取首句、完整意图存为 topic）；
+  就地改名（✓ 按钮与 Enter 两条路径都验证落库）；拖文件后类型自动切换、
+  显式选择后再拖不被改写。
+
+### 本轮引入并修复的缺陷
+1. **PATCH 必炸 MissingGreenlet**：`TimestampMixin.updated_at` 带
+   `onupdate=func.now()`（服务端求值），UPDATE 后 SQLAlchemy 会把该属性标记 expired
+   等待回读；构造响应时 `project.updated_at` 是**同步**属性访问触发的隐式 IO，
+   在 asyncpg 下直接抛异常。INSERT 路径没这问题（服务端默认值走 RETURNING）。
+   → `update_project` 在 flush 后补一次 `session.refresh`。
+2. **改名入口在触屏上不可达**：按钮用了 `opacity-0 group-hover:opacity-100`，
+   触屏没有 hover 态；且 opacity:0 的控件会被无障碍树过滤（实测读页面时整个不出现）。
+   → 改为常驻 `opacity-40`，hover/聚焦补满。
+3. **类型 pin 读到过期闭包**：`typePinned` 原本是 state，`addFiles` 读到的是本次渲染
+   闭包里的旧值——「选完综述立刻拖文件」仍会被改回研究型。该值从不参与渲染。
+   → 改为 ref。
+
+---
+
+## M7 四期完成情况（2026-07-26）
+
+设计依据 `docs/ui-design.md` §3.6，纯前端完成，无新增后端端点。
+
+### 交付
+- **章节反查**（`lib/citation-usage.ts`）：从 `listSections()` 返回的 `cite_keys` 建立
+  `cite_key → 章节标题[]`，按正文顺序排列并在同章内去重；使用持久化 BibTeX key 与文献对应。
+- **Research Context 主列表**（`components/library/entry-list.tsx`）：继续使用固定行高虚拟化，
+  但从 ID / DOI / 分数 / 状态列改为「题名 + 作者/会议/年份 + 被引用章节」。未进入正文时，
+  依次回退到排序理由和入库来源；相关性仍可排序，详细分数与核验 metadata 留在 Inspector。
+- **可操作的研究语境**：新增「正文引用」筛选；搜索同时覆盖标题、作者、会议与章节名。
+  工作台标题显示总文献数和已进入正文的数量，引用位置也进入文献详情抽屉。
+- **独立降级**：章节与检索统计属于增强信息，任一接口失败都不会拖垮文献主列表；
+  未生成正文、旧数据缺 key 时自然回退到排序理由/来源。
+- **延续既有分诊能力**：虚拟化、相关性排序、状态筛选、Shift 连选、批量入库/排除/移除、
+  R1/R2/R3 Inspector 均保留；主视图不再常驻分数条和状态 Badge。
+
+### 验收证据（2026-07-26）
+- `pnpm lint`（`tsc --noEmit`）通过；`pnpm build` 生产构建通过（11/11 静态页）。
+- 真实 API + Postgres 数据验证：202 条文献、6 个章节形成 26 个 cite-key，26 条文献成功
+  反查到章节；抽样文献能按正文顺序返回一到两个章节，未出现孤立 key。
+- `git diff --check` 通过。浏览器视觉复验因本地地址访问策略被阻止，未以截图替代上述证据。
+
+---
+
+## M8 图片与图表生成（2026-07-26）
+
+详细契约与安全边界见 `docs/visual-generation-optimization-plan.md`。
+
+### M8-A：基础闭环
+
+- 新增 `visual_asset`、`visual_source_asset`、`visual_generation_attempt` 三张表；生成图按
+  内容哈希存储，重生成创建新版本，原数据被引用时禁止删除。
+- PaperIR 图片块补齐 `alt_text` / `width`，新增结构化 `XRefRun`、素材引用采集和
+  label 唯一性校验；章节保存时服务端重算 `asset_refs_json`。
+- `LatexProject` 分离文本和二进制文件；texd 接收 base64 PNG/JPEG/PDF，并校验相对路径、
+  扩展名/magic bytes、单文件 16 MiB、最多 32 个图/总计 64 MiB。编译修复轮不可改动图片。
+- 上传图与生成图已接入 PDF、LaTeX ZIP、DOCX 和新增的 `markdown_bundle`；导出附带
+  `visual-provenance.json`。
+
+### M8-B：确定性图表与示意图
+
+- `ChartSpec` 支持柱状图、折线图、散点图、箱线图和热力图，只能引用已解析 `ua_*` 表格；
+  允许显式过滤、排序和 mean/median/sum/count，不接受内联数据、URL、代码、补值或静默采样。
+- `DiagramSpec` 只接受节点/边/分组与 TB/LR 方向，不接受 DOT/Mermaid 源码；上限 30 节点/
+  60 边。
+- 新增无外网 `visuald`：Matplotlib 出 SVG/PDF/300 DPI PNG，Graphviz 负责结构图布局，
+  Pillow 负责图像解码、大小校验和元数据清理；固定中文字体和色盲友好配色。
+- 素材中心新增“图表与插图”页签及非代码向导；图表/示意图可生成预览、批准插入和重生成。
+
+### M8-C：自动建议与 AI 位图
+
+- 全文 write 后运行 `visual_plan`，最多创建 6 条建议；它不调用付费图像 API、不改动 PaperIR，
+  失败也不会阻断 render/export。
+- `AIImageSpec` 仅允许概念性插图，禁止实验数据、坐标轴、结果曲线和精密装置；只有用户点击
+  “生成预览”才会向外部 provider 发送已确认 prompt。
+- 新增独立 `ImageProvider` 契约、注册表与 factory；默认适配器为 Cloudflare Workers AI
+  `@cf/black-forest-labs/flux-1-schnell`，并保留 OpenAI 适配器。配置/密钥与文本模型完全隔离；
+  鉴权/审核/参数错误不重试，429/5xx/网络错误有界退避。
+- AI 图在编辑器和素材中心显示来源标识；设置页只显示 provider/model/密钥是否已配置，
+  成本页记录图像调用、失败、尺寸、usage 与可选成本估算，响应永不返回密钥。
+
+### M8-D：上线与降级
+
+- `VISUALS_ENABLED` / `AI_IMAGES_ENABLED` 分级开关；AI provider 未配置时只禁用 AI 生成，
+  确定性图表、正文和无图导出仍可用。
+- `scripts/dev` 与 compose 加入 visuald 启动/健康检查；visuald 使用只读根文件系统、tmpfs、
+  CPU/内存/进程限额与无出站网络。
+- 写作台专用 Figure NodeView 显示真实预览、caption、alt text、AI 标识和替换入口；
+  Figure XRef 与引用 chip 同样结构化往返，未知 IR 块仍无损透传。
+
+### 验收状态
+
+- 已通过 PaperIR/visuals/latex_render/texd/visuald 的规格、渲染、溯源与二进制反例测试；
+  351 个 Python 测试、前端类型检查/生产构建和 Alembic 漂移检查均通过。
+- 浏览器真实运行 CSV → 柱状图 → worker → visuald → PNG/SVG/PDF → 页面预览；visuald 镜像
+  构建、容器健康检查与 Graphviz 中文结构图三格式渲染也已通过。
+- 真实 Cloudflare 图像冒烟需要 `IMAGE_ACCOUNT_ID` 与 `IMAGE_API_KEY`；未配置的环境只运行 mock
+  provider 契约测试，不会为验收自动产生外部调用。
+
+## M10 Cloudflare Workers AI 生图适配
+
+- worker 已移除 OpenAI 硬编码分支，只消费统一 `ImageProvider`；Cloudflare/OpenAI 由注册表创建，
+  新增 GPT Image、Gemini、ComfyUI 等后端时只需新增适配器与注册动作。
+- 默认占位配置为 Cloudflare Workers AI + FLUX.1-schnell；Account ID 与 Token 留空，设置 API 仅返回
+  `image_provider_configured=false`，前端只禁用 AI 生图，图表、示意图、写作与导出不受影响。
+- mock 测试覆盖官方 REST 路径、Bearer 鉴权、prompt/steps、JSON/base64 与二进制响应、JPEG/PNG
+  校验、401/403/400/422 不重试、429/5xx 有界重试及无配置零网络请求。
+
+### 代码审阅修复（2026-07-26）
+
+三个缺陷都落在同一处覆盖空洞：示意图渲染、box/heatmap 图形、多 series 横轴此前
+**一个测试都没有**，而 `dot` 既不在开发机也不在 CI 里，`/render/diagram` 因此从未被执行过。
+
+1. **带分组的示意图 100% 渲染失败**：`f"subgraph cluster_{_dot_id(id)}"` 生成
+   `subgraph cluster_"enc"`——DOT 文法里这是「一个 ID 后面又跟了一个 ID」，
+   graphviz 直接 syntax error。只要 `DiagramSpec.groups` 非空就必炸，而分组是
+   方案 §2.2 承诺的能力。→ 整个名字包进引号：`subgraph "cluster_enc"`。
+2. **箱线图返回裸 500**：`ax.boxplot(labels=...)` 在 matplotlib 3.9 弃用、3.11 移除，
+   而 visuald 把 matplotlib 钉在 3.11.1；抛出的 `TypeError` 不在 `render_chart`
+   捕获的 `ValueError` 里，于是连 422 都不是。→ 改用 `tick_labels=`。
+3. **多 series 横轴刻度重复**：刻度取自 `records` 的长度，而每个 series 用组内局部
+   下标 `range(len(xs))` 定位。2 个 series × 3 个 x 值画出 6 个刻度
+   （task1,task2,task3,task1,task2,task3），后三个下面没有任何数据点。
+   → 横轴类目改为跨 series 去重保序，各 series 按 x 映射到同一套位置；
+   `numeric_x` 改为按全部记录判定（按组判会让一个 series 落数值轴、另一个落类目轴）；
+   刻度移到循环外设置一次。
+4. 顺带：`ax.legend()` 对 box/heatmap 无意义（它们不产出带 label 的 artist），
+   只会画空图例并抛 UserWarning，已加类型判断跳过。
+
+另两处校验口径不一致，同轮修复：
+
+5. **`in` 过滤器漏行**：`eq` 有字符串兜底比较（CSV 把数值列解析成 `"1"` 时仍能匹配
+   过滤值 `1`），而 `in` 是裸 `actual in expected` 的精确相等。同一份数据同一个值，
+   `eq 1` 命中、`in [1, 2]` 却静默漏掉——图上少画点且不报错。
+   → `in` 改为逐项复用 `eq` 的语义。
+6. **轴标签绕过内容校验**：`x/y/series/error_*` 一直过 `_REMOTE_OR_CODE`，
+   而同样会渲染进 SVG/PDF 的 `x_label/y_label/unit` 是唯一放行的自由文本：
+   `https://…` 写进节点标签被拒、写进 y_label 却通过。并非可利用漏洞
+   （matplotlib 会 XML 转义，前端用 `<img>` 而非内联 SVG），但校验口径不该按字段松紧。
+   → 补 `reject_code_like_labels` 校验器，正常中英文标签与 `%` 单位仍放行。
+
+**验收**：新增 6 个回归测试（五种图形全渲染、多 series 刻度断言、不依赖 graphviz 的
+DOT 文法断言、真实调用 graphviz 的三格式渲染、`in` 与 `eq` 匹配口径一致、轴标签内容校验）。
+在 visuald 镜像内挂载旧代码运行，4 个测试如实失败；换成修复后的代码 11 passed / 0 skipped。
+本地 382 passed / 1 skipped、ruff 与 format 全通过。
+CI 增装 graphviz——否则 `skipif(dot 不存在)` 会永远静默跳过，正是缺陷 1 躲过 CI 的原因。
+
+---
+
+## M9 账号体系与多租户隔离（2026-07-27）
+
+### 账号与会话
+
+- 新增 `app_user`、`user_session`、`auth_action_token`；邮箱规范化唯一，密码使用
+  Argon2id（19 MiB / t=2 / p=1），浏览器只持有 256-bit opaque HttpOnly cookie，数据库
+  只保存 SHA-256。会话空闲 7 天、绝对 30 天，密码修改/重置撤销全部旧会话。
+- 完成注册、邮箱验证、登录、退出、当前账户、忘记/重置/修改密码 API。验证令牌 24 小时、
+  重置令牌 30 分钟且只能消费一次；注册/找回返回统一文案。
+- 登录、注册、找回按 IP 与邮箱分别使用 Redis 限流，Redis 失效时返回 503；危险请求必须
+  携带允许列表 Origin。生产要求 HTTPS、`__Host-` cookie、SMTP 和非通配 CORS。
+
+### 租户隔离与对象存储
+
+- `paper_project.owner_id` 改为非空 UUID 外键，项目创建只能取当前用户，项目列表按 owner
+  过滤。项目、写作、素材、视觉、设置、下载和 SSE 六组 router 共用唯一授权入口；匿名 401，
+  外租户与不存在资源统一 404，各 router 的旧 UUID 直查函数已移除。
+- 素材、视觉和导出写入 `users/{user_id}/projects/{project_id}/...`；OA 全文写入
+  `shared/oa/...`。MinIO bucket 保持无公开 policy，所有二进制只通过认证 API 返回。
+- worker 在任务开始时重新读取项目 owner；外部只能经已授权 API 入队，公共学术目录不提供
+  反查其他账户项目关系的接口。
+
+### 前端与迁移
+
+- Web 默认同源 `/api/v1`，上传/SSE 均携带 cookie；401 统一回登录，403/404 不再 mock。
+  示例数据仅可在开发环境显式开启，生产构建强制关闭。认证区、应用守卫、用户菜单和退出已完成。
+- 0004 先用禁用 placeholder 无损承接旧匿名项目；`paperforge-admin bootstrap-admin` 可安全
+  认领，CSV 可逐项目拆分。对象迁移按复制、读回 SHA-256 校验、更新 key 的顺序执行，旧路径
+  至少保留七天。
+
+### 验收状态
+
+- 全量 Python：380 passed、1 skipped；认证专项 25 个，覆盖会话、令牌、密码策略、限流、
+  Origin、设置最小披露和跨租户参数化反例。Ruff、锁文件和差异检查通过。
+- 前端 TypeScript 与 Next 生产构建通过（16/16 页面）；隔离数据库完成 0003 → 0004 旧数据
+  迁移与 Alembic 无漂移检查。
+- 当前开发数据库仍在 0003；上线需按 `docs/getting-started.md §5.1` 先备份，再由指定管理员
+  显式执行升级、认领和对象迁移。
