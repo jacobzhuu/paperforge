@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -13,6 +14,7 @@ import pytest
 from db import (
     assign_bibtex_key,
     create_project,
+    create_user,
     get_writing_whitelist,
     list_entries,
     reference_metadata_payload,
@@ -79,10 +81,17 @@ class _Candidate:
 
 
 async def _project(session, **kwargs):
+    owner = await create_user(
+        session,
+        email=f"{uuid.uuid4()}@example.test",
+        password_hash="!test-only",
+        verified=True,
+    )
     return await create_project(
         session,
         title=kwargs.pop("title", "RAG survey"),
         paper_type=kwargs.pop("paper_type", "review"),
+        owner_id=owner.id,
         **kwargs,
     )
 
@@ -98,9 +107,7 @@ async def _verified_selected_entry(session, project, candidate=None):
         verified=True,
     )
     payload = await reference_metadata_payload(session, work)
-    await assign_bibtex_key(
-        session, entry, make_bibtex_key, reference=ReferenceMetadata(**payload)
-    )
+    await assign_bibtex_key(session, entry, make_bibtex_key, reference=ReferenceMetadata(**payload))
     return entry, work
 
 

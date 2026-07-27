@@ -13,8 +13,24 @@ from paper_ir.reference import ReferenceMetadata
 
 _STOPWORDS = frozenset(
     {
-        "a", "an", "the", "of", "for", "and", "or", "to", "in", "on", "with",
-        "using", "via", "toward", "towards", "based", "study", "analysis",
+        "a",
+        "an",
+        "the",
+        "of",
+        "for",
+        "and",
+        "or",
+        "to",
+        "in",
+        "on",
+        "with",
+        "using",
+        "via",
+        "toward",
+        "towards",
+        "based",
+        "study",
+        "analysis",
     }
 )
 
@@ -59,9 +75,7 @@ def _first_author_surname(ref: ReferenceMetadata) -> str:
                 parts = name.split()
                 # ``Zhang Q`` 取首段；``Ada Lovelace`` 取末段。
                 surname = (
-                    parts[0]
-                    if len(parts) > 1 and _looks_like_initials(parts[-1])
-                    else parts[-1]
+                    parts[0] if len(parts) > 1 and _looks_like_initials(parts[-1]) else parts[-1]
                 )
             token = _ascii_token(surname)
             if token:
@@ -83,9 +97,7 @@ def make_bibtex_key(ref: ReferenceMetadata, *, taken: set[str] | None = None) ->
     year = str(ref.publication_year) if ref.publication_year else "nd"
     base = f"{_first_author_surname(ref)}{year}{_title_keyword(ref)}"
     base = re.sub(r"[^0-9a-zA-Z]+", "", base)
-    if base in {"", "anonndwork"} or (
-        base.startswith("anon") and _title_keyword(ref) == "work"
-    ):
+    if base in {"", "anonndwork"} or (base.startswith("anon") and _title_keyword(ref) == "work"):
         base = f"ref{year}{_stable_fallback(ref)}"
     if taken is None:
         return base

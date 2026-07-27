@@ -20,7 +20,12 @@ from paperforge_worker.pipelines.cards import (
     extract_card,
     normalize_card,
 )
-from paperforge_worker.pipelines.ranking import rank_candidates, rerank_with_llm
+from paperforge_worker.pipelines.ranking import (
+    AUTO_SELECT_MIN_TOPIC_EVIDENCE,
+    rank_candidates,
+    rerank_with_llm,
+    topic_evidence,
+)
 from paperforge_worker.pipelines.scope import (
     deterministic_scope,
     generate_scope,
@@ -31,6 +36,13 @@ from paperforge_worker.pipelines.scope import (
 )
 
 FIXED_NOW = datetime(2026, 7, 25, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class _Truncated:
+    """被 max_tokens 截断的响应：content 非空但 JSON 没写完。"""
+
+    text: str
 
 
 class _StubProvider:
@@ -45,8 +57,20 @@ class _StubProvider:
         payload = self.payloads.pop(0) if self.payloads else ""
         if isinstance(payload, Exception):
             raise payload
+        if isinstance(payload, _Truncated):
+            return LLMResponse(
+                text=payload.text,
+                model="stub-model",
+                provider="stub",
+                finish_reason="length",
+            )
         text = payload if isinstance(payload, str) else json.dumps(payload)
-        return LLMResponse(text=text, model="stub-model", provider="stub")
+        return LLMResponse(
+            text=text,
+            model="stub-model",
+            provider="stub",
+            finish_reason="stop",
+        )
 
 
 def _runner(payloads: list[Any]) -> tuple[LLMRunner, _StubProvider, list]:
@@ -130,6 +154,45 @@ async def test_generate_scope_falls_back_on_unparsable_output() -> None:
     assert scope["generator"] == "deterministic_fallback"
 
 
+async def test_generate_scope_retries_when_planner_output_is_truncated() -> None:
+    """推理型模型烧光 max_tokens 时 JSON 会断在中途——必须加预算重试，而不是静默降级。
+
+    真实故障：planner 输出正好 1500 tokens（等于预算上限）后被截断，JSON 解析失败，
+    SCOPE 退回确定性回退，于是「序列推荐系统的投毒攻击」只切出一个中文巨型关键词，
+    最终检索回来一批中文医学论文。
+    """
+    truncated = _Truncated('{"research_question": "How do poisoning attacks affect seq')
+    runner, provider, _calls = _runner(
+        [
+            truncated,
+            {
+                "research_question": "How do poisoning attacks affect sequential recommenders?",
+                "scope_summary": "Poisoning attacks on sequential recommendation.",
+                "keyword_groups": [
+                    {"name": "序列推荐", "keywords": ["sequential recommendation"]},
+                    {"name": "投毒攻击", "keywords": ["poisoning attack", "shilling attack"]},
+                ],
+                "subtopics": ["defenses"],
+                "time_range": {"start_year": 2021, "end_year": 2026},
+            },
+        ]
+    )
+    scope = await generate_scope("序列推荐系统的投毒攻击", runner=runner, now=FIXED_NOW)
+
+    assert scope["generator"].startswith("llm:")
+    assert [g["name"] for g in scope["keyword_groups"]] == ["序列推荐", "投毒攻击"]
+    # 重试必须真的加预算，否则只会以同样的方式再截断一次。
+    assert provider.requests[1].max_output_tokens > provider.requests[0].max_output_tokens
+
+
+async def test_generate_scope_gives_up_after_one_truncation_retry() -> None:
+    """重试一次就够：连续截断只能降级，不能无限加预算。"""
+    runner, provider, _calls = _runner([_Truncated('{"a": 1'), _Truncated('{"a": 1')])
+    scope = await generate_scope("RAG for science", runner=runner, now=FIXED_NOW)
+    assert scope["generator"] == "deterministic_fallback"
+    assert len(provider.requests) == 2
+
+
 def test_normalize_scope_repairs_partial_llm_output() -> None:
     scope = normalize_scope(
         {"keyword_groups": ["single string group"], "time_range": {"start_year": 2030}},
@@ -151,6 +214,36 @@ def test_search_queries_and_filters_from_scope() -> None:
     # 确定性回退里 subtopics 就是主题切词，不应再单独成查询。
     assert "graph" not in queries
     assert scope_filters(scope) == {"time_range": {"start_year": 2021, "end_year": 2026}}
+
+
+def test_topic_terms_splits_chinese_topic_into_concepts() -> None:
+    """中文不带空格：整串当一个词会得到任何检索源都命中不了的巨型 token。"""
+    assert topic_terms("序列推荐系统的投毒攻击") == ["序列推荐系统", "投毒攻击"]
+    # 通用后缀对检索没有区分度，应被剥掉。
+    assert topic_terms("扩散模型在医学影像分割中的研究综述") == ["扩散模型", "医学影像分割"]
+
+
+def test_search_queries_prefer_english_for_chinese_topic() -> None:
+    """五个检索源只索引英文题录：中文主题必须改用英文关键词发出去。"""
+    scope = {
+        "topic": "序列推荐系统的投毒攻击",
+        "keyword_groups": [
+            {"name": "序列推荐", "keywords": ["sequential recommendation"]},
+            {"name": "投毒攻击", "keywords": ["poisoning attack", "shilling attack"]},
+        ],
+        "subtopics": [],
+        "time_range": {"start_year": 2021, "end_year": 2026},
+    }
+    queries = search_queries(scope)
+    assert queries[0] == "sequential recommendation poisoning attack"
+    # 中文原标题不能再作为主查询直接打到检索源。
+    assert "序列推荐系统的投毒攻击" not in queries
+
+
+def test_search_queries_keep_chinese_topic_when_no_english_keywords() -> None:
+    """LLM 不可用且主题为中文时召回会很差，但 SEARCH 仍须有产物（draft-first）。"""
+    scope = deterministic_scope("序列推荐系统的投毒攻击", language="zh", now=FIXED_NOW)
+    assert search_queries(scope)[0] == "序列推荐系统的投毒攻击"
 
 
 # ---- 排序 ----
@@ -188,6 +281,56 @@ def test_ranking_prefers_on_topic_recent_work() -> None:
     assert ranked[0].score > ranked[1].score
     assert ranked[0].reason["method"] == "deterministic_v1"
     assert ranked[0].reason["facet_coverage"] > 0
+
+
+def test_chinese_topic_gives_no_topic_evidence_to_unrelated_chinese_work() -> None:
+    """按字切分时「的/系/统」这类高频字会让任何中文文献都和任何中文主题重叠。
+
+    真实故障：一批中文医学论文在「序列推荐系统的投毒攻击」项目里拿到
+    0.09–0.34 的相关性分并被自动入库。二元组切分后主题证据必须归零。
+    """
+    scope = deterministic_scope("序列推荐系统的投毒攻击", language="zh", now=FIXED_NOW)
+    burns = _Candidate(
+        title="烧伤科主导的综合重症监护病房救治危重烧伤的临床实践和模式探讨",
+        abstract="探讨烧伤科主导的综合重症监护病房的救治模式与临床实践。",
+        publication_year=2024,
+        citation_count=5,
+        normalized_title_hash="burns",
+    )
+    ranked = rank_candidates([burns], scope=scope, now=FIXED_NOW)
+    assert topic_evidence(ranked[0]) == 0.0
+
+
+def test_topic_evidence_ignores_recency_and_citation_padding() -> None:
+    """总分里时效与引用量占 0.2：高引近作即使跑题也有分，但它不是主题证据。"""
+    famous_but_off_topic = _Candidate(
+        title="Attention is all you need",
+        abstract="The dominant sequence transduction models use recurrent networks.",
+        publication_year=2025,
+        citation_count=100_000,
+        normalized_title_hash="attn",
+    )
+    ranked = rank_candidates([famous_but_off_topic], scope=_scope(), now=FIXED_NOW)
+    assert ranked[0].score > 0
+    assert topic_evidence(ranked[0]) < AUTO_SELECT_MIN_TOPIC_EVIDENCE
+
+
+def test_english_stopwords_do_not_count_as_topic_evidence() -> None:
+    """research_question 的模板句会把 the/of/in 灌进主题词集合，不能算作证据。"""
+    scope = {
+        "topic": "序列推荐系统的投毒攻击",
+        "research_question": "What is the state of the art in 序列推荐系统的投毒攻击?",
+        "keyword_groups": [{"name": "投毒攻击", "keywords": ["投毒攻击"]}],
+        "time_range": {"start_year": 2021, "end_year": 2026},
+    }
+    medical = _Candidate(
+        title="[Expert consensus on the clinical treatment of burn patients]",
+        abstract="This is the consensus of the experts on the treatment of the patients.",
+        publication_year=2025,
+        normalized_title_hash="med",
+    )
+    ranked = rank_candidates([medical], scope=scope, now=FIXED_NOW)
+    assert topic_evidence(ranked[0]) == 0.0
 
 
 def test_ranking_never_drops_candidates() -> None:

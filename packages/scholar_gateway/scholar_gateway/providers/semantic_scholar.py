@@ -90,8 +90,7 @@ class SemanticScholarDiscoveryAdapter(HttpScholarlyDiscoveryAdapter):
             mapped
             for item in raw_results or []
             if isinstance(item, dict)
-            if (mapped := candidate_from_semantic_scholar_item(query, item, retrieved))
-            is not None
+            if (mapped := candidate_from_semantic_scholar_item(query, item, retrieved)) is not None
         )
         return ScholarlyDiscoveryResult(
             provider_name=self.provider_name,

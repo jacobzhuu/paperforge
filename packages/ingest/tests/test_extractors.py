@@ -48,9 +48,7 @@ def _minimal_pdf(lines: list[str]) -> bytes:
 
 
 def _minimal_docx(paragraphs: list[str]) -> bytes:
-    body = "".join(
-        f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs
-    )
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
     document = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'

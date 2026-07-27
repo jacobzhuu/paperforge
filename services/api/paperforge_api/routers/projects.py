@@ -15,7 +15,6 @@ from db import (
     get_cards,
     get_entry,
     get_job,
-    get_project,
     get_work_authors,
     get_writing_whitelist,
     list_entries,
@@ -25,6 +24,7 @@ from db import (
     project_counters,
     project_llm_cost,
     set_entry_status,
+    update_project,
     update_project_scope,
 )
 from db.models.library import LibraryEntry, LiteratureCard, ScholarlyWork
@@ -32,7 +32,13 @@ from db.models.paper import GenerationJob, PaperProject, SearchRun
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from paperforge_api.deps import get_queue, get_session
+from paperforge_api.deps import (
+    CurrentUserDep,
+    authorize_project_request,
+    get_queue,
+    get_session,
+)
+from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.schemas import (
     CostResponse,
     CreateProjectRequest,
@@ -47,11 +53,14 @@ from paperforge_api.schemas import (
     SearchRequest,
     SearchRunResponse,
     SelectEntriesRequest,
+    UpdateProjectRequest,
     UpdateScopeRequest,
     WhitelistResponse,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["projects"])
+router = APIRouter(
+    prefix="/api/v1", tags=["projects"], dependencies=[Depends(authorize_project_request)]
+)
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
@@ -64,6 +73,7 @@ QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 async def create_project_endpoint(
     request: CreateProjectRequest,
     session: SessionDep,
+    user: CurrentUserDep,
 ) -> ProjectResponse:
     try:
         project = await create_project(
@@ -76,6 +86,7 @@ async def create_project_endpoint(
             venue_template=request.venue_template,
             citation_style=request.citation_style,
             contribution_points=request.contribution_points,
+            owner_id=user.id,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -83,8 +94,10 @@ async def create_project_endpoint(
 
 
 @router.get("/projects", response_model=list[ProjectResponse])
-async def list_projects_endpoint(session: SessionDep) -> list[ProjectResponse]:
-    projects = await list_projects(session)
+async def list_projects_endpoint(
+    session: SessionDep, user: CurrentUserDep
+) -> list[ProjectResponse]:
+    projects = await list_projects(session, owner_id=user.id)
     responses: list[ProjectResponse] = []
     for project in projects:
         counters = await project_counters(session, project.id)
@@ -95,6 +108,35 @@ async def list_projects_endpoint(session: SessionDep) -> list[ProjectResponse]:
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
 async def get_project_endpoint(project_id: str, session: SessionDep) -> ProjectResponse:
     project = await _require_project(session, project_id)
+    counters = await project_counters(session, project.id)
+    return _project_response(project, counters)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project_endpoint(
+    project_id: str,
+    request: UpdateProjectRequest,
+    session: SessionDep,
+) -> ProjectResponse:
+    """
+    改项目元数据（题目 / 主题 / 模板 / 语言 / 引用样式 / 写作模式 / 贡献点）。
+
+    此前项目建出来就再也改不了题目——创建向导是唯一的写入口。这在首页从
+    「一句话研究意图」起步之后是硬伤：标题是从那句话推导出来的，不可改就等于
+    把用户锁死在一个凑合的题目上（docs/ui-design.md §3.2）。
+
+    只更新请求里**实际出现**的字段：`title=null` 与不传 title 在 JSON 里长得不一样，
+    前者应当报 422（题目不能为空），后者应当不动。
+    """
+    project = await _require_project(session, project_id)
+    sent = request.model_fields_set
+    patch: dict[str, Any] = {
+        name: getattr(request, name) for name in sent if hasattr(request, name)
+    }
+    try:
+        await update_project(session, project, **patch)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     counters = await project_counters(session, project.id)
     return _project_response(project, counters)
 
@@ -116,7 +158,9 @@ async def put_scope(
 ) -> ScopeResponse:
     """SCOPE 可编辑、可随时重生成（设计 §3.2：去掉协议锁定语义）。"""
     project = await _require_project(session, project_id)
-    await update_project_scope(session, project, request.scope)
+    # 打上 generator='user'：SEARCH 会自动重生成确定性回退留下的降级 scope，
+    # 手改过的必须豁免，否则用户调好的关键词会被下一次检索悄悄覆盖。
+    await update_project_scope(session, project, {**request.scope, "generator": "user"})
     return ScopeResponse(project_id=str(project.id), scope=project.scope_json or {})
 
 
@@ -346,17 +390,6 @@ async def get_cost(project_id: str, session: SessionDep) -> CostResponse:
 
 
 # ---- 内部工具 ----
-
-
-async def _require_project(session: AsyncSession, project_id: str) -> PaperProject:
-    try:
-        project_uuid = uuid.UUID(project_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    project = await get_project(session, project_uuid)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
 
 
 async def _require_job(session: AsyncSession, job_id: str) -> GenerationJob:

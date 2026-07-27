@@ -3,7 +3,7 @@ name = "paperforge-storage"
 version = "0.1.0"
 description = "PaperForge 对象存储 seam：MinIO/S3 或本地文件系统后端"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["minio>=7.2"]
 
 [build-system]
 requires = ["hatchling"]

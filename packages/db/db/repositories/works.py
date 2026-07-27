@@ -166,9 +166,7 @@ async def _sync_identifiers(
     existing = {
         (row.id_type, row.id_value)
         for row in (
-            await session.scalars(
-                select(WorkIdentifier).where(WorkIdentifier.work_id == work.id)
-            )
+            await session.scalars(select(WorkIdentifier).where(WorkIdentifier.work_id == work.id))
         ).all()
     }
     for identifier in getattr(candidate, "identifiers", ()) or ():
@@ -192,9 +190,7 @@ async def _sync_urls(
 ) -> None:
     existing = {
         row.url
-        for row in (
-            await session.scalars(select(WorkUrl).where(WorkUrl.work_id == work.id))
-        ).all()
+        for row in (await session.scalars(select(WorkUrl).where(WorkUrl.work_id == work.id))).all()
     }
     for link in getattr(candidate, "links", ()) or ():
         if link.url in existing:
@@ -243,19 +239,14 @@ async def get_work_authors(
             .order_by(WorkAuthor.author_order)
         )
     ).all()
-    return [
-        {"author_name": row.author_name, "author_order": row.author_order}
-        for row in rows
-    ]
+    return [{"author_name": row.author_name, "author_order": row.author_order} for row in rows]
 
 
 async def get_work_urls(
     session: AsyncSession,
     work_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
-    rows = (
-        await session.scalars(select(WorkUrl).where(WorkUrl.work_id == work_id))
-    ).all()
+    rows = (await session.scalars(select(WorkUrl).where(WorkUrl.work_id == work_id))).all()
     return [
         {"url": row.url, "url_type": row.url_type, "is_oa": row.is_oa, "source_name": None}
         for row in rows

@@ -2,7 +2,7 @@ from llm_runtime import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 
 
 def test_clean_and_parse_strips_markdown_fence():
-    text = "```json\n{\"a\": 1}\n```"
+    text = '```json\n{"a": 1}\n```'
     assert clean_and_parse_json(text) == {"a": 1}
 
 

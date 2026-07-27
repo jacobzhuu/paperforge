@@ -17,6 +17,11 @@ class WorkerSettings(BaseSettings):
 
     storage_backend: str = "filesystem"
     storage_fs_root: str = "./data/objects"
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "paperforge"
+    minio_secret_key: str = "paperforge-secret"
+    minio_bucket: str = "paperforge"
+    minio_secure: bool = False
 
     llm_default_provider: str = "noop"
     llm_openai_base_url: str = "https://api.openai.com/v1"
@@ -37,6 +42,17 @@ class WorkerSettings(BaseSettings):
 
     texd_url: str = "http://localhost:8081"
     texd_timeout_seconds: int = 120
+    visuals_enabled: bool = True
+    ai_images_enabled: bool = False
+    visuald_url: str = "http://localhost:8082"
+    visuald_timeout_seconds: int = 30
+    image_provider: str = "cloudflare"
+    image_base_url: str = "https://api.cloudflare.com/client/v4"
+    image_api_key: str = ""
+    image_model: str = "@cf/black-forest-labs/flux-1-schnell"
+    image_account_id: str = ""
+    image_timeout_seconds: float = 180.0
+    image_max_retries: int = 2
     log_level: str = "INFO"
 
     def llm_config(self) -> LLMConfig:

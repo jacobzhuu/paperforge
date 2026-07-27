@@ -206,9 +206,7 @@ def test_markdown_surfaces_r2_removal_warnings():
         key="s1",
         title="Body",
         blocks=[ParagraphBlock(runs=[TextRun(v="text")])],
-        citation_warnings=[
-            CitationWarning(path="sections[0]", rejected_keys=("fake2029key",))
-        ],
+        citation_warnings=[CitationWarning(path="sections[0]", rejected_keys=("fake2029key",))],
     )
     markdown = render_markdown(PaperIR(meta=PaperMeta(title="t"), sections=[section]))
     # 静默剔除是不可接受的：预览里必须能看到引用被移除。
@@ -227,3 +225,50 @@ def test_markdown_todo_block_is_prominent():
     markdown = render_markdown(ir)
     assert "**TODO**" in markdown
     assert "待补充实验数据" in markdown
+
+
+def test_markdown_renders_marks_and_lists():
+    """预览与 LaTeX 用同一套语义：强调来自 marks，不是正文里的星号。"""
+    from paper_ir.markdown import render_markdown
+    from paper_ir.schema import (
+        CiteRun,
+        ListBlock,
+        ListItem,
+        PaperIR,
+        PaperMeta,
+        ParagraphBlock,
+        Section,
+        TextRun,
+    )
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T", language="zh"),
+        sections=[
+            Section(
+                key="s1",
+                title="节",
+                blocks=[
+                    ParagraphBlock(
+                        runs=[
+                            TextRun(v="粗", marks=["bold"]),
+                            TextRun(v="斜", marks=["italic"]),
+                        ]
+                    ),
+                    ListBlock(
+                        ordered=True,
+                        items=[
+                            ListItem(runs=[TextRun(v="一"), CiteRun(keys=["k1"])]),
+                            ListItem(runs=[TextRun(v="二")]),
+                        ],
+                    ),
+                    ListBlock(ordered=False, items=[ListItem(runs=[TextRun(v="要点")])]),
+                ],
+            )
+        ],
+    )
+    md = render_markdown(ir, references=[])
+    assert "**粗**" in md
+    assert "*斜*" in md
+    assert "1. 一" in md
+    assert "2. 二" in md
+    assert "- 要点" in md

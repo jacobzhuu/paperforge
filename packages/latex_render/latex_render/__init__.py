@@ -5,9 +5,11 @@ from latex_render.compile import (
     MAX_REPAIR_ROUNDS,
     CompileOutcome,
     TexdClient,
+    bibliography_broken,
     compile_with_repair,
     deterministic_repairs,
     error_context,
+    with_inline_bibliography,
 )
 from latex_render.escape import latex_escape, latex_identifier
 from latex_render.project import (
@@ -15,8 +17,10 @@ from latex_render.project import (
     TEMPLATES,
     LatexProject,
     build_latex_project,
+    render_inline_bibliography,
     render_markdown_fallback,
     resolve_template,
+    template_fallback_warning,
 )
 from latex_render.renderer import render_body, render_section
 
@@ -28,6 +32,7 @@ __all__ = [
     "CompileOutcome",
     "LatexProject",
     "TexdClient",
+    "bibliography_broken",
     "build_latex_project",
     "compile_with_repair",
     "deterministic_repairs",
@@ -35,7 +40,10 @@ __all__ = [
     "latex_escape",
     "latex_identifier",
     "render_body",
+    "render_inline_bibliography",
     "render_markdown_fallback",
     "render_section",
     "resolve_template",
+    "template_fallback_warning",
+    "with_inline_bibliography",
 ]

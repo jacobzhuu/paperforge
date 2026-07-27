@@ -103,3 +103,99 @@ def test_renderer_sanitizes_labels_and_cite_keys_defensively():
     body = render_body(ir)
     assert "\\input" not in body
     assert r"\cite{safe-input-evil}" in body
+
+
+def test_text_marks_render_deterministically_and_stay_escaped():
+    """强调是结构化标记，不是 LLM 写的 LaTeX：内容照常转义后才包命令。"""
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="s1",
+                title="marks",
+                blocks=[
+                    ParagraphBlock(
+                        runs=[
+                            TextRun(v="普通"),
+                            TextRun(v="加粗", marks=["bold"]),
+                            TextRun(v="斜体", marks=["italic"]),
+                            TextRun(v="both", marks=["bold", "italic"]),
+                            # 带标记的文本里出现特殊字符，仍必须被转义。
+                            TextRun(v="100% \\evil", marks=["bold"]),
+                        ]
+                    )
+                ],
+            )
+        ],
+    )
+    body = render_body(ir)
+    assert "\\textbf{加粗}" in body
+    assert "\\emph{斜体}" in body
+    assert "\\emph{\\textbf{both}}" in body
+    # 转义先于包裹：正文里的 % 与反斜杠不能变成活的 LaTeX。
+    assert "\\evil" not in body.replace("\\textbackslash", "")
+    assert "\\%" in body
+
+
+def test_list_block_renders_itemize_and_enumerate_with_citations():
+    from paper_ir.schema import ListBlock, ListItem
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="s1",
+                title="lists",
+                blocks=[
+                    ListBlock(
+                        ordered=True,
+                        items=[
+                            ListItem(runs=[TextRun(v="第一条"), CiteRun(keys=["ok2024"])]),
+                            ListItem(runs=[TextRun(v="第二条", marks=["bold"])]),
+                        ],
+                    ),
+                    ListBlock(ordered=False, items=[ListItem(runs=[TextRun(v="要点")])]),
+                    # 空列表不该渲染出一个空环境（编译会告警）。
+                    ListBlock(ordered=False, items=[]),
+                ],
+            )
+        ],
+    )
+    body = render_body(ir)
+    assert "\\begin{enumerate}" in body and "\\end{enumerate}" in body
+    assert "\\begin{itemize}" in body and "\\end{itemize}" in body
+    assert "\\item 第一条\\cite{ok2024}" in body
+    assert "\\item \\textbf{第二条}" in body
+    assert body.count("\\begin{itemize}") == 1
+
+
+def test_r2_whitelist_covers_citations_inside_list_items():
+    """列表项里的引用同样要过白名单——只查 ParagraphBlock 会给 R2 留绕过口子。"""
+    from paper_ir.schema import ListBlock, ListItem
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="s1",
+                title="lists",
+                blocks=[
+                    ListBlock(
+                        ordered=False,
+                        items=[ListItem(runs=[CiteRun(keys=["ok", "ghost"])])],
+                    )
+                ],
+            )
+        ],
+    )
+    assert ir.collect_cite_keys() == {"ok", "ghost"}
+
+    violations = ir.enforce_cite_key_whitelist({"ok"})
+    assert len(violations) == 1
+    assert violations[0].rejected_keys == ("ghost",)
+    assert ".items[0]" in violations[0].path
+
+    ir.enforce_cite_key_whitelist({"ok"}, strip=True)
+    assert ir.collect_cite_keys() == {"ok"}
+    body = render_body(ir)
+    assert "ghost" not in body

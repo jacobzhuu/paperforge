@@ -307,9 +307,7 @@ class OpenAICompatibleLLMProvider:
             # 预算被推理吃光时 content 会是空的。这与「响应结构非法」是两回事——
             # 前者加预算重试就能救，因此给出独立的 error_code。
             finish_reason = first_choice.get("finish_reason")
-            reasoning = (
-                message.get("reasoning_content") if isinstance(message, dict) else None
-            )
+            reasoning = message.get("reasoning_content") if isinstance(message, dict) else None
             if finish_reason == "length" or (isinstance(reasoning, str) and reasoning.strip()):
                 raise LLMError(
                     provider=self.name,

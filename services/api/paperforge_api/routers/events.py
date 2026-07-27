@@ -17,9 +17,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from paperforge_api.deps import get_session_factory
+from paperforge_api.deps import authorize_project_request, get_session_factory
 
-router = APIRouter(prefix="/api/v1", tags=["events"])
+router = APIRouter(
+    prefix="/api/v1", tags=["events"], dependencies=[Depends(authorize_project_request)]
+)
 
 POLL_INTERVAL_SECONDS = 0.5
 # 空闲心跳：穿透代理的空闲超时，同时让前端知道连接仍然活着。
@@ -34,6 +36,7 @@ async def stream_job_events(
     request: Request,
     session_factory: Annotated[async_sessionmaker, Depends(get_session_factory)],
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    after: int | None = None,
 ) -> StreamingResponse:
     try:
         job_uuid = uuid.UUID(job_id)
@@ -46,9 +49,13 @@ async def stream_job_events(
         if job is None or job.project_id != project_uuid:
             raise HTTPException(status_code=404, detail="job not found")
 
+    # 浏览器自动重连走 Last-Event-ID；前端手动重建 EventSource 时无法设置请求头，
+    # 改用等价的 ?after= 续传。两者都给时以 Last-Event-ID 为准。
     try:
-        after_seq = int(last_event_id) if last_event_id else 0
+        after_seq = int(last_event_id) if last_event_id else (after or 0)
     except ValueError:
+        after_seq = after or 0
+    if after_seq < 0:
         after_seq = 0
 
     return StreamingResponse(
@@ -81,7 +88,6 @@ async def _event_stream(
                 after_seq = event.seq
                 yield _format_event(
                     event_id=event.seq,
-                    event_type=event.event_type,
                     data={
                         "seq": event.seq,
                         "type": event.event_type,
@@ -100,16 +106,23 @@ async def _event_stream(
         if job is not None and job.status in TERMINAL_STATUSES and not events:
             yield _format_event(
                 event_id=after_seq,
-                event_type="job.closed",
-                data={"status": job.status, "progress": job.progress, "stage": job.stage},
+                data={
+                    "type": "job.closed",
+                    "payload": {},
+                    "status": job.status,
+                    "progress": job.progress,
+                    "stage": job.stage,
+                },
             )
             return
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-def _format_event(*, event_id: int, event_type: str, data: dict) -> str:
-    return (
-        f"id: {event_id}\n"
-        f"event: {event_type}\n"
-        f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
-    )
+def _format_event(*, event_id: int, data: dict) -> str:
+    """所有事件走默认 message 通道。
+
+    刻意不发 `event:` 具名字段：具名事件要求前端为每一个阶段名逐一 addEventListener，
+    白名单一旦漏掉某个阶段（曾经漏掉 outline/write/render），事件就静默丢弃、
+    进度条整段任务停在 0%。事件名本来就在 data.type 里，无名下发信息不丢且不会再漏。
+    """
+    return f"id: {event_id}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"

@@ -4,6 +4,18 @@
 （worker 导出产物、API 提供下载）；把实现留在 API 包里会造成包循环依赖。
 """
 
-from storage import FilesystemObjectStore, ObjectStore, content_key
+from storage import (
+    FilesystemObjectStore,
+    MinioObjectStore,
+    ObjectStore,
+    content_key,
+    make_object_store,
+)
 
-__all__ = ["FilesystemObjectStore", "ObjectStore", "content_key"]
+__all__ = [
+    "FilesystemObjectStore",
+    "MinioObjectStore",
+    "ObjectStore",
+    "content_key",
+    "make_object_store",
+]

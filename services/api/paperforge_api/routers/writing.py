@@ -2,36 +2,45 @@
 
 from __future__ import annotations
 
+import re
 import uuid
+from datetime import datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from arq.connections import ArqRedis
 from db import (
     create_job,
     get_cards,
-    get_project,
     get_section,
     get_writing_whitelist,
     latest_document,
     latest_outline,
+    list_assets,
     list_citation_usage,
     list_entries,
     list_sections,
+    list_visuals,
     reference_metadata_payload,
     replace_citation_usage,
     update_outline_tree,
     upsert_section,
 )
-from db.models.paper import ExportArtifact, PaperProject
+from db.models.paper import ExportArtifact
 from db.repositories.exports import list_export_artifacts
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from paper_ir import Bibliography, PaperIR, PaperMeta, ReferenceMetadata, render_markdown
 from paper_ir.schema import Section as IRSection
 from sqlalchemy.ext.asyncio import AsyncSession
-from storage import FilesystemObjectStore
+from storage import make_object_store
 
 from paperforge_api.config import get_settings
-from paperforge_api.deps import get_queue, get_session
+from paperforge_api.deps import (
+    authorize_project_request,
+    get_queue,
+    get_session,
+)
+from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
     CitationAuditResponse,
@@ -52,7 +61,9 @@ from paperforge_api.schemas import (
     WriteRequest,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["writing"])
+router = APIRouter(
+    prefix="/api/v1", tags=["writing"], dependencies=[Depends(authorize_project_request)]
+)
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
@@ -205,6 +216,7 @@ async def put_section(
     ir.enforce_cite_key_whitelist(set(whitelist), strip=True)
     cleaned = ir.sections[0]
     cite_keys = sorted(ir.collect_cite_keys())
+    asset_refs = sorted(ir.collect_asset_refs())
 
     updated = await upsert_section(
         session,
@@ -214,6 +226,7 @@ async def put_section(
         order_no=row.order_no,
         body_ir=cleaned.model_dump(mode="json"),
         cite_keys=cite_keys,
+        asset_refs=asset_refs,
         status="edited",
         model=row.model,
     )
@@ -287,9 +300,7 @@ async def markdown_preview(project_id: str, session: SessionDep) -> MarkdownResp
     references: list[ReferenceMetadata] = []
     for entry, work in await list_entries(session, project.id, status="selected"):
         if entry.bibtex_key and entry.bibtex_key in used_keys:
-            payload = await reference_metadata_payload(
-                session, work, bibtex_key=entry.bibtex_key
-            )
+            payload = await reference_metadata_payload(session, work, bibtex_key=entry.bibtex_key)
             references.append(ReferenceMetadata(**payload))
 
     sections = [IRSection(**row.body_ir_json) for row in rows if row.body_ir_json]
@@ -314,7 +325,24 @@ async def markdown_preview(project_id: str, session: SessionDep) -> MarkdownResp
         bibliography=Bibliography(style=project.citation_style),  # type: ignore[arg-type]
     )
     ir.enforce_cite_key_whitelist(set(whitelist), strip=True)
-    markdown = render_markdown(ir, references=references, style=project.citation_style)
+    asset_urls: dict[str, str] = {}
+    for asset in await list_assets(session, project.id):
+        url = f"/api/v1/projects/{project.id}/assets/{asset.id}/download"
+        asset_urls[str(asset.id)] = url
+        asset_urls[f"ua_{str(asset.id)[:8]}"] = url
+    for visual in await list_visuals(session, project.id):
+        renditions = visual.renditions_json or {}
+        fmt = "png" if "png" in renditions else ("svg" if "svg" in renditions else None)
+        if fmt:
+            url = f"/api/v1/projects/{project.id}/visuals/{visual.id}/renditions/{fmt}"
+            asset_urls[str(visual.id)] = url
+            asset_urls[f"va_{str(visual.id)[:8]}"] = url
+    markdown = render_markdown(
+        ir,
+        references=references,
+        style=project.citation_style,
+        asset_urls=asset_urls,
+    )
     return MarkdownResponse(
         project_id=str(project.id),
         markdown=markdown,
@@ -334,9 +362,7 @@ def _sanitize_outline_tree(tree: dict[str, Any], whitelist: set[str]) -> dict[st
         sections.append(
             {
                 **section,
-                "cite_keys": [
-                    key for key in (section.get("cite_keys") or []) if key in whitelist
-                ],
+                "cite_keys": [key for key in (section.get("cite_keys") or []) if key in whitelist],
             }
         )
     return {**tree, "sections": sections}
@@ -374,17 +400,6 @@ def _count_words(text: str) -> int:
     cjk = len(re.findall(r"[一-鿿]", text))
     latin = len(re.findall(r"[A-Za-z][A-Za-z'-]*", text))
     return cjk + latin
-
-
-async def _require_project(session: AsyncSession, project_id: str) -> PaperProject:
-    try:
-        project_uuid = uuid.UUID(project_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    project = await get_project(session, project_uuid)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
 
 
 async def _enqueue(queue: ArqRedis | None, function: str, *args: Any, **kwargs: Any) -> None:
@@ -444,7 +459,17 @@ async def list_exports(project_id: str, session: SessionDep) -> list[ExportArtif
 
 
 @router.get("/projects/{project_id}/exports/{artifact_id}/download")
-async def download_export(project_id: str, artifact_id: str, session: SessionDep) -> Response:
+async def download_export(
+    project_id: str,
+    artifact_id: str,
+    session: SessionDep,
+    disposition: str = "attachment",
+) -> Response:
+    """取产物。``disposition=inline`` 供页内预览用。
+
+    预览与下载必须是两条不同的响应：`attachment` 会让 `<iframe src>` 变成一次
+    下载，于是「打开导出中心」等于「凭空下载一个文件」，而预览框永远是空的。
+    """
     project = await _require_project(session, project_id)
     try:
         artifact_uuid = uuid.UUID(artifact_id)
@@ -454,30 +479,113 @@ async def download_export(project_id: str, artifact_id: str, session: SessionDep
     if artifact is None or artifact.project_id != project.id or not artifact.object_key:
         raise HTTPException(status_code=404, detail="artifact not found")
 
-    store = FilesystemObjectStore(get_settings().storage_fs_root)
+    store = make_object_store(get_settings())
     try:
         data = store.get(artifact.object_key)
     except (FileNotFoundError, ValueError) as error:
         raise HTTPException(status_code=410, detail="artifact payload is gone") from error
 
     media_type, suffix = _MEDIA_TYPES.get(artifact.format, ("application/octet-stream", "bin"))
-    filename = f"paperforge-v{artifact.document_version or 1}.{suffix}"
+    mode = "inline" if disposition.lower() == "inline" else "attachment"
     return Response(
         content=data,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": _content_disposition(
+                mode,
+                export_filename(
+                    project.title,
+                    fmt=artifact.format,
+                    suffix=suffix,
+                    document_version=artifact.document_version,
+                    created_at=artifact.created_at,
+                ),
+            ),
+            # 产物按内容寻址（object_key 含 sha256 前缀），内容永不原地变化。
+            "Cache-Control": "private, max-age=3600",
+        },
     )
+
+
+_FORMAT_FILENAME_TAG = {
+    "compile_log": "编译日志",
+    "latex_zip": "latex",
+    "bibtex": "refs",
+}
+
+# 文件名里不许出现的字符：路径分隔符与 Windows 保留字符、控制字符、各类空白，
+# 以及中英文标点。中日韩文字与字母数字保留——中文标题正是要读得懂的那部分。
+_UNSAFE_FILENAME_CHARS = re.compile(
+    r'[\x00-\x1f\x7f<>:"/\\|?*\s.,;:!\'’“”，。；：！？、·（）()\[\]{}【】《》〈〉…]+'
+)
+MAX_FILENAME_STEM = 60
+
+
+def _slugify_title(title: str) -> str:
+    """标题 → 文件名主干。保留中日韩文字与字母数字，其余压成连字符。"""
+    cleaned = _UNSAFE_FILENAME_CHARS.sub("-", (title or "").strip())
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-.")
+    if len(cleaned) > MAX_FILENAME_STEM:
+        # 从右侧的连字符处截断，避免把词/短语切成半截。
+        head = cleaned[:MAX_FILENAME_STEM]
+        cut = head.rfind("-")
+        cleaned = (head[:cut] if cut >= MAX_FILENAME_STEM // 2 else head).strip("-")
+    return cleaned
+
+
+def export_filename(
+    title: str,
+    *,
+    fmt: str,
+    suffix: str,
+    document_version: int | None,
+    created_at: datetime | None = None,
+) -> str:
+    """可读文件名：`标题-v2-20260726.pdf`。
+
+    `paperforge-v1.pdf` 在下载目录里既认不出是哪篇论文，也认不出是哪一次导出——
+    同一天导出三次就是三个 `paperforge-v1(1).pdf`。
+    """
+    parts = [_slugify_title(title) or "paperforge"]
+    tag = _FORMAT_FILENAME_TAG.get(fmt)
+    if tag:
+        parts.append(tag)
+    parts.append(f"v{document_version or 1}")
+    if created_at is not None:
+        parts.append(created_at.strftime("%Y%m%d"))
+    return f"{'-'.join(parts)}.{suffix}"
+
+
+def _content_disposition(mode: str, filename: str) -> str:
+    """RFC 6266 / 5987 头部。
+
+    HTTP 头只能承载 latin-1，中文标题因此必须走 ``filename*``；``filename``
+    保留纯 ASCII 兜底（老浏览器与 curl -OJ）。把中文塞进 ``filename``
+    会让 ASGI 编码头部时直接抛 UnicodeEncodeError——下载整个 500。
+    """
+    ascii_fallback = re.sub(r"[^A-Za-z0-9._-]+", "-", filename)
+    ascii_fallback = re.sub(r"-{2,}", "-", ascii_fallback).strip("-.")
+    if not re.match(r"^[A-Za-z0-9]", ascii_fallback):
+        # 纯中文标题会被压成 `v2-20260726.pdf` 之类，加回可识别的前缀。
+        ascii_fallback = f"paperforge-{ascii_fallback}"
+    header = f'{mode}; filename="{ascii_fallback}"'
+    if filename != ascii_fallback:
+        header += f"; filename*=UTF-8''{quote(filename, safe='')}"
+    return header
 
 
 _MEDIA_TYPES = {
     "pdf": ("application/pdf", "pdf"),
     "latex_zip": ("application/zip", "zip"),
     "markdown": ("text/markdown; charset=utf-8", "md"),
+    "markdown_bundle": ("application/zip", "zip"),
     "bibtex": ("application/x-bibtex; charset=utf-8", "bib"),
     "docx": (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "docx",
     ),
+    # 编译日志要能在浏览器里直接打开看，不该强制下载成二进制。
+    "compile_log": ("text/plain; charset=utf-8", "log"),
 }
 
 

@@ -8,6 +8,7 @@ from paper_ir.schema import (
     CiteRun,
     EquationBlock,
     FigureBlock,
+    ListBlock,
     MathInlineRun,
     PaperIR,
     ParagraphBlock,
@@ -15,6 +16,7 @@ from paper_ir.schema import (
     TableBlock,
     TextRun,
     TodoBlock,
+    XRefRun,
 )
 
 from latex_render.escape import latex_escape, latex_identifier
@@ -30,15 +32,25 @@ MAX_TABLE_ROWS_IN_PDF = 40
 MAX_TABLE_COLUMNS_IN_PDF = 8
 
 
-def _render_run(run: TextRun | CiteRun | MathInlineRun) -> str:
+def _render_run(run: TextRun | CiteRun | MathInlineRun | XRefRun) -> str:
     if isinstance(run, TextRun):
-        return latex_escape(run.v)
+        # 强调是**结构化标记**，正文照常转义后再包命令——LLM 无法借此注入
+        # 任意 LaTeX（设计 §4.5：自由 LaTeX 只允许出现在 equation/algorithm）。
+        text = latex_escape(run.v)
+        for mark in run.marks:
+            if mark == "bold":
+                text = f"\\textbf{{{text}}}"
+            elif mark == "italic":
+                text = f"\\emph{{{text}}}"
+        return text
     if isinstance(run, CiteRun):
         # cite 是原子节点；key 白名单在写作期已保证（R2），此处仅确定性展开。
         keys = [latex_identifier(key, prefix="cite") for key in run.keys]
         return f"\\cite{{{','.join(keys)}}}" if keys else ""
     if isinstance(run, MathInlineRun):
         return f"${run.v}$"
+    if isinstance(run, XRefRun):
+        return f"\\ref{{{latex_identifier(run.target, prefix='fig')}}}"
     return ""
 
 
@@ -46,11 +58,7 @@ def _render_block(block, assets: Mapping[str, dict[str, Any]] | None = None) -> 
     if isinstance(block, ParagraphBlock):
         return "".join(_render_run(r) for r in block.runs)
     if isinstance(block, EquationBlock):
-        label = (
-            f"\n\\label{{{latex_identifier(block.label, prefix='eq')}}}"
-            if block.label
-            else ""
-        )
+        label = f"\n\\label{{{latex_identifier(block.label, prefix='eq')}}}" if block.label else ""
         return f"\\begin{{equation}}{label}\n{block.latex}\n\\end{{equation}}"
     if isinstance(block, FigureBlock):
         return _render_figure(block, assets or {})
@@ -61,6 +69,14 @@ def _render_block(block, assets: Mapping[str, dict[str, Any]] | None = None) -> 
     if isinstance(block, TodoBlock):
         # 纯生成模式：实验结果以显式占位符呈现，不编造数据（产品红线）。
         return f"\\todo{{{latex_escape(block.text)}}}"
+    if isinstance(block, ListBlock):
+        env = "enumerate" if block.ordered else "itemize"
+        if not block.items:
+            return ""
+        items = "\n".join(
+            f"  \\item {''.join(_render_run(r) for r in item.runs)}" for item in block.items
+        )
+        return f"\\begin{{{env}}}\n{items}\n\\end{{{env}}}"
     return ""
 
 
@@ -68,20 +84,20 @@ def _render_figure(block: FigureBlock, assets: Mapping[str, dict[str, Any]]) -> 
     asset = assets.get(block.asset_ref) or {}
     path = str(asset.get("figure_path") or asset.get("filename") or "")
     caption = latex_escape(block.caption)
-    label = (
-        f"\n  \\label{{{latex_identifier(block.label, prefix='fig')}}}" if block.label else ""
-    )
+    label = f"\n  \\label{{{latex_identifier(block.label, prefix='fig')}}}" if block.label else ""
+    environment = "figure*" if block.width == "full" else "figure"
+    image_width = "\\textwidth" if block.width == "full" else "\\linewidth"
     if not path:
         # 素材缺失：显式占位，绝不 \includegraphics 一个不存在的文件（编译必挂）。
         return (
-            "\\begin{figure}[t]\n  \\centering\n"
+            f"\\begin{{{environment}}}[t]\n  \\centering\n"
             f"  \\todo{{缺少图片素材：{latex_escape(block.asset_ref)}}}\n"
-            f"  \\caption{{{caption}}}{label}\n\\end{{figure}}"
+            f"  \\caption{{{caption}}}{label}\n\\end{{{environment}}}"
         )
     return (
-        "\\begin{figure}[t]\n  \\centering\n"
-        f"  \\includegraphics[width=\\linewidth]{{{path}}}\n"
-        f"  \\caption{{{caption}}}{label}\n\\end{{figure}}"
+        f"\\begin{{{environment}}}[t]\n  \\centering\n"
+        f"  \\includegraphics[width={image_width}]{{{path}}}\n"
+        f"  \\caption{{{caption}}}{label}\n\\end{{{environment}}}"
     )
 
 
@@ -92,9 +108,7 @@ def _render_table(block: TableBlock, assets: Mapping[str, dict[str, Any]]) -> st
     天然 100% 一致；LLM 无法在此处改动任何数值。
     """
     caption = latex_escape(block.caption)
-    label = (
-        f"\n  \\label{{{latex_identifier(block.label, prefix='tab')}}}" if block.label else ""
-    )
+    label = f"\n  \\label{{{latex_identifier(block.label, prefix='tab')}}}" if block.label else ""
     ref = block.source.ref or ""
     asset = assets.get(ref) or {}
     headers = [str(h) for h in (asset.get("headers") or [])][:MAX_TABLE_COLUMNS_IN_PDF]

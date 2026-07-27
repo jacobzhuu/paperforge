@@ -136,9 +136,7 @@ def test_plan_orders_persisted_pdf_then_arxiv_then_pmc() -> None:
 def test_plan_records_works_without_oa_candidate() -> None:
     plan = plan_oa_fulltext([OaFulltextTarget(work_id="w-2", doi="10.1000/closed")])
     assert plan.candidates == ()
-    assert plan.diagnostics["skipped"] == [
-        {"work_id": "w-2", "reason": "no_oa_pdf_candidate"}
-    ]
+    assert plan.diagnostics["skipped"] == [{"work_id": "w-2", "reason": "no_oa_pdf_candidate"}]
 
 
 def test_acquire_stops_at_first_success_per_work() -> None:
@@ -148,9 +146,7 @@ def test_acquire_stops_at_first_success_per_work() -> None:
         calls.append(str(request.url))
         return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
 
-    plan = plan_oa_fulltext(
-        [OaFulltextTarget(work_id="w-1", arxiv_id="2401.01234", pmcid="PMC1")]
-    )
+    plan = plan_oa_fulltext([OaFulltextTarget(work_id="w-1", arxiv_id="2401.01234", pmcid="PMC1")])
     result = acquire_oa_fulltext(
         plan,
         http_client=_client(

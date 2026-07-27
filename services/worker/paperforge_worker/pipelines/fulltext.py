@@ -97,11 +97,11 @@ async def acquire_fulltexts(
     outcome.acquired = len(result.documents)
     outcome.failures = list(result.failures)
 
-    from storage import FilesystemObjectStore
+    from storage import make_object_store
 
-    store = FilesystemObjectStore(context.settings.storage_fs_root)
+    store = make_object_store(context.settings)
     for document in result.documents:
-        key = f"works/{document.work_id}/fulltext-{document.content_hash[:12]}.bin"
+        key = f"shared/oa/works/{document.work_id}/fulltext-{document.content_hash[:12]}.bin"
         store.put(key, document.content)
         async with context.session() as session:
             session.add(
@@ -123,9 +123,7 @@ async def acquire_fulltexts(
             continue
         # 只保留可用于卡片抽取的块：参考文献段与导航噪声不该占用长上下文预算。
         usable = [
-            chunk.text
-            for chunk in chunks
-            if assess_chunk_quality(text=chunk.text).usable_for_cards
+            chunk.text for chunk in chunks if assess_chunk_quality(text=chunk.text).usable_for_cards
         ]
         text = "\n\n".join(usable)[:MAX_FULLTEXT_CHARS]
         if text:

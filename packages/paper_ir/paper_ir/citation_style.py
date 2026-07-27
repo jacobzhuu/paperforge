@@ -30,12 +30,7 @@ def format_scholarly_reference(
 
 def normalize_citation_style(value: str | None) -> CitationStyle:
     raw = (value or "author_year").strip().lower()
-    compact = (
-        raw.replace("-", "")
-        .replace("_", "")
-        .replace("/", "")
-        .replace(" ", "")
-    )
+    compact = raw.replace("-", "").replace("_", "").replace("/", "").replace(" ", "")
     if compact in {"gbt7714", "gb7714"}:
         return "gbt7714"
     if compact == "apa":

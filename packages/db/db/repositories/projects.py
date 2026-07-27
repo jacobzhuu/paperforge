@@ -39,7 +39,7 @@ async def create_project(
     venue_template: str | None = None,
     citation_style: str = "author_year",
     contribution_points: list[str] | None = None,
-    owner_id: str | None = None,
+    owner_id: uuid.UUID,
 ) -> PaperProject:
     """创建项目。枚举值非法时抛 ValueError（API 转 422）。"""
     if paper_type not in PAPER_TYPES:
@@ -79,16 +79,105 @@ async def get_project(session: AsyncSession, project_id: uuid.UUID) -> PaperProj
     return await session.get(PaperProject, project_id)
 
 
+async def get_owned_project(
+    session: AsyncSession, project_id: uuid.UUID, owner_id: uuid.UUID
+) -> PaperProject | None:
+    return await session.scalar(
+        select(PaperProject).where(
+            PaperProject.id == project_id,
+            PaperProject.owner_id == owner_id,
+        )
+    )
+
+
 async def list_projects(
     session: AsyncSession,
     *,
-    owner_id: str | None = None,
+    owner_id: uuid.UUID,
     limit: int = 100,
 ) -> list[PaperProject]:
     stmt = select(PaperProject).order_by(PaperProject.created_at.desc()).limit(limit)
-    if owner_id is not None:
-        stmt = stmt.where(PaperProject.owner_id == owner_id)
+    stmt = stmt.where(PaperProject.owner_id == owner_id)
     return list((await session.scalars(stmt)).all())
+
+
+#: `update_project` 里「不传就是不改」的哨兵。
+#: 不能用 None 当哨兵——`topic=None` 是合法的「清空主题」，与「别动主题」不是一回事。
+_UNSET: Any = object()
+
+
+async def update_project(
+    session: AsyncSession,
+    project: PaperProject,
+    *,
+    title: str | None = _UNSET,
+    topic: str | None = _UNSET,
+    venue_template: str | None = _UNSET,
+    language: str | None = _UNSET,
+    citation_style: str | None = _UNSET,
+    writing_mode: str | None = _UNSET,
+    contribution_points: list[str] | None = _UNSET,
+) -> PaperProject:
+    """
+    局部更新项目元数据。枚举值非法时抛 ValueError（API 转 422）。
+
+    **不允许改 `paper_type`**：论文类型决定管线形状（`apps/web/lib/pipeline.ts` 的
+    REVIEW_FLOW / ORIGINAL_FLOW）、大纲结构（IMRaD vs 主题章）与是否做数字一致性
+    lint。项目一旦有了文献、大纲或正文，中途换类型只会得到一份自相矛盾的稿子——
+    那是「新建一个项目」，不是「改一个字段」。
+
+    topic / contribution_points 落在 `scope_json` 里而不是独立列，与 `create_project`
+    保持一致；这里做的是**合并**而非整体替换，避免把 SCOPE 生成出来的关键词矩阵
+    连带清空（那是 `update_project_scope` 的职责）。
+    """
+    # title 与 topic 不同：topic=None 是「清空主题」，title=None 是非法的——
+    # 论文永远得有个题目。两者都会走到这里，所以必须分别判。
+    if title is not _UNSET:
+        if title is None or not title.strip():
+            raise ValueError("project title must not be empty")
+        project.title = title.strip()
+    if language is not _UNSET:
+        if language not in LANGUAGES:
+            raise ValueError(f"unsupported language: {language}")
+        project.language = language
+    if citation_style is not _UNSET:
+        if citation_style not in CITATION_STYLES:
+            raise ValueError(f"unsupported citation_style: {citation_style}")
+        project.citation_style = citation_style
+    if writing_mode is not _UNSET:
+        if writing_mode not in WRITING_MODES:
+            raise ValueError(f"unsupported writing_mode: {writing_mode}")
+        project.writing_mode = writing_mode
+    if venue_template is not _UNSET:
+        project.venue_template = venue_template
+
+    if topic is not _UNSET or contribution_points is not _UNSET:
+        scope = dict(project.scope_json or {})
+        if topic is not _UNSET:
+            if topic and topic.strip():
+                scope["topic"] = topic.strip()
+            else:
+                scope.pop("topic", None)
+        if contribution_points is not _UNSET:
+            points = [p.strip() for p in (contribution_points or []) if p.strip()]
+            if points:
+                scope["contribution_points"] = points
+            else:
+                scope.pop("contribution_points", None)
+        # 赋新 dict 而不是原地改：scope_json 是 JSON 列，原地 mutate SQLAlchemy 检测不到。
+        project.scope_json = scope or None
+
+    await session.flush()
+    # 必须 refresh 而不是只 flush。
+    #
+    # `TimestampMixin.updated_at` 带 `onupdate=func.now()`——这是**服务端**求值的，
+    # 所以 UPDATE 落库后 SQLAlchemy 会把该属性标记为 expired 等待回读。之后任何一次
+    # `project.updated_at` 都是**同步**属性访问触发的隐式 IO，在 asyncpg 下直接
+    # 抛 MissingGreenlet（实测：PATCH 端点构造响应时必炸）。
+    # INSERT 路径没这个问题（服务端默认值走 RETURNING 一次取回），所以
+    # `create_project` 不需要这一步。
+    await session.refresh(project)
+    return project
 
 
 async def update_project_scope(

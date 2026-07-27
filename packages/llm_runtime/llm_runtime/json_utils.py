@@ -100,16 +100,11 @@ def _audit_cite_keys(
         for key, value in list(data.items()):
             child_path = f"{path}.{key}" if path else key
             is_paper_ir_cite_keys = key == "keys" and data.get("t") == "cite"
-            if (
-                (key in _CITE_KEY_LIST_KEYS or is_paper_ir_cite_keys)
-                and isinstance(value, list)
-            ):
+            if (key in _CITE_KEY_LIST_KEYS or is_paper_ir_cite_keys) and isinstance(value, list):
                 normalized = [str(item) for item in value]
                 rejected = tuple(item for item in normalized if item not in allowed)
                 if rejected:
-                    violations.append(
-                        CiteKeyViolation(path=child_path, rejected_keys=rejected)
-                    )
+                    violations.append(CiteKeyViolation(path=child_path, rejected_keys=rejected))
                 if strip:
                     data[key] = [item for item in normalized if item in allowed]
             else:

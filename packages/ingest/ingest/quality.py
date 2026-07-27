@@ -126,12 +126,7 @@ def assess_chunk_quality(
         reasons.append("too_short")
 
     score = max(0.0, min(1.0, density * 0.6 + relevance * 0.3 - boilerplate * 0.4 + 0.1))
-    usable = (
-        not is_reference
-        and not is_navigation
-        and len(normalized) >= 40
-        and score >= 0.2
-    )
+    usable = not is_reference and not is_navigation and len(normalized) >= 40 and score >= 0.2
     if not usable and not reasons:
         reasons.append("low_information_density")
 

@@ -136,9 +136,7 @@ def test_asset_kind_inference(filename: str, expected: str) -> None:
 
 
 def test_declared_kind_wins_over_inference() -> None:
-    assert (
-        infer_asset_kind(filename="x.csv", mime_type="text/csv", declared="dataset") == "dataset"
-    )
+    assert infer_asset_kind(filename="x.csv", mime_type="text/csv", declared="dataset") == "dataset"
 
 
 @pytest.mark.parametrize(

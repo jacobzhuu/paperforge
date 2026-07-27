@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # PaperIR：结构化论文中间表示（方案 §4.5）。
 # 继承旧系统「渲染器只消费 IR、不消费 LLM 原始输出」的原则，面向 LaTeX 重新设计。
@@ -13,9 +13,17 @@ CitationStyleName = Literal["gbt7714", "ieee", "apa", "author_year"]
 
 
 # ---- 行内 run（段落内的原子片段）----
+
+# 行内强调。刻意只有两种，且是**结构化标记**而不是 LLM 写的自由 LaTeX：
+# 渲染器据此确定性展开 \textbf{} / \emph{}，正文内容照常转义。
+# 这样编辑器可以提供加粗/斜体而不破坏「LLM 不书写 LaTeX」的边界（设计 §4.5）。
+TextMark = Literal["bold", "italic"]
+
+
 class TextRun(BaseModel):
     t: Literal["text"] = "text"
     v: str
+    marks: list[TextMark] = Field(default_factory=list)
 
 
 class CiteRun(BaseModel):
@@ -28,7 +36,15 @@ class MathInlineRun(BaseModel):
     v: str
 
 
-Run = TextRun | CiteRun | MathInlineRun
+class XRefRun(BaseModel):
+    """对结构化图表标签的稳定交叉引用。"""
+
+    t: Literal["xref"] = "xref"
+    target: str
+    kind: Literal["figure"] = "figure"
+
+
+Run = TextRun | CiteRun | MathInlineRun | XRefRun
 
 
 # ---- 块级元素 ----
@@ -47,7 +63,9 @@ class FigureBlock(BaseModel):
     type: Literal["figure"] = "figure"
     asset_ref: str
     caption: str = ""
+    alt_text: str = ""
     label: str | None = None
+    width: Literal["column", "full"] = "column"
 
 
 class TableSource(BaseModel):
@@ -75,6 +93,20 @@ class TodoBlock(BaseModel):
     text: str = "待补充实验数据"
 
 
+class ListItem(BaseModel):
+    """列表项：与段落同构，因此项内同样可以有引用与行内公式。"""
+
+    runs: list[Run] = Field(default_factory=list)
+
+
+class ListBlock(BaseModel):
+    """无序 / 有序列表。渲染为 itemize / enumerate。"""
+
+    type: Literal["list"] = "list"
+    ordered: bool = False
+    items: list[ListItem] = Field(default_factory=list)
+
+
 Block = (
     ParagraphBlock
     | EquationBlock
@@ -82,6 +114,7 @@ Block = (
     | TableBlock
     | AlgorithmBlock
     | TodoBlock
+    | ListBlock
 )
 
 
@@ -122,21 +155,57 @@ class Bibliography(BaseModel):
     entries_from: Literal["library"] = "library"
 
 
+def _run_containers(block: Block) -> list[tuple[str, list[Run]]]:
+    """块内所有承载 run 的容器，附带用于 violation path 的下标后缀。
+
+    新增可含 run 的块类型时**必须**在这里登记，否则 R2 白名单校验会漏掉它。
+    """
+    if isinstance(block, ParagraphBlock):
+        return [("", block.runs)]
+    if isinstance(block, ListBlock):
+        return [(f".items[{index}]", item.runs) for index, item in enumerate(block.items)]
+    return []
+
+
 class PaperIR(BaseModel):
     meta: PaperMeta
     sections: list[Section] = Field(default_factory=list)
     bibliography: Bibliography = Field(default_factory=Bibliography)
 
+    @model_validator(mode="after")
+    def labels_are_unique(self) -> PaperIR:
+        labels: set[str] = set()
+        for section in self.sections:
+            for block in section.blocks:
+                label = getattr(block, "label", None)
+                if not label:
+                    continue
+                if label in labels:
+                    raise ValueError(f"duplicate PaperIR label: {label}")
+                labels.add(label)
+        return self
+
     def collect_cite_keys(self) -> set[str]:
-        """遍历所有段落，收集用到的 cite keys（供 R2 白名单审计）。"""
+        """遍历所有承载 run 的块，收集用到的 cite keys（供 R2 白名单审计）。"""
         keys: set[str] = set()
         for section in self.sections:
             for block in section.blocks:
-                if isinstance(block, ParagraphBlock):
-                    for run in block.runs:
+                for _, runs in _run_containers(block):
+                    for run in runs:
                         if isinstance(run, CiteRun):
                             keys.update(run.keys)
         return keys
+
+    def collect_asset_refs(self) -> set[str]:
+        """收集图与表使用的素材引用，供持久化、导出与删除保护使用。"""
+        refs: set[str] = set()
+        for section in self.sections:
+            for block in section.blocks:
+                if isinstance(block, FigureBlock) and block.asset_ref:
+                    refs.add(block.asset_ref)
+                elif isinstance(block, TableBlock) and block.source.ref:
+                    refs.add(block.source.ref)
+        return refs
 
     def enforce_cite_key_whitelist(
         self,
@@ -153,29 +222,30 @@ class PaperIR(BaseModel):
         violations: list[PaperIRCiteKeyViolation] = []
         for section_index, section in enumerate(self.sections):
             for block_index, block in enumerate(section.blocks):
-                if not isinstance(block, ParagraphBlock):
-                    continue
-                for run_index, run in enumerate(block.runs):
-                    if not isinstance(run, CiteRun):
-                        continue
-                    rejected = tuple(key for key in run.keys if key not in allowed_cite_keys)
-                    if not rejected:
-                        continue
-                    path = (
-                        f"sections[{section_index}].blocks[{block_index}]"
-                        f".runs[{run_index}].keys"
-                    )
-                    violation = PaperIRCiteKeyViolation(
-                        path=path,
-                        rejected_keys=rejected,
-                    )
-                    violations.append(violation)
-                    if strip:
-                        run.keys = [key for key in run.keys if key in allowed_cite_keys]
-                        section.citation_warnings.append(
-                            CitationWarning(
-                                path=path,
-                                rejected_keys=rejected,
-                            )
+                # 列表项里的引用同样要过白名单——只查 ParagraphBlock 会给
+                # R2 留一个绕过口子。
+                for suffix, runs in _run_containers(block):
+                    for run_index, run in enumerate(runs):
+                        if not isinstance(run, CiteRun):
+                            continue
+                        rejected = tuple(key for key in run.keys if key not in allowed_cite_keys)
+                        if not rejected:
+                            continue
+                        path = (
+                            f"sections[{section_index}].blocks[{block_index}]"
+                            f"{suffix}.runs[{run_index}].keys"
                         )
+                        violation = PaperIRCiteKeyViolation(
+                            path=path,
+                            rejected_keys=rejected,
+                        )
+                        violations.append(violation)
+                        if strip:
+                            run.keys = [key for key in run.keys if key in allowed_cite_keys]
+                            section.citation_warnings.append(
+                                CitationWarning(
+                                    path=path,
+                                    rejected_keys=rejected,
+                                )
+                            )
         return violations

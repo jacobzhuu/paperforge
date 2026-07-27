@@ -26,9 +26,7 @@ async def create_outline(
     if status not in OUTLINE_STATUSES:
         raise ValueError(f"unsupported outline status: {status}")
     current = await session.scalar(
-        select(func.coalesce(func.max(Outline.version), 0)).where(
-            Outline.project_id == project_id
-        )
+        select(func.coalesce(func.max(Outline.version), 0)).where(Outline.project_id == project_id)
     )
     outline = Outline(
         project_id=project_id,
@@ -180,9 +178,7 @@ async def replace_citation_usage(
     usages: list[dict[str, Any]],
 ) -> int:
     """重写某章节的引用使用记录（引用审计页的数据源）。"""
-    await session.execute(
-        delete(CitationUsage).where(CitationUsage.section_id == section_id)
-    )
+    await session.execute(delete(CitationUsage).where(CitationUsage.section_id == section_id))
     for usage in usages:
         session.add(
             CitationUsage(

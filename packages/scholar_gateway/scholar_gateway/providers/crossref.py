@@ -56,9 +56,7 @@ class CrossrefDiscoveryAdapter(HttpScholarlyDiscoveryAdapter):
             if isinstance(item, dict)
             if (mapped := candidate_from_crossref_item(query, item, retrieved)) is not None
         )
-        hit_count = (
-            int_or_none(message.get("total-results")) if isinstance(message, dict) else None
-        )
+        hit_count = int_or_none(message.get("total-results")) if isinstance(message, dict) else None
         return ScholarlyDiscoveryResult(
             provider_name=self.provider_name,
             query=query,

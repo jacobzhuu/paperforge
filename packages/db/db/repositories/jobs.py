@@ -15,7 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.paper import GenerationJob, JobEvent, LlmCallLog
 
-JOB_KINDS = frozenset({"search", "ingest", "cards", "outline", "write", "compile", "full"})
+JOB_KINDS = frozenset(
+    {"search", "ingest", "cards", "outline", "write", "compile", "visual", "full"}
+)
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
 
 
@@ -93,17 +95,11 @@ async def update_job(
 
 def lock_generation_job_stmt(job_id: uuid.UUID) -> Select:
     """Serialize event sequence allocation per generation job."""
-    return (
-        select(GenerationJob.id)
-        .where(GenerationJob.id == job_id)
-        .with_for_update()
-    )
+    return select(GenerationJob.id).where(GenerationJob.id == job_id).with_for_update()
 
 
 def next_job_event_seq_stmt(job_id: uuid.UUID) -> Select:
-    return select(func.coalesce(func.max(JobEvent.seq), 0) + 1).where(
-        JobEvent.job_id == job_id
-    )
+    return select(func.coalesce(func.max(JobEvent.seq), 0) + 1).where(JobEvent.job_id == job_id)
 
 
 async def append_job_event(

@@ -5,7 +5,52 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+class LoginRequest(BaseModel):
+    # Kept as `email` for API compatibility, but development also accepts the
+    # local username `admin` when AUTH_DEV_LOGIN_ENABLED is enabled.
+    email: str = Field(min_length=1, max_length=320)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class TokenRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(TokenRequest):
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AuthMessageResponse(BaseModel):
+    message: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    display_name: str | None = None
+    email_verified: bool
+
+
+class LoginResponse(BaseModel):
+    user: UserResponse
 
 PaperType = Literal["review", "original"]
 WritingMode = Literal["auto", "assisted"]
@@ -23,6 +68,24 @@ class CreateProjectRequest(BaseModel):
     venue_template: str | None = None
     citation_style: CitationStyle = "author_year"
     contribution_points: list[str] = Field(default_factory=list)
+
+
+class UpdateProjectRequest(BaseModel):
+    """
+    项目元数据的局部更新。所有字段可选，**未出现的字段不改**
+    （靠 `model_fields_set` 区分「没传」与「传了 null」——后者是合法的清空）。
+
+    刻意不含 `paper_type`：论文类型决定管线形状、大纲结构与是否做数字一致性 lint，
+    中途改只会得到自相矛盾的稿子。换类型 = 新建项目。
+    """
+
+    title: str | None = None
+    topic: str | None = None
+    venue_template: str | None = None
+    language: Language | None = None
+    citation_style: CitationStyle | None = None
+    writing_mode: WritingMode | None = None
+    contribution_points: list[str] | None = None
 
 
 class ProjectResponse(BaseModel):
@@ -219,8 +282,17 @@ class MarkdownResponse(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    formats: list[Literal["pdf", "latex_zip", "markdown", "bibtex", "docx"]] = Field(
-        default_factory=lambda: ["pdf", "latex_zip", "markdown", "bibtex", "docx"]
+    formats: list[Literal["pdf", "latex_zip", "markdown", "markdown_bundle", "bibtex", "docx"]] = (
+        Field(
+            default_factory=lambda: [
+                "pdf",
+                "latex_zip",
+                "markdown",
+                "markdown_bundle",
+                "bibtex",
+                "docx",
+            ]
+        )
     )
 
 
@@ -252,6 +324,64 @@ class AssetResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     # asset_ref 供大纲/章节引用素材（渲染期确定性展开）。
     asset_ref: str | None = None
+
+
+# ---- M8：视觉建议 / 生成 / 审核 ----
+
+
+class CreateVisualRequest(BaseModel):
+    spec: dict[str, Any]
+    title: str | None = None
+    caption: str = ""
+    alt_text: str = ""
+    target_section_key: str | None = None
+    suggested_block_index: int | None = None
+
+
+class UpdateVisualRequest(BaseModel):
+    spec: dict[str, Any] | None = None
+    title: str | None = None
+    caption: str | None = None
+    alt_text: str | None = None
+    target_section_key: str | None = None
+    suggested_block_index: int | None = None
+
+
+class ApproveVisualRequest(BaseModel):
+    section_key: str
+    block_index: int
+
+
+class RegenerateVisualRequest(BaseModel):
+    spec: dict[str, Any] | None = None
+    caption: str | None = None
+    alt_text: str | None = None
+
+
+class VisualResponse(BaseModel):
+    id: str
+    asset_ref: str
+    kind: str
+    generation_status: str
+    review_status: str
+    title: str | None = None
+    caption: str = ""
+    caption_hint: str | None = None
+    alt_text: str = ""
+    target_section_key: str | None = None
+    suggested_block_index: int | None = None
+    figure_label: str
+    spec: dict[str, Any]
+    provider: str | None = None
+    model: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    renditions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    input_hash: str
+    content_hash: str | None = None
+    version: int = 1
+    supersedes_id: str | None = None
+    created_at: datetime | None = None
 
 
 class NumLintResponse(BaseModel):
@@ -327,14 +457,18 @@ class SettingsResponse(BaseModel):
     """运行时配置概览。密钥永不回传，只报告是否已配置。"""
 
     llm_provider: str
-    llm_base_url: str
     llm_api_key_configured: bool = False
     llm_enabled: bool = False
     roles: list[RoleModelResponse] = Field(default_factory=list)
-    scholar_contact_email: str | None = None
+    scholar_contact_email_configured: bool = False
     semantic_scholar_key_configured: bool = False
     storage_backend: str = "filesystem"
-    texd_url: str = ""
+    visuals_enabled: bool = True
+    ai_images_enabled: bool = False
+    image_provider: str = ""
+    image_model: str = ""
+    image_api_key_configured: bool = False
+    image_provider_configured: bool = False
 
 
 class OutlineVersionResponse(BaseModel):

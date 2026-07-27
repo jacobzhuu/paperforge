@@ -31,7 +31,10 @@
 
 {{ body }}
 
-{% if has_bibliography %}\IfFileExists{gbt7714.sty}{\bibliographystyle{gbt7714-numerical}}{\bibliographystyle{unsrt}}
+{% if has_bibliography %}%% gbt7714 宏包自己会发 \bibliographystyle{gbt7714-numerical}；这里再发一次
+%% 就是 .aux 里的第二个 \bibstyle，BibTeX 会报
+%% 「Illegal, another \bibstyle command」。所以只在宏包缺失时才补 unsrt。
+\IfFileExists{gbt7714.sty}{}{\bibliographystyle{unsrt}}
 \bibliography{refs}
 {% endif %}
 \end{document}

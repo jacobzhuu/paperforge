@@ -252,9 +252,7 @@ def _verify_by_title(
             "title": title,
             "checked_candidates": checked,
             "best_similarity": round(best[0], 4) if best else None,
-            "reason": (
-                "no candidate reached the 0.90 title threshold with agreeing author/year"
-            ),
+            "reason": ("no candidate reached the 0.90 title threshold with agreeing author/year"),
         },
     )
 

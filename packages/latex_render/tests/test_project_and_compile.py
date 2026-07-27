@@ -12,11 +12,15 @@ from latex_render import (
     TEMPLATES,
     CompileOutcome,
     TexdClient,
+    bibliography_broken,
     build_latex_project,
     compile_with_repair,
     deterministic_repairs,
     error_context,
+    render_inline_bibliography,
     resolve_template,
+    template_fallback_warning,
+    with_inline_bibliography,
 )
 from paper_ir import (
     CiteRun,
@@ -79,6 +83,17 @@ def test_project_splits_sections_and_inputs_them() -> None:
     assert "\\section{Introduction}" in project.files[section_files[0]]
 
 
+def test_project_carries_binary_figures_without_text_coercion() -> None:
+    png = b"\x89PNG\r\n\x1a\ncontent"
+    project = build_latex_project(
+        _ir(), references=[_ref()], figure_files={"figures/result.png": png}
+    )
+    assert project.binary_files == {"figures/result.png": png}
+    payload = project.to_payload()
+    assert payload["text_files"]["main.tex"] == project.files["main.tex"]
+    assert "figures/result.png" in payload["binary_files"]
+
+
 def test_special_characters_are_escaped_in_body_and_title() -> None:
     project = build_latex_project(_ir(), references=[_ref()])
     body = project.files["sections/00-s1.tex"]
@@ -132,8 +147,7 @@ def test_unknown_template_falls_back_to_article() -> None:
 def test_missing_package_is_dropped_not_fatal() -> None:
     files = {
         "main.tex": (
-            "\\documentclass{article}\n\\usepackage{gbt7714}\n"
-            "\\begin{document}x\\end{document}"
+            "\\documentclass{article}\n\\usepackage{gbt7714}\n\\begin{document}x\\end{document}"
         )
     }
     log = "LaTeX Error: File `gbt7714.sty' not found."
@@ -258,3 +272,164 @@ def test_texd_unreachable_degrades_instead_of_raising() -> None:
     # Draft-first：编译服务挂了也返回结构化结果，交付工程 + 日志。
     assert not result.ok
     assert "unreachable" in result.log
+
+
+def test_texd_client_sends_binary_files_as_separate_base64_channel() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        payload = json.loads(request.content)
+        assert payload["text_files"] == {"main.tex": "x"}
+        assert payload["binary_files"]["figures/a.png"] == "iVBORw0KGgpyZXN0"
+        return httpx.Response(
+            200,
+            json={"ok": True, "log": "ok", "pdf_base64": "JVBERi0="},
+        )
+
+    client = TexdClient(
+        "http://texd.invalid",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = client.compile(
+        {"main.tex": "x"},
+        binary_files={"figures/a.png": b"\x89PNG\r\n\x1a\nrest"},
+    )
+    assert result.ok
+
+
+# ---- 书目兜底：编译「成功」但引用全是 [?] 的那类静默失败 ----
+
+# 沙箱缓存只读时 Tectonic 的真实日志形状（compile_log-5bbfdbb52102.log）。
+_BST_FAILURE_LOG = """note: Running TeX ...
+note: Running BibTeX on main.aux ...
+note: downloading unsrt.bst
+note: Rerunning TeX because bibtex was run ...
+warning: open of input unsrt.bst failed
+caused by: couldn't open /root/.cache/Tectonic/bundles/data/x/unsrt.bst-tmp-pid12 for writing
+caused by: Read-only file system (os error 30)
+warning: errors were issued by BibTeX, but were ignored.
+"""
+
+
+def test_bibliography_broken_detects_bst_failure_and_undefined_citations() -> None:
+    assert bibliography_broken(_BST_FAILURE_LOG)
+    assert bibliography_broken("LaTeX Warning: Citation `lewis2020retrieval' on page 3 undefined")
+    assert bibliography_broken("I couldn't open style file unsrt.bst")
+    assert not bibliography_broken("note: Running TeX ...\nnote: Writing `main.pdf`")
+
+
+def test_benign_bibtex_error_does_not_count_as_a_broken_bibliography() -> None:
+    """BibTeX 报错 ≠ 书目没排出来。
+
+    实测：gbt7714 模板重复发 `\\bibstyle` 会让 BibTeX 报一个 error，但 .bbl 完好、
+    PDF 里 `[1] [2]` 一切正常。凭这行降级，会把投稿方 .bst 的排版换成内联兜底，
+    还挂上一个假的「降级」告警。
+    """
+    log = (
+        "note: Running BibTeX on main.aux ...\n"
+        "warning: errors were issued by BibTeX, but were ignored; use --print for details.\n"
+    )
+    assert not bibliography_broken(log)
+
+
+def test_inline_bibliography_replaces_bibliography_command_only() -> None:
+    # gbt7714 模板把 \bibliographystyle 包在 \IfFileExists 的分支里：动它会吃掉右花括号。
+    main = (
+        "\\IfFileExists{gbt7714.sty}{\\bibliographystyle{gbt7714-numerical}}"
+        "{\\bibliographystyle{unsrt}}\n\\bibliography{refs}\n\\end{document}"
+    )
+    block = "\\begin{thebibliography}{9}\n x \n\\end{thebibliography}"
+    patched = with_inline_bibliography({"main.tex": main}, block)
+    assert patched is not None
+    assert "\\bibliography{refs}" not in patched["main.tex"]
+    assert "{\\bibliographystyle{gbt7714-numerical}}" in patched["main.tex"]
+    assert "thebibliography" in patched["main.tex"]
+
+
+def test_inline_bibliography_returns_none_when_nothing_to_replace() -> None:
+    assert with_inline_bibliography({"main.tex": "no bibliography here"}, "block") is None
+    assert with_inline_bibliography({"main.tex": "\\bibliography{refs}"}, "") is None
+
+
+def test_compile_falls_back_to_inline_bibliography_when_bibtex_fails() -> None:
+    """编译 ok 但书目坏了，也必须重编——否则交付的是一篇全 [?] 的 PDF。"""
+    client = _StubTexd(
+        [
+            CompileOutcome(ok=True, pdf=b"%PDF-broken-refs", log=_BST_FAILURE_LOG),
+            CompileOutcome(ok=True, pdf=b"%PDF-good", log="note: Writing `main.pdf`"),
+        ]
+    )
+    result = compile_with_repair(
+        {"main.tex": "x\\bibliographystyle{unsrt}\n\\bibliography{refs}"},
+        client=client,
+        inline_bibliography="\\begin{thebibliography}{9}\n\\bibitem{a} A\n\\end{thebibliography}",
+    )
+    assert result.ok
+    assert result.bibliography_ok
+    assert result.pdf == b"%PDF-good"
+    assert result.repairs[-1]["kind"] == "inline_bibliography"
+    assert "thebibliography" in client.calls[-1]["main.tex"]
+
+
+def test_inline_bibliography_fallback_is_rejected_if_it_breaks_the_build() -> None:
+    """兜底把原本能过的编译搞挂时，保留原成品——降级不该变成回退。"""
+    client = _StubTexd(
+        [
+            CompileOutcome(ok=True, pdf=b"%PDF-broken-refs", log=_BST_FAILURE_LOG),
+            CompileOutcome(ok=False, log="! Emergency stop"),
+        ]
+    )
+    result = compile_with_repair(
+        {"main.tex": "x\\bibliography{refs}"},
+        client=client,
+        inline_bibliography="\\begin{thebibliography}{9}\n\\bibitem{a} A\n\\end{thebibliography}",
+    )
+    assert result.ok
+    assert result.pdf == b"%PDF-broken-refs"
+    assert not result.bibliography_ok  # 静默失败必须留痕，交给上层报警
+    assert not result.repairs
+
+
+def test_compile_without_fallback_reports_broken_bibliography() -> None:
+    client = _StubTexd([CompileOutcome(ok=True, pdf=b"%PDF", log=_BST_FAILURE_LOG)])
+    result = compile_with_repair({"main.tex": "x\\bibliography{refs}"}, client=client)
+    assert result.ok
+    assert not result.bibliography_ok
+    assert len(client.calls) == 1
+
+
+def test_render_inline_bibliography_is_deterministic_and_matches_cite_keys() -> None:
+    block = render_inline_bibliography([_ref(), _ref(work_key="w2", bibtex_key="devlin2019bert")])
+    assert block.startswith("\\begin{thebibliography}{9}")
+    assert "\\bibitem{lewis2020retrieval}" in block
+    assert "\\bibitem{devlin2019bert}" in block
+    assert block == render_inline_bibliography(
+        [_ref(), _ref(work_key="w2", bibtex_key="devlin2019bert")]
+    )
+
+
+def test_render_inline_bibliography_escapes_and_skips_keyless_refs() -> None:
+    assert render_inline_bibliography([]) == ""
+    assert render_inline_bibliography([_ref(bibtex_key=None)]) == ""
+    block = render_inline_bibliography([_ref(title="Cost is 100% & rising")])
+    assert "100\\% \\&" in block
+
+
+def test_cn_thesis_maps_to_the_chinese_template() -> None:
+    """界面「中文学位论文/学报」发的是 cn_thesis；它此前静默退回 article。"""
+    assert resolve_template("cn_thesis") == "cn_thesis"
+    assert TEMPLATES["cn_thesis"] == TEMPLATES["gbt7714"]
+    assert template_fallback_warning("cn_thesis") is None
+    assert template_fallback_warning("IEEEtran") is None
+
+
+def test_unimplemented_template_is_reported_instead_of_silently_downgraded() -> None:
+    warning = template_fallback_warning("acmart")
+    assert warning == {
+        "stage": "template",
+        "reason": "template_not_implemented",
+        "requested": "acmart",
+        "used": "article",
+    }
+    assert resolve_template("acmart") == "article"
+    assert template_fallback_warning(None) is None

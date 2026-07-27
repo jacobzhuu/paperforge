@@ -15,7 +15,98 @@ from typing import Any
 from llm_runtime import LLMRunner
 from scholar_gateway import ScholarlyWorkCandidate
 
-_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]+|[一-鿿]")
+_LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]+")
+_CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
+
+# 功能词不携带主题信息。research_question 的模板句（"What is the state of the art in …"）
+# 会把它们灌进主题词集合，于是任何一篇英文摘要都能靠 the/of/in 拿到虚高的重叠分。
+_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "these",
+        "those",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "had",
+        "its",
+        "their",
+        "our",
+        "using",
+        "used",
+        "use",
+        "via",
+        "based",
+        "into",
+        "over",
+        "under",
+        "between",
+        "among",
+        "such",
+        "than",
+        "then",
+        "when",
+        "where",
+        "which",
+        "what",
+        "who",
+        "how",
+        "why",
+        "can",
+        "may",
+        "might",
+        "will",
+        "would",
+        "state",
+        "art",
+        "novel",
+        "new",
+        "approach",
+        "approaches",
+        "study",
+        "studies",
+        "paper",
+        "papers",
+        "results",
+        "result",
+        "show",
+        "shows",
+        "propose",
+        "proposed",
+        "we",
+        "it",
+        "is",
+        "of",
+        "in",
+        "on",
+        "to",
+        "by",
+        "as",
+        "at",
+        "an",
+        "or",
+        "be",
+        "not",
+        # 中文侧同理：这些二元组在任何中文题录里都出现，不构成主题证据。
+        "研究",
+        "综述",
+        "分析",
+        "方法",
+        "基于",
+        "我们",
+        "本文",
+        "一种",
+        "以及",
+    }
+)
 
 # 打分权重：主题匹配为主，时效与影响力为辅（只影响排序，不影响准入）。
 WEIGHT_TITLE = 0.40
@@ -32,11 +123,34 @@ judge only from the given title/abstract — never invent facts about a paper;
 a paper you cannot judge should get a low score, not an invented justification."""
 
 
+# 自动入库的主题证据下限。低于这个值意味着标题、摘要、概念面、LLM 判断
+# 四个信号**全都**没有把候选和主题联系起来——分数只是时效与引用量堆出来的。
+AUTO_SELECT_MIN_TOPIC_EVIDENCE = 0.05
+
+
 @dataclass(frozen=True)
 class RankedCandidate:
     candidate: ScholarlyWorkCandidate
     score: float
     reason: dict[str, Any] = field(default_factory=dict)
+
+
+def topic_evidence(item: RankedCandidate) -> float:
+    """候选与主题之间最强的那一路证据（取四个信号的最大值）。
+
+    总分里时效占 0.12、引用量占 0.08，一篇 2025 年的高引论文即使跟主题毫无关系
+    也能拿到 0.15 左右——所以「是否够格自动入库」不能看总分，只能看主题证据本身。
+    """
+    signals = (
+        item.reason.get("title_match"),
+        item.reason.get("abstract_match"),
+        item.reason.get("facet_coverage"),
+        item.reason.get("llm_score"),
+    )
+    return max(
+        (float(value) for value in signals if isinstance(value, int | float)),
+        default=0.0,
+    )
 
 
 def rank_candidates(
@@ -167,9 +281,19 @@ def _sort_key(item: RankedCandidate) -> tuple[float, int, str]:
 
 
 def _tokens(text: str | None) -> set[str]:
+    """英文按词、中文按二元组切分。
+
+    单个汉字不是有意义的检索单位：按字切分时「的/系/统」这类高频字会让任何一篇
+    中文文献都跟任何一个中文主题产生重叠——一批中文医学论文曾因此在
+    「序列推荐系统的投毒攻击」项目里拿到 0.09–0.34 的相关性分并被自动入库。
+    二元组要求字面连续，跨主题的偶然重合会掉到接近零。
+    """
     if not text:
         return set()
-    return {token.lower() for token in _TOKEN_RE.findall(text)}
+    tokens = {token.lower() for token in _LATIN_TOKEN_RE.findall(text)}
+    for run in _CJK_RUN_RE.findall(text):
+        tokens |= {run[index : index + 2] for index in range(len(run) - 1)}
+    return tokens - _STOPWORDS
 
 
 def _scope_tokens(scope: dict[str, Any]) -> set[str]:

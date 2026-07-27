@@ -208,9 +208,7 @@ def expand_citation_snowball(
     diagnostics["forward_candidate_count"] = forward_count
     diagnostics["backward_candidate_count"] = backward_count
     diagnostics["discovered_candidate_count"] = len(discovered)
-    diagnostics["errors"] = [
-        call for call in diagnostics["provider_calls"] if call.get("error")
-    ]
+    diagnostics["errors"] = [call for call in diagnostics["provider_calls"] if call.get("error")]
     return SnowballExpansionResult(
         seed_work_ids=tuple(seed.work_id for seed in selected),
         discovered_candidates=tuple(discovered),
@@ -230,11 +228,7 @@ def _append_unique_candidates(
         if prefer == "openalex":
             key = candidate.doi or candidate.openalex_id or candidate.normalized_title_hash
         else:
-            key = (
-                candidate.doi
-                or candidate.semantic_scholar_id
-                or candidate.normalized_title_hash
-            )
+            key = candidate.doi or candidate.semantic_scholar_id or candidate.normalized_title_hash
         if key and key not in seen_keys:
             seen_keys.add(key)
             discovered.append(candidate)
@@ -512,9 +506,7 @@ def _cached_json_get(
             raise ValueError(f"{provider_name} cached payload was not an object")
         return payload, True
 
-    breaker = (
-        provider_circuit_breaker(provider_name) if circuit_breaker_threshold > 0 else None
-    )
+    breaker = provider_circuit_breaker(provider_name) if circuit_breaker_threshold > 0 else None
     if breaker is not None:
         # 抛 ProviderCircuitOpenError；雪球调用方按 call 记录诊断。
         breaker.allow(provider_name)

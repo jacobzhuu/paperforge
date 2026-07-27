@@ -33,11 +33,45 @@ class Settings(BaseSettings):
 
     texd_url: str = "http://localhost:8081"
     texd_timeout_seconds: int = 120
+    visuals_enabled: bool = True
+    ai_images_enabled: bool = False
+    visuald_url: str = "http://localhost:8082"
+    visuald_timeout_seconds: int = 30
+    image_provider: str = "cloudflare"
+    image_base_url: str = "https://api.cloudflare.com/client/v4"
+    image_api_key: str = ""
+    image_model: str = "@cf/black-forest-labs/flux-1-schnell"
+    image_account_id: str = ""
+    image_timeout_seconds: float = 180.0
+    image_max_retries: int = 2
 
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     cors_allow_origins: str = "http://localhost:3000"
     log_level: str = "INFO"
+
+    # Authentication. Production should use HTTPS + SMTP; localhost keeps an explicit
+    # developer mode so the one-command environment remains usable.
+    auth_cookie_secure: bool = False
+    auth_session_days: int = 30
+    auth_idle_days: int = 7
+    auth_rate_limit_enabled: bool = True
+    # Local-only escape hatch for development before real email delivery is enabled.
+    # create_app() refuses to start with this enabled outside a localhost HTTP setup.
+    auth_dev_login_enabled: bool = True
+    auth_email_mode: str = "file"  # file (local development) | smtp
+    auth_email_outbox_dir: str = "./data/auth-outbox"
+    public_app_url: str = "http://localhost:3000"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
+
+    @property
+    def auth_cookie_name(self) -> str:
+        return "__Host-paperforge_session" if self.auth_cookie_secure else "paperforge_session"
 
     def llm_config(self) -> LLMConfig:
         try:

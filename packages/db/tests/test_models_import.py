@@ -13,14 +13,39 @@ from sqlalchemy.dialects import postgresql
 
 def test_expected_tables_registered():
     tables = set(Base.metadata.tables.keys())
+    assert {"app_user", "user_session", "auth_action_token"} <= tables
     # 保留的 scholarly_work 系 5 张
-    assert {"scholarly_work", "work_identifier", "work_url", "work_author",
-            "scholarly_http_cache"} <= tables
+    assert {
+        "scholarly_work",
+        "work_identifier",
+        "work_url",
+        "work_author",
+        "scholarly_http_cache",
+    } <= tables
     # 新增的项目/论文结构域
-    assert {"paper_project", "generation_job", "job_event", "library_entry",
-            "literature_card", "document_file", "user_asset", "outline",
-            "paper_document", "paper_section", "citation_usage", "search_run",
-            "export_artifact", "llm_call_log"} <= tables
+    assert {
+        "paper_project",
+        "generation_job",
+        "job_event",
+        "library_entry",
+        "literature_card",
+        "document_file",
+        "user_asset",
+        "outline",
+        "paper_document",
+        "paper_section",
+        "citation_usage",
+        "search_run",
+        "export_artifact",
+        "llm_call_log",
+    } <= tables
+
+
+def test_project_owner_is_required_uuid_foreign_key():
+    owner = m.PaperProject.__table__.c.owner_id
+    assert owner.nullable is False
+    assert str(owner.type) == "UUID"
+    assert {fk.target_fullname for fk in owner.foreign_keys} == {"app_user.id"}
 
 
 def test_library_entry_has_bibtex_unique_and_verified_at():

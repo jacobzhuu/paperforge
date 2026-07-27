@@ -4,6 +4,7 @@
 （筛选裁决/守恒账本/质量评估/效应量）不迁移（方案 §3.3）。
 """
 
+from db.models.auth import AppUser, AuthActionToken, UserSession
 from db.models.library import (
     DocumentFile,
     LibraryEntry,
@@ -26,9 +27,14 @@ from db.models.paper import (
     PaperSection,
     SearchRun,
     UserAsset,
+    VisualAsset,
+    VisualGenerationAttempt,
+    VisualSourceAsset,
 )
 
 __all__ = [
+    "AppUser",
+    "AuthActionToken",
     "CitationUsage",
     "DocumentFile",
     "ExportArtifact",
@@ -45,6 +51,10 @@ __all__ = [
     "ScholarlyWork",
     "SearchRun",
     "UserAsset",
+    "UserSession",
+    "VisualAsset",
+    "VisualGenerationAttempt",
+    "VisualSourceAsset",
     "WorkAuthor",
     "WorkIdentifier",
     "WorkUrl",

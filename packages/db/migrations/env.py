@@ -28,8 +28,10 @@ DEFAULT_DATABASE_URL = "postgresql+asyncpg://paperforge:paperforge@localhost:154
 
 
 def _database_url() -> str:
-    return os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url") or (
-        DEFAULT_DATABASE_URL
+    return (
+        os.environ.get("DATABASE_URL")
+        or config.get_main_option("sqlalchemy.url")
+        or (DEFAULT_DATABASE_URL)
     )
 
 

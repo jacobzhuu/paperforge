@@ -28,9 +28,11 @@ from scholar_gateway import (
 
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.ranking import (
+    AUTO_SELECT_MIN_TOPIC_EVIDENCE,
     RankedCandidate,
     rank_candidates,
     rerank_with_llm,
+    topic_evidence,
 )
 from paperforge_worker.pipelines.scope import scope_filters, search_queries
 
@@ -93,8 +95,8 @@ async def run_search(
             failed = result.status == "failed"
             error_code = result.errors[0].error_code if result.errors else None
             # 前端只认 succeeded/partial/failed 三态。
-            run_status = "failed" if failed else (
-                "partial" if result.status == "partial" else "succeeded"
+            run_status = (
+                "failed" if failed else ("partial" if result.status == "partial" else "succeeded")
             )
             await record_search_run(
                 session,
@@ -160,6 +162,17 @@ async def run_search(
         ranked=ranked,
         auto_select_top_k=top_k,
     )
+    if ranked and not outcome.selected_count:
+        # 有候选却一篇都不够格自动入库：检索式跟主题对不上（中文主题 + 英文检索源
+        # 是最常见的成因）。这必须让用户看见，否则前端只会显示一个空文献库。
+        outcome.warnings.append(
+            {
+                "stage": "search",
+                "reason": "no_topically_relevant_results",
+                "queries": queries,
+                "candidates_reviewed": len(ranked),
+            }
+        )
     return outcome
 
 
@@ -222,14 +235,19 @@ async def _persist(
 
     R1：这些候选来自 provider 真实响应，因此以 ``verified=True`` 入库；
     是否进入写作白名单还要看 status='selected' 且已分配 bibtex_key。
-    全自动模式取 top-K 直接置为 selected（设计 §3.4）。
+    全自动模式取 top-K 直接置为 selected（设计 §3.4），但 top-K 只是**名额上限**：
+    还要过主题证据下限才真的入库。检索源返回的东西未必和主题有关（中文主题打到
+    只索引英文的检索源时尤其如此），而 selected 会直接进入引用白名单——名次靠前
+    不等于切题，这里必须再拦一道，否则无关文献会被当成可引用的文献基础。
+    低于门槛的候选仍以 candidate 留档，用户可以自行圈选，不丢数据。
     """
     persisted = 0
     selected = 0
     async with context.session() as session:
         for index, item in enumerate(ranked):
             work, _created = await upsert_work(session, item.candidate)
-            status = "selected" if index < auto_select_top_k else "candidate"
+            relevant = topic_evidence(item) >= AUTO_SELECT_MIN_TOPIC_EVIDENCE
+            status = "selected" if index < auto_select_top_k and relevant else "candidate"
             entry, _entry_created = await upsert_entry(
                 session,
                 project_id=context.project_id,

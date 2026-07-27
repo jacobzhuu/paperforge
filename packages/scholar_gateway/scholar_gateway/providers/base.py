@@ -268,9 +268,7 @@ class HttpScholarlyDiscoveryAdapter:
                     "cache_hit": False,
                     "rate_limited": True,
                     "fallback_reason": "circuit_open",
-                    "circuit_cooldown_remaining_seconds": round(
-                        fetch_error.remaining_seconds, 1
-                    ),
+                    "circuit_cooldown_remaining_seconds": round(fetch_error.remaining_seconds, 1),
                     "consecutive_429_count": fetch_error.consecutive_429_count,
                 },
             )
@@ -308,9 +306,7 @@ class HttpScholarlyDiscoveryAdapter:
             metadata["rate_limited"] = True
             metadata["attempt_count"] = fetched.attempt_count
             metadata["retry_exhausted"] = fetched.retry_exhausted
-            metadata["retry_after_seconds"] = (
-                fetched.retry_after_seconds or RETRY_AFTER_MAX_SECONDS
-            )
+            metadata["retry_after_seconds"] = fetched.retry_after_seconds or RETRY_AFTER_MAX_SECONDS
             metadata["rate_limit_429_count"] = fetched.rate_limit_429_count
             if fetched.daily_quota_exhausted:
                 metadata["daily_quota_exhausted"] = True

@@ -142,9 +142,7 @@ def test_sqlalchemy_cache_backend_round_trip_and_ttl() -> None:
 
     # TTL 之外读不到（时钟前移等价于条目过期）。
     stale_clock = datetime.now(UTC) + timedelta(hours=100)
-    assert (
-        cache.get(url="https://x.org/a", params={"q": 1}, ttl_hours=1.0, now=stale_clock) is None
-    )
+    assert cache.get(url="https://x.org/a", params={"q": 1}, ttl_hours=1.0, now=stale_clock) is None
 
 
 def test_sqlalchemy_cache_backend_ignores_non_200() -> None:

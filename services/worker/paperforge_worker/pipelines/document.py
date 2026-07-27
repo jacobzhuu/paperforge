@@ -33,6 +33,7 @@ from paper_ir import (
     ReferenceMetadata,
     render_markdown,
 )
+from paper_ir.schema import Section as IRSection
 
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.writing import (
@@ -47,6 +48,10 @@ logger = get_logger(__name__)
 
 # 摘要/引言/结论在正文写完后生成（设计 §4.4.1）。
 FRAME_ORDER = {"abstract": -2, "introduction": -1, "conclusion": 999}
+
+# write 阶段在整条管线里占的进度区间（与 worker._STAGE_PROGRESS 对齐）。
+_WRITE_PROGRESS_START = 0.65
+_WRITE_PROGRESS_END = 0.90
 
 
 @dataclass
@@ -107,9 +112,32 @@ async def write_document(
     writing_context = WritingContext(outline=outline, language=language)
     body_sections = [s for s in sections if s.get("kind") != "frame"]
     frame_sections = [s for s in sections if s.get("kind") == "frame"]
+    order_by_key = {str(s.get("key") or ""): index for index, s in enumerate(sections)}
+
+    # 建档提前到写作之前。write 是全管线最长的一段（本地实测 7 节约 18 分钟），
+    # 而此前所有章节只在末尾一次性 upsert：中途撞上 arq job_timeout 或 worker 重启，
+    # 已经写完的章节连同那十几分钟的 LLM 调用一起蒸发，重跑只能从头再写一遍。
+    # 现在写完一节存一节，末尾那次全量 upsert 仍然保留（它带全篇白名单终检），
+    # 只是不再是唯一的落库时机。
+    async with context.session() as session:
+        document = await create_document(
+            session,
+            project_id=context.project_id,
+            outline_id=outline_id,
+        )
+        document_id = document.id
+    outcome.document_id = str(document_id)
+
+    # write 阶段横跨 0.65→0.90，按「正文 + 框架 + 润色」的步数线性摊进度条。
+    total_steps = len(sections) * 2 if coherence else len(sections)
+    steps_done = 0
+
+    def _progress() -> float:
+        span = _WRITE_PROGRESS_END - _WRITE_PROGRESS_START
+        return _WRITE_PROGRESS_START + span * min(1.0, steps_done / max(1, total_steps))
 
     drafts: dict[str, SectionDraft] = {}
-    for index, section in enumerate(body_sections):
+    for section in body_sections:
         draft = await _write_one(
             section=section,
             cards=cards,
@@ -122,6 +150,15 @@ async def write_document(
         )
         drafts[draft.section_key] = draft
         writing_context.register(draft.section_key, draft)
+        await _persist_draft(
+            context,
+            document_id=document_id,
+            draft=draft,
+            order_no=order_by_key.get(draft.section_key, len(drafts) - 1),
+            whitelist=whitelist,
+            language=language,
+        )
+        steps_done += 1
         await context.emit(
             "write.section",
             {
@@ -131,9 +168,8 @@ async def write_document(
                 "generator": draft.generator,
             },
             stage="write",
-            progress=None,
+            progress=_progress(),
         )
-        del index
 
     # 框架章节后写：此时滚动摘要已覆盖全部正文。
     for section in frame_sections:
@@ -148,16 +184,53 @@ async def write_document(
             assets=assets,
         )
         drafts[draft.section_key] = draft
+        await _persist_draft(
+            context,
+            document_id=document_id,
+            draft=draft,
+            order_no=order_by_key.get(draft.section_key, len(drafts) - 1),
+            whitelist=whitelist,
+            language=language,
+        )
+        steps_done += 1
+        # 框架章节此前不发事件：摘要/引言/结论那几分钟前端完全没有进度可看。
+        await context.emit(
+            "write.section",
+            {
+                "section": draft.section_key,
+                "title": draft.title,
+                "words": draft.word_count,
+                "generator": draft.generator,
+            },
+            stage="write",
+            progress=_progress(),
+        )
 
     if coherence:
-        for key, draft in drafts.items():
-            if draft.generator.startswith("llm"):
-                drafts[key] = await coherence_pass(
-                    draft=draft,
-                    context=writing_context,
-                    whitelist=set(whitelist),
-                    runner=runner,
-                )
+        polishable = [key for key, draft in drafts.items() if draft.generator.startswith("llm")]
+        for done, key in enumerate(polishable, start=1):
+            polished = await coherence_pass(
+                draft=drafts[key],
+                context=writing_context,
+                whitelist=set(whitelist),
+                runner=runner,
+            )
+            drafts[key] = polished
+            await _persist_draft(
+                context,
+                document_id=document_id,
+                draft=polished,
+                order_no=order_by_key.get(key, 0),
+                whitelist=whitelist,
+                language=language,
+            )
+            steps_done += 1
+            await context.emit(
+                "write.coherence",
+                {"section": key, "done": done, "total": len(polishable)},
+                stage="write",
+                progress=_progress(),
+            )
 
     ordered = _ordered_drafts(sections, drafts)
     ir = _build_paper_ir(
@@ -174,51 +247,25 @@ async def write_document(
             {"stage": "citecheck", "reason": "cite_keys_stripped", "count": len(violations)}
         )
 
+    # 收尾再全量写一次：这一遍的 body_ir 来自跑过全篇白名单终检的 IR，
+    # 顺带把 order_no 归一到最终顺序，覆盖掉写作途中按大纲下标存的那版。
     async with context.session() as session:
-        document = await create_document(
-            session,
-            project_id=context.project_id,
-            outline_id=outline_id,
-        )
         for order_no, (section_key, draft) in enumerate(ordered):
             ir_section = next((s for s in ir.sections if s.key == section_key), None)
-            body_ir = ir_section.model_dump(mode="json") if ir_section else None
-            cite_keys = sorted(
-                {key for p in draft.paragraphs for key in p.get("cite_keys", [])}
-            )
-            row = await upsert_section(
-                session,
-                document_id=document.id,
-                section_key=section_key,
-                title=draft.title,
-                order_no=order_no,
-                body_ir=body_ir,
-                cite_keys=cite_keys,
-                model=draft.model,
-            )
-            usages = [
-                {
-                    "work_id": whitelist[key],
-                    "cite_key": key,
-                    "context_snippet": _snippet(draft, key),
-                }
-                for key in cite_keys
-                if key in whitelist
-            ]
-            await replace_citation_usage(
+            await _upsert_draft(
                 session,
                 project_id=context.project_id,
-                section_id=row.id,
-                usages=usages,
+                document_id=document_id,
+                draft=draft,
+                order_no=order_no,
+                body_ir=ir_section.model_dump(mode="json") if ir_section else None,
+                whitelist=whitelist,
             )
-        outcome.document_id = str(document.id)
 
     outcome.section_count = len(ordered)
     outcome.word_count = sum(draft.word_count for _key, draft in ordered)
     outcome.cite_key_count = len(ir.collect_cite_keys())
-    outcome.citation_warning_count = sum(
-        len(section.citation_warnings) for section in ir.sections
-    )
+    outcome.citation_warning_count = sum(len(section.citation_warnings) for section in ir.sections)
     outcome.rewrite_count = sum(draft.rewrite_count for _key, draft in ordered)
 
     # NUMLINT：正文数值 vs 素材解析值（设计 §4.4.2 红线的 lint 层）。
@@ -253,6 +300,87 @@ async def write_document(
         kind = draft.generator.split(":")[0]
         outcome.generator_mix[kind] = outcome.generator_mix.get(kind, 0) + 1
     return outcome
+
+
+async def _persist_draft(
+    context: JobContext,
+    *,
+    document_id: uuid.UUID,
+    draft: SectionDraft,
+    order_no: int,
+    whitelist: dict[str, uuid.UUID],
+    language: str,
+) -> None:
+    """单节落库（写完一节存一节）。
+
+    红线不因为「存得早」而放松：这里同样跑一次 typed-IR 白名单检查，
+    数据库里任何时刻都不会出现白名单外的引用。
+    """
+    single = _build_paper_ir(title="", language=language, drafts=[(draft.section_key, draft)])
+    single.enforce_cite_key_whitelist(set(whitelist), strip=True)
+    ir_section = single.sections[0] if single.sections else None
+    try:
+        async with context.session() as session:
+            await _upsert_draft(
+                session,
+                project_id=context.project_id,
+                document_id=document_id,
+                draft=draft,
+                order_no=order_no,
+                body_ir=ir_section.model_dump(mode="json") if ir_section else None,
+                whitelist=whitelist,
+            )
+    except Exception as error:  # noqa: BLE001 - 中途落库失败不该毁掉整轮写作
+        logger.warning(
+            "incremental section persist failed",
+            extra={"section": draft.section_key, "error": type(error).__name__},
+        )
+
+
+async def _upsert_draft(
+    session,
+    *,
+    project_id: uuid.UUID,
+    document_id: uuid.UUID,
+    draft: SectionDraft,
+    order_no: int,
+    body_ir: dict[str, Any] | None,
+    whitelist: dict[str, uuid.UUID],
+) -> None:
+    """章节 + 引用使用记录的落库动作，中途存与收尾存共用同一份实现。"""
+    cite_keys = sorted({key for p in draft.paragraphs for key in p.get("cite_keys", [])})
+    asset_refs: list[str] = []
+    if body_ir:
+        section_ir = IRSection(**body_ir)
+        asset_refs = sorted(
+            PaperIR(meta=PaperMeta(title=""), sections=[section_ir]).collect_asset_refs()
+        )
+    row = await upsert_section(
+        session,
+        document_id=document_id,
+        section_key=draft.section_key,
+        title=draft.title,
+        order_no=order_no,
+        body_ir=body_ir,
+        cite_keys=cite_keys,
+        asset_refs=asset_refs,
+        model=draft.model,
+    )
+    usages = [
+        {
+            "work_id": whitelist[key],
+            "cite_key": key,
+            "context_snippet": _snippet(draft, key),
+        }
+        for key in cite_keys
+        if key in whitelist
+    ]
+    await replace_citation_usage(
+        session,
+        project_id=project_id,
+        section_id=row.id,
+        usages=usages,
+    )
 
 
 async def build_markdown(

@@ -14,7 +14,10 @@ dependencies = [
     "llm-runtime",
     "paper-ir",
     "latex-render",
+    "paperforge-storage",
+    "paperforge-visuals",
     "psycopg[binary]>=3.2",
+    "pypdfium2>=4.30,<5",
 ]
 
 [tool.uv.sources]
@@ -25,6 +28,7 @@ ingest = { workspace = true }
 llm-runtime = { workspace = true }
 paper-ir = { workspace = true }
 latex-render = { workspace = true }
+paperforge-visuals = { workspace = true }
 paperforge-storage = { workspace = true }
 
 [build-system]

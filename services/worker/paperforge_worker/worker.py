@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from arq import func
 from arq.connections import RedisSettings
 from db import get_project, update_job, update_project_scope
 from db.session import make_engine, make_session_factory
@@ -37,8 +38,12 @@ from paperforge_worker.pipelines.quality import (
 )
 from paperforge_worker.pipelines.scope import generate_scope
 from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
+from paperforge_worker.pipelines.visuals import generate_visual, suggest_visuals
 
 logger = get_logger(__name__)
+
+# 一键生成的单任务超时（秒）。默认 job_timeout 管的是单阶段任务。
+FULL_PIPELINE_TIMEOUT_SECONDS = 7200
 
 # 综述管线 M1 阶段权重（用于进度条；后续里程碑会追加 outline/write/render）。
 _STAGE_PROGRESS = {
@@ -52,6 +57,8 @@ _STAGE_PROGRESS = {
     "outline": 0.65,
     "write": 0.90,
     "citecheck": 0.93,
+    "visual_plan": 0.95,
+    "visual_generate": 0.75,
     "render": 0.98,
     "done": 1.0,
 }
@@ -99,6 +106,20 @@ async def _run_stage(
     return result
 
 
+def scope_needs_regeneration(scope: dict[str, Any]) -> bool:
+    """已存的 scope 是否需要在检索前重生成。
+
+    确定性回退是降级品——LLM 当时不可用或输出不合法才会留下它。若不重生成，项目会被
+    永久钉死在这份 scope 上：前端默认只在项目没有 topic 时才请求重生成，于是变成
+    「关键词很差 → 检索结果跑题 → 再点一次还是同样的关键词」。中文主题尤其致命，
+    回退切出来的中文关键词打不中任何只索引英文的检索源。
+    用户手改过的 scope 带 generator='user'，永远豁免。
+    """
+    if not scope.get("keyword_groups"):
+        return True
+    return str(scope.get("generator") or "").startswith("deterministic")
+
+
 async def run_library_pipeline(
     ctx: dict,
     project_id: str,
@@ -135,8 +156,7 @@ async def run_library_pipeline(
 
         await _mark_running(context)
 
-        needs_scope = regenerate_scope or not scope.get("keyword_groups")
-        if needs_scope:
+        if regenerate_scope or scope_needs_regeneration(scope):
             generated = await _run_stage(
                 context,
                 "scope",
@@ -505,9 +525,7 @@ async def _quality(context: JobContext):
         }
         years = [work.publication_year for _e, work in entries if work.publication_year]
         fulltext_used = sum(
-            1
-            for card in (await _cards(session, context.project_id))
-            if card.fulltext_used
+            1 for card in (await _cards(session, context.project_id)) if card.fulltext_used
         )
         scope = dict((project.scope_json or {}) if project else {})
 
@@ -595,10 +613,61 @@ async def run_export_pipeline(
         return {"project_id": project_id, "export": outcome.to_payload() if outcome else None}
 
 
-def _object_store(settings: Settings):
-    from storage import FilesystemObjectStore
+async def run_visual_suggest_pipeline(
+    ctx: dict,
+    project_id: str,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """全文完成后的视觉建议；不会调用付费图片服务或改动 PaperIR。"""
+    settings: Settings = ctx.get("settings") or get_settings()
+    project_uuid = uuid.UUID(project_id)
+    async with job_context(
+        project_id=project_uuid,
+        job_id=uuid.UUID(job_id) if job_id else None,
+        settings=settings,
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+    ) as context:
+        await _mark_running(context)
+        outcome = await _run_stage(
+            context, "visual_plan", lambda: suggest_visuals(context), kind="visual"
+        )
+        await _finish(context, delivered=outcome is not None)
+        return {"project_id": project_id, "visual_plan": outcome.to_payload() if outcome else None}
 
-    return FilesystemObjectStore(settings.storage_fs_root)
+
+async def run_visual_generate_pipeline(
+    ctx: dict,
+    project_id: str,
+    job_id: str | None = None,
+    *,
+    visual_id: str,
+) -> dict[str, Any]:
+    """渲染一个已确认规格的视觉资产。"""
+    settings: Settings = ctx.get("settings") or get_settings()
+    project_uuid = uuid.UUID(project_id)
+    async with job_context(
+        project_id=project_uuid,
+        job_id=uuid.UUID(job_id) if job_id else None,
+        settings=settings,
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+    ) as context:
+        await _mark_running(context)
+        outcome = await _run_stage(
+            context,
+            "visual_generate",
+            lambda: generate_visual(context, uuid.UUID(visual_id)),
+            kind="visual",
+        )
+        await _finish(context, delivered=bool(outcome and outcome.status == "ready"))
+        return {"project_id": project_id, "visual": outcome.to_payload() if outcome else None}
+
+
+def _object_store(settings: Settings):
+    from storage import make_object_store
+
+    return make_object_store(settings)
 
 
 async def run_full_pipeline(ctx: dict, project_id: str, job_id: str | None = None) -> dict:
@@ -630,6 +699,12 @@ async def run_full_pipeline(ctx: dict, project_id: str, job_id: str | None = Non
         )
         export_outcome = None
         if write_outcome and write_outcome.section_count:
+            await _run_stage(
+                context,
+                "visual_plan",
+                lambda: suggest_visuals(context),
+                kind="visual",
+            )
             export_outcome = await _run_stage(
                 context,
                 "render",
@@ -668,9 +743,7 @@ async def _outline(context: JobContext):
                     else []
                 ),
                 methods=tuple(
-                    cards_by_work[work.id].methods_json or []
-                    if work.id in cards_by_work
-                    else []
+                    cards_by_work[work.id].methods_json or [] if work.id in cards_by_work else []
                 ),
             )
             for entry, work in entries
@@ -762,11 +835,17 @@ class WorkerSettings:
         run_ingest_pipeline,
         run_snowball_pipeline,
         run_quality_pipeline,
-        run_full_pipeline,
+        run_visual_suggest_pipeline,
+        run_visual_generate_pipeline,
+        # 一键生成串起 scope→…→render 十个阶段，是唯一会跑到小时级的任务：
+        # 实测 7 节 / 46 篇约 22 分钟，章节与文献翻倍就顶到默认超时上。
+        # 超时不是重试而是直接判失败（arq 用 asyncio.wait_for，抛的是 TimeoutError），
+        # 所以宁可给宽，真挂住了还有 LLM 侧的单请求超时兜底。
+        func(run_full_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
     ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     # 论文生成是分钟级任务：给足超时，并限制并发以尊重 provider 配额。
-    job_timeout = 1800
+    job_timeout = 3600
     max_jobs = 4

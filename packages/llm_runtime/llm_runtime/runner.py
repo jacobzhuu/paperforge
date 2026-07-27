@@ -195,6 +195,7 @@ class LLMRunner:
         allowed_cite_keys: set[str] | None = None,
         mode: Literal["report", "strip"] = "report",
         metadata: dict[str, Any] | None = None,
+        _retry_on_truncation: bool = True,
     ) -> JsonResult:
         """结构化输出调用：净化 JSON 并做 R2 cite-key 审计。
 
@@ -220,6 +221,26 @@ class LLMRunner:
                 mode=mode,
             )
         except (ValueError, TypeError) as error:
+            # 推理型模型把思维链计入 max_tokens。预算刚好够开口、不够写完时，
+            # content 非空但 JSON 在中途断掉：provider 层的「零 content」判定救不到
+            # 这一档，截断的 JSON 只会解析失败，然后整条管线静默降级到确定性回退。
+            # finish_reason='length' 是这里唯一可靠的信号，据此加倍预算重试一次。
+            if (
+                _retry_on_truncation
+                and response.finish_reason == "length"
+                and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
+            ):
+                return await self.agenerate_json(
+                    role,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_output_tokens=min(max_output_tokens * 2, MAX_OUTPUT_TOKENS_CEILING),
+                    temperature=temperature,
+                    allowed_cite_keys=allowed_cite_keys,
+                    mode=mode,
+                    metadata={**(metadata or {}), "retry": "json_truncated"},
+                    _retry_on_truncation=False,
+                )
             return JsonResult(
                 value=None,
                 raw_text=response.text,

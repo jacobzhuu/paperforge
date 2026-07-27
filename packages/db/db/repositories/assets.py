@@ -49,9 +49,7 @@ async def list_assets(
     kind: str | None = None,
 ) -> list[UserAsset]:
     stmt = (
-        select(UserAsset)
-        .where(UserAsset.project_id == project_id)
-        .order_by(UserAsset.created_at)
+        select(UserAsset).where(UserAsset.project_id == project_id).order_by(UserAsset.created_at)
     )
     if kind:
         stmt = stmt.where(UserAsset.kind == kind)

@@ -25,14 +25,21 @@ _SYSTEM_PROMPT_ZH = """你是科研文献调研的规划助手。根据论文主
 {
   "research_question": "一句话研究问题",
   "scope_summary": "2-3 句范围说明（包含/排除什么）",
-  "keyword_groups": [{"name": "概念名", "keywords": ["同义词1", "同义词2"]}],
+  "keyword_groups": [{"name": "概念名", "keywords": ["term1", "term2"]}],
   "subtopics": ["子主题1", "子主题2"],
   "time_range": {"start_year": 2019, "end_year": 2025},
   "inclusion_notes": ["纳入偏好"],
   "exclusion_notes": ["排除偏好"]
 }
 要求：keyword_groups 覆盖主题的正交概念面（方法/任务/领域/评价），每组给同义词与常见缩写；
-不要编造不存在的专有名词；时间窗按领域节奏给出合理区间。"""
+不要编造不存在的专有名词；时间窗按领域节奏给出合理区间。
+
+**keywords 必须全部是英文检索词**（name 与其余叙述字段用中文）。
+检索面向的是 OpenAlex / arXiv / Semantic Scholar / Crossref / Europe PMC，
+它们只索引英文题录：中文检索词几乎必然零召回，或召回完全无关的中文期刊文献。
+请把主题翻译成该领域论文实际使用的英文术语，例如
+「序列推荐系统的投毒攻击」→ "sequential recommendation"、"poisoning attack"、
+"shilling attack"、"data poisoning"、"recommender system robustness"。"""
 
 _SYSTEM_PROMPT_EN = """You plan literature searches for research papers. Given a paper topic,
 output a search scope plan. Output JSON only, no commentary. Fields:
@@ -46,16 +53,49 @@ output a search scope plan. Output JSON only, no commentary. Fields:
   "exclusion_notes": ["exclusion preference"]
 }
 Requirements: keyword_groups must cover orthogonal facets (method/task/domain/evaluation)
-with synonyms and common abbreviations; never invent proper nouns that do not exist."""
+with synonyms and common abbreviations; never invent proper nouns that do not exist.
+
+**Every keyword must be English**, even when the topic is written in another language.
+The providers behind this plan (OpenAlex / arXiv / Semantic Scholar / Crossref /
+Europe PMC) index English metadata only, so non-English keywords either return
+nothing or return unrelated foreign-language articles. Translate the topic into the
+English terminology the field actually publishes under."""
 
 _STOPWORDS_EN = frozenset(
     {
-        "a", "an", "the", "of", "for", "and", "or", "to", "in", "on", "with",
-        "using", "via", "based", "study", "review", "survey", "analysis",
-        "research", "paper", "towards", "toward", "about",
+        "a",
+        "an",
+        "the",
+        "of",
+        "for",
+        "and",
+        "or",
+        "to",
+        "in",
+        "on",
+        "with",
+        "using",
+        "via",
+        "based",
+        "study",
+        "review",
+        "survey",
+        "analysis",
+        "research",
+        "paper",
+        "towards",
+        "toward",
+        "about",
     }
 )
 _STOPWORDS_ZH = frozenset({"的", "了", "与", "和", "及", "研究", "综述", "分析", "方法", "基于"})
+
+_CJK_CHAR_RE = re.compile(r"[一-鿿]+")
+_LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+# 中文虚词：在这些字处断开长串，得到可检索的概念片段。
+_CJK_GLUE_RE = re.compile(r"[的了与和及在中对于之或等及以并而且把被从向为其所]")
+# 通用后缀对检索没有区分度，剥掉后剩下的才是真正的概念词。
+_CJK_GENERIC_SUFFIXES = ("研究综述", "综述", "研究", "分析", "方法", "技术", "进展", "应用")
 
 
 async def generate_scope(
@@ -81,7 +121,9 @@ async def generate_scope(
         "planner",
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_output_tokens=1500,
+        # 推理型 planner 模型（deepseek-v4-pro 等）把思维链算进 max_tokens，
+        # 1500 只够想不够写：JSON 会在中途断掉，整个 SCOPE 静默退回确定性回退。
+        max_output_tokens=3000,
         temperature=0.2,
         metadata={"stage": "scope"},
     )
@@ -118,9 +160,9 @@ def normalize_scope(
     if not groups:
         groups = fallback["keyword_groups"]
 
-    subtopics = [
-        text for text in (_clean_text(s) for s in _as_list(raw.get("subtopics"))) if text
-    ][:MAX_SUBTOPICS]
+    subtopics = [text for text in (_clean_text(s) for s in _as_list(raw.get("subtopics"))) if text][
+        :MAX_SUBTOPICS
+    ]
 
     return {
         "topic": topic,
@@ -187,26 +229,58 @@ def topic_terms(topic: str) -> list[str]:
         return []
     terms: list[str] = []
     seen: set[str] = set()
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]+|[一-鿿]{2,}", text):
-        lowered = token.lower()
-        if lowered in _STOPWORDS_EN or token in _STOPWORDS_ZH:
-            continue
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        terms.append(token)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]+|[一-鿿]+", text):
+        for term in _split_cjk_run(token) if _is_cjk(token) else [token]:
+            lowered = term.lower()
+            if lowered in _STOPWORDS_EN or term in _STOPWORDS_ZH:
+                continue
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            terms.append(term)
     return terms
 
 
+def _is_cjk(token: str) -> bool:
+    return bool(token) and _CJK_CHAR_RE.fullmatch(token) is not None
+
+
+def _split_cjk_run(run: str) -> list[str]:
+    """把中文长串切成概念片段。
+
+    中文不带空格，整串当一个词会得到「序列推荐系统的投毒攻击」这种没有任何检索源
+    命中的巨型 token。这里在虚词处断开（的/在/中/与……）并剥掉「研究/综述」这类
+    对检索毫无区分度的通用后缀，得到 ["序列推荐系统", "投毒攻击"]。
+    不追求分词器级别的准确度，只求把正交概念面拆开。
+    """
+    segments = [segment for segment in _CJK_GLUE_RE.split(run) if len(segment) >= 2]
+    trimmed: list[str] = []
+    for segment in segments:
+        while len(segment) > 2 and segment.endswith(_CJK_GENERIC_SUFFIXES):
+            for suffix in _CJK_GENERIC_SUFFIXES:
+                if segment.endswith(suffix) and len(segment) - len(suffix) >= 2:
+                    segment = segment[: -len(suffix)]
+                    break
+            else:
+                break
+        trimmed.append(segment)
+    return trimmed or ([run] if len(run) >= 2 else [])
+
+
 def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
-    """由 scope 生成检索式：主查询 + 各概念面组合（provider 侧还会各自净化语法）。"""
+    """由 scope 生成检索式：主查询 + 各概念面组合（provider 侧还会各自净化语法）。
+
+    主查询优先用英文：五个检索源都只索引英文题录，把中文标题原样发出去要么零召回，
+    要么召回中文期刊里字面碰巧重合的无关文献（曾经用「序列推荐系统的投毒攻击」
+    检索，Europe PMC 返回的全是中文医学论文）。因此当主题不含拉丁字母时，
+    改用 scope 里的英文关键词组当主查询，中文原标题只在没有英文关键词时才兜底。
+    """
     topic = _clean_text(scope.get("topic")) or ""
-    groups = [
-        group for group in _as_list(scope.get("keyword_groups")) if isinstance(group, dict)
-    ]
+    groups = [group for group in _as_list(scope.get("keyword_groups")) if isinstance(group, dict)]
+    lead = _primary_query(topic, groups)
     queries: list[str] = []
-    if topic:
-        queries.append(topic)
+    if lead:
+        queries.append(lead)
     if groups:
         joined = " AND ".join(
             "(" + " OR ".join(f'"{kw}"' for kw in _as_list(group.get("keywords"))[:4]) + ")"
@@ -215,12 +289,16 @@ def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
         )
         if joined:
             queries.append(joined)
+    lead_is_latin = _has_latin(lead)
     for subtopic in _as_list(scope.get("subtopics"))[:2]:
         text = _clean_text(subtopic)
         if not text or text.lower() in topic.lower():
             # 确定性回退的 subtopics 就是主题切词，单独成查询只会稀释召回。
             continue
-        queries.append(f"{topic} {text}" if topic else text)
+        if _has_latin(text) != lead_is_latin:
+            # 中英混排的检索式两边都不讨好：任何一个源都只按字面匹配其中一半。
+            continue
+        queries.append(f"{lead} {text}" if lead else text)
     deduped: list[str] = []
     seen: set[str] = set()
     for query in queries:
@@ -229,6 +307,28 @@ def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
             seen.add(key)
             deduped.append(query)
     return deduped[:max_queries]
+
+
+def _has_latin(text: str) -> bool:
+    return bool(_LATIN_CHAR_RE.search(text or ""))
+
+
+def _primary_query(topic: str, groups: list[dict[str, Any]]) -> str:
+    """主查询：纯英文主题直接用；含中文的主题改用英文关键词组拼装。"""
+    if topic and not _CJK_CHAR_RE.search(topic):
+        return topic
+    leads: list[str] = []
+    for group in groups:
+        for keyword in _as_list(group.get("keywords")):
+            text = _clean_text(keyword)
+            if text and _has_latin(text):
+                leads.append(text)
+                break
+        if len(leads) >= 3:
+            break
+    # 一个英文关键词都没有（LLM 不可用且主题为中文）时只能回落到原标题：
+    # 召回大概率很差，但 SEARCH 阶段仍有产物，且低分候选不会被自动入库。
+    return " ".join(leads) or topic
 
 
 def scope_filters(scope: dict[str, Any]) -> dict[str, Any]:

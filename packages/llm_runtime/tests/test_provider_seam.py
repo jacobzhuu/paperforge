@@ -252,9 +252,7 @@ def test_runner_does_not_retry_forever_on_truncation():
         LLMConfig(provider="openai", base_url="http://stub/v1", api_key="k"),
         provider=provider,
     )
-    result = runner.generate(
-        "planner", system_prompt="s", user_prompt="u", max_output_tokens=1000
-    )
+    result = runner.generate("planner", system_prompt="s", user_prompt="u", max_output_tokens=1000)
     assert result is None
     # 最多重试一次：绝不无界重试烧钱。
     assert len(attempts) == 2

@@ -433,9 +433,7 @@ def candidate_from_openalex_item(
     )
     landing_url, pdf_urls = openalex_urls(item)
     best_oa = item.get("best_oa_location")
-    license_value = (
-        first_string(best_oa.get("license")) if isinstance(best_oa, dict) else None
-    )
+    license_value = first_string(best_oa.get("license")) if isinstance(best_oa, dict) else None
     return candidate(
         query=query,
         title=title,
@@ -610,9 +608,7 @@ def candidate_from_europe_pmc_item(
         license=first_string(item.get("license")),
         citation_count=int_or_none(item.get("citedByCount")),
         identifiers=identifiers(doi=doi, pmid=pmid, pmcid=pmcid),
-        links=links(
-            ((source_url, "landing_page", "europe_pmc"), (pdf_url, "pdf", "europe_pmc"))
-        ),
+        links=links(((source_url, "landing_page", "europe_pmc"), (pdf_url, "pdf", "europe_pmc"))),
         authors=europe_pmc_authors(item.get("authorString")),
         raw_provider_metadata=item,
     )

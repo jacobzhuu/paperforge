@@ -31,6 +31,7 @@ ALLOWED_ENVIRONMENTS = frozenset(
         "enumerate",
         "description",
         "figure",
+        "figure*",
         "table",
         "tabular",
         "algorithm",
@@ -40,8 +41,46 @@ ALLOWED_ENVIRONMENTS = frozenset(
         "quote",
         "verbatim",
         "IEEEkeywords",
+        # 书目兜底自己会写 thebibliography：不列进白名单，修复轮次会把它当
+        # 「未定义环境」剥掉——正好把刚补上的参考文献表又删掉。
+        "thebibliography",
     }
 )
+
+# 书目**真的没排出来**的信号（Tectonic 把 BibTeX 的错误降级成 warning 后继续
+# 走完，因此「编译成功 + 全文 [?]」是完全可能的，必须主动识别）：
+#   warning: open of input unsrt.bst failed        ← 取不到 .bst（只读缓存/无外网）
+#   I couldn't open style file unsrt.bst           ← 同上，BibTeX 侧的说法
+#   LaTeX Warning: Citation `foo2020bar' ... undefined
+#
+# 刻意**不**把 `errors were issued by BibTeX` 当作充分信号：BibTeX 的错误未必
+# 影响书目（实测 gbt7714 模板重复发 \bibstyle 会报一个 error，但 .bbl 完好、
+# PDF 里编号引用一切正常）。凭它降级会把投稿方 .bst 的排版换成内联兜底，
+# 还给用户挂上一个假的「降级」告警——比不修更糟。
+_BIBTEX_FAILURE_RES = (
+    re.compile(r"open of input \S*\.bst failed", re.IGNORECASE),
+    re.compile(r"I couldn't open style file", re.IGNORECASE),
+    re.compile(r"Citation [`'][^'\n]+' (?:on page \d+ )?undefined", re.IGNORECASE),
+)
+# `\bibliography{refs}`——把它换成内联 thebibliography 就绕开了整条 BibTeX 通路。
+# 不动同处的 `\bibliographystyle`：模板里它可能包在 `\IfFileExists{}{}{}` 的分支
+# 里，用 `%` 注释会连带吃掉后面的右花括号，把导言区搞坏。它本身不打开 .bst
+# （只有 bibtex 程序读 .bst），留着无害。
+_BIB_DATA_RE = re.compile(r"\\bibliography\{[^}]*\}")
+_BEGIN_DOCUMENT_RE = re.compile(r"\\begin\{document\}")
+
+# natbib 兼容垫片。gbt7714 会加载 natbib，而 natbib 在作者-年份模式下拒绝
+# 没有 author-year 元数据的 `\bibitem`——报错点在 **读 .aux 时**，所以垫片
+# 必须落在导言区，写进 body 已经晚了（实测：`main.aux:78: Package natbib
+# Error: Bibliography not compatible with author-year citations`，编译直接挂，
+# 兜底反而被判定为「把编译搞挂」而弃用）。
+# 未加载 natbib 的模板（article / IEEEtran）不受影响。
+_NATBIB_SHIM = """%% [paperforge] 内联书目兜底的 natbib 垫片：切到数字引用，
+%% 否则读 .aux 时 natbib 会因 \\bibitem 缺 author-year 元数据而报错。
+\\makeatletter
+\\@ifpackageloaded{natbib}{\\setcitestyle{numbers,square}}{}
+\\makeatother
+"""
 
 _MISSING_PACKAGE_RE = re.compile(r"LaTeX Error: File `([^']+)\.sty' not found", re.IGNORECASE)
 _UNDEFINED_ENV_RE = re.compile(r"LaTeX Error: Environment ([A-Za-z*]+) undefined", re.IGNORECASE)
@@ -58,6 +97,9 @@ class CompileOutcome:
     rounds: int = 0
     repairs: list[dict[str, Any]] = field(default_factory=list)
     files: dict[str, str] = field(default_factory=dict)
+    # 书目是否真的排出来了。`ok=True` 不含这一层：BibTeX 失败会被 Tectonic
+    # 降级为 warning，PDF 照样产出，只是每个引用都变成 `[?]`。
+    bibliography_ok: bool = True
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -65,8 +107,36 @@ class CompileOutcome:
             "rounds": self.rounds,
             "pdf_bytes": len(self.pdf) if self.pdf else 0,
             "repairs": self.repairs,
+            "bibliography_ok": self.bibliography_ok,
             "log_tail": self.log[-2000:],
         }
+
+
+def bibliography_broken(log: str) -> bool:
+    """日志是否表明书目没排出来（.bst 取不到 / 引用全未定义）。"""
+    return any(pattern.search(log) for pattern in _BIBTEX_FAILURE_RES)
+
+
+def with_inline_bibliography(
+    files: dict[str, str],
+    block: str,
+    *,
+    entrypoint: str = "main.tex",
+) -> dict[str, str] | None:
+    """把 `\\bibliography{refs}` 换成内联 ``thebibliography``；无处可换时返回 None。
+
+    同时在导言区插入 natbib 垫片——见 ``_NATBIB_SHIM``。
+    """
+    main = files.get(entrypoint)
+    if not main or not block or not _BIB_DATA_RE.search(main):
+        return None
+    replaced = _BIB_DATA_RE.sub(lambda _: block, main, count=1)
+    replaced = _BEGIN_DOCUMENT_RE.sub(
+        lambda match: _NATBIB_SHIM + match.group(0), replaced, count=1
+    )
+    patched = dict(files)
+    patched[entrypoint] = replaced
+    return patched
 
 
 class TexdClient:
@@ -96,11 +166,24 @@ class TexdClient:
             self._client = httpx.Client(timeout=self.timeout_seconds, trust_env=False)
         return self._client
 
-    def compile(self, files: dict[str, str], *, entrypoint: str = "main.tex") -> CompileOutcome:
+    def compile(
+        self,
+        files: dict[str, str],
+        *,
+        entrypoint: str = "main.tex",
+        binary_files: dict[str, bytes] | None = None,
+    ) -> CompileOutcome:
         try:
             response = self.client.post(
                 f"{self.base_url}/compile",
-                json={"files": files, "entrypoint": entrypoint},
+                json={
+                    "text_files": files,
+                    "binary_files": {
+                        path: base64.b64encode(content).decode("ascii")
+                        for path, content in (binary_files or {}).items()
+                    },
+                    "entrypoint": entrypoint,
+                },
                 timeout=self.timeout_seconds,
             )
         except httpx.HTTPError as error:
@@ -127,12 +210,32 @@ def compile_with_repair(
     entrypoint: str = "main.tex",
     patcher: Callable[[dict[str, str], str], dict[str, str] | None] | None = None,
     max_rounds: int = MAX_REPAIR_ROUNDS,
+    inline_bibliography: str | None = None,
+    binary_files: dict[str, bytes] | None = None,
 ) -> CompileOutcome:
-    """编译 + 有界修复。永不抛出：失败也返回带日志的结果（draft-first）。"""
+    """编译 + 有界修复。永不抛出：失败也返回带日志的结果（draft-first）。
+
+    `inline_bibliography` 是确定性生成的 ``thebibliography`` 兜底块：BibTeX
+    取不到 .bst 时（沙箱缓存只读 / 无外网）会被换进 main.tex 重编一次，
+    否则成品 PDF 里每个引用都是 `[?]`——而编译「成功」，没人会发现。
+    """
     current = dict(files)
-    outcome = client.compile(current, entrypoint=entrypoint)
-    outcome.files = current
+    immutable_binaries = dict(binary_files or {})
+    repairs: list[dict[str, Any]] = []
+    outcome = _compile_once(client, current, entrypoint, immutable_binaries)
+    # 书目降级与语法修复正交，不占用 max_rounds 预算。
+    current, outcome = _ensure_bibliography(
+        current,
+        outcome,
+        client=client,
+        entrypoint=entrypoint,
+        block=inline_bibliography,
+        repairs=repairs,
+        binary_files=immutable_binaries,
+    )
     if outcome.ok:
+        outcome.rounds = len(repairs)
+        outcome.repairs = list(repairs)
         return outcome
 
     for round_index in range(1, max_rounds + 1):
@@ -146,14 +249,65 @@ def compile_with_repair(
         if not actions:
             break
         current = repaired
-        outcome = client.compile(current, entrypoint=entrypoint)
+        outcome = _compile_once(client, current, entrypoint, immutable_binaries)
+        repairs.extend(actions)
+        if outcome.ok:
+            # 语法修好之后书目仍可能是坏的（.bst 取不到与语法错误互不相干）。
+            current, outcome = _ensure_bibliography(
+                current,
+                outcome,
+                client=client,
+                entrypoint=entrypoint,
+                block=inline_bibliography,
+                repairs=repairs,
+                binary_files=immutable_binaries,
+            )
         outcome.rounds = round_index
-        outcome.repairs.extend(actions)
-        outcome.files = current
+        outcome.repairs = list(repairs)
         if outcome.ok:
             return outcome
     outcome.files = current
+    outcome.repairs = list(repairs)
     return outcome
+
+
+def _compile_once(
+    client: TexdClient,
+    files: dict[str, str],
+    entrypoint: str,
+    binary_files: dict[str, bytes],
+) -> CompileOutcome:
+    if binary_files:
+        outcome = client.compile(files, entrypoint=entrypoint, binary_files=binary_files)
+    else:
+        outcome = client.compile(files, entrypoint=entrypoint)
+    outcome.files = files
+    outcome.bibliography_ok = not bibliography_broken(outcome.log)
+    return outcome
+
+
+def _ensure_bibliography(
+    current: dict[str, str],
+    outcome: CompileOutcome,
+    *,
+    client: TexdClient,
+    entrypoint: str,
+    block: str | None,
+    repairs: list[dict[str, Any]],
+    binary_files: dict[str, bytes],
+) -> tuple[dict[str, str], CompileOutcome]:
+    """书目坏了就换成内联 ``thebibliography`` 重编一次。"""
+    if outcome.bibliography_ok or not block:
+        return current, outcome
+    patched = with_inline_bibliography(current, block, entrypoint=entrypoint)
+    if patched is None:
+        return current, outcome
+    candidate = _compile_once(client, patched, entrypoint, binary_files)
+    # 只在兜底确实修好书目、且没把原本能过的编译搞挂时采纳。
+    if candidate.bibliography_ok and (candidate.ok or not outcome.ok):
+        repairs.append({"kind": "inline_bibliography", "reason": "bibtex_unavailable"})
+        return patched, candidate
+    return current, outcome
 
 
 def deterministic_repairs(
@@ -218,7 +372,9 @@ __all__ = [
     "MAX_REPAIR_ROUNDS",
     "CompileOutcome",
     "TexdClient",
+    "bibliography_broken",
     "compile_with_repair",
     "deterministic_repairs",
     "error_context",
+    "with_inline_bibliography",
 ]

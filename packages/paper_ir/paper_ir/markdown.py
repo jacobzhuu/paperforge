@@ -15,6 +15,7 @@ from paper_ir.schema import (
     CiteRun,
     EquationBlock,
     FigureBlock,
+    ListBlock,
     MathInlineRun,
     PaperIR,
     ParagraphBlock,
@@ -22,6 +23,7 @@ from paper_ir.schema import (
     TableBlock,
     TextRun,
     TodoBlock,
+    XRefRun,
 )
 
 _HEADING = {1: "##", 2: "###", 3: "####"}
@@ -32,12 +34,26 @@ def render_markdown(
     *,
     references: Iterable[ReferenceMetadata] = (),
     style: CitationStyle | str | None = None,
+    asset_urls: Mapping[str, str] | None = None,
 ) -> str:
     """渲染整篇 Markdown：标题 + 摘要 + 章节 + 参考文献。"""
     refs = list(references)
     numbering = {ref.bibtex_key: index + 1 for index, ref in enumerate(refs) if ref.bibtex_key}
     by_key = {ref.bibtex_key: ref for ref in refs if ref.bibtex_key}
     citation_style = style or ir.bibliography.style
+    figure_numbering = {
+        block.label: index
+        for index, block in enumerate(
+            (
+                block
+                for section in ir.sections
+                for block in section.blocks
+                if isinstance(block, FigureBlock)
+            ),
+            start=1,
+        )
+        if block.label
+    }
 
     parts: list[str] = [f"# {ir.meta.title}".rstrip()]
     if ir.meta.authors:
@@ -50,7 +66,15 @@ def render_markdown(
         parts.append(f"**{heading}**：{', '.join(ir.meta.keywords)}")
 
     for section in ir.sections:
-        parts.append(_render_section(section, numbering=numbering, language=ir.meta.language))
+        parts.append(
+            _render_section(
+                section,
+                numbering=numbering,
+                figure_numbering=figure_numbering,
+                language=ir.meta.language,
+                asset_urls=asset_urls or {},
+            )
+        )
 
     if refs:
         heading = "参考文献" if ir.meta.language == "zh" else "References"
@@ -65,32 +89,61 @@ def _render_section(
     section: Section,
     *,
     numbering: Mapping[str, int],
+    figure_numbering: Mapping[str, int],
     language: str,
+    asset_urls: Mapping[str, str],
 ) -> str:
     heading = _HEADING.get(section.level, "####")
     lines = [f"{heading} {section.title}"]
     for block in section.blocks:
-        rendered = _render_block(block, numbering=numbering)
+        rendered = _render_block(
+            block,
+            numbering=numbering,
+            figure_numbering=figure_numbering,
+            language=language,
+            asset_urls=asset_urls,
+        )
         if rendered:
             lines.append(rendered)
     for warning in section.citation_warnings:
         # 编辑器可见的 R2 告警在预览里也保留，避免「静默剔除」。
         keys = ", ".join(warning.rejected_keys)
-        lines.append(f"> ⚠️ {warning.message}（{keys}）" if language == "zh" else
-                     f"> ⚠️ {warning.message} ({keys})")
+        lines.append(
+            f"> ⚠️ {warning.message}（{keys}）"
+            if language == "zh"
+            else f"> ⚠️ {warning.message} ({keys})"
+        )
     return "\n\n".join(lines)
 
 
-def _render_block(block, *, numbering: Mapping[str, int]) -> str:
+def _render_block(
+    block,
+    *,
+    numbering: Mapping[str, int],
+    figure_numbering: Mapping[str, int],
+    language: str,
+    asset_urls: Mapping[str, str],
+) -> str:
     if isinstance(block, ParagraphBlock):
-        return "".join(_render_run(run, numbering=numbering) for run in block.runs).strip()
+        return "".join(
+            _render_run(
+                run,
+                numbering=numbering,
+                figure_numbering=figure_numbering,
+                language=language,
+            )
+            for run in block.runs
+        ).strip()
     if isinstance(block, EquationBlock):
         return f"$$\n{block.latex}\n$$"
     if isinstance(block, FigureBlock):
         caption = block.caption or ""
-        return f"![{caption}]({block.asset_ref})\n\n*{caption}*" if caption else (
-            f"![]({block.asset_ref})"
-        )
+        alt = block.alt_text or caption
+        source = asset_urls.get(block.asset_ref, block.asset_ref)
+        figure_no = figure_numbering.get(block.label or "")
+        prefix = "图" if language == "zh" else "Figure"
+        legend = f"{prefix} {figure_no}　{caption}" if figure_no else caption
+        return f"![{alt}]({source})\n\n*{legend}*" if legend else f"![{alt}]({source})"
     if isinstance(block, TableBlock):
         ref = block.source.ref or ""
         return f"*表：{block.caption}*（数据来源：{ref}）" if block.caption else f"*表*（{ref}）"
@@ -99,12 +152,39 @@ def _render_block(block, *, numbering: Mapping[str, int]) -> str:
     if isinstance(block, TodoBlock):
         # 不编造实验数据：占位符在预览里必须醒目（设计 §4.4.2 红线）。
         return f"> **TODO**：{block.text}"
+    if isinstance(block, ListBlock):
+        lines = []
+        for index, item in enumerate(block.items, start=1):
+            bullet = f"{index}." if block.ordered else "-"
+            body = "".join(
+                _render_run(
+                    run,
+                    numbering=numbering,
+                    figure_numbering=figure_numbering,
+                    language=language,
+                )
+                for run in item.runs
+            ).strip()
+            lines.append(f"{bullet} {body}")
+        return "\n".join(lines)
     return ""
 
 
-def _render_run(run, *, numbering: Mapping[str, int]) -> str:
+def _render_run(
+    run,
+    *,
+    numbering: Mapping[str, int],
+    figure_numbering: Mapping[str, int],
+    language: str,
+) -> str:
     if isinstance(run, TextRun):
-        return run.v
+        text = run.v
+        # 与 LaTeX 渲染器保持同一套语义：强调来自结构化 marks，不是正文里的星号。
+        if "bold" in run.marks:
+            text = f"**{text}**"
+        if "italic" in run.marks:
+            text = f"*{text}*"
+        return text
     if isinstance(run, CiteRun):
         if not run.keys:
             return ""
@@ -115,6 +195,11 @@ def _render_run(run, *, numbering: Mapping[str, int]) -> str:
         return " " + "".join(marks)
     if isinstance(run, MathInlineRun):
         return f"${run.v}$"
+    if isinstance(run, XRefRun):
+        index = figure_numbering.get(run.target)
+        if index is None:
+            return "图 ?" if language == "zh" else "Figure ?"
+        return f"图 {index}" if language == "zh" else f"Figure {index}"
     return ""
 
 

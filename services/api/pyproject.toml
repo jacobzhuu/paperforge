@@ -15,12 +15,16 @@ dependencies = [
     "ingest",
     "paperforge-storage",
     "paperforge-worker",
+    "paperforge-visuals",
     "arq>=0.26",
     "python-multipart>=0.0.9",
+    "argon2-cffi>=23.1",
+    "email-validator>=2.2",
 ]
 
 [project.scripts]
 paperforge-api = "paperforge_api.__main__:main"
+paperforge-admin = "paperforge_api.admin:main"
 
 [tool.uv.sources]
 paperforge-observability = { workspace = true }
@@ -31,6 +35,7 @@ scholar-gateway = { workspace = true }
 ingest = { workspace = true }
 paperforge-storage = { workspace = true }
 paperforge-worker = { workspace = true }
+paperforge-visuals = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

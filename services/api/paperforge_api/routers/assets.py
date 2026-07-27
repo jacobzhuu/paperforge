@@ -13,21 +13,24 @@ from db import (
     create_asset,
     delete_asset,
     get_asset,
-    get_project,
     list_assets,
     parsed_asset_payloads,
+    visual_source_dependency_count,
 )
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from ingest import parse_asset
 from ingest.numlint import lint_sections
 from sqlalchemy.ext.asyncio import AsyncSession
-from storage import FilesystemObjectStore
+from storage import make_object_store
 
 from paperforge_api.config import get_settings
-from paperforge_api.deps import get_session
+from paperforge_api.deps import authorize_project_request, get_session
+from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.schemas import AssetResponse, NumLintResponse
 
-router = APIRouter(prefix="/api/v1", tags=["assets"])
+router = APIRouter(
+    prefix="/api/v1", tags=["assets"], dependencies=[Depends(authorize_project_request)]
+)
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -61,8 +64,11 @@ async def upload_asset(
         kind=kind,
     )
 
-    store = FilesystemObjectStore(get_settings().storage_fs_root)
-    object_key = f"projects/{project.id}/assets/{uuid.uuid4()}-{_safe_name(filename)}"
+    store = make_object_store(get_settings())
+    object_key = (
+        f"users/{project.owner_id}/projects/{project.id}/assets/"
+        f"{uuid.uuid4()}-{_safe_name(filename)}"
+    )
     store.put(object_key, content)
 
     payload = dict(parsed.parsed)
@@ -106,6 +112,11 @@ async def remove_asset(project_id: str, asset_id: str, session: SessionDep) -> N
     asset = await get_asset(session, asset_uuid)
     if asset is None or asset.project_id != project.id:
         raise HTTPException(status_code=404, detail="asset not found")
+    if await visual_source_dependency_count(session, asset.id):
+        raise HTTPException(
+            status_code=409,
+            detail="asset is used by a versioned visual and cannot be deleted",
+        )
     await delete_asset(session, asset)
 
 
@@ -119,14 +130,14 @@ async def download_asset(project_id: str, asset_id: str, session: SessionDep) ->
     asset = await get_asset(session, asset_uuid)
     if asset is None or asset.project_id != project.id or not asset.object_key:
         raise HTTPException(status_code=404, detail="asset not found")
-    store = FilesystemObjectStore(get_settings().storage_fs_root)
+    store = make_object_store(get_settings())
     try:
         data = store.get(asset.object_key)
     except (FileNotFoundError, ValueError) as error:
         raise HTTPException(status_code=410, detail="asset payload is gone") from error
     return Response(
         content=data,
-        media_type="application/octet-stream",
+        media_type=_asset_media_type(data),
         headers={"Content-Disposition": f'attachment; filename="{asset.title or "asset"}"'},
     )
 
@@ -184,12 +195,11 @@ def _safe_name(name: str) -> str:
     return cleaned.strip("-") or "asset"
 
 
-async def _require_project(session: AsyncSession, project_id: str):
-    try:
-        project_uuid = uuid.UUID(project_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    project = await get_project(session, project_uuid)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
+def _asset_media_type(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    return "application/octet-stream"

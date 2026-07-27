@@ -192,9 +192,7 @@ async def get_cards(
     project_id: uuid.UUID,
 ) -> dict[uuid.UUID, LiteratureCard]:
     rows = (
-        await session.scalars(
-            select(LiteratureCard).where(LiteratureCard.project_id == project_id)
-        )
+        await session.scalars(select(LiteratureCard).where(LiteratureCard.project_id == project_id))
     ).all()
     return {row.work_id: row for row in rows}
 

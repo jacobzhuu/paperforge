@@ -87,8 +87,7 @@ class ArxivDiscoveryAdapter(HttpScholarlyDiscoveryAdapter):
                         error_code="arxiv_http_error",
                         message=f"arxiv returned HTTP {fetched.status_code}.",
                         status_code=fetched.status_code,
-                        retryable=fetched.status_code in {408, 429}
-                        or fetched.status_code >= 500,
+                        retryable=fetched.status_code in {408, 429} or fetched.status_code >= 500,
                     ),
                 ),
                 metadata={"cache_hit": fetched.cache_hit},

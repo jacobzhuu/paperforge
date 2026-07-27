@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import subprocess
 import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 # Tectonic 编译沙箱（方案 §4.6）：独立容器、无外网、只读模板、资源限额。
 # 接收 LaTeX 工程（多文件），Tectonic 编译为 PDF，返回 PDF + 日志。
@@ -15,9 +17,19 @@ app = FastAPI(title="PaperForge texd", version="0.1.0")
 
 
 class CompileRequest(BaseModel):
-    # 相对路径 → 文件内容（main.tex、sections/*.tex、refs.bib、figures 以 base64 另行处理）
-    files: dict[str, str]
+    text_files: dict[str, str] = Field(default_factory=dict)
+    binary_files: dict[str, str] = Field(default_factory=dict)
+    # 旧客户端兼容字段；新客户端只发送 text_files。
+    files: dict[str, str] | None = None
     entrypoint: str = "main.tex"
+
+    @model_validator(mode="after")
+    def merge_legacy_files(self) -> CompileRequest:
+        if self.files:
+            if self.text_files:
+                raise ValueError("send either files or text_files, not both")
+            self.text_files = dict(self.files)
+        return self
 
 
 class CompileResult(BaseModel):
@@ -41,25 +53,71 @@ def _resolve_project_path(root: Path, relative_path: str) -> Path:
     return resolved
 
 
+MAX_BINARY_FILES = 32
+MAX_BINARY_FILE_BYTES = 16 * 1024 * 1024
+MAX_BINARY_TOTAL_BYTES = 64 * 1024 * 1024
+_BINARY_MAGIC = {
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".pdf": (b"%PDF-",),
+}
+
+
+def _decode_binary_files(encoded_files: dict[str, str]) -> tuple[dict[str, bytes], str | None]:
+    if len(encoded_files) > MAX_BINARY_FILES:
+        return {}, f"too many binary files: maximum is {MAX_BINARY_FILES}"
+    decoded: dict[str, bytes] = {}
+    total = 0
+    for rel, encoded in encoded_files.items():
+        suffix = Path(rel).suffix.lower()
+        signatures = _BINARY_MAGIC.get(suffix)
+        if signatures is None:
+            return {}, f"unsupported binary extension: {suffix or '(none)'}"
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return {}, f"invalid base64 binary file: {rel}"
+        if not data or len(data) > MAX_BINARY_FILE_BYTES:
+            return {}, f"binary file exceeds 16 MiB or is empty: {rel}"
+        if not any(data.startswith(signature) for signature in signatures):
+            return {}, f"binary extension and magic bytes disagree: {rel}"
+        total += len(data)
+        if total > MAX_BINARY_TOTAL_BYTES:
+            return {}, "binary files exceed 64 MiB total"
+        decoded[rel] = data
+    return decoded, None
+
+
 @app.post("/compile", response_model=CompileResult)
 def compile_project(req: CompileRequest) -> CompileResult:
     """Compile in FastAPI's sync worker pool so health checks stay responsive."""
-    import base64
-
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        for rel, content in req.files.items():
+        binaries, binary_error = _decode_binary_files(req.binary_files)
+        if binary_error:
+            return CompileResult(ok=False, log=binary_error)
+        if set(req.text_files) & set(binaries):
+            return CompileResult(ok=False, log="path supplied as both text and binary")
+        for rel, content in req.text_files.items():
             try:
                 path = _resolve_project_path(root, rel)
             except ValueError as exc:
                 return CompileResult(ok=False, log=str(exc))
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+        for rel, content in binaries.items():
+            try:
+                path = _resolve_project_path(root, rel)
+            except ValueError as exc:
+                return CompileResult(ok=False, log=str(exc))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
         try:
             entry = _resolve_project_path(root, req.entrypoint)
         except ValueError as exc:
             return CompileResult(ok=False, log=str(exc))
-        if req.entrypoint not in req.files or not entry.is_file():
+        if req.entrypoint not in req.text_files or not entry.is_file():
             return CompileResult(ok=False, log=f"entrypoint not supplied: {req.entrypoint}")
         try:
             proc = subprocess.run(

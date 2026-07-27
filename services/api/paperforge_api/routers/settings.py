@@ -9,20 +9,17 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any
 
-from db import (
-    get_project,
-    latest_document,
-    list_sections,
-    project_llm_cost,
-)
+from db import latest_document, list_sections, project_llm_cost
 from db.models.paper import Outline, PaperDocument
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from llm_runtime import DEFAULT_ROLE_MODELS
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from visuals import ImageProviderConfig, image_provider_configured
 
 from paperforge_api.config import get_settings
-from paperforge_api.deps import get_session
+from paperforge_api.deps import authorize_project_request, get_session
+from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.schemas import (
     DocumentVersionResponse,
     OutlineVersionResponse,
@@ -31,7 +28,9 @@ from paperforge_api.schemas import (
     VersionHistoryResponse,
 )
 
-router = APIRouter(prefix="/api/v1", tags=["settings"])
+router = APIRouter(
+    prefix="/api/v1", tags=["settings"], dependencies=[Depends(authorize_project_request)]
+)
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -62,14 +61,28 @@ async def read_settings() -> SettingsResponse:
     ]
     return SettingsResponse(
         llm_provider=settings.llm_default_provider,
-        llm_base_url=settings.llm_openai_base_url,
         llm_api_key_configured=bool(settings.llm_openai_api_key.strip()),
         llm_enabled=settings.llm_default_provider.strip().lower() not in {"", "noop"},
         roles=roles,
-        scholar_contact_email=settings.scholar_contact_email or None,
+        scholar_contact_email_configured=bool(settings.scholar_contact_email.strip()),
         semantic_scholar_key_configured=bool(settings.semantic_scholar_api_key.strip()),
         storage_backend=settings.storage_backend,
-        texd_url=settings.texd_url,
+        visuals_enabled=settings.visuals_enabled,
+        ai_images_enabled=settings.ai_images_enabled,
+        image_provider=settings.image_provider,
+        image_model=settings.image_model,
+        image_api_key_configured=bool(settings.image_api_key.strip()),
+        image_provider_configured=image_provider_configured(
+            ImageProviderConfig(
+                provider=settings.image_provider,
+                api_key=settings.image_api_key,
+                model=settings.image_model,
+                base_url=settings.image_base_url,
+                account_id=settings.image_account_id,
+                timeout_seconds=settings.image_timeout_seconds,
+                max_retries=settings.image_max_retries,
+            )
+        ),
     )
 
 
@@ -151,6 +164,41 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
         )
     ).all()
     totals = await project_llm_cost(session, project.id)
+    from db.models.paper import VisualAsset, VisualGenerationAttempt
+
+    image_row = (
+        await session.execute(
+            select(
+                func.count(VisualGenerationAttempt.id),
+                func.count(VisualGenerationAttempt.error_code),
+                func.coalesce(func.sum(VisualGenerationAttempt.cost_estimate), 0.0),
+            )
+            .join(VisualAsset, VisualAsset.id == VisualGenerationAttempt.visual_id)
+            .where(VisualAsset.project_id == project.id)
+        )
+    ).one()
+    image_sizes = (
+        await session.execute(
+            select(
+                VisualGenerationAttempt.provider,
+                VisualGenerationAttempt.model,
+                VisualGenerationAttempt.output_width,
+                VisualGenerationAttempt.output_height,
+                func.count(VisualGenerationAttempt.id),
+                func.count(VisualGenerationAttempt.error_code),
+                func.coalesce(func.sum(VisualGenerationAttempt.cost_estimate), 0.0),
+            )
+            .join(VisualAsset, VisualAsset.id == VisualGenerationAttempt.visual_id)
+            .where(VisualAsset.project_id == project.id)
+            .group_by(
+                VisualGenerationAttempt.provider,
+                VisualGenerationAttempt.model,
+                VisualGenerationAttempt.output_width,
+                VisualGenerationAttempt.output_height,
+            )
+            .order_by(func.count(VisualGenerationAttempt.id).desc())
+        )
+    ).all()
     return {
         "project_id": str(project.id),
         "totals": totals,
@@ -167,15 +215,21 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
             }
             for row in rows
         ],
+        "images": {
+            "call_count": int(image_row[0] or 0),
+            "failed_call_count": int(image_row[1] or 0),
+            "cost_estimate": float(image_row[2] or 0.0),
+            "by_size": [
+                {
+                    "provider": row[0],
+                    "model": row[1],
+                    "width": row[2],
+                    "height": row[3],
+                    "call_count": int(row[4] or 0),
+                    "failed_call_count": int(row[5] or 0),
+                    "cost_estimate": float(row[6] or 0.0),
+                }
+                for row in image_sizes
+            ],
+        },
     }
-
-
-async def _require_project(session: AsyncSession, project_id: str):
-    try:
-        project_uuid = uuid.UUID(project_id)
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail="project not found") from error
-    project = await get_project(session, project_uuid)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project

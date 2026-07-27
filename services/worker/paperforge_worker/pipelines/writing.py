@@ -110,9 +110,7 @@ class SectionDraft:
                 {  # type: ignore[arg-type]
                     "path": warning.get("path", ""),
                     "rejected_keys": tuple(warning.get("rejected_keys", ())),
-                    "message": warning.get(
-                        "message", "引用已移除：引用键不在项目写作白名单中"
-                    ),
+                    "message": warning.get("message", "引用已移除：引用键不在项目写作白名单中"),
                 }
             )
         return section
@@ -191,8 +189,7 @@ async def write_section(
         draft.rewrite_count = 1
         rejected = sorted({key for v in result.violations for key in v.rejected_keys})
         retry_prompt = (
-            f"{user_prompt}\n\n---\n"
-            f"上一版使用了不在白名单中的引用键：{', '.join(rejected)}。"
+            f"{user_prompt}\n\n---\n上一版使用了不在白名单中的引用键：{', '.join(rejected)}。"
             if context.language == "zh"
             else (
                 f"{user_prompt}\n\n---\n"

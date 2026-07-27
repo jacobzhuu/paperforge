@@ -199,28 +199,28 @@ def _extract_docx_content(*, content: bytes, mime_type: str) -> ParsedContent:
     text, segment_payloads = _join_segments(segments)
     return ParsedContent(
         text=text,
-            title=_derive_title(text),
-            source_type="office_document",
-            metadata={
-                **mime_policy_metadata(mime_type),
-                "extractor": "docx_xml_text_v2",
-                "parser_status": "success",
-                "parser_kind": "docx",
-                "content_type": mime_type,
-                "text_length": len(text),
+        title=_derive_title(text),
+        source_type="office_document",
+        metadata={
+            **mime_policy_metadata(mime_type),
+            "extractor": "docx_xml_text_v2",
+            "parser_status": "success",
+            "parser_kind": "docx",
+            "content_type": mime_type,
+            "text_length": len(text),
+            "paragraph_count": paragraph_no,
+            "table_count": table_no,
+            "locator_reliability": "paragraph_and_table_xml_order",
+            "citation_offsets_exact_in_extracted_text": True,
+            "content_structure_hints": {
                 "paragraph_count": paragraph_no,
                 "table_count": table_no,
-                "locator_reliability": "paragraph_and_table_xml_order",
-                "citation_offsets_exact_in_extracted_text": True,
-                "content_structure_hints": {
-                    "paragraph_count": paragraph_no,
-                    "table_count": table_no,
-                    "structure_segment_count": len(segment_payloads),
-                },
-                "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
-                "structure_segments": segment_payloads,
+                "structure_segment_count": len(segment_payloads),
             },
-        )
+            "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
+            "structure_segments": segment_payloads,
+        },
+    )
 
 
 def _extract_pptx_content(*, content: bytes, mime_type: str) -> ParsedContent:
@@ -244,21 +244,21 @@ def _extract_pptx_content(*, content: bytes, mime_type: str) -> ParsedContent:
             segments.append(
                 _TextSegment(
                     text=text,
-                        locator={
-                            "format": "pptx",
-                            "slide_number": slide_no,
-                            "slide_range": [slide_no, slide_no],
-                            "structure_kind": "slide_text",
-                            "text_block_count": len(
-                                [
-                                    node
-                                    for node in _iter_elements(root, "t")
-                                    if _normalize_line(node.text or "")
-                                ]
-                            ),
-                        },
-                    )
+                    locator={
+                        "format": "pptx",
+                        "slide_number": slide_no,
+                        "slide_range": [slide_no, slide_no],
+                        "structure_kind": "slide_text",
+                        "text_block_count": len(
+                            [
+                                node
+                                for node in _iter_elements(root, "t")
+                                if _normalize_line(node.text or "")
+                            ]
+                        ),
+                    },
                 )
+            )
     text, segment_payloads = _join_segments(segments)
     return ParsedContent(
         text=text,
@@ -266,25 +266,25 @@ def _extract_pptx_content(*, content: bytes, mime_type: str) -> ParsedContent:
         source_type="office_document",
         metadata={
             **mime_policy_metadata(mime_type),
-                "extractor": "pptx_slide_xml_text_v2",
-                "parser_status": "success",
-                "parser_kind": "pptx",
-                "content_type": mime_type,
-                "text_length": len(text),
+            "extractor": "pptx_slide_xml_text_v2",
+            "parser_status": "success",
+            "parser_kind": "pptx",
+            "content_type": mime_type,
+            "text_length": len(text),
+            "slide_count": len(slide_names),
+            "locator_reliability": "slide_xml_order",
+            "citation_offsets_exact_in_extracted_text": True,
+            "content_structure_hints": {
                 "slide_count": len(slide_names),
-                "locator_reliability": "slide_xml_order",
-                "citation_offsets_exact_in_extracted_text": True,
-                "content_structure_hints": {
-                    "slide_count": len(slide_names),
-                    "text_block_count": sum(
-                        int(segment.get("text_block_count") or 0) for segment in segment_payloads
-                    ),
-                    "structure_segment_count": len(segment_payloads),
-                },
-                "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
-                "structure_segments": segment_payloads,
+                "text_block_count": sum(
+                    int(segment.get("text_block_count") or 0) for segment in segment_payloads
+                ),
+                "structure_segment_count": len(segment_payloads),
             },
-        )
+            "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
+            "structure_segments": segment_payloads,
+        },
+    )
 
 
 def _extract_xlsx_content(*, content: bytes, mime_type: str) -> ParsedContent:
@@ -335,34 +335,31 @@ def _extract_xlsx_content(*, content: bytes, mime_type: str) -> ParsedContent:
         source_type="office_document",
         metadata={
             **mime_policy_metadata(mime_type),
-                "extractor": "xlsx_sheet_xml_text_v2",
-                "parser_status": "success",
-                "parser_kind": "xlsx",
-                "content_type": mime_type,
-                "text_length": len(text),
+            "extractor": "xlsx_sheet_xml_text_v2",
+            "parser_status": "success",
+            "parser_kind": "xlsx",
+            "content_type": mime_type,
+            "text_length": len(text),
+            "sheet_count": len(worksheet_names),
+            "table_count": len(segment_payloads),
+            "locator_reliability": "sheet_cell_reference",
+            "citation_offsets_exact_in_extracted_text": True,
+            "content_structure_hints": {
                 "sheet_count": len(worksheet_names),
                 "table_count": len(segment_payloads),
-                "locator_reliability": "sheet_cell_reference",
-                "citation_offsets_exact_in_extracted_text": True,
-                "content_structure_hints": {
-                    "sheet_count": len(worksheet_names),
-                    "table_count": len(segment_payloads),
-                    "table_row_count": sum(
-                        int(segment.get("table_row_count") or 0) for segment in segment_payloads
-                    ),
-                    "table_column_count_max": max(
-                        (
-                            int(segment.get("table_column_count") or 0)
-                            for segment in segment_payloads
-                        ),
-                        default=0,
-                    ),
-                    "structure_segment_count": len(segment_payloads),
-                },
-                "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
-                "structure_segments": segment_payloads,
+                "table_row_count": sum(
+                    int(segment.get("table_row_count") or 0) for segment in segment_payloads
+                ),
+                "table_column_count_max": max(
+                    (int(segment.get("table_column_count") or 0) for segment in segment_payloads),
+                    default=0,
+                ),
+                "structure_segment_count": len(segment_payloads),
             },
-        )
+            "parser_warnings": [OFFICE_VISUAL_LAYOUT_FALLBACK_REASON],
+            "structure_segments": segment_payloads,
+        },
+    )
 
 
 def _open_office_zip(content: bytes, *, expected_member: str) -> ZipFile:

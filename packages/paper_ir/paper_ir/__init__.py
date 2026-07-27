@@ -27,12 +27,14 @@ from paper_ir.schema import (
     Block,
     CitationWarning,
     CiteRun,
+    FigureBlock,
     PaperIR,
     PaperIRCiteKeyViolation,
     PaperMeta,
     ParagraphBlock,
     Section,
     TextRun,
+    XRefRun,
 )
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "CitationStyle",
     "CitationWarning",
     "CiteRun",
+    "FigureBlock",
     "PaperIR",
     "PaperIRCiteKeyViolation",
     "PaperMeta",
@@ -49,6 +52,7 @@ __all__ = [
     "ReferenceMetadata",
     "Section",
     "TextRun",
+    "XRefRun",
     "format_scholarly_reference",
     "make_bibtex_key",
     "parse_bibtex_entries",
