@@ -8,6 +8,7 @@ RUN_DIR="${STATE_DIR}/run"
 LOG_DIR="${STATE_DIR}/logs"
 WEB_URL="${PAPERFORGE_WEB_URL:-http://localhost:3000}"
 API_URL="${PAPERFORGE_API_URL:-http://localhost:8080}"
+WEB_MODE="${PAPERFORGE_WEB_MODE:-development}"
 TEXD_URL="${PAPERFORGE_TEXD_URL:-http://localhost:8081}"
 VISUALD_URL="${PAPERFORGE_VISUALD_URL:-http://localhost:8082}"
 POSTGRES_HOST_PORT="${PAPERFORGE_POSTGRES_PORT:-15432}"
@@ -262,6 +263,19 @@ up() {
     CI=1 "${PNPM_COMMAND[@]}" install --frozen-lockfile
   )
 
+  if [ "${WEB_MODE}" = "production" ]; then
+    echo "Building production Web app..."
+    (
+      cd "${ROOT_DIR}/apps/web"
+      PAPERFORGE_API_INTERNAL_BASE="http://127.0.0.1:8080" \
+        NEXT_PUBLIC_DEMO_MODE=false \
+        "${PNPM_COMMAND[@]}" build
+    )
+  elif [ "${WEB_MODE}" != "development" ]; then
+    echo "Unsupported PAPERFORGE_WEB_MODE: ${WEB_MODE}" >&2
+    return 1
+  fi
+
   echo "Starting Docker services..."
   "${COMPOSE[@]}" up -d --build
 
@@ -287,8 +301,17 @@ up() {
   start_process worker "${ROOT_DIR}" \
     env REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" VISUALD_URL="${VISUALD_URL}" \
       uv run arq paperforge_worker.worker.WorkerSettings
-  start_process web "${ROOT_DIR}/apps/web" \
-    "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port 3000
+  if [ "${WEB_MODE}" = "production" ]; then
+    start_process web "${ROOT_DIR}/apps/web" \
+      env \
+        NODE_ENV=production \
+        PAPERFORGE_API_INTERNAL_BASE="http://127.0.0.1:8080" \
+        NEXT_PUBLIC_DEMO_MODE=false \
+        "${PNPM_COMMAND[@]}" start --hostname 127.0.0.1 --port 3000
+  else
+    start_process web "${ROOT_DIR}/apps/web" \
+      "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port 3000
+  fi
 
   echo "Waiting for health checks..."
   wait_redis

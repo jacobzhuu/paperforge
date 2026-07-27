@@ -14,7 +14,10 @@ export function middleware(request: NextRequest) {
     request.cookies.has('paperforge_session') ||
     request.cookies.has('__Host-paperforge_session');
   if (!hasSession && !PUBLIC_PATHS.has(pathname)) {
-    const login = new URL('/login', request.url);
+    // Reverse proxies can present their loopback upstream as request.url. Production
+    // deployments provide the canonical public origin so redirects never leak localhost.
+    const redirectBase = process.env.PAPERFORGE_PUBLIC_APP_URL?.trim() || request.url;
+    const login = new URL('/login', redirectBase);
     login.searchParams.set('next', `${pathname}${request.nextUrl.search}`);
     return NextResponse.redirect(login);
   }
