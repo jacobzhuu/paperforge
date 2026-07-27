@@ -117,7 +117,7 @@ export function ActionMenu({
                   close(false);
                   item.onSelect();
                 }}
-                className="flex w-full items-start gap-2.5 rounded px-2 py-2 text-left transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="flex min-h-11 w-full items-start gap-2.5 rounded px-2 py-2 text-left transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0">

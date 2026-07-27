@@ -43,7 +43,7 @@ export function Drawer({
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <div
-        className="absolute inset-0 bg-black/50 animate-fade-in dark:bg-black/70"
+        className="absolute inset-0 bg-black/45 backdrop-blur-[2px] animate-fade-in dark:bg-black/70"
         onClick={onClose}
         aria-hidden="true"
       />
@@ -55,11 +55,11 @@ export function Drawer({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cn(
-          'relative z-10 flex h-full w-full max-w-xl flex-col bg-card shadow-xl animate-slide-in-right',
+          'relative z-10 flex h-[100dvh] w-full max-w-xl flex-col bg-card/95 shadow-xl backdrop-blur-xl animate-slide-in-right sm:border-l',
           className,
         )}
       >
-        <header className="flex items-start justify-between gap-4 border-b p-5">
+        <header className="flex items-start justify-between gap-4 border-b px-5 pb-4 pt-[max(1.25rem,env(safe-area-inset-top))]">
           <div className="space-y-1">
             {title && (
               <h2 id={titleId} className="text-lg font-semibold leading-tight">
@@ -72,12 +72,16 @@ export function Drawer({
               </p>
             )}
           </div>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭">
+          <Button variant="ghost" size="icon" className="h-11 w-11" onClick={onClose} aria-label="关闭">
             <X />
           </Button>
         </header>
-        <div className="flex-1 overflow-y-auto scrollbar-thin p-5">{children}</div>
-        {footer && <footer className="border-t p-4">{footer}</footer>}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-thin p-5">{children}</div>
+        {footer && (
+          <footer className="shrink-0 border-t bg-card/95 px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-4 backdrop-blur-xl">
+            {footer}
+          </footer>
+        )}
       </aside>
     </div>
   );

@@ -62,14 +62,12 @@ export function Checkbox({
       disabled={disabled}
       onClick={() => onCheckedChange?.(!checked)}
       className={cn(
-        BOX_CLASS,
-        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
-        checked && 'border-primary bg-primary text-primary-foreground',
+        'flex h-11 w-11 shrink-0 items-center justify-center rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
         className,
       )}
       {...rest}
     >
-      {checked && <Check className="h-3 w-3" strokeWidth={3} />}
+      <CheckboxIndicator checked={checked} disabled={disabled} />
     </button>
   );
 }
