@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import io
+import os
+
 import httpx
 import pytest
 from latex_render import (
@@ -24,6 +27,7 @@ from latex_render import (
 )
 from paper_ir import (
     CiteRun,
+    PaperAuthor,
     PaperIR,
     PaperMeta,
     ParagraphBlock,
@@ -31,7 +35,7 @@ from paper_ir import (
     Section,
     TextRun,
 )
-from paper_ir.schema import EquationBlock, TodoBlock
+from paper_ir.schema import EquationBlock, TableBlock, TableSource, TodoBlock
 
 
 def _ref(**overrides) -> ReferenceMetadata:
@@ -108,6 +112,128 @@ def test_multiple_authors_use_latex_separator_without_printing_it() -> None:
     project = build_latex_project(ir)
     assert r"Ada \& Smith \and Lin Chen" in project.files["main.tex"]
     assert r"\textbackslash{}and" not in project.files["main.tex"]
+
+
+def test_structured_authors_render_affiliations_corresponding_email_and_orcid() -> None:
+    ir = _ir()
+    ir.meta.author_details = [
+        PaperAuthor(
+            id="a1",
+            name="Ada Lovelace",
+            affiliations=["Analytical Engine Lab"],
+            email="ada@example.org",
+            orcid="0000-0002-1825-0097",
+            corresponding=True,
+        ),
+        PaperAuthor(
+            id="a2",
+            name="Lin Chen",
+            affiliations=["Analytical Engine Lab", "Paper Forge Institute"],
+        ),
+    ]
+    project = build_latex_project(ir)
+    main = project.files["main.tex"]
+    assert r"Ada Lovelace\textsuperscript{1,*}" in main
+    assert r"Lin Chen\textsuperscript{1,2}" in main
+    assert "Corresponding author: ada@example.org" in main
+    assert "ORCID: Ada Lovelace: 0000-0002-1825-0097" in main
+    assert r"\small\shortstack{" in main
+
+
+def test_structured_author_details_compile_in_real_texd() -> None:
+    """结构化作者不能只验证字符串；它会在 ``\\maketitle`` 时二次展开。
+
+    本地/部署验收显式传入 ``PAPERFORGE_TEST_TEXD_URL`` 时跑真实
+    Tectonic；普通单测环境没有 texd 时保持可移植。
+    """
+    texd_url = os.getenv("PAPERFORGE_TEST_TEXD_URL")
+    if not texd_url:
+        pytest.skip("set PAPERFORGE_TEST_TEXD_URL to run the real texd regression")
+
+    ir = _ir(language="zh")
+    ir.sections = []
+    ir.meta.author_details = [
+        PaperAuthor(
+            id="a1",
+            name="朱子阳",
+            affiliations=["北京邮电大学"],
+            orcid="0009-0001-1933-1921",
+        )
+    ]
+    project = build_latex_project(ir, template="cn_thesis")
+    client = TexdClient(texd_url)
+    try:
+        outcome = client.compile(project.files, entrypoint=project.entrypoint)
+    finally:
+        client.close()
+    assert outcome.ok, outcome.log
+    assert outcome.pdf and outcome.pdf.startswith(b"%PDF")
+
+
+def test_long_single_column_table_compiles_across_pages_in_real_texd() -> None:
+    texd_url = os.getenv("PAPERFORGE_TEST_TEXD_URL")
+    if not texd_url:
+        pytest.skip("set PAPERFORGE_TEST_TEXD_URL to run the real texd regression")
+
+    rows = [
+        [
+            f"Study {index}: " + "complete research title " * 5,
+            str(2000 + index),
+            "Detailed method and setting " * 4,
+            "Located full text",
+        ]
+        for index in range(1, 21)
+    ]
+    rows[-1][0] = "LASTROW"
+    ir = PaperIR(
+        meta=PaperMeta(title="Long table regression", language="en"),
+        sections=[
+            Section(
+                key="synthesis",
+                title="Synthesis",
+                blocks=[
+                    TableBlock(
+                        caption="Methods and evidence",
+                        label="tab:evidence",
+                        source=TableSource(
+                            kind="inline",
+                            data={
+                                "headers": ["Study", "Year", "Method", "Evidence"],
+                                "rows": rows,
+                            },
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    project = build_latex_project(ir, template="article")
+    client = TexdClient(texd_url)
+    try:
+        outcome = client.compile(project.files, entrypoint=project.entrypoint)
+    finally:
+        client.close()
+    assert outcome.ok, outcome.log
+    assert outcome.pdf
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(outcome.pdf))
+    text = " ".join(
+        " ".join((page.extract_text() or "").split()) for page in reader.pages
+    )
+    assert len(reader.pages) >= 2
+    assert "LASTROW" in text
+
+
+def test_ieee_structured_authors_use_ieee_blocks() -> None:
+    ir = _ir()
+    ir.meta.author_details = [
+        PaperAuthor(id="a1", name="Ada Lovelace", affiliations=["Engine Lab"]),
+    ]
+    main = build_latex_project(ir, template="ieee").files["main.tex"]
+    assert r"\IEEEauthorblockN{Ada Lovelace\textsuperscript{1}}" in main
+    assert r"\IEEEauthorblockA{\textsuperscript{1} Engine Lab}" in main
 
 
 def test_todo_block_renders_visible_placeholder() -> None:
@@ -192,6 +318,15 @@ def test_undefined_command_is_removed() -> None:
 def test_error_context_extracts_line_numbers() -> None:
     log = "! Undefined control sequence.\nl.42 \\foo bar\nl.99 \\baz"
     assert error_context(log)[0] == {"line": 42, "snippet": "\\foo bar"}
+
+
+def test_error_context_extracts_tectonic_file_and_line() -> None:
+    log = "error: sections/00-s1.tex:38: Missing } inserted\nerror: halted"
+    assert error_context(log)[0] == {
+        "file": "sections/00-s1.tex",
+        "line": 38,
+        "snippet": "Missing } inserted",
+    }
 
 
 # ---- 编译流程 ----

@@ -34,6 +34,7 @@ ALLOWED_ENVIRONMENTS = frozenset(
         "figure*",
         "table",
         "tabular",
+        "longtable",
         "algorithm",
         "algorithmic",
         "abstract",
@@ -87,6 +88,10 @@ _UNDEFINED_ENV_RE = re.compile(r"LaTeX Error: Environment ([A-Za-z*]+) undefined
 # 日志里的控制序列只有一个反斜杠：`l.5 \madeupcommand`。
 _UNDEFINED_CONTROL_RE = re.compile(r"Undefined control sequence.*?\\([A-Za-z@]+)", re.DOTALL)
 _ERROR_LINE_RE = re.compile(r"^l\.(\d+)\s*(.*)$", re.MULTILINE)
+_TECTONIC_ERROR_LINE_RE = re.compile(
+    r"^error:\s+([^:\n]+):(\d+):\s*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass
@@ -360,6 +365,20 @@ def deterministic_repairs(
 def error_context(log: str, *, max_items: int = 5) -> list[dict[str, Any]]:
     """从日志抽出报错行号与片段，供 LLM 做最小修补时定位。"""
     items: list[dict[str, Any]] = []
+    # Tectonic HTTP 服务的常见形态：
+    # ``error: sections/00-s1.tex:42: Missing } inserted``。
+    # 旧实现只识别传统 TeX 的 ``l.42 ...``，会让可修复的
+    # 章节错误在第 0 轮就停止。
+    for match in _TECTONIC_ERROR_LINE_RE.finditer(log):
+        items.append(
+            {
+                "file": match.group(1).strip(),
+                "line": int(match.group(2)),
+                "snippet": match.group(3)[:200],
+            }
+        )
+        if len(items) >= max_items:
+            return items
     for match in _ERROR_LINE_RE.finditer(log):
         items.append({"line": int(match.group(1)), "snippet": match.group(2)[:200]})
         if len(items) >= max_items:

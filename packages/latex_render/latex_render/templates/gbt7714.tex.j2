@@ -6,6 +6,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{longtable}
 \usepackage{hyperref}
 \hypersetup{hidelinks}
 \usepackage{xcolor}
@@ -30,7 +31,7 @@
 \providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
 
 \title{ {{- title -}} }
-{% if authors %}\author{ {{- authors -}} }{% else %}\author{}{% endif %}
+{% if author_block %}\author{ {{- author_block -}} }{% else %}\author{}{% endif %}
 \date{}
 
 \begin{document}

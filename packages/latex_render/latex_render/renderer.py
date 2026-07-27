@@ -79,7 +79,7 @@ def _render_block(
     if isinstance(block, FigureBlock):
         return _render_figure(block, assets or {}, twocolumn)
     if isinstance(block, TableBlock):
-        return _render_table(block, assets or {})
+        return _render_table(block, assets or {}, twocolumn=twocolumn)
     if isinstance(block, AlgorithmBlock):
         return f"\\begin{{algorithm}}\n{block.latex}\n\\end{{algorithm}}"
     if isinstance(block, TodoBlock):
@@ -148,14 +148,19 @@ def _clean_caption(value: str) -> str:
     ).strip()
 
 
-def _render_table(block: TableBlock, assets: Mapping[str, dict[str, Any]]) -> str:
+def _render_table(
+    block: TableBlock,
+    assets: Mapping[str, dict[str, Any]],
+    *,
+    twocolumn: bool = False,
+) -> str:
     """从上传素材或内联比较矩阵确定性渲染 booktabs 表格。
 
     单元格内容原样取自结构化输入（只做 LaTeX 转义），LLM 不直接书写 LaTeX，
     也不能在渲染阶段改动任何数值。
     """
     caption = latex_escape(block.caption)
-    label = f"\n  \\label{{{latex_identifier(block.label, prefix='tab')}}}" if block.label else ""
+    label = f"\\label{{{latex_identifier(block.label, prefix='tab')}}}" if block.label else ""
     ref = block.source.ref or ""
     asset = block.source.data if block.source.kind == "inline" else assets.get(ref)
     asset = asset or {}
@@ -165,7 +170,7 @@ def _render_table(block: TableBlock, assets: Mapping[str, dict[str, Any]]) -> st
     if not headers or not rows:
         return (
             f"\\begin{{table}}[{_FLOAT_PLACEMENT}]\n  \\centering\n"
-            f"  \\caption{{{caption}}}{label}\n"
+            f"  \\caption{{{caption}}}\n  {label}\n"
             f"  \\todo{{缺少表格素材：{latex_escape(ref or 'inline')}}}\n\\end{{table}}"
         )
 
@@ -186,6 +191,53 @@ def _render_table(block: TableBlock, assets: Mapping[str, dict[str, Any]]) -> st
             + "".join(f"p{{{other_width:.3f}\\linewidth}}" for _ in headers[1:])
             + "@{}"
         )
+    header_row = (
+        "    "
+        + " & ".join(f"{{\\raggedright\\bfseries {latex_escape(h)}\\par}}" for h in headers)
+        + " \\\\"
+    )
+    row_lines: list[str] = []
+    for row in rows[:MAX_TABLE_ROWS_IN_PDF]:
+        cells = [
+            f"{{\\raggedright {latex_escape(str(cell))}\\par}}" for cell in row[: len(headers)]
+        ]
+        cells += [""] * (len(headers) - len(cells))
+        row_lines.append("    " + " & ".join(cells) + " \\\\")
+
+    # 普通 table/tabular 是不可分页盒子；较长的文献矩阵会继续排到页面边界之外，
+    # Tectonic 仍返回成功，PDF 却把后半截直接裁掉。单栏模板改用 longtable，
+    # 让 LaTeX 只在行与行之间分页，并在续页重复表头。
+    if not twocolumn:
+        lines = [
+            "\\begingroup",
+            "  \\small",
+            f"  \\begin{{longtable}}{{{column_spec}}}",
+            f"    \\caption{{{caption}}}{label} \\\\",
+            "    \\toprule",
+            header_row,
+            "    \\midrule",
+            "    \\endfirsthead",
+            "    \\toprule",
+            header_row,
+            "    \\midrule",
+            "    \\endhead",
+            "    \\midrule",
+            "    \\endfoot",
+            "    \\bottomrule",
+            "    \\endlastfoot",
+            *row_lines,
+            "  \\end{longtable}",
+            "\\endgroup",
+        ]
+        if len(rows) > MAX_TABLE_ROWS_IN_PDF:
+            lines.insert(
+                -2,
+                f"  % [paperforge] table truncated to {MAX_TABLE_ROWS_IN_PDF} rows "
+                f"(source has {len(rows)})",
+            )
+        return "\n".join(lines)
+
+    # IEEE 双栏模式不支持 longtable；保留单栏内的表格浮动体行为。
     lines = [
         f"\\begin{{table}}[{_FLOAT_PLACEMENT}]",
         "  \\centering",
@@ -193,17 +245,10 @@ def _render_table(block: TableBlock, assets: Mapping[str, dict[str, Any]]) -> st
         f"  \\caption{{{caption}}}{label}",
         f"  \\begin{{tabular}}{{{column_spec}}}",
         "    \\toprule",
-        "    "
-        + " & ".join(f"{{\\raggedright\\bfseries {latex_escape(h)}\\par}}" for h in headers)
-        + " \\\\",
+        header_row,
         "    \\midrule",
+        *row_lines,
     ]
-    for row in rows[:MAX_TABLE_ROWS_IN_PDF]:
-        cells = [
-            f"{{\\raggedright {latex_escape(str(cell))}\\par}}" for cell in row[: len(headers)]
-        ]
-        cells += [""] * (len(headers) - len(cells))
-        lines.append("    " + " & ".join(cells) + " \\\\")
     lines += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}"]
     if len(rows) > MAX_TABLE_ROWS_IN_PDF:
         lines.insert(

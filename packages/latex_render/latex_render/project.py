@@ -53,6 +53,7 @@ TWO_COLUMN_TEMPLATE_FILES = frozenset({"ieeetran.tex.j2"})
 def is_two_column(template: str | None) -> bool:
     return TEMPLATES[resolve_template(template)] in TWO_COLUMN_TEMPLATE_FILES
 
+
 # 引用样式 → BibTeX 书目风格（模板内可再降级）。
 BIBSTYLE_BY_CITATION_STYLE = {
     "ieee": "IEEEtran",
@@ -169,13 +170,7 @@ def build_latex_project(
         .get_template(TEMPLATES[template_name])
         .render(
             title=latex_escape(ir.meta.title),
-            # Escape author names individually so the template-level ``\and`` command remains
-            # executable. Escaping the joined string printed a literal "\and" in the PDF.
-            authors=(
-                " \\and ".join(latex_escape(author) for author in ir.meta.authors)
-                if ir.meta.authors
-                else ""
-            ),
+            author_block=_render_author_block(ir, template_name),
             abstract=latex_escape(ir.meta.abstract),
             keywords=latex_escape(", ".join(ir.meta.keywords)),
             keywords_label="Keywords:" if ir.meta.language != "zh" else "关键词：",
@@ -190,6 +185,62 @@ def build_latex_project(
     for name, content in (figure_files or {}).items():
         project.with_binary_file(name, content)
     return project
+
+
+def _render_author_block(ir: PaperIR, template_name: str) -> str:
+    """Render structured bylines without handing template commands to an LLM."""
+    authors = ir.meta.author_details
+    if not authors:
+        return " \\and ".join(latex_escape(author) for author in ir.meta.authors)
+
+    affiliations: list[str] = []
+    affiliation_index: dict[str, int] = {}
+    for author in authors:
+        for affiliation in author.affiliations:
+            key = affiliation.casefold()
+            if key not in affiliation_index:
+                affiliations.append(affiliation)
+                affiliation_index[key] = len(affiliations)
+
+    rendered_names: list[str] = []
+    for author in authors:
+        marks = [str(affiliation_index[item.casefold()]) for item in author.affiliations]
+        if author.corresponding:
+            marks.append("*")
+        suffix = f"\\textsuperscript{{{','.join(marks)}}}" if marks else ""
+        rendered_names.append(f"{latex_escape(author.name)}{suffix}")
+
+    detail_lines = [
+        f"\\textsuperscript{{{index}}} {latex_escape(affiliation)}"
+        for index, affiliation in enumerate(affiliations, start=1)
+    ]
+    corresponding = [author for author in authors if author.corresponding and author.email]
+    if corresponding:
+        emails = ", ".join(latex_escape(str(author.email)) for author in corresponding)
+        detail_lines.append(f"\\textsuperscript{{*}} Corresponding author: {emails}")
+    orcids = [
+        f"{latex_escape(author.name)}: {latex_escape(author.orcid)}"
+        for author in authors
+        if author.orcid
+    ]
+    if orcids:
+        detail_lines.append(f"ORCID: {'; '.join(orcids)}")
+
+    if template_name in {"ieee", "ieeetran"}:
+        names = ", ".join(rendered_names)
+        details = " \\\\ ".join(detail_lines)
+        return f"\\IEEEauthorblockN{{{names}}}" + (
+            f"\n\\IEEEauthorblockA{{{details}}}" if details else ""
+        )
+
+    names = " \\and ".join(rendered_names)
+    details = " \\\\ ".join(detail_lines)
+    # ``article`` 在 ``\\maketitle`` 中会把 ``\\author`` 放进一个内部 tabular。
+    # 直接把多条单位/邮箱/ORCID 用 ``\\`` 嵌进带 ``\\small`` 的分组，
+    # 第二个换行会在 Tectonic 展开内部 tabular 时破坏分组。
+    # ``\\shortstack`` 是 LaTeX 内建的嵌套多行容器，无需新宏包，
+    # 既保留分行排版又不改变 IEEE 的专用作者块。
+    return names + (f" \\\\ {{\\small\\shortstack{{{details}}}}}" if details else "")
 
 
 def render_inline_bibliography(

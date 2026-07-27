@@ -274,7 +274,7 @@ def test_missing_asset_placeholder_keeps_the_same_placement():
     assert "\\todo{" in latex
 
 
-def test_tables_are_not_pinned_to_the_page_top_either():
+def test_single_column_tables_are_page_breakable():
     from paper_ir.schema import TableBlock, TableSource
 
     ir = PaperIR(
@@ -295,8 +295,39 @@ def test_tables_are_not_pinned_to_the_page_top_either():
         ],
     )
     latex = render_body(ir, {"ua_1": {"headers": ["m", "s"], "rows": [["A", "0.8"]]}})
+    assert "\\begin{longtable}" in latex
+    assert "\\endfirsthead" in latex
+    assert "\\endhead" in latex
+    assert "\\begin{table}" not in latex
+
+
+def test_two_column_tables_keep_the_supported_float_environment():
+    from paper_ir.schema import TableBlock, TableSource
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="results",
+                level=1,
+                title="Results",
+                blocks=[
+                    TableBlock(
+                        caption="Main results",
+                        label="tab:main",
+                        source=TableSource(kind="user_asset", ref="ua_1"),
+                    )
+                ],
+            )
+        ],
+    )
+    latex = render_body(
+        ir,
+        {"ua_1": {"headers": ["m", "s"], "rows": [["A", "0.8"]]}},
+        twocolumn=True,
+    )
     assert "\\begin{table}[!htbp]" in latex
-    assert "\\begin{table}[t]" not in latex
+    assert "\\begin{longtable}" not in latex
 
 
 def test_inline_literature_matrix_renders_without_external_asset():
@@ -328,6 +359,7 @@ def test_inline_literature_matrix_renders_without_external_asset():
     assert "Located full text" in latex
     assert "\\todo{" not in latex
     assert "p{0.280\\linewidth}" in latex
+    assert "\\begin{longtable}" in latex
 
 
 def test_build_project_picks_column_layout_from_the_template():

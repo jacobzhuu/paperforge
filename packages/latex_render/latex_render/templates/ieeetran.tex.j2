@@ -7,6 +7,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{longtable}
 \usepackage{xcolor}
 \usepackage{cite}
 {% if language == 'zh' %}\usepackage{ctex}{% endif %}
@@ -30,7 +31,7 @@
 \begin{document}
 
 \title{ {{- title -}} }
-{% if authors %}\author{\IEEEauthorblockN{ {{- authors -}} }}{% endif %}
+{% if author_block %}\author{ {{- author_block -}} }{% endif %}
 \maketitle
 
 {% if abstract %}\begin{abstract}
