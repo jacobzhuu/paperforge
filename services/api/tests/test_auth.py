@@ -40,7 +40,12 @@ def auth_client(clean_pg_database_url, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", clean_pg_database_url)
     monkeypatch.setenv("AUTH_RATE_LIMIT_ENABLED", "false")
     monkeypatch.setenv("AUTH_EMAIL_MODE", "console")
+    # 与 test_projects_api.py 的 client 夹具同理：必须与开发者的真实 provider
+    # 配置隔离，否则本地填了 Cloudflare 凭据时 image_provider_configured 断言会翻车。
     monkeypatch.setenv("LLM_DEFAULT_PROVIDER", "noop")
+    monkeypatch.setenv("LLM_OPENAI_API_KEY", "")
+    monkeypatch.setenv("IMAGE_API_KEY", "")
+    monkeypatch.setenv("IMAGE_ACCOUNT_ID", "")
     import paperforge_api.config as api_config
     import paperforge_api.deps as api_deps
     import paperforge_api.routers.auth as auth_router
