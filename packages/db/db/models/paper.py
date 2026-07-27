@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -35,6 +37,11 @@ class PaperProject(Base, TimestampMixin):
         ForeignKey("app_user.id", ondelete="RESTRICT"), index=True, nullable=False
     )
     title: Mapped[str] = mapped_column(Text, nullable=False)
+    # 项目内部名称与发表题名分离。历史项目保持为空，渲染时回退到 title。
+    publication_title: Mapped[str | None] = mapped_column(Text)
+    authors_json: Mapped[list | None] = mapped_column(JSONB)
+    keywords_json: Mapped[list | None] = mapped_column(JSONB)
+    metadata_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paper_type: Mapped[str] = mapped_column(String(16), nullable=False)  # review|original
     writing_mode: Mapped[str] = mapped_column(String(16), nullable=False)  # auto|assisted
     language: Mapped[str] = mapped_column(String(8), default="en", nullable=False)  # zh|en
@@ -108,6 +115,13 @@ class VisualAsset(Base, TimestampMixin):
     __tablename__ = "visual_asset"
     __table_args__ = (
         Index("ix_visual_asset_project_kind_status", "project_id", "kind", "generation_status"),
+        Index(
+            "uq_visual_asset_active_slot",
+            "project_id",
+            "logical_slot_key",
+            unique=True,
+            postgresql_where=text("is_active = true"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -136,6 +150,17 @@ class VisualAsset(Base, TimestampMixin):
     supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("visual_asset.id", ondelete="SET NULL"), index=True
     )
+    # 规划上下文（M8+）。全部可空：历史行不需要回填，只会显示为「无过期判断」。
+    #
+    # paper_snapshot_hash 记录建议**基于哪一版正文**。用户改完正文后，旧建议
+    # 看起来仍像是最新的——这是最容易让人把过期示意图批准进论文的地方。
+    # 哈希不同时界面提示「建议基于旧版正文」，但绝不自动删除已有资产。
+    paper_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
+    suggestion_reason: Mapped[str | None] = mapped_column(Text)
+    source_section_keys: Mapped[list | None] = mapped_column(JSONB)
+    # 逻辑槽位由「章节 + 插入位置」组成；同槽位只能有一个活动版本。
+    logical_slot_key: Mapped[str | None] = mapped_column(String(160), index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class VisualSourceAsset(Base):
@@ -239,6 +264,92 @@ class CitationUsage(Base):
     )
 
 
+class QualityReportRecord(Base):
+    """绑定论文快照的持久化质量报告。"""
+
+    __tablename__ = "quality_report"
+    __table_args__ = (
+        Index(
+            "ix_quality_report_project_profile_created",
+            "project_id",
+            "quality_profile",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_document.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    document_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    paper_snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    quality_profile: Mapped[str] = mapped_column(String(16), nullable=False)
+    review_style: Mapped[str] = mapped_column(String(16), nullable=False)
+    readiness_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    blockers_json: Mapped[list | None] = mapped_column(JSONB)
+    warnings_json: Mapped[list | None] = mapped_column(JSONB)
+    scores_json: Mapped[dict | None] = mapped_column(JSONB)
+    metrics_json: Mapped[dict | None] = mapped_column(JSONB)
+    layout_checks_json: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ClaimEvidenceAnchor(Base):
+    """一条具体论断到原始证据位置的可审阅映射。"""
+
+    __tablename__ = "claim_evidence_anchor"
+    __table_args__ = (
+        UniqueConstraint(
+            "quality_report_id",
+            "claim_hash",
+            "cite_key",
+            name="uq_claim_evidence_report_claim_cite",
+        ),
+        Index("ix_claim_evidence_project_core", "project_id", "is_core"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    quality_report_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("quality_report.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_document.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    section_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_section.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    work_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("scholarly_work.id", ondelete="SET NULL"), index=True
+    )
+    section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_text: Mapped[str] = mapped_column(Text, nullable=False)
+    claim_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    is_core: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cite_key: Mapped[str | None] = mapped_column(String(128))
+    source_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_page: Mapped[int | None] = mapped_column(Integer)
+    source_section: Mapped[str | None] = mapped_column(Text)
+    source_paragraph: Mapped[int | None] = mapped_column(Integer)
+    evidence_excerpt: Mapped[str | None] = mapped_column(Text)
+    evidence_hash: Mapped[str | None] = mapped_column(String(64))
+    support_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    support_score: Mapped[float | None] = mapped_column(Float)
+    manual_status: Mapped[str] = mapped_column(String(24), default="unreviewed", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class SearchRun(Base):
     """检索留痕（轻量复现，非账本）—— 取代旧 occurrence 守恒（方案 §3.3）。"""
 
@@ -273,6 +384,14 @@ class ExportArtifact(Base):
     object_key: Mapped[str | None] = mapped_column(String(512))
     compile_log_key: Mapped[str | None] = mapped_column(String(512))
     content_hash: Mapped[str | None] = mapped_column(String(80))
+    quality_report_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("quality_report.id", ondelete="SET NULL"), index=True
+    )
+    quality_profile: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
+    readiness_status: Mapped[str] = mapped_column(
+        String(32), default="unassessed", nullable=False
+    )
+    paper_snapshot_hash: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -23,7 +23,7 @@ from paperforge_worker.context import JobContext
 MAX_LIST_ITEMS = 6
 MAX_SUMMARY_CHARS = 800
 
-_SYSTEM_PROMPT_ZH = """你是文献卡片抽取助手。只依据给定的标题/摘要/元数据抽取，
+_SYSTEM_PROMPT_ZH = """你是文献卡片抽取助手。只依据给定的标题/摘要/元数据/全文抽取，
 **不得**补充给定文本以外的任何事实、数字或结论。只输出 JSON：
 {
   "summary": "2-3 句话概述这篇文献做了什么",
@@ -31,11 +31,16 @@ _SYSTEM_PROMPT_ZH = """你是文献卡片抽取助手。只依据给定的标题
   "methods": ["方法/技术"],
   "results": ["结论性发现（只写文中出现的）"],
   "limitations": ["局限（未提及则留空数组）"],
-  "quotable_points": ["写作时可引用的要点"]
+  "quotable_points": [
+    {"text": "原文证据片段", "page": 3, "section": "Results", "paragraph": 2}
+  ]
 }
-若摘要缺失或信息不足，相应数组留空，不要编造。"""
+全文包含 [[PAGE=... | SECTION=...]] 定位标记时必须原样回填页码/章节；
+没有可靠定位时相应字段填 null。证据片段应尽量保持原文。
+若信息不足，相应数组留空，不要编造。"""
 
-_SYSTEM_PROMPT_EN = """You extract literature cards. Use ONLY the given title/abstract/metadata;
+_SYSTEM_PROMPT_EN = """You extract literature cards. Use ONLY the given
+title/abstract/metadata/full text;
 never add facts, numbers, or conclusions that are not present in the given text. Output JSON only:
 {
   "summary": "2-3 sentences on what this work does",
@@ -43,9 +48,14 @@ never add facts, numbers, or conclusions that are not present in the given text.
   "methods": ["method/technique"],
   "results": ["findings stated in the text"],
   "limitations": ["limitations, empty array if not stated"],
-  "quotable_points": ["points usable when citing this work"]
+  "quotable_points": [
+    {"text": "verbatim evidence excerpt", "page": 3,
+     "section": "Results", "paragraph": 2}
+  ]
 }
-If the abstract is missing or thin, return empty arrays — never invent."""
+When full text contains [[PAGE=... | SECTION=...]] markers, copy the page/section
+locator. Use null when no reliable locator exists. Keep evidence excerpts close to
+the source wording. If evidence is thin, return empty arrays — never invent."""
 
 
 @dataclass
@@ -210,7 +220,7 @@ def normalize_card(raw: dict[str, Any]) -> dict[str, Any]:
         "methods": _clean_list(raw.get("methods")),
         "results": _clean_list(raw.get("results")),
         "limitations": _clean_list(raw.get("limitations")),
-        "quotable_points": _clean_list(raw.get("quotable_points")),
+        "quotable_points": _clean_evidence_points(raw.get("quotable_points")),
     }
 
 
@@ -224,7 +234,10 @@ def deterministic_card(*, title: str, abstract: str | None) -> dict[str, Any]:
         "results": [],
         "limitations": [],
         # 可引要点直接取摘要原句：可引用且绝不改写事实。
-        "quotable_points": sentences[:MAX_LIST_ITEMS],
+        "quotable_points": [
+            {"text": sentence, "page": None, "section": "abstract", "paragraph": index + 1}
+            for index, sentence in enumerate(sentences[:MAX_LIST_ITEMS])
+        ],
         "extraction_model": "deterministic_abstract_v1",
     }
 
@@ -248,3 +261,28 @@ def _clean_list(value: Any) -> list[str]:
         return []
     items = [_clean_text(item) for item in value]
     return [item for item in items if item][:MAX_LIST_ITEMS]
+
+
+def _clean_evidence_points(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    points: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            text = _clean_text(item)
+            point = {"text": text, "page": None, "section": None, "paragraph": None}
+        elif isinstance(item, dict):
+            text = _clean_text(item.get("text") or item.get("excerpt"))
+            page = item.get("page")
+            paragraph = item.get("paragraph")
+            point = {
+                "text": text,
+                "page": page if isinstance(page, int) and page > 0 else None,
+                "section": _clean_text(item.get("section")) or None,
+                "paragraph": paragraph if isinstance(paragraph, int) and paragraph > 0 else None,
+            }
+        else:
+            continue
+        if point["text"]:
+            points.append(point)
+    return points[:MAX_LIST_ITEMS]

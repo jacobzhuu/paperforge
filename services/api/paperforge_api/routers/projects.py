@@ -23,6 +23,7 @@ from db import (
     list_search_runs,
     project_counters,
     project_llm_cost,
+    request_polish_skip,
     set_entry_status,
     update_project,
     update_project_scope,
@@ -86,6 +87,9 @@ async def create_project_endpoint(
             venue_template=request.venue_template,
             citation_style=request.citation_style,
             contribution_points=request.contribution_points,
+            publication_title=request.publication_title,
+            authors=request.authors,
+            keywords=request.keywords,
             owner_id=user.id,
         )
     except ValueError as error:
@@ -382,6 +386,24 @@ async def get_job_endpoint(project_id: str, job_id: str, session: SessionDep) ->
     return _job_response(job)
 
 
+@router.post("/projects/{project_id}/jobs/{job_id}/polish/skip", response_model=JobResponse)
+async def skip_polish(project_id: str, job_id: str, session: SessionDep) -> JobResponse:
+    """跳过剩余的连贯性润色。
+
+    润色是每节一次 LLM 调用、整体十几分钟的收尾工序，稿子在此之前就已经完整落库。
+    要不要等它，应该由用户当场决定，而不是只能干等或者把整个任务杀掉——
+    已润色的章节保留，剩下的直接交付初稿。
+    """
+    project = await _require_project(session, project_id)
+    job = await _require_job(session, job_id)
+    if job.project_id != project.id:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail="job already finished")
+    await request_polish_skip(session, job)
+    return _job_response(job)
+
+
 @router.get("/projects/{project_id}/cost", response_model=CostResponse)
 async def get_cost(project_id: str, session: SessionDep) -> CostResponse:
     project = await _require_project(session, project_id)
@@ -448,6 +470,10 @@ def _project_response(project: PaperProject, counters: dict[str, int]) -> Projec
         citation_style=project.citation_style,
         topic=scope.get("topic"),
         contribution_points=scope.get("contribution_points") or [],
+        publication_title=project.publication_title,
+        authors=project.authors_json or [],
+        keywords=project.keywords_json or [],
+        metadata_confirmed=project.metadata_confirmed_at is not None,
         library_count=counters.get("library_count", 0),
         section_count=counters.get("section_count", 0),
         created_at=project.created_at,

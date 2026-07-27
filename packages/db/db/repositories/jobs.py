@@ -93,6 +93,20 @@ async def update_job(
     return job
 
 
+# 用户在润色途中点「跳过」时写进 checkpoint 的开关。API 写、worker 在每节之间读，
+# 键名放在数据层是为了两边只认同一个字符串。
+POLISH_SKIP_KEY = "polish_skip"
+
+
+async def request_polish_skip(session: AsyncSession, job: GenerationJob) -> GenerationJob:
+    """请求跳过剩余的连贯性润色。幂等；worker 写完当前这一节后才会看到。"""
+    return await update_job(session, job, checkpoint={POLISH_SKIP_KEY: True})
+
+
+def polish_skip_requested(job: GenerationJob | None) -> bool:
+    return bool(job is not None and (job.checkpoint_json or {}).get(POLISH_SKIP_KEY))
+
+
 def lock_generation_job_stmt(job_id: uuid.UUID) -> Select:
     """Serialize event sequence allocation per generation job."""
     return select(GenerationJob.id).where(GenerationJob.id == job_id).with_for_update()

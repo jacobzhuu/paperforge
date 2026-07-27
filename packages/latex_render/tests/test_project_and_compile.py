@@ -102,6 +102,14 @@ def test_special_characters_are_escaped_in_body_and_title() -> None:
     assert "100\\%" in project.files["main.tex"]
 
 
+def test_multiple_authors_use_latex_separator_without_printing_it() -> None:
+    ir = _ir()
+    ir.meta.authors = ["Ada & Smith", "Lin Chen"]
+    project = build_latex_project(ir)
+    assert r"Ada \& Smith \and Lin Chen" in project.files["main.tex"]
+    assert r"\textbackslash{}and" not in project.files["main.tex"]
+
+
 def test_todo_block_renders_visible_placeholder() -> None:
     """不编造实验数据：占位符必须在 PDF 里显眼（红色 TODO）。"""
     project = build_latex_project(_ir(), references=[_ref()])

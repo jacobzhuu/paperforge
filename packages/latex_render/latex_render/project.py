@@ -40,6 +40,19 @@ TEMPLATES: dict[str, str] = {
 }
 DEFAULT_TEMPLATE = "article"
 
+# 哪些**骨架文件**是双栏排版。只有它们才该用 `figure*`/`table*` 跨栏浮动体。
+#
+# `article.tex.j2` 与 `gbt7714.tex.j2` 的 `\documentclass` 都没有 `twocolumn`——
+# 在那里用带星环境不会更宽，只会继承「只能放页顶或浮动页」的限制，图因此堆到文末。
+#
+# 按**文件**而不是别名判断：别名表里 `ieee` 和 `ieeetran` 指向同一个骨架，
+# 按别名列举迟早会漏掉一个（第一版就漏了 `ieee`）。
+TWO_COLUMN_TEMPLATE_FILES = frozenset({"ieeetran.tex.j2"})
+
+
+def is_two_column(template: str | None) -> bool:
+    return TEMPLATES[resolve_template(template)] in TWO_COLUMN_TEMPLATE_FILES
+
 # 引用样式 → BibTeX 书目风格（模板内可再降级）。
 BIBSTYLE_BY_CITATION_STYLE = {
     "ieee": "IEEEtran",
@@ -132,11 +145,12 @@ def build_latex_project(
     template_name = resolve_template(template)
     project = LatexProject(template=template_name)
     refs = list(references)
+    twocolumn = is_two_column(template_name)
 
     section_files: list[str] = []
     for index, section in enumerate(ir.sections):
         rel = f"sections/{index:02d}-{_safe_stem(section.key)}.tex"
-        project.with_file(rel, render_section(section, assets) + "\n")
+        project.with_file(rel, render_section(section, assets, twocolumn=twocolumn) + "\n")
         section_files.append(rel)
 
     body = "\n".join(f"\\input{{{path[:-4]}}}" for path in section_files)
@@ -155,7 +169,13 @@ def build_latex_project(
         .get_template(TEMPLATES[template_name])
         .render(
             title=latex_escape(ir.meta.title),
-            authors=latex_escape(" \\and ".join(ir.meta.authors)) if ir.meta.authors else "",
+            # Escape author names individually so the template-level ``\and`` command remains
+            # executable. Escaping the joined string printed a literal "\and" in the PDF.
+            authors=(
+                " \\and ".join(latex_escape(author) for author in ir.meta.authors)
+                if ir.meta.authors
+                else ""
+            ),
             abstract=latex_escape(ir.meta.abstract),
             keywords=latex_escape(", ".join(ir.meta.keywords)),
             keywords_label="Keywords:" if ir.meta.language != "zh" else "关键词：",

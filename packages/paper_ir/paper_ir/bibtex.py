@@ -177,7 +177,8 @@ def build_bibtex_database(refs: Iterable[ReferenceMetadata]):
             fields["publisher"] = ref.publisher
         if ref.doi:
             fields["doi"] = ref.doi
-        if ref.arxiv_id:
+        # 正式出版版本优先；已有 DOI 或 venue 时不再把同一条目标成 arXiv 预印本。
+        if ref.arxiv_id and not ref.doi and not ref.venue_name:
             fields["eprint"] = ref.arxiv_id
             fields["archivePrefix"] = "arXiv"
         entry = Entry(_entry_type(ref), fields=fields)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -207,7 +209,7 @@ async def upsert_card(
     methods: list[str] | None = None,
     results: list[str] | None = None,
     limitations: list[str] | None = None,
-    quotable_points: list[str] | None = None,
+    quotable_points: list[Any] | None = None,
     fulltext_used: bool = False,
     extraction_model: str | None = None,
     source_hash: str | None = None,
@@ -258,14 +260,15 @@ async def reference_metadata_payload(
     bibtex_key: str | None = None,
 ) -> dict[str, Any]:
     """构造 paper_ir.ReferenceMetadata 的构造参数（db 不依赖 paper_ir）。"""
+    authors = await get_work_authors(session, work.id)
     return {
         "work_key": str(work.id),
         "bibtex_key": bibtex_key,
-        "title": work.canonical_title,
+        "title": _clean_reference_text(work.canonical_title),
         "normalized_title": None,
         "publication_year": work.publication_year,
-        "venue_name": work.venue_name,
-        "publisher": work.publisher,
+        "venue_name": _clean_reference_text(work.venue_name),
+        "publisher": _clean_reference_text(work.publisher),
         "doi": work.doi,
         "pmid": work.pmid,
         "pmcid": work.pmcid,
@@ -275,5 +278,33 @@ async def reference_metadata_payload(
         "corpus_id": work.corpus_id,
         "work_type": work.work_type,
         "language": work.language,
-        "citation_metadata": {"authors": await get_work_authors(session, work.id)},
+        "citation_metadata": {
+            "authors": [
+                {
+                    **author,
+                    "author_name": _clean_author_name(str(author.get("author_name") or "")),
+                }
+                for author in authors
+                if _clean_author_name(str(author.get("author_name") or ""))
+            ]
+        },
     }
+
+
+def _clean_reference_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = html.unescape(value)
+    cleaned = re.sub(r"</?(?:i|b|em|strong|sub|sup)\b[^>]*>", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    return " ".join(cleaned.split()) or None
+
+
+def _clean_author_name(value: str) -> str:
+    cleaned = _clean_reference_text(value) or ""
+    if "," in cleaned:
+        return cleaned
+    parts = cleaned.split()
+    if len(parts) == 2 and re.fullmatch(r"(?:[A-Z]\.?){1,4}", parts[-1]):
+        return f"{parts[0]}, {parts[1]}"
+    return cleaned

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from llm_runtime import LLMRunner
-from paper_ir import CiteRun, ParagraphBlock, Section, TextRun
+from paper_ir import CiteRun, ParagraphBlock, Section, TableBlock, TableSource, TextRun
 
 MAX_PARAGRAPHS_PER_SECTION = 8
 MAX_ROLLING_SUMMARY_CHARS = 600
@@ -43,13 +43,15 @@ _SYSTEM_PROMPT_ZH = f"""你是学术综述写作助手。根据大纲与文献�
 只输出 JSON：
 {{
   "paragraphs": [
-    {{"text": "段落正文（不要在正文里写引用标记）", "cite_keys": ["该段支撑文献的引用键"]}}
+    {{"sentences": [
+      {{"text": "一个完整论断句（不要写引用标记）", "cite_keys": ["只支撑本句的引用键"]}}
+    ]}}
   ],
   "terms": [{{"term": "术语", "translation": "译名/缩写"}}]
 }}
 要求：
 - 按主题论证展开，不要逐篇复述文献；每段 3-6 句，观点先行、证据跟随；
-- cite_keys **只能**从给定的可用引用键清单里选，禁止发明；无支撑文献的段落给空数组；
+- 每个句子的 cite_keys 只能列真正支撑该句的可用引用键；禁止发明或在段末堆整段引用；
 - 正文里不要写 [1]、(Smith 2020) 之类的标记——引用由系统按 cite_keys 渲染；
 - 沿用给定术语表中的译名与缩写；新术语登记到 terms。
 - {_NO_FABRICATION_ZH}"""
@@ -58,25 +60,30 @@ _SYSTEM_PROMPT_EN = f"""You write sections of an academic review. Follow the out
 Output JSON only:
 {{
   "paragraphs": [
-    {{"text": "paragraph prose (no inline citation markers)", "cite_keys": ["supporting keys"]}}
+    {{"sentences": [
+      {{"text": "one complete claim sentence (no inline markers)",
+       "cite_keys": ["keys supporting only this sentence"]}}
+    ]}}
   ],
   "terms": [{{"term": "term", "translation": "abbreviation or gloss"}}]
 }}
 Rules:
 - argue by theme, never paper-by-paper; 3-6 sentences per paragraph, claim first, evidence after;
-- cite_keys MUST come from the provided key list; never invent one; use [] when unsupported;
+- each sentence's cite_keys MUST support that exact sentence and come from the provided list;
+  never invent or pile paragraph-wide citations at the end; use [] when unsupported;
 - do not write inline markers like [1] or (Smith 2020) — the system renders citations;
 - reuse the given glossary terms consistently; register new terms in `terms`.
 - {_NO_FABRICATION_EN}"""
 
 _COHERENCE_PROMPT_ZH = """你是学术论文的连贯性编辑。给定相邻章节的正文，改写目标章节，使其：
 过渡自然、术语一致、不与其他章节重复论述。只输出 JSON，结构与输入相同：
-{"paragraphs": [{"text": "...", "cite_keys": [...]}]}
+{"paragraphs": [{"sentences": [{"text": "...", "cite_keys": [...]}]}]}
 不得新增引用键，不得改动或新增任何数字。"""
 
 _COHERENCE_PROMPT_EN = """You are a coherence editor. Rewrite the target section so that it
 transitions smoothly, uses consistent terminology, and does not repeat neighbouring sections.
-Output JSON with the same shape: {"paragraphs": [{"text": "...", "cite_keys": [...]}]}
+Output JSON with the same sentence-level shape:
+{"paragraphs": [{"sentences": [{"text": "...", "cite_keys": [...]}]}]}
 Never add cite keys and never add or change any number."""
 
 
@@ -85,6 +92,7 @@ class SectionDraft:
     section_key: str
     title: str
     paragraphs: list[dict[str, Any]] = field(default_factory=list)
+    inline_tables: list[dict[str, Any]] = field(default_factory=list)
     citation_warnings: list[dict[str, Any]] = field(default_factory=list)
     terms: dict[str, str] = field(default_factory=dict)
     model: str | None = None
@@ -97,13 +105,38 @@ class SectionDraft:
 
     def to_ir_section(self, *, level: int = 1) -> Section:
         """转成 PaperIR Section：cite 是原子节点，不是正文里的字符串。"""
-        blocks: list[ParagraphBlock] = []
+        blocks: list[Any] = []
         for paragraph in self.paragraphs:
-            runs: list[Any] = [TextRun(v=paragraph.get("text", ""))]
-            keys = [key for key in paragraph.get("cite_keys", []) if key]
-            if keys:
-                runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
+            sentence_rows = paragraph.get("sentences") or []
+            runs: list[Any] = []
+            if sentence_rows:
+                for index, sentence in enumerate(sentence_rows):
+                    runs.append(TextRun(v=str(sentence.get("text") or "")))
+                    keys = [key for key in sentence.get("cite_keys", []) if key]
+                    if keys:
+                        runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
+                    if index < len(sentence_rows) - 1:
+                        runs.append(TextRun(v=" "))
+            else:
+                runs.append(TextRun(v=paragraph.get("text", "")))
+                keys = [key for key in paragraph.get("cite_keys", []) if key]
+                if keys:
+                    runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
             blocks.append(ParagraphBlock(runs=runs))
+        for table in self.inline_tables:
+            headers = table.get("headers") or []
+            rows = table.get("rows") or []
+            if headers and rows:
+                blocks.append(
+                    TableBlock(
+                        source=TableSource(
+                            kind="inline",
+                            data={"headers": headers, "rows": rows},
+                        ),
+                        caption=str(table.get("caption") or ""),
+                        label=str(table.get("label") or "") or None,
+                    )
+                )
         section = Section(key=self.section_key, level=level, title=self.title, blocks=blocks)
         for warning in self.citation_warnings:
             section.citation_warnings.append(
@@ -122,6 +155,7 @@ class WritingContext:
 
     outline: dict[str, Any]
     language: str = "en"
+    paper_type: str = "review"
     glossary: dict[str, str] = field(default_factory=dict)
     rolling_summaries: dict[str, str] = field(default_factory=dict)
 
@@ -158,7 +192,17 @@ async def write_section(
     title = str(section.get("title") or section_key)
     allowed = {key for key in section.get("cite_keys", []) if key in whitelist}
 
-    draft = SectionDraft(section_key=section_key, title=title)
+    draft = SectionDraft(
+        section_key=section_key,
+        title=title,
+        inline_tables=[
+            dict(table) for table in section.get("inline_tables") or [] if isinstance(table, dict)
+        ],
+    )
+    if section.get("deterministic_text"):
+        draft.paragraphs = [{"text": str(section["deterministic_text"]), "cite_keys": []}]
+        draft.generator = "deterministic_search_log"
+        return draft
     if runner is None or not runner.enabled:
         draft.paragraphs = deterministic_paragraphs(section, cards, allowed)
         draft.generator = "deterministic"
@@ -302,6 +346,20 @@ def _build_prompt(
             values = card.get(field_name) or []
             if values:
                 parts.append(f"  {field_name}: {'; '.join(str(v) for v in values[:3])}")
+        if card.get("fulltext_used"):
+            points = card.get("quotable_points") or []
+            located = [point for point in points if isinstance(point, dict) and point.get("text")]
+            for point in located[:3]:
+                locator = ", ".join(
+                    item
+                    for item in (
+                        f"p.{point['page']}" if point.get("page") else "",
+                        str(point.get("section") or ""),
+                        f"para.{point['paragraph']}" if point.get("paragraph") else "",
+                    )
+                    if item
+                )
+                parts.append(f"  fulltext evidence ({locator or 'unlocated'}): {point['text']}")
         card_lines.append("\n".join(parts))
 
     points = section.get("argument_points") or []
@@ -322,12 +380,25 @@ def _build_prompt(
             "Literature cards:",
             "\n\n".join(card_lines) or "(no cards assigned to this section)",
             "",
-            _asset_block(assets or [], language=context.language, section=section),
+            _asset_block(
+                assets or [],
+                language=context.language,
+                section=section,
+                paper_type=context.paper_type,
+                cards=[cards.get(key) or {} for key in sorted(allowed)],
+            ),
         ]
     )
 
 
-def _asset_block(assets: list[dict[str, Any]], *, language: str, section: dict[str, Any]) -> str:
+def _asset_block(
+    assets: list[dict[str, Any]],
+    *,
+    language: str,
+    section: dict[str, Any],
+    paper_type: str,
+    cards: list[dict[str, Any]],
+) -> str:
     """素材接地块。
 
     数字红线（设计 §4.4.2）：正文数字必须来自 parsed_json 的确定性注入。
@@ -336,6 +407,40 @@ def _asset_block(assets: list[dict[str, Any]], *, language: str, section: dict[s
     """
     zh = language == "zh"
     grounding = section.get("grounding")
+    located_fulltext = any(
+        card.get("fulltext_used")
+        and any(
+            isinstance(point, dict)
+            and point.get("text")
+            and (point.get("page") or point.get("section") or point.get("paragraph"))
+            for point in card.get("quotable_points") or []
+        )
+        for card in cards
+    )
+    if paper_type == "review":
+        if located_fulltext:
+            return (
+                "综述证据规则：数字、因果、比较、效果和结论性论断只能使用上方标注为 "
+                "fulltext evidence 的原文证据，并必须在同一句 cite_keys 中引用对应文献；"
+                "摘要只用于背景。"
+                if zh
+                else (
+                    "Review evidence rule: numeric, causal, comparative, effect, and "
+                    "conclusion claims may only use located fulltext evidence shown above "
+                    "and must cite its key in the same sentence; abstracts support "
+                    "background only."
+                )
+            )
+        return (
+            "综述证据规则：本节没有可定位全文证据；只写背景，不得写数字、因果、比较、"
+            "效果或结论性论断。"
+            if zh
+            else (
+                "Review evidence rule: no located fulltext evidence is available; write "
+                "background only, with no numeric, causal, comparative, effect, or "
+                "conclusion claims."
+            )
+        )
     if not assets:
         if grounding == "user_asset" or section.get("kind") == "body":
             return (
@@ -380,6 +485,20 @@ def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
         if isinstance(item, str):
             text, keys = item, []
         elif isinstance(item, dict):
+            sentence_rows = _normalize_sentences(item.get("sentences"), allowed=allowed)
+            if sentence_rows:
+                paragraphs.append(
+                    {
+                        "text": " ".join(sentence["text"] for sentence in sentence_rows),
+                        "cite_keys": list(
+                            dict.fromkeys(
+                                key for sentence in sentence_rows for key in sentence["cite_keys"]
+                            )
+                        ),
+                        "sentences": sentence_rows,
+                    }
+                )
+                continue
             text = item.get("text") or item.get("content") or ""
             keys = item.get("cite_keys") or item.get("citations") or []
         else:
@@ -394,6 +513,26 @@ def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
         ]
         paragraphs.append({"text": text, "cite_keys": cite_keys})
     return paragraphs
+
+
+def _normalize_sentences(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    sentences: list[dict[str, Any]] = []
+    for item in raw[:24]:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_paragraph(item.get("text") or item.get("content") or "")
+        if not text:
+            continue
+        keys = item.get("cite_keys") or item.get("citations") or []
+        cite_keys = [
+            key
+            for key in dict.fromkeys(str(value).strip() for value in keys if str(value).strip())
+            if key in allowed
+        ]
+        sentences.append({"text": text, "cite_keys": cite_keys})
+    return sentences
 
 
 def normalize_terms(raw: Any) -> dict[str, str]:

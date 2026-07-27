@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select
@@ -39,6 +40,9 @@ async def create_project(
     venue_template: str | None = None,
     citation_style: str = "author_year",
     contribution_points: list[str] | None = None,
+    publication_title: str | None = None,
+    authors: list[str] | None = None,
+    keywords: list[str] | None = None,
     owner_id: uuid.UUID,
 ) -> PaperProject:
     """创建项目。枚举值非法时抛 ValueError（API 转 422）。"""
@@ -69,6 +73,9 @@ async def create_project(
         status="draft",
         scope_json=scope_json or None,
         owner_id=owner_id,
+        publication_title=(publication_title or "").strip() or None,
+        authors_json=[item.strip() for item in (authors or []) if item.strip()] or None,
+        keywords_json=[item.strip() for item in (keywords or []) if item.strip()] or None,
     )
     session.add(project)
     await session.flush()
@@ -117,6 +124,10 @@ async def update_project(
     citation_style: str | None = _UNSET,
     writing_mode: str | None = _UNSET,
     contribution_points: list[str] | None = _UNSET,
+    publication_title: str | None = _UNSET,
+    authors: list[str] | None = _UNSET,
+    keywords: list[str] | None = _UNSET,
+    metadata_confirmed: bool | None = _UNSET,
 ) -> PaperProject:
     """
     局部更新项目元数据。枚举值非法时抛 ValueError（API 转 422）。
@@ -150,6 +161,27 @@ async def update_project(
         project.writing_mode = writing_mode
     if venue_template is not _UNSET:
         project.venue_template = venue_template
+    publication_metadata_changed = any(
+        value is not _UNSET for value in (publication_title, authors, keywords)
+    )
+    if publication_title is not _UNSET:
+        project.publication_title = (
+            publication_title.strip() if isinstance(publication_title, str) else None
+        ) or None
+    if authors is not _UNSET:
+        project.authors_json = [item.strip() for item in (authors or []) if item.strip()] or None
+    if keywords is not _UNSET:
+        project.keywords_json = [item.strip() for item in (keywords or []) if item.strip()] or None
+    if metadata_confirmed is not _UNSET:
+        project.metadata_confirmed_at = datetime.now(UTC) if metadata_confirmed else None
+    elif publication_metadata_changed:
+        # A previously confirmed title/byline must not remain confirmed after it changes.
+        project.metadata_confirmed_at = None
+
+    if publication_metadata_changed or metadata_confirmed is not _UNSET:
+        from db.repositories.quality import invalidate_quality_reports_for_project
+
+        await invalidate_quality_reports_for_project(session, project.id)
 
     if topic is not _UNSET or contribution_points is not _UNSET:
         scope = dict(project.scope_json or {})

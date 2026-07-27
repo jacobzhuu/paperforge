@@ -138,6 +138,10 @@ async def upsert_section(
     section.model = model
     section.updated_at = datetime.now(UTC)
     await session.flush()
+    # 正文或 FigureBlock 一旦变化，绑定旧快照的质量报告立即失效。
+    from db.repositories.quality import invalidate_quality_reports_for_document
+
+    await invalidate_quality_reports_for_document(session, document_id)
     return section
 
 
@@ -190,6 +194,13 @@ async def replace_citation_usage(
             )
         )
     await session.flush()
+    from db.repositories.quality import invalidate_quality_reports_for_document
+
+    document_id = await session.scalar(
+        select(PaperSection.document_id).where(PaperSection.id == section_id)
+    )
+    if document_id:
+        await invalidate_quality_reports_for_document(session, document_id)
     return len(usages)
 
 

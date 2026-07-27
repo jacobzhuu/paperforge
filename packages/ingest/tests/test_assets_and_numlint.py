@@ -240,3 +240,43 @@ def test_note_numbers_survive_the_raw_text_fallback() -> None:
         parsed_assets=[asset.parsed],
     )
     assert report.consistent
+
+
+def test_review_number_may_come_from_located_fulltext_evidence() -> None:
+    report = lint_sections(
+        [{"section_key": "review", "text": "Recovery increased by 27%."}],
+        parsed_assets=[],
+        paper_type="review",
+        literature_evidence=[
+            {
+                "cite_key": "smith2020",
+                "text": "Recovery increased by 27%.",
+                "located": True,
+            }
+        ],
+    )
+    assert report.consistent
+    assert report.sourced[0].source_asset == "fulltext:smith2020"
+
+
+def test_chemical_name_number_is_ignored() -> None:
+    report = lint_sections(
+        [{"section_key": "background", "text": "吲哚-3-乙酸参与根系信号传导。"}],
+        parsed_assets=[],
+        paper_type="review",
+    )
+    assert report.consistent
+
+
+def test_model_gene_and_version_identifiers_are_not_experimental_numbers() -> None:
+    report = lint_sections(
+        [
+            {
+                "section_key": "background",
+                "text": "GPT-12、IL-17、p53、3D 与 version 2.1 are identifiers, not results.",
+            }
+        ],
+        parsed_assets=[],
+        paper_type="review",
+    )
+    assert report.consistent

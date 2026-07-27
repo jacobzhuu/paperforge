@@ -68,6 +68,9 @@ class CreateProjectRequest(BaseModel):
     venue_template: str | None = None
     citation_style: CitationStyle = "author_year"
     contribution_points: list[str] = Field(default_factory=list)
+    publication_title: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
 
 
 class UpdateProjectRequest(BaseModel):
@@ -86,6 +89,10 @@ class UpdateProjectRequest(BaseModel):
     citation_style: CitationStyle | None = None
     writing_mode: WritingMode | None = None
     contribution_points: list[str] | None = None
+    publication_title: str | None = None
+    authors: list[str] | None = None
+    keywords: list[str] | None = None
+    metadata_confirmed: bool | None = None
 
 
 class ProjectResponse(BaseModel):
@@ -99,6 +106,10 @@ class ProjectResponse(BaseModel):
     citation_style: str = "author_year"
     topic: str | None = None
     contribution_points: list[str] = Field(default_factory=list)
+    publication_title: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    metadata_confirmed: bool = False
     library_count: int = 0
     section_count: int = 0
     created_at: datetime | None = None
@@ -150,13 +161,20 @@ class ScholarlyWorkResponse(BaseModel):
     citation_count: int | None = None
 
 
+class QuotablePointResponse(BaseModel):
+    text: str
+    page: int | None = None
+    section: str | None = None
+    paragraph: int | None = None
+
+
 class LiteratureCardResponse(BaseModel):
     summary: str = ""
     contributions: list[str] = Field(default_factory=list)
     methods: list[str] = Field(default_factory=list)
     results: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
-    quotable_points: list[str] = Field(default_factory=list)
+    quotable_points: list[str | QuotablePointResponse] = Field(default_factory=list)
     fulltext_used: bool = False
     extraction_model: str | None = None
 
@@ -250,6 +268,10 @@ class SectionResponse(BaseModel):
 class UpdateSectionRequest(BaseModel):
     body_ir: dict[str, Any]
     title: str | None = None
+    #: 基础版本。与 ApproveVisualRequest 同一套乐观并发协议：视觉批准会直接
+    #: 改写章节 IR，若此时保存一份基于旧版本的草稿，刚插入的 FigureBlock
+    #: 会被静默删掉。可空以兼容旧客户端。
+    expected_updated_at: datetime | None = None
 
 
 class CitationAuditRow(BaseModel):
@@ -294,6 +316,7 @@ class ExportRequest(BaseModel):
             ]
         )
     )
+    quality_profile: Literal["draft", "submission"] = "draft"
 
 
 class ExportArtifactResponse(BaseModel):
@@ -304,6 +327,10 @@ class ExportArtifactResponse(BaseModel):
     content_hash: str | None = None
     created_at: datetime | None = None
     download_url: str | None = None
+    quality_report_id: str | None = None
+    quality_profile: Literal["draft", "submission"] = "draft"
+    readiness_status: str = "unassessed"
+    paper_snapshot_hash: str | None = None
 
 
 # ---- M4：素材与数字 lint ----
@@ -350,12 +377,77 @@ class UpdateVisualRequest(BaseModel):
 class ApproveVisualRequest(BaseModel):
     section_key: str
     block_index: int
+    #: 客户端读到该章节时的 `updated_at`。带上它才有乐观并发保护：
+    #: 服务端发现章节已被别处改动就返回 409 `section_changed`，而不是
+    #: 把插图写进一份已经过期的 IR 上。为兼容旧客户端保持可空。
+    expected_section_updated_at: datetime | None = None
+
+
+class DraftVisualRequest(BaseModel):
+    """让模型把「一句话想法」补成一份完整的视觉规格。
+
+    此前新建一张 AI 插图要用户手写图注、替代文本和构图描述三段文本，还得自己
+    避开会触发内容审核的词——那是把提示词工程外包给了作者。这里只收一句意图，
+    其余交给 planner 角色补全。
+    """
+
+    kind: Literal["diagram", "ai_image"] = "ai_image"
+    intent: str = Field(default="", max_length=500)
+    target_section_key: str | None = None
+
+
+class DraftVisualResponse(BaseModel):
+    title: str = ""
+    caption: str = ""
+    alt_text: str = ""
+    spec: dict[str, Any] = Field(default_factory=dict)
+    #: `llm:<model>` 或 `deterministic`——界面据此说明这份草稿是不是模型写的。
+    generator: str = "deterministic"
 
 
 class RegenerateVisualRequest(BaseModel):
     spec: dict[str, Any] | None = None
     caption: str | None = None
     alt_text: str | None = None
+
+
+class VisualErrorResponse(BaseModel):
+    """结构化失败信息。
+
+    `code` 取自 `visuals.errors` 的统一词表；历史行里的旧值在读侧被映射过来，
+    因此界面只需要认识一套词表。`message` 是可执行的中文提示，不是厂商英文串
+    的转述。`request_id` 现在在失败路径上也有值（provider 抛错前读 cf-ray）。
+    """
+
+    code: str
+    message: str
+    retryable: bool = False
+    request_id: str | None = None
+    #: 脱敏后的技术细节，折叠展示，供排查用。
+    detail: str | None = None
+
+
+class VisualSummaryResponse(BaseModel):
+    """项目视觉状态计数。
+
+    导航状态点、项目概览与导出提醒都只需要这几个数字；让它们各自去拉一遍
+    完整视觉列表（含 spec 与 renditions）纯属浪费。
+
+    注：`stale`（建议基于旧版正文）依赖 `paper_snapshot_hash`，随规划器一起
+    落地，这里作为可选字段返回。
+    """
+
+    project_id: str
+    pending: int = 0
+    generating: int = 0
+    ready: int = 0
+    approved: int = 0
+    failed: int = 0
+    rejected: int = 0
+    stale: int = 0
+    #: 最近一次批准插入的时间。导出中心用它和产物时间比，判断「这份 PDF 是不是
+    #: 早于最近一次插图」——批准图片不会自动重新编译，用户得知道该重跑一次。
+    latest_approved_at: datetime | None = None
 
 
 class VisualResponse(BaseModel):
@@ -374,13 +466,28 @@ class VisualResponse(BaseModel):
     spec: dict[str, Any]
     provider: str | None = None
     model: str | None = None
+    #: 平铺的 error_code / error_message 与嵌套的 `error` 并存一个版本，
+    #: 前端切完再废弃平铺字段。
     error_code: str | None = None
     error_message: str | None = None
+    error: VisualErrorResponse | None = None
     renditions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     input_hash: str
     content_hash: str | None = None
     version: int = 1
     supersedes_id: str | None = None
+    #: 最近一次生成的实际输出尺寸。Cloudflare 不接受尺寸参数，用户要看到
+    #: 的是**真实拿到了什么**，而不是他当初在下拉框里选了什么。
+    output_width: int | None = None
+    output_height: int | None = None
+    #: AI 插图**实际会发送给图像服务商**的那一句。生成确认框展示它，
+    #: 而不是让界面自己再拼一遍——否则用户确认的文本与真正发出去的会分叉。
+    resolved_prompt: str | None = None
+    #: 建议依据的正文快照。与当前正文不一致时界面提示「建议基于旧版正文」。
+    paper_snapshot_hash: str | None = None
+    suggestion_reason: str | None = None
+    source_section_keys: list[str] = Field(default_factory=list)
+    stale: bool = False
     created_at: datetime | None = None
 
 
@@ -408,8 +515,13 @@ class IngestRequest(BaseModel):
     max_works: int = 12
 
 
+class GenerationOptionsRequest(BaseModel):
+    quality_profile: Literal["draft", "submission"] = "draft"
+    review_style: Literal["narrative", "systematic"] = "narrative"
+
+
 class QualityResponse(BaseModel):
-    """质量评分报告：只呈现，不设门槛（设计 §3.4）。"""
+    """绑定正文快照的质量与投稿就绪报告。"""
 
     project_id: str
     section_count: int = 0
@@ -425,6 +537,43 @@ class QualityResponse(BaseModel):
     soft_check: list[dict[str, Any]] = Field(default_factory=list)
     hints: list[dict[str, Any]] = Field(default_factory=list)
     generated_at: str | None = None
+    report_id: str | None = None
+    document_version: int | None = None
+    paper_snapshot_hash: str | None = None
+    quality_profile: Literal["draft", "submission"] = "draft"
+    review_style: Literal["narrative", "systematic"] = "narrative"
+    readiness_status: str = "unassessed"
+    stale: bool = False
+    blockers: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    scores: dict[str, float] = Field(default_factory=dict)
+    core_claim_count: int = 0
+    core_claim_fulltext_count: int = 0
+    core_claim_fulltext_coverage: float = 0.0
+    layout_checks: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClaimEvidenceResponse(BaseModel):
+    id: str
+    report_id: str
+    section_key: str
+    claim_text: str
+    claim_kind: str
+    is_core: bool = False
+    cite_key: str | None = None
+    source_kind: str
+    source_page: int | None = None
+    source_section: str | None = None
+    source_paragraph: int | None = None
+    evidence_excerpt: str | None = None
+    evidence_hash: str | None = None
+    support_status: str
+    support_score: float | None = None
+    manual_status: str = "unreviewed"
+
+
+class ReviewClaimEvidenceRequest(BaseModel):
+    manual_status: Literal["unreviewed", "confirmed", "rejected"]
 
 
 class RefineRequest(BaseModel):
@@ -453,6 +602,29 @@ class RoleModelResponse(BaseModel):
     description: str = ""
 
 
+class ImageProviderCapabilitiesResponse(BaseModel):
+    """图像提供商**真正**支持的能力。
+
+    界面按这份声明渲染表单，不再假设所有提供商能力相同。Cloudflare
+    FLUX.1-schnell 的请求体只有 prompt 与 steps——`supported_sizes` 为空时
+    界面必须显示「尺寸由提供商决定」，而不是一个不会生效的比例下拉框。
+
+    **只含能力，不含凭据**：没有 Token、Account ID 或 Base URL。
+    """
+
+    provider: str
+    model: str
+    supported_sizes: list[str] = Field(default_factory=list)
+    supported_aspect_ratios: list[str] = Field(default_factory=list)
+    quality_modes: list[str] = Field(default_factory=list)
+    prompt_max_length: int = 4000
+    supports_negative_prompt: bool = False
+    supports_seed: bool = False
+    fixed_output_size: str | None = None
+    cost_estimate_available: bool = False
+    note: str | None = None
+
+
 class SettingsResponse(BaseModel):
     """运行时配置概览。密钥永不回传，只报告是否已配置。"""
 
@@ -469,6 +641,7 @@ class SettingsResponse(BaseModel):
     image_model: str = ""
     image_api_key_configured: bool = False
     image_provider_configured: bool = False
+    image_capabilities: ImageProviderCapabilitiesResponse | None = None
 
 
 class OutlineVersionResponse(BaseModel):

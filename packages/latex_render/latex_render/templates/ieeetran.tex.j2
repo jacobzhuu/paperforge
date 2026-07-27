@@ -11,6 +11,20 @@
 \usepackage{cite}
 {% if language == 'zh' %}\usepackage{ctex}{% endif %}
 
+%% 浮动体排版参数（核心 LaTeX，不引入任何宏包——texd 运行时无外网，
+%% Tectonic 的包缓存只在镜像构建期预热，新增 \usepackage 会直接编译失败）。
+%%
+%% 默认值非常保守：一页最多 2 个顶部浮动体、正文至少要占 20%，稍微放不下
+%% LaTeX 就把图推进延迟队列，队列只在 \clearpage / 文末冲刷——这正是
+%% 「图片全堆在论文最后」的成因。下面把配额放宽到排版上仍然合理的范围。
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{5}
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.7}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.75}
+
 \providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
 
 \begin{document}
@@ -27,6 +41,8 @@
 \end{IEEEkeywords}{% endif %}
 
 {{ body }}
+
+\clearpage
 
 {% if has_bibliography %}\bibliographystyle{IEEEtran}
 \bibliography{refs}

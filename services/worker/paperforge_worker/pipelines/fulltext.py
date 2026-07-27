@@ -123,7 +123,9 @@ async def acquire_fulltexts(
             continue
         # 只保留可用于卡片抽取的块：参考文献段与导航噪声不该占用长上下文预算。
         usable = [
-            chunk.text for chunk in chunks if assess_chunk_quality(text=chunk.text).usable_for_cards
+            _located_chunk_text(chunk, parsed.metadata or {})
+            for chunk in chunks
+            if assess_chunk_quality(text=chunk.text).usable_for_cards
         ]
         text = "\n\n".join(usable)[:MAX_FULLTEXT_CHARS]
         if text:
@@ -147,3 +149,27 @@ def _as_uuid(value: str):
     import uuid
 
     return uuid.UUID(value)
+
+
+def _located_chunk_text(chunk: Any, metadata: dict[str, Any]) -> str:
+    """把可靠页码/章节标记注入全文上下文，供证据锚点确定性回存。"""
+    start = int((chunk.metadata or {}).get("char_start") or 0)
+    segments = metadata.get("structure_segments") or []
+    located = next(
+        (
+            segment
+            for segment in segments
+            if int(segment.get("char_start") or 0)
+            <= start
+            < int(segment.get("char_end") or 0)
+        ),
+        {},
+    )
+    markers: list[str] = []
+    if located.get("page_locator_reliable") and located.get("page_number") is not None:
+        markers.append(f"PAGE={located['page_number']}")
+    section = located.get("section_title") or located.get("heading")
+    if section:
+        markers.append(f"SECTION={str(section)[:160]}")
+    prefix = f"[[{' | '.join(markers)}]]\n" if markers else ""
+    return prefix + chunk.text

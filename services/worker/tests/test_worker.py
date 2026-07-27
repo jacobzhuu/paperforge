@@ -80,3 +80,16 @@ async def test_library_pipeline_can_defer_finalization():
 
     source = inspect.getsource(worker.run_full_pipeline)
     assert "finalize=False" in source
+
+
+def test_submission_full_pipeline_runs_quality_before_visuals_and_export():
+    """A technically successful submission job must stop before producing an export."""
+    import inspect
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    quality_at = source.index('"quality"')
+    visual_at = source.index('"visual_plan"')
+    render_at = source.index('"render"')
+    assert quality_at < visual_at < render_at
+    assert 'quality_outcome.readiness_status in {"preflight_ready", "submission_ready"}' in source
+    assert '"quality.blocked"' in source

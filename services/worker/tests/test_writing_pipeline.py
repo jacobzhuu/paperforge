@@ -418,6 +418,61 @@ def test_deterministic_body_sections_cover_every_card() -> None:
     assert assigned == {"a", "b"}
 
 
+async def test_review_outline_adds_comparison_limitations_and_conflict_synthesis() -> None:
+    cards = [
+        CardBrief(
+            cite_key="a",
+            title="Study A",
+            year=2018,
+            methods=("field experiment",),
+            fulltext_used=True,
+        ),
+        CardBrief(cite_key="b", title="Study B", year=2024, methods=("simulation",)),
+    ]
+    outcome = await generate_outline(
+        topic="Evidence synthesis",
+        research_question="What agrees?",
+        cards=cards,
+        whitelist={"a", "b"},
+        runner=None,
+    )
+
+    synthesis = next(
+        section
+        for section in outcome.tree["sections"]
+        if section.get("synthesis_kind") == "comparison_limitations_conflicts"
+    )
+    assert synthesis["cite_keys"] == ["a", "b"]
+    assert synthesis["inline_tables"][0]["rows"][0][-1] == "Located full text"
+
+
+async def test_review_synthesis_table_becomes_inline_table_ir() -> None:
+    section = {
+        "key": "synthesis",
+        "title": "Cross-study synthesis",
+        "cite_keys": [],
+        "inline_tables": [
+            {
+                "caption": "Evidence matrix",
+                "label": "tab:evidence",
+                "headers": ["Study", "Evidence"],
+                "rows": [["A", "Full text"]],
+            }
+        ],
+    }
+    draft = await write_section(
+        section=section,
+        cards={},
+        whitelist=set(),
+        context=WritingContext(outline={"sections": [section]}),
+        runner=None,
+    )
+    table = draft.to_ir_section().blocks[-1]
+    assert table.type == "table"
+    assert table.source.kind == "inline"
+    assert table.source.data == {"headers": ["Study", "Evidence"], "rows": [["A", "Full text"]]}
+
+
 # ---- 工具函数 ----
 
 
@@ -433,6 +488,28 @@ def test_normalize_paragraphs_filters_and_dedupes_keys() -> None:
     assert paragraphs[0]["text"] == "spaced text"
     assert paragraphs[0]["cite_keys"] == ["gao2023survey"]
     assert len(paragraphs) == 2
+
+
+def test_sentence_level_citations_are_interleaved_in_ir() -> None:
+    paragraphs = normalize_paragraphs(
+        [
+            {
+                "sentences": [
+                    {"text": "Background context is established.", "cite_keys": []},
+                    {
+                        "text": "Retrieval improves grounding.",
+                        "cite_keys": ["lewis2020retrieval"],
+                    },
+                ]
+            }
+        ],
+        allowed={"lewis2020retrieval"},
+    )
+    draft = SectionDraft(section_key="s1", title="Evidence", paragraphs=paragraphs)
+    runs = draft.to_ir_section().blocks[0].runs
+    assert [run.t for run in runs] == ["text", "text", "text", "cite"]
+    assert runs[-1].keys == ["lewis2020retrieval"]
+    assert paragraphs[0]["cite_keys"] == ["lewis2020retrieval"]
 
 
 def test_count_words_handles_chinese_and_english() -> None:

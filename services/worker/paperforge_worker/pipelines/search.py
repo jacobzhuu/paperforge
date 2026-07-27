@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from db import record_search_run, upsert_entry, upsert_work
@@ -30,6 +31,7 @@ from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.ranking import (
     AUTO_SELECT_MIN_TOPIC_EVIDENCE,
     RankedCandidate,
+    balanced_selection_indices,
     rank_candidates,
     rerank_with_llm,
     topic_evidence,
@@ -243,11 +245,12 @@ async def _persist(
     """
     persisted = 0
     selected = 0
+    selected_indices = balanced_selection_indices(ranked, limit=auto_select_top_k)
     async with context.session() as session:
         for index, item in enumerate(ranked):
             work, _created = await upsert_work(session, item.candidate)
             relevant = topic_evidence(item) >= AUTO_SELECT_MIN_TOPIC_EVIDENCE
-            status = "selected" if index < auto_select_top_k and relevant else "candidate"
+            status = "selected" if index in selected_indices and relevant else "candidate"
             entry, _entry_created = await upsert_entry(
                 session,
                 project_id=context.project_id,
@@ -259,6 +262,18 @@ async def _persist(
                     **item.reason,
                     "provider": item.candidate.provider_name,
                     "provider_record_id": item.candidate.provider_record_id,
+                    "selection_stratum": (
+                        "foundational"
+                        if (item.candidate.publication_year or 9999)
+                        <= datetime.now(UTC).year - 6
+                        else "recent"
+                    ),
+                    "fulltext_available": bool(
+                        item.candidate.pmcid
+                        or item.candidate.arxiv_id
+                        or item.candidate.oa_status not in {None, "closed"}
+                        or any(link.is_oa for link in item.candidate.links)
+                    ),
                 },
                 verified=True,
             )

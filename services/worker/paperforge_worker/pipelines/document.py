@@ -20,6 +20,7 @@ from db import (
     latest_outline,
     list_entries,
     parsed_asset_payloads,
+    polish_skip_requested,
     reference_metadata_payload,
     replace_citation_usage,
     upsert_section,
@@ -50,8 +51,14 @@ logger = get_logger(__name__)
 FRAME_ORDER = {"abstract": -2, "introduction": -1, "conclusion": 999}
 
 # write 阶段在整条管线里占的进度区间（与 worker._STAGE_PROGRESS 对齐）。
+# 分节写作与连贯性润色各占一段：润色是独立阶段名（polish），界面上不能再叫「分节写作」——
+# 那会让人对着一屏「已生成」的章节以为系统卡死了。
 _WRITE_PROGRESS_START = 0.65
+_POLISH_PROGRESS_START = 0.82
 _WRITE_PROGRESS_END = 0.90
+
+WRITE_STAGE = "write"
+POLISH_STAGE = "polish"
 
 
 @dataclass
@@ -66,6 +73,9 @@ class WriteOutcome:
     unsourced_number_count: int = 0
     generator_mix: dict[str, int] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    polished_count: int = 0
+    polish_pending_count: int = 0
+    polish_skipped: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -79,6 +89,11 @@ class WriteOutcome:
             "unsourced_number_count": self.unsourced_number_count,
             "generator_mix": self.generator_mix,
             "warnings": self.warnings,
+            "polished_count": self.polished_count,
+            # 跳过是用户的主动选择，不是降级；但产物里必须留下痕迹，
+            # 否则「这稿为什么读起来不如上次连贯」将无从追溯。
+            "polish_pending_count": self.polish_pending_count,
+            "polish_skipped": self.polish_skipped,
         }
 
 
@@ -88,6 +103,7 @@ async def write_document(
     language: str = "en",
     title: str = "",
     coherence: bool = True,
+    paper_type: str = "review",
 ) -> WriteOutcome:
     """按大纲逐章写作并落库，返回统计。"""
     outcome = WriteOutcome()
@@ -109,7 +125,7 @@ async def write_document(
         outcome.warnings.append({"stage": "write", "reason": "empty_outline"})
         return outcome
 
-    writing_context = WritingContext(outline=outline, language=language)
+    writing_context = WritingContext(outline=outline, language=language, paper_type=paper_type)
     body_sections = [s for s in sections if s.get("kind") != "frame"]
     frame_sections = [s for s in sections if s.get("kind") == "frame"]
     order_by_key = {str(s.get("key") or ""): index for index, s in enumerate(sections)}
@@ -128,13 +144,30 @@ async def write_document(
         document_id = document.id
     outcome.document_id = str(document_id)
 
-    # write 阶段横跨 0.65→0.90，按「正文 + 框架 + 润色」的步数线性摊进度条。
-    total_steps = len(sections) * 2 if coherence else len(sections)
-    steps_done = 0
+    # 分节写作占 0.65→0.82，润色占 0.82→0.90：两段各自线性摊，
+    # 用户看到的百分比因此和「写到第几节 / 润到第几节」对得上。
+    written = 0
+    total_sections = len(sections)
 
-    def _progress() -> float:
-        span = _WRITE_PROGRESS_END - _WRITE_PROGRESS_START
-        return _WRITE_PROGRESS_START + span * min(1.0, steps_done / max(1, total_steps))
+    def _write_progress() -> float:
+        span = _POLISH_PROGRESS_START - _WRITE_PROGRESS_START
+        return _WRITE_PROGRESS_START + span * min(1.0, written / max(1, total_sections))
+
+    async def _emit_section(draft: SectionDraft) -> None:
+        await context.emit(
+            "write.section",
+            {
+                "section": draft.section_key,
+                "title": draft.title,
+                "words": draft.word_count,
+                "generator": draft.generator,
+                # 序号是「正在做什么」的一半信息量：只报标题，用户无从判断还剩多少。
+                "index": written,
+                "total": total_sections,
+            },
+            stage=WRITE_STAGE,
+            progress=_write_progress(),
+        )
 
     drafts: dict[str, SectionDraft] = {}
     for section in body_sections:
@@ -158,18 +191,8 @@ async def write_document(
             whitelist=whitelist,
             language=language,
         )
-        steps_done += 1
-        await context.emit(
-            "write.section",
-            {
-                "section": draft.section_key,
-                "title": draft.title,
-                "words": draft.word_count,
-                "generator": draft.generator,
-            },
-            stage="write",
-            progress=_progress(),
-        )
+        written += 1
+        await _emit_section(draft)
 
     # 框架章节后写：此时滚动摘要已覆盖全部正文。
     for section in frame_sections:
@@ -192,45 +215,22 @@ async def write_document(
             whitelist=whitelist,
             language=language,
         )
-        steps_done += 1
+        written += 1
         # 框架章节此前不发事件：摘要/引言/结论那几分钟前端完全没有进度可看。
-        await context.emit(
-            "write.section",
-            {
-                "section": draft.section_key,
-                "title": draft.title,
-                "words": draft.word_count,
-                "generator": draft.generator,
-            },
-            stage="write",
-            progress=_progress(),
-        )
+        await _emit_section(draft)
 
     if coherence:
-        polishable = [key for key, draft in drafts.items() if draft.generator.startswith("llm")]
-        for done, key in enumerate(polishable, start=1):
-            polished = await coherence_pass(
-                draft=drafts[key],
-                context=writing_context,
-                whitelist=set(whitelist),
-                runner=runner,
-            )
-            drafts[key] = polished
-            await _persist_draft(
-                context,
-                document_id=document_id,
-                draft=polished,
-                order_no=order_by_key.get(key, 0),
-                whitelist=whitelist,
-                language=language,
-            )
-            steps_done += 1
-            await context.emit(
-                "write.coherence",
-                {"section": key, "done": done, "total": len(polishable)},
-                stage="write",
-                progress=_progress(),
-            )
+        await _polish_all(
+            context,
+            drafts=drafts,
+            document_id=document_id,
+            order_by_key=order_by_key,
+            whitelist=whitelist,
+            language=language,
+            writing_context=writing_context,
+            runner=runner,
+            outcome=outcome,
+        )
 
     ordered = _ordered_drafts(sections, drafts)
     ir = _build_paper_ir(
@@ -278,6 +278,20 @@ async def write_document(
             for key, draft in ordered
         ],
         parsed_assets=assets,
+        paper_type=paper_type,
+        literature_evidence=[
+            {
+                "cite_key": key,
+                "text": point.get("text") if isinstance(point, dict) else point,
+                "located": bool(
+                    isinstance(point, dict)
+                    and (point.get("page") or point.get("section") or point.get("paragraph"))
+                ),
+            }
+            for key, card in cards.items()
+            if card.get("fulltext_used")
+            for point in card.get("quotable_points") or []
+        ],
     )
     outcome.numlint_consistent = report.consistent
     outcome.unsourced_number_count = len(report.unsourced)
@@ -300,6 +314,107 @@ async def write_document(
         kind = draft.generator.split(":")[0]
         outcome.generator_mix[kind] = outcome.generator_mix.get(kind, 0) + 1
     return outcome
+
+
+async def _polish_all(
+    context: JobContext,
+    *,
+    drafts: dict[str, SectionDraft],
+    document_id: uuid.UUID,
+    order_by_key: dict[str, int],
+    whitelist: dict[str, uuid.UUID],
+    language: str,
+    writing_context: WritingContext,
+    runner,
+    outcome: WriteOutcome,
+) -> None:
+    """连贯性润色：独立阶段、逐节可见、随时可跳过。
+
+    这一段动辄十几分钟，且此时所有章节都已「已生成」并落库——用户看到的是一屏
+    完成的正文配一个不动的「分节写作」，只能理解为卡死。所以它有自己的阶段名，
+    每节报一次进度，并且允许中途叫停：已润色的保留，剩下的直接用初稿。
+    """
+    polishable = [key for key, draft in drafts.items() if draft.generator.startswith("llm")]
+    total = len(polishable)
+    outcome.polish_pending_count = total
+    if not total:
+        return
+
+    span = _WRITE_PROGRESS_END - _POLISH_PROGRESS_START
+    await context.emit(
+        "polish.started",
+        {"total": total},
+        stage=POLISH_STAGE,
+        progress=_POLISH_PROGRESS_START,
+    )
+
+    done = 0
+    for key in polishable:
+        # 每节之间查一次开关：正在跑的那一节跑完再停，不打断已经付过钱的调用。
+        if await _polish_skip_requested(context):
+            outcome.polish_skipped = True
+            await context.emit(
+                "polish.skipped",
+                {"done": done, "total": total, "remaining": total - done},
+                stage=POLISH_STAGE,
+                progress=_POLISH_PROGRESS_START + span * (done / total),
+            )
+            logger.info(
+                "coherence polish skipped by user",
+                extra={"done": done, "total": total},
+            )
+            break
+        draft = drafts[key]
+        polished = await coherence_pass(
+            draft=draft,
+            context=writing_context,
+            whitelist=set(whitelist),
+            runner=runner,
+        )
+        drafts[key] = polished
+        await _persist_draft(
+            context,
+            document_id=document_id,
+            draft=polished,
+            order_no=order_by_key.get(key, 0),
+            whitelist=whitelist,
+            language=language,
+        )
+        done += 1
+        outcome.polished_count = done
+        await context.emit(
+            "polish.section",
+            {
+                "section": key,
+                "title": polished.title,
+                "done": done,
+                "total": total,
+            },
+            stage=POLISH_STAGE,
+            progress=_POLISH_PROGRESS_START + span * (done / total),
+        )
+
+    outcome.polish_pending_count = total - done
+    await context.emit(
+        "polish.completed",
+        {"done": done, "total": total, "skipped": outcome.polish_skipped},
+        stage=POLISH_STAGE,
+        progress=_WRITE_PROGRESS_END,
+    )
+
+
+async def _polish_skip_requested(context: JobContext) -> bool:
+    """用户是否按下了「跳过润色」（标记写在 job.checkpoint_json 上）。"""
+    if context.job_id is None:
+        return False
+    from db.models.paper import GenerationJob
+
+    try:
+        async with context.session() as session:
+            return polish_skip_requested(await session.get(GenerationJob, context.job_id))
+    except Exception:  # noqa: BLE001 - 读不到开关就当没按过，继续润色
+        logger.warning("failed to read polish skip flag", exc_info=True)
+        return False
 
 
 async def _persist_draft(
@@ -501,6 +616,8 @@ async def _card_context(session, project_id: uuid.UUID) -> dict[str, dict[str, A
             "methods": (card.methods_json if card else None) or [],
             "results": (card.results_json if card else None) or [],
             "limitations": (card.limitations_json if card else None) or [],
+            "quotable_points": (card.quotable_points_json if card else None) or [],
+            "fulltext_used": bool(card and card.fulltext_used),
         }
     return context
 

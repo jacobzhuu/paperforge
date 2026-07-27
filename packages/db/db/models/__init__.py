@@ -17,6 +17,7 @@ from db.models.library import (
 )
 from db.models.paper import (
     CitationUsage,
+    ClaimEvidenceAnchor,
     ExportArtifact,
     GenerationJob,
     JobEvent,
@@ -25,6 +26,7 @@ from db.models.paper import (
     PaperDocument,
     PaperProject,
     PaperSection,
+    QualityReportRecord,
     SearchRun,
     UserAsset,
     VisualAsset,
@@ -36,6 +38,7 @@ __all__ = [
     "AppUser",
     "AuthActionToken",
     "CitationUsage",
+    "ClaimEvidenceAnchor",
     "DocumentFile",
     "ExportArtifact",
     "GenerationJob",
@@ -47,6 +50,7 @@ __all__ = [
     "PaperDocument",
     "PaperProject",
     "PaperSection",
+    "QualityReportRecord",
     "ScholarlyHttpCache",
     "ScholarlyWork",
     "SearchRun",

@@ -33,6 +33,8 @@ from paperforge_worker.pipelines.importing import (
 )
 from paperforge_worker.pipelines.outline import CardBrief, generate_outline
 from paperforge_worker.pipelines.quality import (
+    apply_readiness_gate,
+    build_claim_evidence,
     build_quality_report,
     soft_check_citations,
 )
@@ -45,7 +47,12 @@ logger = get_logger(__name__)
 # 一键生成的单任务超时（秒）。默认 job_timeout 管的是单阶段任务。
 FULL_PIPELINE_TIMEOUT_SECONDS = 7200
 
-# 综述管线 M1 阶段权重（用于进度条；后续里程碑会追加 outline/write/render）。
+# 综述管线阶段权重（用于进度条）。
+#
+# 这是**一键生成那条长管线**的绝对刻度，只对 run_full_pipeline / run_library_pipeline
+# 有意义。单阶段任务（视觉建议、单张生图）不能复用它：`visual_generate` 此前在这里
+# 挂着 0.75，而它根本不是全文管线的阶段——独立的生图任务因此长期停在 75%，
+# 完成时才直接跳到 100%。单阶段任务改为由调用方显式传 `progress`。
 _STAGE_PROGRESS = {
     "scope": 0.10,
     "search": 0.40,
@@ -58,7 +65,6 @@ _STAGE_PROGRESS = {
     "write": 0.90,
     "citecheck": 0.93,
     "visual_plan": 0.95,
-    "visual_generate": 0.75,
     "render": 0.98,
     "done": 1.0,
 }
@@ -70,6 +76,7 @@ async def _run_stage(
     runner: Callable[[], Awaitable[Any]],
     *,
     kind: str = "library",
+    progress: float | None = None,
 ) -> Any:
     """执行一个阶段：成功发事件，失败留降级标记并继续（gate-free）。"""
     await context.emit(f"{stage}.started", {}, stage=stage)
@@ -100,7 +107,7 @@ async def _run_stage(
         f"{stage}.completed",
         payload,
         stage=stage,
-        progress=_STAGE_PROGRESS.get(stage),
+        progress=progress if progress is not None else _STAGE_PROGRESS.get(stage),
         checkpoint={stage: payload or True},
     )
     return result
@@ -320,7 +327,7 @@ async def run_write_pipeline(
             project = await get_project(session, project_uuid)
             if project is None:
                 raise ValueError(f"project not found: {project_id}")
-            language, title = project.language, project.title
+            language, title, paper_type = project.language, project.title, project.paper_type
         await _mark_running(context)
         outcome = await _run_stage(
             context,
@@ -330,6 +337,7 @@ async def run_write_pipeline(
                 language=language,
                 title=title,
                 coherence=coherence,
+                paper_type=paper_type,
             ),
         )
         await _finish(context, delivered=bool(outcome and outcome.section_count))
@@ -479,6 +487,10 @@ async def run_quality_pipeline(
     ctx: dict,
     project_id: str,
     job_id: str | None = None,
+    *,
+    quality_profile: str = "draft",
+    review_style: str = "narrative",
+    layout_checks: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """质量报告：语义软校验 + 覆盖建议 + 评分（只提示，不阻断）。"""
     settings: Settings = ctx.get("settings") or get_settings()
@@ -494,21 +506,38 @@ async def run_quality_pipeline(
         report = await _run_stage(
             context,
             "quality",
-            lambda: _quality(context),
+            lambda: _quality(
+                context,
+                quality_profile=quality_profile,
+                review_style=review_style,
+                layout_checks=layout_checks,
+            ),
             kind="write",
         )
         await _finish(context, delivered=report is not None)
         return {"project_id": project_id, "quality": report.to_payload() if report else None}
 
 
-async def _quality(context: JobContext):
+async def _quality(
+    context: JobContext,
+    *,
+    quality_profile: str = "draft",
+    review_style: str = "narrative",
+    layout_checks: dict[str, Any] | None = None,
+):
     from db import (
+        create_quality_report,
+        document_snapshot_hash,
         get_project,
         get_writing_whitelist,
         latest_document,
+        latest_quality_report,
         list_citation_usage,
+        list_claim_evidence,
         list_entries,
+        list_search_runs,
         list_sections,
+        replace_claim_evidence,
     )
 
     async with context.session() as session:
@@ -518,16 +547,40 @@ async def _quality(context: JobContext):
         rows = await list_sections(session, document.id) if document else []
         usage_rows = await list_citation_usage(session, context.project_id)
         entries = await list_entries(session, context.project_id, status="selected")
+        cards = await _cards(session, context.project_id)
+        search_runs = await list_search_runs(session, context.project_id)
+        previous_report = await latest_quality_report(
+            session,
+            context.project_id,
+            quality_profile=quality_profile,
+        )
+        previous_anchors = (
+            await list_claim_evidence(
+                session,
+                context.project_id,
+                quality_report_id=previous_report.id,
+            )
+            if previous_report is not None
+            else []
+        )
         abstracts = {
             entry.bibtex_key: work.abstract
             for entry, work in entries
             if entry.bibtex_key and work.abstract
         }
         years = [work.publication_year for _e, work in entries if work.publication_year]
-        fulltext_used = sum(
-            1 for card in (await _cards(session, context.project_id)) if card.fulltext_used
-        )
+        fulltext_used = sum(1 for card in cards if card.fulltext_used)
         scope = dict((project.scope_json or {}) if project else {})
+        evidence_sources = {
+            entry.bibtex_key: {
+                "work_id": work.id,
+                "fulltext_used": bool(card and card.fulltext_used),
+                "quotable_points": (card.quotable_points_json if card else None) or [],
+            }
+            for entry, work in entries
+            if entry.bibtex_key
+            for card in [next((item for item in cards if item.work_id == work.id), None)]
+        }
 
     frame_keys = {"abstract", "introduction", "conclusion"}
     sections = [
@@ -553,7 +606,7 @@ async def _quality(context: JobContext):
         abstracts=abstracts,
         runner=context.llm_runner(),
     )
-    return build_quality_report(
+    report = build_quality_report(
         sections=sections,
         whitelist_size=len(whitelist),
         publication_years=years,
@@ -561,6 +614,68 @@ async def _quality(context: JobContext):
         soft_check=findings,
         scope=scope,
     )
+    report.document_version = document.version if document else None
+    report.paper_snapshot_hash = document_snapshot_hash(rows) if document else None
+    report.quality_profile = quality_profile
+    report.review_style = review_style
+    report.layout_checks = layout_checks or {"status": "not_run", "passed": None}
+    report.claim_evidence = build_claim_evidence(rows=rows, evidence_sources=evidence_sources)
+    manual_statuses = {
+        (anchor.claim_hash, anchor.cite_key, anchor.evidence_hash): anchor.manual_status
+        for anchor in previous_anchors
+        if anchor.manual_status != "unreviewed"
+    }
+    for anchor in report.claim_evidence:
+        anchor["manual_status"] = manual_statuses.get(
+            (anchor["claim_hash"], anchor["cite_key"], anchor["evidence_hash"]),
+            "unreviewed",
+        )
+    if project is not None:
+        apply_readiness_gate(
+            report,
+            rows=rows,
+            project=project,
+            whitelist=set(whitelist),
+            search_runs=search_runs,
+        )
+    if document is not None and report.paper_snapshot_hash:
+        async with context.session() as session:
+            record = await create_quality_report(
+                session,
+                project_id=context.project_id,
+                document_id=document.id,
+                document_version=document.version,
+                paper_snapshot_hash=report.paper_snapshot_hash,
+                quality_profile=quality_profile,
+                review_style=review_style,
+                readiness_status=report.readiness_status,
+                blockers=report.blockers,
+                warnings=report.warnings,
+                scores=report.scores,
+                metrics=report.to_payload(),
+                layout_checks=report.layout_checks,
+            )
+            await replace_claim_evidence(
+                session,
+                quality_report_id=record.id,
+                project_id=context.project_id,
+                document_id=document.id,
+                anchors=report.claim_evidence,
+            )
+            report.report_id = str(record.id)
+    await context.emit(
+        "quality.metrics",
+        {
+            "quality_profile": quality_profile,
+            "review_style": review_style,
+            "readiness_status": report.readiness_status,
+            "core_claim_fulltext_coverage": report.core_claim_fulltext_coverage,
+            "blocker_codes": [item.get("code") for item in report.blockers],
+            "warning_codes": [item.get("code") or item.get("kind") for item in report.warnings],
+        },
+        stage="quality",
+    )
+    return report
 
 
 async def _cards(session, project_id):
@@ -588,6 +703,10 @@ async def run_export_pipeline(
     job_id: str | None = None,
     *,
     formats: list[str] | None = None,
+    quality_profile: str = "draft",
+    quality_report_id: str | None = None,
+    readiness_status: str = "unassessed",
+    paper_snapshot_hash: str | None = None,
 ) -> dict[str, Any]:
     """RENDER 任务：PaperIR → LaTeX 工程 → texd 编译 → 产物落对象存储。"""
     settings: Settings = ctx.get("settings") or get_settings()
@@ -604,7 +723,15 @@ async def run_export_pipeline(
         outcome = await _run_stage(
             context,
             "render",
-            lambda: export_document(context, formats=formats, store=store),
+            lambda: export_document(
+                context,
+                formats=formats,
+                store=store,
+                quality_profile=quality_profile,
+                quality_report_id=quality_report_id,
+                readiness_status=readiness_status,
+                paper_snapshot_hash=paper_snapshot_hash,
+            ),
             kind="export",
         )
         # Draft-first：只要有任一产物（哪怕只是 LaTeX 工程 + 日志）就算交付。
@@ -629,8 +756,13 @@ async def run_visual_suggest_pipeline(
         scholar_cache=ctx.get("scholar_cache"),
     ) as context:
         await _mark_running(context)
+        # 单阶段任务：这一阶段跑完任务就结束了，进度就是 1.0。
         outcome = await _run_stage(
-            context, "visual_plan", lambda: suggest_visuals(context), kind="visual"
+            context,
+            "visual_plan",
+            lambda: suggest_visuals(context),
+            kind="visual",
+            progress=1.0,
         )
         await _finish(context, delivered=outcome is not None)
         return {"project_id": project_id, "visual_plan": outcome.to_payload() if outcome else None}
@@ -659,6 +791,7 @@ async def run_visual_generate_pipeline(
             "visual_generate",
             lambda: generate_visual(context, uuid.UUID(visual_id)),
             kind="visual",
+            progress=1.0,
         )
         await _finish(context, delivered=bool(outcome and outcome.status == "ready"))
         return {"project_id": project_id, "visual": outcome.to_payload() if outcome else None}
@@ -670,11 +803,18 @@ def _object_store(settings: Settings):
     return make_object_store(settings)
 
 
-async def run_full_pipeline(ctx: dict, project_id: str, job_id: str | None = None) -> dict:
+async def run_full_pipeline(
+    ctx: dict,
+    project_id: str,
+    job_id: str | None = None,
+    *,
+    quality_profile: str = "draft",
+    review_style: str = "narrative",
+) -> dict:
     """kind=full 一键生成入口。
 
-    综述管线：scope→search→curate→ingest→cards→outline→write→citecheck→render→review。
-    M1–M2 覆盖到 write；render 随 M3 接入本函数。
+    综述管线：scope→search→curate→ingest→cards→outline→write→quality→visual→render。
+    投稿模式的质量失败保留任务技术成功，但不会进入视觉或导出。
     """
     settings: Settings = ctx.get("settings") or get_settings()
     # finalize=False：文献阶段结束不收尾，任务状态要覆盖到 render 为止。
@@ -690,45 +830,99 @@ async def run_full_pipeline(ctx: dict, project_id: str, job_id: str | None = Non
         async with context.session() as session:
             project = await get_project(session, project_uuid)
             language = project.language if project else "en"
-            title = project.title if project else ""
-        outline_outcome = await _run_stage(context, "outline", lambda: _outline(context))
+            title = (project.publication_title or project.title) if project else ""
+            paper_type = project.paper_type if project else "review"
+        outline_outcome = await _run_stage(
+            context,
+            "outline",
+            lambda: _outline(context, review_style=review_style),
+        )
         write_outcome = await _run_stage(
             context,
             "write",
-            lambda: write_document(context, language=language, title=title),
+            lambda: write_document(
+                context,
+                language=language,
+                title=title,
+                paper_type=paper_type,
+            ),
         )
+        quality_outcome = None
         export_outcome = None
         if write_outcome and write_outcome.section_count:
-            await _run_stage(
+            quality_outcome = await _run_stage(
                 context,
-                "visual_plan",
-                lambda: suggest_visuals(context),
-                kind="visual",
+                "quality",
+                lambda: _quality(
+                    context,
+                    quality_profile=quality_profile,
+                    review_style=review_style,
+                ),
+                kind="write",
             )
-            export_outcome = await _run_stage(
-                context,
-                "render",
-                lambda: export_document(context, store=_object_store(settings)),
+            can_render = quality_profile == "draft" or (
+                quality_outcome is not None
+                and quality_outcome.readiness_status in {"preflight_ready", "submission_ready"}
             )
+            if can_render:
+                await _run_stage(
+                    context,
+                    "visual_plan",
+                    lambda: suggest_visuals(context),
+                    kind="visual",
+                )
+                export_outcome = await _run_stage(
+                    context,
+                    "render",
+                    lambda: export_document(
+                        context,
+                        store=_object_store(settings),
+                        quality_profile=quality_profile,
+                        quality_report_id=(quality_outcome.report_id if quality_outcome else None),
+                        readiness_status=(
+                            quality_outcome.readiness_status if quality_outcome else "unassessed"
+                        ),
+                        paper_snapshot_hash=(
+                            quality_outcome.paper_snapshot_hash if quality_outcome else None
+                        ),
+                    ),
+                )
+            elif quality_outcome is not None:
+                await context.emit(
+                    "quality.blocked",
+                    {
+                        "readiness_status": quality_outcome.readiness_status,
+                        "blockers": quality_outcome.blockers,
+                    },
+                    stage="quality",
+                )
         # Draft-first：正文写不出来也交付已入库的文献与大纲。
         await _finish(context, delivered=bool(library.get("search")))
         return {
             **library,
             "outline": outline_outcome.to_payload() if outline_outcome else None,
             "write": write_outcome.to_payload() if write_outcome else None,
+            "quality": quality_outcome.to_payload() if quality_outcome else None,
             "export": export_outcome.to_payload() if export_outcome else None,
         }
 
 
-async def _outline(context: JobContext):
+async def _outline(context: JobContext, *, review_style: str = "narrative"):
     """从库内卡片构造大纲输入并生成章节树。"""
-    from db import create_outline, get_cards, get_writing_whitelist, list_entries
+    from db import (
+        create_outline,
+        get_cards,
+        get_writing_whitelist,
+        list_entries,
+        list_search_runs,
+    )
 
     async with context.session() as session:
         project = await get_project(session, context.project_id)
         whitelist = await get_writing_whitelist(session, context.project_id)
         cards_by_work = await get_cards(session, context.project_id)
         entries = await list_entries(session, context.project_id, status="selected")
+        search_runs = await list_search_runs(session, context.project_id)
         briefs = [
             CardBrief(
                 cite_key=entry.bibtex_key,
@@ -745,6 +939,17 @@ async def _outline(context: JobContext):
                 methods=tuple(
                     cards_by_work[work.id].methods_json or [] if work.id in cards_by_work else []
                 ),
+                results=tuple(
+                    cards_by_work[work.id].results_json or [] if work.id in cards_by_work else []
+                ),
+                limitations=tuple(
+                    cards_by_work[work.id].limitations_json or []
+                    if work.id in cards_by_work
+                    else []
+                ),
+                fulltext_used=bool(
+                    work.id in cards_by_work and cards_by_work[work.id].fulltext_used
+                ),
             )
             for entry, work in entries
             if entry.bibtex_key
@@ -752,6 +957,30 @@ async def _outline(context: JobContext):
         scope = dict((project.scope_json or {}) if project else {})
         language = project.language if project else "en"
         paper_type = project.paper_type if project else "review"
+
+    completed_search = bool(search_runs) and all(
+        run.status == "succeeded" and not run.error for run in search_runs
+    )
+    criteria = list(scope.get("inclusion_criteria") or [])
+    if not criteria:
+        criteria = [
+            "direct relevance to the research question",
+            "verifiable scholarly metadata",
+            "eligible publication type and language",
+        ]
+    search_method = (
+        {
+            "databases": sorted({run.provider for run in search_runs}),
+            "queries": [run.query_text for run in search_runs],
+            "dates": sorted({run.executed_at.date().isoformat() for run in search_runs}),
+            "hit_count": sum(int(run.hit_count or 0) for run in search_runs),
+            "retrieved_count": sum(int(run.retrieved_count or 0) for run in search_runs),
+            "selected_count": len(entries),
+            "inclusion_criteria": criteria,
+        }
+        if review_style == "systematic" and completed_search
+        else None
+    )
 
     outcome = await generate_outline(
         topic=str(scope.get("topic") or (project.title if project else "")),
@@ -761,6 +990,8 @@ async def _outline(context: JobContext):
         language=language,
         paper_type=paper_type,
         runner=context.llm_runner(),
+        review_style=review_style,
+        search_method=search_method,
     )
     async with context.session() as session:
         await create_outline(session, project_id=context.project_id, tree=outcome.tree)

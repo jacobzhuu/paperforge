@@ -24,6 +24,11 @@ _ORDINAL_CONTEXT_RE = re.compile(
     r"(?:图|表|式|第|章节|节)\s*$|(?:figure|fig\.|table|tab\.|section|sec\.|equation|eq\.)\s*$",
     re.IGNORECASE,
 )
+_NAMED_IDENTIFIER_RE = re.compile(
+    r"\b(?:[A-Za-z][A-Za-z0-9]*[-_.]?\d+(?:\.\d+)*(?:[A-Za-z]+)?|v\d+(?:\.\d+)*)\b",
+    re.IGNORECASE,
+)
+_VERSION_CONTEXT_RE = re.compile(r"(?:version|ver\.?|model|版本|模型)\s*$", re.IGNORECASE)
 
 
 @dataclass
@@ -73,7 +78,10 @@ class NumLintReport:
         }
 
 
-def build_asset_index(parsed_assets: list[dict[str, Any]]) -> dict[str, str]:
+def build_asset_index(
+    parsed_assets: list[dict[str, Any]],
+    literature_evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
     """数值 → 素材来源标识。素材解析结果是正文数字的唯一合法出处。"""
     index: dict[str, str] = {}
     for asset in parsed_assets:
@@ -84,6 +92,12 @@ def build_asset_index(parsed_assets: list[dict[str, Any]]) -> dict[str, str]:
             index.setdefault(normalize_number(str(number)), label)
         for key, value in (asset.get("numeric_cells") or {}).items():
             index.setdefault(normalize_number(str(value)), f"{label}[{key}]")
+    for evidence in literature_evidence or []:
+        if not isinstance(evidence, dict) or not evidence.get("located"):
+            continue
+        label = str(evidence.get("cite_key") or "literature")
+        for number in extract_numbers(str(evidence.get("text") or "")):
+            index.setdefault(normalize_number(number), f"fulltext:{label}")
     return index
 
 
@@ -128,6 +142,8 @@ def lint_sections(
     sections: list[dict[str, Any]],
     *,
     parsed_assets: list[dict[str, Any]],
+    paper_type: str = "original",
+    literature_evidence: list[dict[str, Any]] | None = None,
 ) -> NumLintReport:
     """对整篇文稿做数字一致性检查。
 
@@ -135,7 +151,10 @@ def lint_sections(
     没有任何素材时，正文里**任何**实验数值都算未溯源——这正是纯生成模式
     必须使用 `\\todo{待补充实验数据}` 占位而不是写数字的原因。
     """
-    index = build_asset_index(parsed_assets)
+    index = build_asset_index(
+        parsed_assets,
+        literature_evidence if paper_type == "review" else None,
+    )
     report = NumLintReport(asset_number_count=len(index))
     for section in sections:
         report.findings.extend(
@@ -154,6 +173,23 @@ def _is_ignorable(value: str, text: str, start: int) -> bool:
     if value in TRIVIAL_NUMBERS:
         return True
     prefix = text[max(0, start - 12) : start]
+    chemical_context = text[max(0, start - 20) : start + len(value) + 20]
+    chemical_value = value.lstrip("+-")
+    if re.search(
+        rf"[A-Za-z\u4e00-\u9fff]+-{re.escape(chemical_value)}-[A-Za-z\u4e00-\u9fff]+",
+        chemical_context,
+    ):
+        return True
+    identifier_start = max(0, start - 24)
+    identifier_context = text[identifier_start : start + len(value) + 12]
+    local_number_start = start - identifier_start
+    if any(
+        match.start() <= local_number_start < match.end()
+        for match in _NAMED_IDENTIFIER_RE.finditer(identifier_context)
+    ):
+        return True
+    if _VERSION_CONTEXT_RE.search(prefix):
+        return True
     return bool(_ORDINAL_CONTEXT_RE.search(prefix))
 
 

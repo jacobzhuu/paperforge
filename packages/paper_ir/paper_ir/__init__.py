@@ -33,6 +33,8 @@ from paper_ir.schema import (
     PaperMeta,
     ParagraphBlock,
     Section,
+    TableBlock,
+    TableSource,
     TextRun,
     XRefRun,
 )
@@ -51,6 +53,8 @@ __all__ = [
     "ParagraphBlock",
     "ReferenceMetadata",
     "Section",
+    "TableBlock",
+    "TableSource",
     "TextRun",
     "XRefRun",
     "format_scholarly_reference",

@@ -34,6 +34,7 @@ _SYSTEM_PROMPT_ZH = """你是综述论文的大纲规划助手。根据研究问
 }
 要求：
 - 主体章节按**主题**组织，不要按文献逐篇罗列；
+- 至少有一节跨文献综合，明确比较研究方法、证据一致与冲突、以及方法局限；
 - cite_keys 只能从给定的引用键清单中选，**禁止**发明新的引用键；
 - 每篇文献尽量被分配到某一章；确实无关的可以不分配；
 - 不要包含摘要/引言/结论章节，它们由系统单独生成。"""
@@ -52,6 +53,7 @@ literature cards, output a section tree. Output JSON only:
 }
 Rules:
 - organize body sections by THEME, never as a paper-by-paper list;
+- include cross-study synthesis that compares methods, agreements/conflicts, and limitations;
 - cite_keys must come from the given key list; never invent a key;
 - try to assign every work to some section; genuinely irrelevant ones may be left out;
 - do not include abstract/introduction/conclusion — the system generates those separately."""
@@ -90,6 +92,9 @@ class CardBrief:
     summary: str | None = None
     contributions: tuple[str, ...] = ()
     methods: tuple[str, ...] = ()
+    results: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+    fulltext_used: bool = False
 
 
 async def generate_outline(
@@ -101,9 +106,12 @@ async def generate_outline(
     language: str = "en",
     paper_type: str = "review",
     runner: LLMRunner | None = None,
+    review_style: str = "narrative",
+    search_method: dict[str, Any] | None = None,
 ) -> OutlineOutcome:
     """产出章节树。永远返回合法大纲。"""
-    allowed = {card.cite_key for card in cards if card.cite_key in whitelist}
+    allowed_cards = [card for card in cards if card.cite_key in whitelist]
+    allowed = {card.cite_key for card in allowed_cards}
     if paper_type == "original":
         body = imrad_body_sections(sorted(allowed), language=language)
         generator = "imrad_template"
@@ -111,13 +119,17 @@ async def generate_outline(
         body, generator = await _body_sections(
             topic=topic,
             research_question=research_question,
-            cards=[card for card in cards if card.cite_key in allowed],
+            cards=allowed_cards,
             allowed=allowed,
             language=language,
             runner=runner,
         )
 
     body = _reclaim_orphans(body, allowed)
+    if paper_type == "review" and len(allowed_cards) >= 2:
+        body.append(review_synthesis_section(allowed_cards, language=language))
+    if paper_type == "review" and review_style == "systematic" and search_method:
+        body.insert(0, systematic_method_section(search_method, language=language))
     sections = _with_frame_sections(body, language=language, paper_type=paper_type)
     assigned = {key for section in sections for key in section.get("cite_keys", [])}
     outcome = OutlineOutcome(
@@ -126,6 +138,8 @@ async def generate_outline(
             "research_question": research_question,
             "language": language,
             "paper_type": paper_type,
+            "review_style": review_style if search_method else "narrative",
+            "search_method": search_method,
             "sections": sections,
         },
         generator=generator,
@@ -134,6 +148,40 @@ async def generate_outline(
         orphan_key_count=len(allowed - assigned),
     )
     return outcome
+
+
+def systematic_method_section(search_method: dict[str, Any], *, language: str) -> dict[str, Any]:
+    providers = ", ".join(search_method.get("databases") or [])
+    queries = "; ".join(search_method.get("queries") or [])
+    dates = ", ".join(search_method.get("dates") or [])
+    retrieved = int(search_method.get("retrieved_count") or 0)
+    selected = int(search_method.get("selected_count") or 0)
+    criteria = "; ".join(search_method.get("inclusion_criteria") or [])
+    if language == "zh":
+        title = "检索方法与纳入标准"
+        text = (
+            f"本综述检索了 {providers}。检索式为：{queries}。检索执行日期为 {dates}。"
+            f"共获取 {retrieved} 条记录，最终纳入 {selected} 篇文献。"
+            f"纳入标准为：{criteria}。所有数量均直接来自本项目检索日志。"
+        )
+    else:
+        title = "Search Methods and Eligibility Criteria"
+        text = (
+            f"The review searched {providers}. Queries were: {queries}. Searches were run on "
+            f"{dates}. The searches retrieved {retrieved} records and {selected} works were "
+            f"included. Inclusion criteria were: {criteria}. All counts come directly from the "
+            "project search log."
+        )
+    return {
+        "key": "search_methods",
+        "level": 1,
+        "title": title,
+        "summary": title,
+        "argument_points": [],
+        "cite_keys": [],
+        "kind": "body",
+        "deterministic_text": text,
+    }
 
 
 async def _body_sections(
@@ -155,6 +203,12 @@ async def _body_sections(
             bits.append(f"  {card.summary[:220]}")
         if card.contributions:
             bits.append(f"  contributions: {'; '.join(card.contributions[:3])}")
+        if card.methods:
+            bits.append(f"  methods: {'; '.join(card.methods[:3])}")
+        if card.results:
+            bits.append(f"  results: {'; '.join(card.results[:3])}")
+        if card.limitations:
+            bits.append(f"  limitations: {'; '.join(card.limitations[:3])}")
         lines.append("\n".join(bits))
 
     result = await runner.agenerate_json(
@@ -261,6 +315,84 @@ def deterministic_body_sections(
             }
         )
     return sections
+
+
+def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") -> dict[str, Any]:
+    """Create a deterministic synthesis section and a compact literature matrix.
+
+    The table only contains bibliographic metadata, evidence availability, and card-level
+    method descriptions. Findings and conflicts remain prose claims so the sentence-level
+    evidence gate can verify every substantive conclusion.
+    """
+    zh = language == "zh"
+    headers = (
+        ["研究", "年份", "方法/对象", "证据基础"]
+        if zh
+        else ["Study", "Year", "Method / setting", "Evidence basis"]
+    )
+    rows: list[list[str]] = []
+    for card in cards[:20]:
+        method = (
+            _clean(card.methods[0])[:100] if card.methods else ("未报告" if zh else "Not reported")
+        )
+        evidence = (
+            "已定位全文"
+            if zh and card.fulltext_used
+            else "摘要/元数据"
+            if zh
+            else "Located full text"
+            if card.fulltext_used
+            else "Abstract / metadata"
+        )
+        rows.append(
+            [
+                _clean(card.title)[:90],
+                str(card.year) if card.year else ("未注明" if zh else "n.d."),
+                method,
+                evidence,
+            ]
+        )
+    return {
+        "key": "review_synthesis",
+        "level": 1,
+        "title": "跨研究比较、局限与证据冲突"
+        if zh
+        else "Cross-study Comparison, Limitations, and Evidence Conflicts",
+        "summary": (
+            "跨文献比较研究方法与证据基础，区分一致结论、相互冲突的发现和仍未解决的问题。"
+            if zh
+            else (
+                "Compare methods and evidence bases across studies, separating agreements, "
+                "conflicting findings, and unresolved questions."
+            )
+        ),
+        "argument_points": (
+            [
+                "比较研究方法、样本或分析框架，而非逐篇复述",
+                "只基于可定位全文证据判断结果一致或冲突",
+                "综合文献明确报告的方法局限与证据缺口",
+            ]
+            if zh
+            else [
+                "Compare methods, samples, or analytical frameworks rather than listing papers",
+                "Judge agreement or conflict only from located full-text evidence",
+                "Synthesize explicitly reported methodological limitations and evidence gaps",
+            ]
+        ),
+        "cite_keys": [card.cite_key for card in cards],
+        "kind": "body",
+        "synthesis_kind": "comparison_limitations_conflicts",
+        "inline_tables": [
+            {
+                "caption": "纳入研究的方法与证据基础比较"
+                if zh
+                else "Methods and evidence basis of included studies",
+                "label": "tab:literature-matrix",
+                "headers": headers,
+                "rows": rows,
+            }
+        ],
+    }
 
 
 def imrad_body_sections(cite_keys: list[str], *, language: str = "en") -> list[dict[str, Any]]:

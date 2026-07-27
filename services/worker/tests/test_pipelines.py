@@ -22,6 +22,7 @@ from paperforge_worker.pipelines.cards import (
 )
 from paperforge_worker.pipelines.ranking import (
     AUTO_SELECT_MIN_TOPIC_EVIDENCE,
+    balanced_selection_indices,
     rank_candidates,
     rerank_with_llm,
     topic_evidence,
@@ -95,6 +96,10 @@ class _Candidate:
     provider_name: str = "openalex"
     provider_record_id: str | None = "W1"
     raw_provider_metadata: dict[str, Any] = field(default_factory=dict)
+    oa_status: str | None = None
+    pmcid: str | None = None
+    arxiv_id: str | None = None
+    links: tuple[Any, ...] = ()
 
 
 # ---- SCOPE ----
@@ -340,6 +345,30 @@ def test_ranking_never_drops_candidates() -> None:
     ranked = rank_candidates(candidates, scope=_scope(), now=FIXED_NOW)
     # 分数只用于排序与推荐，不做硬性纳入/排除（设计 §3.2）。
     assert len(ranked) == 5
+
+
+def test_balanced_selection_keeps_foundational_and_recent_work() -> None:
+    candidates = [
+        _Candidate(
+            title="Foundational retrieval augmented generation",
+            abstract="retrieval generation hallucination",
+            publication_year=2018,
+            normalized_title_hash="old",
+        ),
+        *[
+            _Candidate(
+                title=f"Recent retrieval augmented generation {index}",
+                abstract="retrieval generation hallucination",
+                publication_year=2025,
+                normalized_title_hash=f"new-{index}",
+            )
+            for index in range(5)
+        ],
+    ]
+    ranked = rank_candidates(candidates, scope=_scope(), now=FIXED_NOW)
+    selected = balanced_selection_indices(ranked, limit=4, now=FIXED_NOW)
+    selected_years = {ranked[index].candidate.publication_year for index in selected}
+    assert selected_years == {2018, 2025}
 
 
 async def test_llm_rerank_blends_scores_and_keeps_unmentioned_candidates() -> None:

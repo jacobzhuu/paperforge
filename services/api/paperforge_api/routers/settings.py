@@ -15,13 +15,18 @@ from fastapi import APIRouter, Depends
 from llm_runtime import DEFAULT_ROLE_MODELS
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from visuals import ImageProviderConfig, image_provider_configured
+from visuals import (
+    ImageProviderConfig,
+    image_provider_capabilities,
+    image_provider_configured,
+)
 
 from paperforge_api.config import get_settings
 from paperforge_api.deps import authorize_project_request, get_session
 from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.schemas import (
     DocumentVersionResponse,
+    ImageProviderCapabilitiesResponse,
     OutlineVersionResponse,
     RoleModelResponse,
     SettingsResponse,
@@ -59,6 +64,19 @@ async def read_settings() -> SettingsResponse:
         )
         for role in ROLES
     ]
+    image_config = ImageProviderConfig(
+        provider=settings.image_provider,
+        api_key=settings.image_api_key,
+        model=settings.image_model,
+        base_url=settings.image_base_url,
+        account_id=settings.image_account_id,
+        timeout_seconds=settings.image_timeout_seconds,
+        max_retries=settings.image_max_retries,
+    )
+    # 能力声明只描述**提供商能做什么**，不含任何凭据；界面按它渲染表单，
+    # 因此不会再出现「选了横向 3:2 却拿到方图」这类不会生效的选项。
+    capabilities = image_provider_capabilities(image_config)
+
     return SettingsResponse(
         llm_provider=settings.llm_default_provider,
         llm_api_key_configured=bool(settings.llm_openai_api_key.strip()),
@@ -72,16 +90,23 @@ async def read_settings() -> SettingsResponse:
         image_provider=settings.image_provider,
         image_model=settings.image_model,
         image_api_key_configured=bool(settings.image_api_key.strip()),
-        image_provider_configured=image_provider_configured(
-            ImageProviderConfig(
-                provider=settings.image_provider,
-                api_key=settings.image_api_key,
-                model=settings.image_model,
-                base_url=settings.image_base_url,
-                account_id=settings.image_account_id,
-                timeout_seconds=settings.image_timeout_seconds,
-                max_retries=settings.image_max_retries,
+        image_provider_configured=image_provider_configured(image_config),
+        image_capabilities=(
+            ImageProviderCapabilitiesResponse(
+                provider=capabilities.provider,
+                model=capabilities.model,
+                supported_sizes=list(capabilities.supported_sizes),
+                supported_aspect_ratios=list(capabilities.supported_aspect_ratios),
+                quality_modes=list(capabilities.quality_modes),
+                prompt_max_length=capabilities.prompt_max_length,
+                supports_negative_prompt=capabilities.supports_negative_prompt,
+                supports_seed=capabilities.supports_seed,
+                fixed_output_size=capabilities.fixed_output_size,
+                cost_estimate_available=capabilities.cost_estimate_available,
+                note=capabilities.note,
             )
+            if capabilities is not None
+            else None
         ),
     )
 

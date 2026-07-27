@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -76,6 +77,9 @@ class ExportOutcome:
     warnings: list[dict[str, Any]] = field(default_factory=list)
     # 书目是否排出来了。与 compile_ok 分开：引用全 [?] 的 PDF 也是「编译成功」的。
     bibliography_ok: bool = True
+    readiness_status: str = "unassessed"
+    layout_checks: dict[str, Any] = field(default_factory=dict)
+    blockers: list[dict[str, Any]] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -87,7 +91,18 @@ class ExportOutcome:
             "template": self.template,
             "warnings": self.warnings,
             "bibliography_ok": self.bibliography_ok,
+            "readiness_status": self.readiness_status,
+            "layout_checks": self.layout_checks,
+            "blockers": self.blockers,
         }
+
+
+@dataclass(frozen=True)
+class ExportQualityContext:
+    profile: str = "draft"
+    report_id: uuid.UUID | None = None
+    readiness_status: str = "unassessed"
+    paper_snapshot_hash: str | None = None
 
 
 async def export_document(
@@ -95,10 +110,21 @@ async def export_document(
     *,
     formats: list[str] | None = None,
     store: Any,
+    quality_profile: str = "draft",
+    quality_report_id: str | None = None,
+    readiness_status: str = "unassessed",
+    paper_snapshot_hash: str | None = None,
 ) -> ExportOutcome:
     """渲染并导出。``store`` 是对象存储 seam（put/get）。"""
     outcome = ExportOutcome()
     wanted = [fmt for fmt in (formats or list(EXPORT_FORMATS)) if fmt in EXPORT_FORMATS]
+    quality = ExportQualityContext(
+        profile=quality_profile,
+        report_id=uuid.UUID(quality_report_id) if quality_report_id else None,
+        readiness_status=readiness_status,
+        paper_snapshot_hash=paper_snapshot_hash,
+    )
+    outcome.readiness_status = readiness_status
 
     async with context.session() as session:
         project = await get_project(session, context.project_id)
@@ -120,19 +146,23 @@ async def export_document(
                 )
                 references.append(ReferenceMetadata(**payload))
         document_version = document.version
-        title = project.title
+        title = project.publication_title or project.title
+        authors = project.authors_json or []
+        keywords = project.keywords_json or []
         language = project.language
         citation_style = project.citation_style
         requested_template = project.venue_template
         template = resolve_template(requested_template)
         user_assets = await list_assets(session, context.project_id)
-        visual_assets = await list_visuals(session, context.project_id)
+        visual_assets = await list_visuals(session, context.project_id, active_only=True)
 
     ir = _build_ir(
         rows,
         title=title,
         language=language,
         citation_style=citation_style,
+        authors=authors,
+        keywords=keywords,
     )
     # R2 收口：导出前再检查一次，渲染器永远拿不到白名单外的 cite key。
     stripped = ir.enforce_cite_key_whitelist(set(whitelist), strip=True)
@@ -164,6 +194,20 @@ async def export_document(
         json.dumps(provenance, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
     outcome.warnings.extend(project_files.warnings)
+    referenced_asset_refs = ir.collect_asset_refs()
+    visual_preflight_issues = []
+    for visual in visual_assets:
+        if f"va_{str(visual.id)[:8]}" not in referenced_asset_refs:
+            continue
+        qa = (visual.renditions_json or {}).get("_provenance", {}).get("visual_qa")
+        if not isinstance(qa, dict) or not qa.get("passed", False):
+            visual_preflight_issues.append(
+                {
+                    "code": "visual_preflight_missing_or_failed",
+                    "message": f"视觉 {visual.figure_label} 未通过内容边界、留白、字号与宽高比预检",
+                    "visual_id": str(visual.id),
+                }
+            )
 
     if "markdown" in wanted:
         markdown = render_markdown(
@@ -173,7 +217,13 @@ async def export_document(
             asset_urls={ref: path for ref, (path, _) in markdown_figures.items()},
         )
         outcome.formats["markdown"] = await _store(
-            context, store, "markdown", markdown.encode("utf-8"), "md", document_version
+            context,
+            store,
+            "markdown",
+            markdown.encode("utf-8"),
+            "md",
+            document_version,
+            quality=quality,
         )
     if "markdown_bundle" in wanted:
         markdown = render_markdown(
@@ -184,7 +234,13 @@ async def export_document(
         )
         bundle = _markdown_bundle(markdown, markdown_figures, provenance)
         outcome.formats["markdown_bundle"] = await _store(
-            context, store, "markdown_bundle", bundle, "zip", document_version
+            context,
+            store,
+            "markdown_bundle",
+            bundle,
+            "zip",
+            document_version,
+            quality=quality,
         )
     if "bibtex" in wanted and references:
         try:
@@ -195,12 +251,19 @@ async def export_document(
                 render_bibtex(references).encode("utf-8"),
                 "bib",
                 document_version,
+                quality=quality,
             )
         except ValueError as error:
             outcome.warnings.append({"stage": "bibtex", "reason": str(error)[:200]})
     if "latex_zip" in wanted:
         outcome.formats["latex_zip"] = await _store(
-            context, store, "latex_zip", _zip_project(project_files), "zip", document_version
+            context,
+            store,
+            "latex_zip",
+            _zip_project(project_files),
+            "zip",
+            document_version,
+            quality=quality,
         )
 
     if "docx" in wanted:
@@ -216,7 +279,13 @@ async def export_document(
             outcome.warnings.append({"stage": "docx", "reason": "pandoc_unavailable"})
         else:
             outcome.formats["docx"] = await _store(
-                context, store, "docx", docx, "docx", document_version
+                context,
+                store,
+                "docx",
+                docx,
+                "docx",
+                document_version,
+                quality=quality,
             )
 
     if "pdf" in wanted:
@@ -230,6 +299,14 @@ async def export_document(
             # 库内元数据生成，LLM 不参与）。没有它，PDF 会「编译成功」但
             # 全文引用都是 [?]。
             inline_bibliography=render_inline_bibliography(references, style=citation_style),
+            expected_figure_count=sum(
+                1
+                for section in ir.sections
+                for block in section.blocks
+                if getattr(block, "type", None) == "figure"
+            ),
+            visual_preflight_issues=visual_preflight_issues,
+            quality=quality,
         )
     return outcome
 
@@ -242,7 +319,11 @@ async def _compile_pdf(
     outcome: ExportOutcome,
     document_version: int,
     inline_bibliography: str = "",
+    expected_figure_count: int = 0,
+    visual_preflight_issues: list[dict[str, Any]] | None = None,
+    quality: ExportQualityContext | None = None,
 ) -> None:
+    quality = quality or ExportQualityContext()
     client = TexdClient(
         context.settings.texd_url,
         timeout_seconds=float(context.settings.texd_timeout_seconds),
@@ -262,6 +343,22 @@ async def _compile_pdf(
     except Exception as error:  # noqa: BLE001 - 编译失败绝不阻断导出
         logger.warning("compile crashed", extra={"error": type(error).__name__})
         outcome.warnings.append({"stage": "compile", "reason": type(error).__name__})
+        outcome.readiness_status = "needs_revision" if quality.profile == "submission" else "draft"
+        outcome.layout_checks = {
+            "passed": False,
+            "status": "compile_crashed",
+            "blockers": [
+                {"code": "pdf_compile_crashed", "message": "PDF 编译服务异常，无法完成版面验收"}
+            ],
+        }
+        outcome.blockers = list(outcome.layout_checks["blockers"])
+        await _update_quality_after_layout(
+            context,
+            quality=quality,
+            readiness_status=outcome.readiness_status,
+            layout_checks=outcome.layout_checks,
+            blockers=outcome.blockers,
+        )
         return
     finally:
         client.close()
@@ -276,14 +373,90 @@ async def _compile_pdf(
     elif not result.bibliography_ok:
         # 兜底也没用上（比如根本没有参考文献元数据）：引用会是 [?]，必须说清。
         outcome.warnings.append({"stage": "bibliography", "reason": "citations_unresolved"})
-    outcome.log_key = await _store(
-        context, store, "compile_log", result.log.encode("utf-8"), "log", document_version
-    )
     if result.ok and result.pdf:
+        source_constraints_ok = (
+            sum(
+                content.count("height=0.78\\textheight,keepaspectratio")
+                for path, content in project_files.files.items()
+                if path.startswith("sections/")
+            )
+            >= expected_figure_count
+        )
+        outcome.layout_checks = inspect_pdf_layout(
+            result.pdf,
+            compile_log=result.log,
+            expected_figure_count=expected_figure_count,
+            source_constraints_ok=source_constraints_ok,
+            visual_preflight_issues=visual_preflight_issues or [],
+        )
+        layout_passed = bool(outcome.layout_checks.get("passed"))
+        if quality.profile == "submission":
+            outcome.readiness_status = "submission_ready" if layout_passed else "needs_revision"
+            if not layout_passed:
+                outcome.blockers = list(outcome.layout_checks.get("blockers") or [])
+        await _update_quality_after_layout(
+            context,
+            quality=quality,
+            readiness_status=outcome.readiness_status,
+            layout_checks=outcome.layout_checks,
+            blockers=outcome.blockers,
+        )
+        final_quality = ExportQualityContext(
+            profile=quality.profile,
+            report_id=quality.report_id,
+            readiness_status=outcome.readiness_status,
+            paper_snapshot_hash=quality.paper_snapshot_hash,
+        )
+        outcome.log_key = await _store(
+            context,
+            store,
+            "compile_log",
+            result.log.encode("utf-8"),
+            "log",
+            document_version,
+            quality=final_quality,
+        )
         outcome.formats["pdf"] = await _store(
-            context, store, "pdf", result.pdf, "pdf", document_version
+            context,
+            store,
+            "pdf",
+            result.pdf,
+            "pdf",
+            document_version,
+            quality=final_quality,
         )
     else:
+        outcome.readiness_status = "needs_revision" if quality.profile == "submission" else "draft"
+        outcome.layout_checks = {
+            "passed": False,
+            "status": "compile_failed",
+            "blockers": [
+                {"code": "pdf_compile_failed", "message": "PDF 编译失败，无法完成版面验收"}
+            ],
+        }
+        outcome.blockers = list(outcome.layout_checks["blockers"])
+        await _update_quality_after_layout(
+            context,
+            quality=quality,
+            readiness_status=outcome.readiness_status,
+            layout_checks=outcome.layout_checks,
+            blockers=outcome.blockers,
+        )
+        failed_quality = ExportQualityContext(
+            profile=quality.profile,
+            report_id=quality.report_id,
+            readiness_status=outcome.readiness_status,
+            paper_snapshot_hash=quality.paper_snapshot_hash,
+        )
+        outcome.log_key = await _store(
+            context,
+            store,
+            "compile_log",
+            result.log.encode("utf-8"),
+            "log",
+            document_version,
+            quality=failed_quality,
+        )
         # Draft-first：PDF 编不出来，交付修复后的工程 + 日志，前端展示报错行。
         outcome.warnings.append(
             {
@@ -304,7 +477,221 @@ async def _compile_pdf(
             ),
             "zip",
             document_version,
+            quality=failed_quality,
         )
+
+
+def inspect_pdf_layout(
+    pdf: bytes,
+    *,
+    compile_log: str,
+    expected_figure_count: int,
+    source_constraints_ok: bool,
+    visual_preflight_issues: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """逐页检查缺字、题注、图像位置、异常空白页与引用解析。"""
+    from pypdf import PdfReader
+
+    blockers: list[dict[str, Any]] = []
+    try:
+        reader = PdfReader(io.BytesIO(pdf))
+        page_texts = [(page.extract_text() or "") for page in reader.pages]
+        image_counts: list[int] = []
+        for page in reader.pages:
+            try:
+                image_counts.append(len(list(page.images)))
+            except Exception:  # noqa: BLE001 - 个别 PDF image stream 无法解码时保守计 0
+                image_counts.append(0)
+    except Exception as error:  # noqa: BLE001 - 损坏 PDF 结构化返回，不泄漏异常
+        return {
+            "passed": False,
+            "status": "pdf_unreadable",
+            "blockers": [
+                {"code": "pdf_unreadable", "message": f"PDF 无法解析：{type(error).__name__}"}
+            ],
+        }
+
+    image_boxes: list[dict[str, Any]] = []
+    image_bounds_violations: list[dict[str, Any]] = []
+    try:
+        import pypdfium2 as pdfium
+        from pypdfium2 import raw as pdfium_c
+
+        pdfium_document = pdfium.PdfDocument(pdf)
+        for page_index in range(len(pdfium_document)):
+            page = pdfium_document[page_index]
+            page_width, page_height = page.get_width(), page.get_height()
+            for image_index, item in enumerate(
+                page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]), start=1
+            ):
+                left, bottom, right, top = item.get_pos()
+                box = {
+                    "page": page_index + 1,
+                    "image": image_index,
+                    "box": [round(left, 2), round(bottom, 2), round(right, 2), round(top, 2)],
+                    "page_size": [round(page_width, 2), round(page_height, 2)],
+                }
+                image_boxes.append(box)
+                width = right - left
+                height = top - bottom
+                if (
+                    left < -1
+                    or bottom < -1
+                    or right > page_width + 1
+                    or top > page_height + 1
+                    or width > page_width - 24
+                    or height > page_height * 0.82
+                ):
+                    image_bounds_violations.append(box)
+            page.close()
+        pdfium_document.close()
+    except Exception as error:  # noqa: BLE001 - 结构检查失败时保守阻断投稿
+        image_bounds_violations.append(
+            {"code": "image_bounds_check_failed", "error": type(error).__name__}
+        )
+
+    reference_page = next(
+        (
+            index
+            for index, text in enumerate(page_texts)
+            if re.search(r"(?:^|\n)\s*(?:References|Bibliography|参考文献)\s*(?:\n|$)", text, re.I)
+        ),
+        None,
+    )
+    caption_numbers = [
+        match.group(1)
+        for text in page_texts
+        for match in re.finditer(r"(?:Figure|Fig\.|图)\s*([0-9]+)", text, re.I)
+    ]
+    caption_count = len(caption_numbers)
+    empty_pages = [
+        index + 1
+        for index, (text, images) in enumerate(zip(page_texts, image_counts, strict=True))
+        if len("".join(text.split())) < 20 and images == 0
+    ]
+    images_after_references = (
+        sum(image_counts[reference_page:])
+        if reference_page is not None and expected_figure_count
+        else 0
+    )
+    missing_glyphs = bool(
+        re.search(
+            r"Missing character:|Unicode character .* not set up|does not contain requested Script",
+            compile_log,
+            re.I,
+        )
+    )
+    unresolved_citations = bool(
+        re.search(r"Citation .* undefined|There were undefined references", compile_log, re.I)
+        or any("[?]" in text or "??" in text for text in page_texts)
+    )
+    if missing_glyphs:
+        blockers.append({"code": "missing_glyphs", "message": "编译日志检测到 Unicode 缺字"})
+    if unresolved_citations:
+        blockers.append(
+            {"code": "unresolved_citations", "message": "PDF 中存在未解析引用或交叉引用"}
+        )
+    if caption_count != expected_figure_count:
+        blockers.append(
+            {
+                "code": "figure_caption_count_mismatch",
+                "message": "PDF 题注数量与 FigureBlock 数量不一致",
+                "expected": expected_figure_count,
+                "actual": caption_count,
+            }
+        )
+    if len(caption_numbers) != len(set(caption_numbers)):
+        blockers.append({"code": "duplicate_figure_numbers", "message": "PDF 存在重复图号"})
+    if images_after_references:
+        blockers.append(
+            {
+                "code": "figures_after_references",
+                "message": "参考文献起始页或其后仍有图片",
+                "count": images_after_references,
+            }
+        )
+    if empty_pages:
+        blockers.append(
+            {
+                "code": "abnormal_blank_pages",
+                "message": "PDF 存在异常空白页",
+                "pages": empty_pages,
+            }
+        )
+    if not source_constraints_ok:
+        blockers.append({"code": "image_bounds_unconstrained", "message": "部分图片缺少宽高双约束"})
+    if image_bounds_violations:
+        blockers.append(
+            {
+                "code": "image_bounds_violation",
+                "message": "PDF 中存在越出版心或高度异常的图片",
+                "items": image_bounds_violations,
+            }
+        )
+    blockers.extend(visual_preflight_issues or [])
+    return {
+        "passed": not blockers,
+        "status": "passed" if not blockers else "failed",
+        "page_count": len(page_texts),
+        "expected_figure_count": expected_figure_count,
+        "caption_count": caption_count,
+        "caption_numbers": caption_numbers,
+        "reference_start_page": reference_page + 1 if reference_page is not None else None,
+        "image_count_by_page": image_counts,
+        "images_after_references": images_after_references,
+        "empty_pages": empty_pages,
+        "missing_glyphs": missing_glyphs,
+        "unresolved_citations": unresolved_citations,
+        "image_bounds_constrained": source_constraints_ok,
+        "image_boxes": image_boxes,
+        "image_bounds_violations": image_bounds_violations,
+        "visual_preflight_issues": visual_preflight_issues or [],
+        "blockers": blockers,
+    }
+
+
+async def _update_quality_after_layout(
+    context: JobContext,
+    *,
+    quality: ExportQualityContext,
+    readiness_status: str,
+    layout_checks: dict[str, Any],
+    blockers: list[dict[str, Any]],
+) -> None:
+    if quality.report_id is None:
+        return
+    from db.models.paper import QualityReportRecord
+
+    async with context.session() as session:
+        report = await session.get(QualityReportRecord, quality.report_id)
+        if report is None or report.project_id != context.project_id:
+            return
+        report.layout_checks_json = layout_checks
+        if quality.profile == "submission":
+            report.readiness_status = readiness_status
+            existing = [
+                item
+                for item in (report.blockers_json or [])
+                if not str(item.get("code") or "").startswith(
+                    (
+                        "pdf_",
+                        "figure_",
+                        "duplicate_",
+                        "figures_",
+                        "abnormal_",
+                        "image_",
+                        "missing_glyph",
+                        "unresolved_",
+                    )
+                )
+            ]
+            report.blockers_json = existing + blockers
+        metrics = dict(report.metrics_json or {})
+        metrics["layout_checks"] = layout_checks
+        metrics["readiness_status"] = report.readiness_status
+        metrics["blockers"] = report.blockers_json or []
+        report.metrics_json = metrics
+        await session.flush()
 
 
 def _make_patcher(context: JobContext):
@@ -364,6 +751,8 @@ def _build_ir(
     title: str,
     language: str,
     citation_style: str,
+    authors: list[str] | None = None,
+    keywords: list[str] | None = None,
 ) -> PaperIR:
     sections = [IRSection(**row.body_ir_json) for row in rows if row.body_ir_json]
     abstract_section = next((s for s in sections if s.key == "abstract"), None)
@@ -377,7 +766,13 @@ def _build_ir(
         ).strip()
     body = [s for s in sections if s.key != "abstract"]
     return PaperIR(
-        meta=PaperMeta(title=title, abstract=abstract, language=language),  # type: ignore[arg-type]
+        meta=PaperMeta(
+            title=title,
+            authors=authors or [],
+            abstract=abstract,
+            keywords=keywords or [],
+            language=language,  # type: ignore[arg-type]
+        ),
         sections=body,
         bibliography=Bibliography(style=citation_style),  # type: ignore[arg-type]
     )
@@ -420,6 +815,19 @@ def _resolve_visual_files(
             try:
                 content = store.get(user_asset.object_key)
             except (FileNotFoundError, ValueError):
+                continue
+            parsed = user_asset.parsed_json or {}
+            if parsed.get("headers") and parsed.get("rows"):
+                # 表格素材不需要复制进 LaTeX 工程；渲染器直接消费已解析的结构化数据。
+                render_assets[asset_ref] = dict(parsed)
+                provenance.append(
+                    {
+                        "asset_ref": asset_ref,
+                        "kind": "uploaded_table",
+                        "source_object_key": user_asset.object_key,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
                 continue
             suffix = _image_suffix(content)
             if suffix is None:
@@ -599,7 +1007,10 @@ async def _store(
     data: bytes,
     suffix: str,
     document_version: int,
+    *,
+    quality: ExportQualityContext | None = None,
 ) -> str:
+    quality = quality or ExportQualityContext()
     digest = hashlib.sha256(data).hexdigest()
     if context.owner_id is None:
         raise ValueError("project owner is unavailable")
@@ -621,6 +1032,10 @@ async def _store(
                     format=kind,
                     object_key=key,
                     content_hash=digest,
+                    quality_report_id=quality.report_id,
+                    quality_profile=quality.profile,
+                    readiness_status=quality.readiness_status,
+                    paper_snapshot_hash=quality.paper_snapshot_hash,
                 )
             )
     return key

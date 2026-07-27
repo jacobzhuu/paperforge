@@ -5,19 +5,22 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from arq.connections import ArqRedis
 from db import (
     create_job,
+    document_snapshot_hash,
     get_cards,
     get_section,
     get_writing_whitelist,
     latest_document,
     latest_outline,
+    latest_quality_report,
     list_assets,
     list_citation_usage,
+    list_claim_evidence,
     list_entries,
     list_sections,
     list_visuals,
@@ -26,14 +29,15 @@ from db import (
     update_outline_tree,
     upsert_section,
 )
-from db.models.paper import ExportArtifact
+from db.models.paper import ClaimEvidenceAnchor, ExportArtifact
 from db.repositories.exports import list_export_artifacts
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from paper_ir import Bibliography, PaperIR, PaperMeta, ReferenceMetadata, render_markdown
 from paper_ir.schema import Section as IRSection
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
 
+from paperforge_api.concurrency import require_section_unchanged
 from paperforge_api.config import get_settings
 from paperforge_api.deps import (
     authorize_project_request,
@@ -45,8 +49,10 @@ from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
     CitationAuditResponse,
     CitationAuditRow,
+    ClaimEvidenceResponse,
     ExportArtifactResponse,
     ExportRequest,
+    GenerationOptionsRequest,
     IngestRequest,
     JobResponse,
     MarkdownResponse,
@@ -54,6 +60,7 @@ from paperforge_api.schemas import (
     QualityResponse,
     RefineRequest,
     RefineResponse,
+    ReviewClaimEvidenceRequest,
     SectionResponse,
     SnowballRequest,
     UpdateOutlineRequest,
@@ -142,11 +149,20 @@ async def generate_full(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    request: GenerationOptionsRequest | None = None,
 ) -> JobResponse:
     """一键全管线（kind=full）。"""
     project = await _require_project(session, project_id)
     job = await create_job(session, project_id=project.id, kind="full")
-    await _enqueue(queue, "run_full_pipeline", str(project.id), str(job.id))
+    options = request or GenerationOptionsRequest()
+    await _enqueue(
+        queue,
+        "run_full_pipeline",
+        str(project.id),
+        str(job.id),
+        quality_profile=options.quality_profile,
+        review_style=options.review_style,
+    )
     return _job_response(job)
 
 
@@ -197,6 +213,10 @@ async def put_section(
 
     R2：编辑器提交的 body_ir 会再过一次白名单——前端 chip 已限制取值，
     这里是服务端的兜底，手工构造请求也无法引入幻觉引用。
+
+    乐观并发：带 `expected_updated_at` 时，若章节已被别处改动就返回 409
+    `section_changed`。最典型的场景是视觉批准刚把 FigureBlock 写进这一节，
+    而编辑器手上还是插图之前的草稿——直接保存会把图静默删掉。
     """
     project = await _require_project(session, project_id)
     document = await latest_document(session, project.id)
@@ -205,6 +225,7 @@ async def put_section(
     row = await get_section(session, document_id=document.id, section_key=section_key)
     if row is None:
         raise HTTPException(status_code=404, detail="section not found")
+    require_section_unchanged(row, request.expected_updated_at)
 
     whitelist = await get_writing_whitelist(session, project.id)
     try:
@@ -384,6 +405,27 @@ def _section_response(row) -> SectionResponse:
     )
 
 
+def _claim_evidence_response(row: ClaimEvidenceAnchor) -> ClaimEvidenceResponse:
+    return ClaimEvidenceResponse(
+        id=str(row.id),
+        report_id=str(row.quality_report_id),
+        section_key=row.section_key,
+        claim_text=row.claim_text,
+        claim_kind=row.claim_kind,
+        is_core=row.is_core,
+        cite_key=row.cite_key,
+        source_kind=row.source_kind,
+        source_page=row.source_page,
+        source_section=row.source_section,
+        source_paragraph=row.source_paragraph,
+        evidence_excerpt=row.evidence_excerpt,
+        evidence_hash=row.evidence_hash,
+        support_status=row.support_status,
+        support_score=row.support_score,
+        manual_status=row.manual_status,
+    )
+
+
 def _count_section_words(body: dict[str, Any]) -> int:
     text = " ".join(
         run.get("v", "")
@@ -429,6 +471,42 @@ async def start_export(
     document = await latest_document(session, project.id)
     if document is None:
         raise HTTPException(status_code=409, detail="generate the paper before exporting")
+    rows = await list_sections(session, document.id)
+    snapshot_hash = document_snapshot_hash(rows)
+    quality_report = await latest_quality_report(
+        session,
+        project.id,
+        quality_profile=request.quality_profile,
+    )
+    if request.quality_profile == "submission":
+        blockers: list[dict[str, Any]] = []
+        if quality_report is None:
+            blockers.append(
+                {"code": "quality_report_missing", "message": "请先生成投稿质量报告"}
+            )
+        else:
+            stale = quality_report.stale or quality_report.paper_snapshot_hash != snapshot_hash
+            if stale:
+                quality_report.stale = True
+                blockers.append(
+                    {
+                        "code": "quality_report_stale",
+                        "message": "正文、引用或视觉已变化，请重新质检",
+                    }
+                )
+            if quality_report.readiness_status not in {"preflight_ready", "submission_ready"}:
+                blockers.extend(quality_report.blockers_json or [])
+        if blockers:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "submission_quality_gate_failed",
+                    "readiness_status": (
+                        quality_report.readiness_status if quality_report else "unassessed"
+                    ),
+                    "blockers": blockers,
+                },
+            )
     job = await create_job(session, project_id=project.id, kind="compile")
     await _enqueue(
         queue,
@@ -436,6 +514,10 @@ async def start_export(
         str(project.id),
         str(job.id),
         formats=request.formats,
+        quality_profile=request.quality_profile,
+        quality_report_id=str(quality_report.id) if quality_report else None,
+        readiness_status=quality_report.readiness_status if quality_report else "unassessed",
+        paper_snapshot_hash=snapshot_hash,
     )
     return _job_response(job)
 
@@ -453,6 +535,10 @@ async def list_exports(project_id: str, session: SessionDep) -> list[ExportArtif
             content_hash=row.content_hash,
             created_at=row.created_at,
             download_url=f"/api/v1/projects/{project.id}/exports/{row.id}/download",
+            quality_report_id=str(row.quality_report_id) if row.quality_report_id else None,
+            quality_profile=row.quality_profile,
+            readiness_status=row.readiness_status,
+            paper_snapshot_hash=row.paper_snapshot_hash,
         )
         for row in rows
     ]
@@ -650,15 +736,28 @@ async def start_quality(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    request: GenerationOptionsRequest | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await create_job(session, project_id=project.id, kind="write")
-    await _enqueue(queue, "run_quality_pipeline", str(project.id), str(job.id))
+    options = request or GenerationOptionsRequest()
+    await _enqueue(
+        queue,
+        "run_quality_pipeline",
+        str(project.id),
+        str(job.id),
+        quality_profile=options.quality_profile,
+        review_style=options.review_style,
+    )
     return _job_response(job)
 
 
 @router.get("/projects/{project_id}/quality", response_model=QualityResponse)
-async def get_quality(project_id: str, session: SessionDep) -> QualityResponse:
+async def get_quality(
+    project_id: str,
+    session: SessionDep,
+    quality_profile: Literal["draft", "submission"] = Query(default="draft"),
+) -> QualityResponse:
     """同步计算质量报告的确定性部分（软校验需要 LLM，走任务）。"""
     from paperforge_worker.pipelines.quality import build_quality_report, count_words
 
@@ -666,6 +765,34 @@ async def get_quality(project_id: str, session: SessionDep) -> QualityResponse:
     whitelist = await get_writing_whitelist(session, project.id)
     document = await latest_document(session, project.id)
     rows = await list_sections(session, document.id) if document else []
+    persisted = await latest_quality_report(
+        session,
+        project.id,
+        quality_profile=quality_profile,
+    )
+    current_hash = document_snapshot_hash(rows) if document else None
+    if persisted is not None:
+        stale = persisted.stale or persisted.paper_snapshot_hash != current_hash
+        if stale and not persisted.stale:
+            persisted.stale = True
+            await session.flush()
+        payload = dict(persisted.metrics_json or {})
+        payload.update(
+            {
+                "report_id": str(persisted.id),
+                "document_version": persisted.document_version,
+                "paper_snapshot_hash": persisted.paper_snapshot_hash,
+                "quality_profile": persisted.quality_profile,
+                "review_style": persisted.review_style,
+                "readiness_status": persisted.readiness_status,
+                "stale": stale,
+                "blockers": persisted.blockers_json or [],
+                "warnings": persisted.warnings_json or [],
+                "scores": persisted.scores_json or {},
+                "layout_checks": persisted.layout_checks_json or {},
+            }
+        )
+        return QualityResponse(project_id=str(project.id), **payload)
     entries = await list_entries(session, project.id, status="selected")
     cards = await get_cards(session, project.id)
 
@@ -695,7 +822,64 @@ async def get_quality(project_id: str, session: SessionDep) -> QualityResponse:
         fulltext_coverage=(fulltext_used / len(entries)) if entries else 0.0,
         scope=dict(project.scope_json or {}),
     )
+    report.document_version = document.version if document else None
+    report.paper_snapshot_hash = current_hash
+    report.quality_profile = quality_profile
+    report.readiness_status = "unassessed"
     return QualityResponse(project_id=str(project.id), **report.to_payload())
+
+
+@router.get(
+    "/projects/{project_id}/quality/evidence",
+    response_model=list[ClaimEvidenceResponse],
+)
+async def get_claim_evidence(
+    project_id: str,
+    session: SessionDep,
+    report_id: str | None = Query(default=None),
+    core_only: bool = Query(default=False),
+) -> list[ClaimEvidenceResponse]:
+    project = await _require_project(session, project_id)
+    try:
+        selected_report_id = uuid.UUID(report_id) if report_id else None
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="quality report not found") from error
+    if selected_report_id is None:
+        report = await latest_quality_report(session, project.id)
+        selected_report_id = report.id if report else None
+    if selected_report_id is None:
+        return []
+    rows = await list_claim_evidence(
+        session,
+        project.id,
+        quality_report_id=selected_report_id,
+        core_only=core_only,
+    )
+    return [_claim_evidence_response(row) for row in rows]
+
+
+@router.patch(
+    "/projects/{project_id}/quality/evidence/{anchor_id}",
+    response_model=ClaimEvidenceResponse,
+)
+async def review_claim_evidence(
+    project_id: str,
+    anchor_id: str,
+    request: ReviewClaimEvidenceRequest,
+    session: SessionDep,
+) -> ClaimEvidenceResponse:
+    from db import set_claim_manual_status
+
+    project = await _require_project(session, project_id)
+    try:
+        anchor_uuid = uuid.UUID(anchor_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="evidence anchor not found") from error
+    anchor = await session.get(ClaimEvidenceAnchor, anchor_uuid)
+    if anchor is None or anchor.project_id != project.id:
+        raise HTTPException(status_code=404, detail="evidence anchor not found")
+    await set_claim_manual_status(session, anchor, request.manual_status)
+    return _claim_evidence_response(anchor)
 
 
 @router.post("/projects/{project_id}/sections/{section_key}/refine", response_model=RefineResponse)

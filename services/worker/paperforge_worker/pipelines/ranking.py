@@ -128,6 +128,55 @@ a paper you cannot judge should get a low score, not an invented justification."
 AUTO_SELECT_MIN_TOPIC_EVIDENCE = 0.05
 
 
+def balanced_selection_indices(
+    ranked: list[RankedCandidate],
+    *,
+    limit: int,
+    now: datetime | None = None,
+) -> set[int]:
+    """按相关性、年代与 OA 可得性分层选取，避免 top-K 只追逐最新年份。"""
+    if limit <= 0:
+        return set()
+    clock = now or datetime.now(UTC)
+    eligible = [
+        index
+        for index, item in enumerate(ranked)
+        if topic_evidence(item) >= AUTO_SELECT_MIN_TOPIC_EVIDENCE
+    ]
+    foundational = [
+        index
+        for index in eligible
+        if (ranked[index].candidate.publication_year or clock.year) <= clock.year - 6
+    ]
+    recent = [
+        index
+        for index in eligible
+        if (ranked[index].candidate.publication_year or 0) >= clock.year - 3
+    ]
+    oa = [
+        index
+        for index in eligible
+        if ranked[index].candidate.oa_status not in {None, "closed"}
+        or ranked[index].candidate.pmcid
+        or ranked[index].candidate.arxiv_id
+        or any(link.is_oa for link in ranked[index].candidate.links)
+    ]
+    selected: list[int] = []
+
+    def take(pool: list[int], count: int) -> None:
+        for index in pool:
+            if index not in selected:
+                selected.append(index)
+            if len([item for item in selected if item in pool]) >= count or len(selected) >= limit:
+                return
+
+    take(foundational, max(1, round(limit * 0.25)) if foundational else 0)
+    take(recent, max(1, round(limit * 0.4)) if recent else 0)
+    take(oa, max(1, round(limit * 0.4)) if oa else 0)
+    take(eligible, limit)
+    return set(selected[:limit])
+
+
 @dataclass(frozen=True)
 class RankedCandidate:
     candidate: ScholarlyWorkCandidate

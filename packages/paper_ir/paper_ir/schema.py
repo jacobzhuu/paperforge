@@ -71,6 +71,7 @@ class FigureBlock(BaseModel):
 class TableSource(BaseModel):
     kind: Literal["user_asset", "inline"]
     ref: str | None = None
+    data: dict[str, object] | None = None
 
 
 class TableBlock(BaseModel):

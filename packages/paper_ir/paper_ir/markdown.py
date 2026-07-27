@@ -146,6 +146,24 @@ def _render_block(
         return f"![{alt}]({source})\n\n*{legend}*" if legend else f"![{alt}]({source})"
     if isinstance(block, TableBlock):
         ref = block.source.ref or ""
+        data = block.source.data or {}
+        headers = [str(item) for item in data.get("headers") or []]
+        rows = data.get("rows") or []
+        if headers and rows:
+
+            def cell(value: object) -> str:
+                return str(value).replace("|", "\\|").replace("\n", " ")
+
+            lines = [
+                "| " + " | ".join(cell(item) for item in headers) + " |",
+                "| " + " | ".join("---" for _ in headers) + " |",
+            ]
+            for row in rows:
+                values = list(row)[: len(headers)] if isinstance(row, list) else [row]
+                values += [""] * (len(headers) - len(values))
+                lines.append("| " + " | ".join(cell(item) for item in values) + " |")
+            caption = f"*{block.caption}*\n\n" if block.caption else ""
+            return caption + "\n".join(lines)
         return f"*表：{block.caption}*（数据来源：{ref}）" if block.caption else f"*表*（{ref}）"
     if isinstance(block, AlgorithmBlock):
         return f"```\n{block.latex}\n```"
