@@ -54,7 +54,6 @@ import {
 } from '@/lib/api';
 import type {
   CitationAudit,
-  CreateVisualRequest,
   MarkdownPreview as MarkdownPreviewData,
   NumLintReport,
   PaperSection,
@@ -823,8 +822,8 @@ export function WritingWorkbench() {
         aiGenerationAvailable={visualsModule.aiGenerationAvailable}
         targetSectionKey={activeKey}
         capabilities={visualsModule.capabilities}
-        onSubmit={(payload: Partial<CreateVisualRequest>) => {
-          if (editingVisual) void visualsModule.edit(editingVisual, payload);
+        onSubmit={(payload) => {
+          if (editingVisual) void visualsModule.createRevision(editingVisual, payload);
         }}
       />
 

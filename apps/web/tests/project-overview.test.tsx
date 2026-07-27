@@ -191,6 +191,8 @@ describe('项目概览的「跑通全管线」按钮', () => {
     fireEvent.click(runAllButton());
 
     expect(generateAll).toHaveBeenCalledTimes(1);
-    resolve({ data: { id: 'j1' } as Job });
+    await act(async () => {
+      resolve({ data: { id: 'j1' } as Job });
+    });
   });
 });

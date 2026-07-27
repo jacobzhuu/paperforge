@@ -37,7 +37,7 @@ def _context(project_id: uuid.UUID, job_id: uuid.UUID, session_factory) -> JobCo
     return JobContext(
         project_id=project_id,
         job_id=job_id,
-        settings=WorkerSettings(),
+        settings=WorkerSettings(llm_default_provider="noop"),
         session_factory=session_factory,
         http_client=httpx.Client(),
         scholar_cache=InMemoryHttpCache(),

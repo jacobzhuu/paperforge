@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 class RegisterRequest(BaseModel):
@@ -52,6 +54,73 @@ class UserResponse(BaseModel):
 class LoginResponse(BaseModel):
     user: UserResponse
 
+
+class AuthorDetail(BaseModel):
+    """一位作者在当前论文里的署名快照。"""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    affiliations: list[str] = Field(default_factory=list, max_length=8)
+    email: EmailStr | None = None
+    orcid: str | None = Field(default=None, max_length=19)
+    corresponding: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        result = " ".join(value.split())
+        if not result:
+            raise ValueError("author name must not be empty")
+        return result
+
+    @field_validator("affiliations")
+    @classmethod
+    def clean_affiliations(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            item = " ".join(value.split())[:240]
+            key = item.casefold()
+            if item and key not in seen:
+                seen.add(key)
+                cleaned.append(item)
+        return cleaned
+
+    @field_validator("orcid")
+    @classmethod
+    def validate_orcid(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        compact = re.sub(r"[^0-9Xx]", "", value)
+        if len(compact) != 16:
+            raise ValueError("ORCID must contain 16 digits")
+        total = 0
+        for char in compact[:15]:
+            if not char.isdigit():
+                raise ValueError("ORCID has an invalid format")
+            total = (total + int(char)) * 2
+        remainder = (12 - total % 11) % 11
+        expected = "X" if remainder == 10 else str(remainder)
+        if compact[-1].upper() != expected:
+            raise ValueError("ORCID checksum is invalid")
+        compact = compact[:15] + compact[-1].upper()
+        return "-".join(compact[index : index + 4] for index in range(0, 16, 4))
+
+    @model_validator(mode="after")
+    def corresponding_author_has_email(self) -> AuthorDetail:
+        if self.corresponding and self.email is None:
+            raise ValueError("a corresponding author must have an email address")
+        return self
+
+
+class AcademicProfileRequest(BaseModel):
+    profile: AuthorDetail | None = None
+
+
+class AcademicProfileResponse(BaseModel):
+    profile: AuthorDetail | None = None
+
+
 PaperType = Literal["review", "original"]
 WritingMode = Literal["auto", "assisted"]
 Language = Literal["zh", "en"]
@@ -70,6 +139,7 @@ class CreateProjectRequest(BaseModel):
     contribution_points: list[str] = Field(default_factory=list)
     publication_title: str | None = None
     authors: list[str] = Field(default_factory=list)
+    author_details: list[AuthorDetail] | None = None
     keywords: list[str] = Field(default_factory=list)
 
 
@@ -91,6 +161,7 @@ class UpdateProjectRequest(BaseModel):
     contribution_points: list[str] | None = None
     publication_title: str | None = None
     authors: list[str] | None = None
+    author_details: list[AuthorDetail] | None = None
     keywords: list[str] | None = None
     metadata_confirmed: bool | None = None
 
@@ -108,6 +179,7 @@ class ProjectResponse(BaseModel):
     contribution_points: list[str] = Field(default_factory=list)
     publication_title: str | None = None
     authors: list[str] = Field(default_factory=list)
+    author_details: list[AuthorDetail] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     metadata_confirmed: bool = False
     library_count: int = 0
@@ -391,16 +463,23 @@ class DraftVisualRequest(BaseModel):
     其余交给 planner 角色补全。
     """
 
-    kind: Literal["diagram", "ai_image"] = "ai_image"
+    kind: Literal["auto", "chart", "diagram", "ai_image"] = "auto"
     intent: str = Field(default="", max_length=500)
     target_section_key: str | None = None
+    source_asset_refs: list[str] = Field(default_factory=list, max_length=12)
 
 
 class DraftVisualResponse(BaseModel):
+    kind: Literal["chart", "diagram", "ai_image"]
     title: str = ""
     caption: str = ""
     alt_text: str = ""
     spec: dict[str, Any] = Field(default_factory=dict)
+    target_section_key: str | None = None
+    suggested_block_index: int | None = None
+    reason: str = ""
+    context_summary: str = ""
+    warnings: list[str] = Field(default_factory=list)
     #: `llm:<model>` 或 `deterministic`——界面据此说明这份草稿是不是模型写的。
     generator: str = "deterministic"
 
@@ -409,6 +488,7 @@ class RegenerateVisualRequest(BaseModel):
     spec: dict[str, Any] | None = None
     caption: str | None = None
     alt_text: str | None = None
+    revision_instruction: str | None = Field(default=None, max_length=500)
 
 
 class VisualErrorResponse(BaseModel):

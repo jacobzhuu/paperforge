@@ -21,6 +21,7 @@ import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
+import { PublicationMetadata } from '@/components/project/publication-metadata';
 import { useJobEvent, useJobFinished, useProject } from '@/components/project/project-context';
 import {
   ALL_EXPORT_FORMATS,
@@ -89,7 +90,7 @@ function groupRuns(artifacts: ExportArtifact[]): ExportRun[] {
 }
 
 export function ExportCenter() {
-  const { projectId, progress, busy, startJob } = useProject();
+  const { projectId, project, progress, busy, startJob, reload: reloadProject } = useProject();
   const { toast } = useToast();
 
   const [artifacts, setArtifacts] = React.useState<ExportArtifact[]>([]);
@@ -176,6 +177,14 @@ export function ExportCenter() {
           </Button>
         }
       />
+
+      {project && (
+        <PublicationMetadata
+          project={project}
+          onSaved={reloadProject}
+          collapsedByDefault
+        />
+      )}
 
       <FormatSelector formats={formats} onChange={setFormats} />
 
@@ -319,7 +328,7 @@ function VisualExportSummary({
       {(unhandled > 0 || summary.failed > 0 || outdated) && (
         <Link
           href={projectHref(projectId, 'visuals')}
-          className="inline-block text-xs underline underline-offset-2"
+          className="inline-flex min-h-11 items-center text-xs underline underline-offset-2"
         >
           去视觉工作台处理 →
         </Link>
@@ -445,7 +454,7 @@ function PdfPreviewPane({
       {/* 不内嵌 PDF 阅读器的浏览器（部分移动端）拿不到上面的预览，给一条出路。 */}
       <p className="text-xs text-muted-foreground">
         预览为空？
-        <a href={src} target="_blank" rel="noreferrer" className="mx-1 underline">
+        <a href={src} target="_blank" rel="noreferrer" className="mx-1 inline-flex min-h-11 items-center underline">
           在新标签打开 PDF
         </a>
         或从右侧下载。

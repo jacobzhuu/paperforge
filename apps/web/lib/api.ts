@@ -33,7 +33,10 @@ import type {
   VisualDraft,
   VisualSummary,
   CreateVisualRequest,
+  RegenerateVisualRequest,
   AuthUser,
+  AcademicProfile,
+  AuthorDetail,
 } from './types';
 import { MOCK_LIBRARY, MOCK_PROJECTS, MOCK_SEARCH_RUNS } from './mock';
 
@@ -134,6 +137,17 @@ async function withFallback<T>(
 
 export function getCurrentUser(): Promise<AuthUser> {
   return request<AuthUser>('/auth/me');
+}
+
+export function getAcademicProfile(): Promise<AcademicProfile> {
+  return request<AcademicProfile>('/auth/me/academic-profile');
+}
+
+export function updateAcademicProfile(profile: AuthorDetail | null): Promise<AcademicProfile> {
+  return request<AcademicProfile>('/auth/me/academic-profile', {
+    method: 'PATCH',
+    body: JSON.stringify({ profile }),
+  });
 }
 
 export async function registerAccount(body: {
@@ -803,7 +817,12 @@ export function suggestVisuals(projectId: string): Promise<ApiResult<Job | undef
  */
 export function draftVisual(
   projectId: string,
-  payload: { kind: 'diagram' | 'ai_image'; intent: string; target_section_key?: string | null },
+  payload: {
+    kind: 'auto' | 'chart' | 'diagram' | 'ai_image';
+    intent: string;
+    target_section_key?: string | null;
+    source_asset_refs?: string[];
+  },
 ): Promise<ApiResult<VisualDraft | undefined>> {
   return withFallback(
     () =>
@@ -900,7 +919,7 @@ export function rejectVisual(
 export function regenerateVisual(
   projectId: string,
   visualId: string,
-  payload: Partial<CreateVisualRequest> = {},
+  payload: RegenerateVisualRequest = {},
 ): Promise<ApiResult<VisualAsset | undefined>> {
   return withFallback(
     () =>

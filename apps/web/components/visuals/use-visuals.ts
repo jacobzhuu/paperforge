@@ -18,6 +18,7 @@ import type {
   CreateVisualRequest,
   ImageProviderCapabilities,
   Job,
+  RegenerateVisualRequest,
   VisualAsset,
 } from '@/lib/types';
 import { useAsyncModule } from '@/lib/useAsyncModule';
@@ -54,7 +55,11 @@ export interface VisualsController {
   deterministicSlotsFull: boolean;
 
   generate: (visual: VisualAsset) => Promise<void>;
-  createRevision: (visual: VisualAsset, payload?: Partial<CreateVisualRequest>) => Promise<void>;
+  createRevision: (
+    visual: VisualAsset,
+    payload?: RegenerateVisualRequest,
+    generateNow?: boolean,
+  ) => Promise<void>;
   edit: (visual: VisualAsset, payload: Partial<CreateVisualRequest>) => Promise<void>;
   create: (payload: CreateVisualRequest, generateNow: boolean) => Promise<void>;
   approve: (
@@ -169,15 +174,21 @@ export function useVisuals(projectId: string): VisualsController {
   );
 
   const createRevision = React.useCallback(
-    async (visual: VisualAsset, payload?: Partial<CreateVisualRequest>) => {
+    async (
+      visual: VisualAsset,
+      payload?: RegenerateVisualRequest,
+      generateNow = visual.kind !== 'ai_image',
+    ) => {
       try {
         const revision = await regenerateVisual(projectId, visual.id, payload);
         if (!revision.data) {
           toast({ title: '新版本未能创建', description: '后端不可用。', variant: 'error' });
           return;
         }
-        const started = await generateVisual(projectId, revision.data.id);
-        track(revision.data.id, started.data, '后端不可用：无法生成新版本预览');
+        if (generateNow) {
+          const started = await generateVisual(projectId, revision.data.id);
+          track(revision.data.id, started.data, '后端不可用：无法生成新版本预览');
+        }
         listModule.reload();
       } catch (err) {
         toast({ title: '重新生成失败', description: describeError(err), variant: 'error' });
@@ -191,7 +202,10 @@ export function useVisuals(projectId: string): VisualsController {
       try {
         // 已有预览的资产不能原地改规格（后端 409）：那会让屏幕上的图与它的
         // 规格对不上。这种情况走新版本，旧版本仍留在 lineage 里可比较。
-        if (visual.generation_status === 'proposed' || visual.generation_status === 'failed') {
+        if (
+          visual.review_status === 'pending' &&
+          (visual.generation_status === 'proposed' || visual.generation_status === 'failed')
+        ) {
           await updateVisual(projectId, visual.id, payload);
           listModule.reload();
         } else {

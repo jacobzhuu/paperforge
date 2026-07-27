@@ -148,6 +148,7 @@ async def export_document(
         document_version = document.version
         title = project.publication_title or project.title
         authors = project.authors_json or []
+        author_details = getattr(project, "author_details_json", None) or []
         keywords = project.keywords_json or []
         language = project.language
         citation_style = project.citation_style
@@ -162,6 +163,7 @@ async def export_document(
         language=language,
         citation_style=citation_style,
         authors=authors,
+        author_details=author_details,
         keywords=keywords,
     )
     # R2 收口：导出前再检查一次，渲染器永远拿不到白名单外的 cite key。
@@ -489,7 +491,7 @@ def inspect_pdf_layout(
     source_constraints_ok: bool,
     visual_preflight_issues: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """逐页检查缺字、题注、图像位置、异常空白页与引用解析。"""
+    """逐页检查缺字、题注、图文边界、异常空白页与引用解析。"""
     from pypdf import PdfReader
 
     blockers: list[dict[str, Any]] = []
@@ -549,6 +551,47 @@ def inspect_pdf_layout(
         image_bounds_violations.append(
             {"code": "image_bounds_check_failed", "error": type(error).__name__}
         )
+
+    # TeX 会允许一个不可分页的 tabular 继续排到页面底部之外，并仍以成功状态
+    # 生成 PDF。文本抽取也可能读到这些位于负坐标的内容，所以只看页数/日志会漏检。
+    # 直接检查 PDF 页面文字对象的几何边界，捕获表格或正文被页面裁切的情况。
+    text_bounds_violations: list[dict[str, Any]] = []
+    text_bounds_check_error: str | None = None
+    try:
+        import pypdfium2 as pdfium
+        from pypdfium2 import raw as pdfium_c
+
+        pdfium_document = pdfium.PdfDocument(pdf)
+        for page_index in range(len(pdfium_document)):
+            page = pdfium_document[page_index]
+            page_width, page_height = page.get_width(), page.get_height()
+            for text_index, item in enumerate(
+                page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_TEXT]), start=1
+            ):
+                left, bottom, right, top = item.get_pos()
+                if (
+                    left < -1
+                    or bottom < -1
+                    or right > page_width + 1
+                    or top > page_height + 1
+                ):
+                    text_bounds_violations.append(
+                        {
+                            "page": page_index + 1,
+                            "text_object": text_index,
+                            "box": [
+                                round(left, 2),
+                                round(bottom, 2),
+                                round(right, 2),
+                                round(top, 2),
+                            ],
+                            "page_size": [round(page_width, 2), round(page_height, 2)],
+                        }
+                    )
+            page.close()
+        pdfium_document.close()
+    except Exception as error:  # noqa: BLE001 - 无法验证文字边界时投稿模式保守阻断
+        text_bounds_check_error = type(error).__name__
 
     reference_page = next(
         (
@@ -628,6 +671,23 @@ def inspect_pdf_layout(
                 "items": image_bounds_violations,
             }
         )
+    if text_bounds_check_error:
+        blockers.append(
+            {
+                "code": "text_bounds_check_failed",
+                "message": "PDF 文字边界检查失败",
+                "error": text_bounds_check_error,
+            }
+        )
+    elif text_bounds_violations:
+        blockers.append(
+            {
+                "code": "text_bounds_violation",
+                "message": "PDF 中存在越出页面边界的文字，可能有表格或正文被裁切",
+                "count": len(text_bounds_violations),
+                "items": text_bounds_violations[:20],
+            }
+        )
     blockers.extend(visual_preflight_issues or [])
     return {
         "passed": not blockers,
@@ -645,6 +705,9 @@ def inspect_pdf_layout(
         "image_bounds_constrained": source_constraints_ok,
         "image_boxes": image_boxes,
         "image_bounds_violations": image_bounds_violations,
+        "text_bounds_violations": text_bounds_violations[:20],
+        "text_bounds_violation_count": len(text_bounds_violations),
+        "text_bounds_check_error": text_bounds_check_error,
         "visual_preflight_issues": visual_preflight_issues or [],
         "blockers": blockers,
     }
@@ -680,6 +743,7 @@ async def _update_quality_after_layout(
                         "figures_",
                         "abnormal_",
                         "image_",
+                        "text_",
                         "missing_glyph",
                         "unresolved_",
                     )
@@ -752,6 +816,7 @@ def _build_ir(
     language: str,
     citation_style: str,
     authors: list[str] | None = None,
+    author_details: list[dict[str, Any]] | None = None,
     keywords: list[str] | None = None,
 ) -> PaperIR:
     sections = [IRSection(**row.body_ir_json) for row in rows if row.body_ir_json]
@@ -769,6 +834,7 @@ def _build_ir(
         meta=PaperMeta(
             title=title,
             authors=authors or [],
+            author_details=author_details or [],
             abstract=abstract,
             keywords=keywords or [],
             language=language,  # type: ignore[arg-type]

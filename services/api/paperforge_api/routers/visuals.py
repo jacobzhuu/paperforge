@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
+from copy import deepcopy
 from typing import Annotated, Any, Literal
 
 from arq.connections import ArqRedis
@@ -157,6 +159,21 @@ Rules:
   express the mechanism abstractly instead.
 - For "diagram": 3-7 nodes, every edge must reference existing node ids."""
 
+_QUANTITATIVE_INTENT = re.compile(
+    r"比较|对比|趋势|变化|分布|差异|结果|性能|随.+变化|compare|comparison|trend|"
+    r"distribution|difference|result|performance|over time",
+    re.IGNORECASE,
+)
+_RELATIONAL_INTENT = re.compile(
+    r"流程|步骤|机制|关系|架构|组件|分类|框架|路径|过程|flow|process|mechanism|"
+    r"relationship|architecture|component|taxonomy|framework|pipeline",
+    re.IGNORECASE,
+)
+_CONCEPTUAL_INTENT = re.compile(
+    r"概念|意象|封面|插图|氛围|隐喻|concept|conceptual|illustration|metaphor|cover",
+    re.IGNORECASE,
+)
+
 
 @router.post("/projects/{project_id}/visuals/draft", response_model=DraftVisualResponse)
 async def draft_visual(
@@ -178,8 +195,41 @@ async def draft_visual(
 
     document = await latest_document(session, project.id)
     rows = await list_sections(session, document.id) if document else []
-    context = "\n".join(f"- [{row.section_key}] {row.title}" for row in rows[:12])
+    assets = await list_assets(session, project.id)
     intent = request.intent.strip() or "a figure that helps the reader follow this paper"
+
+    target = _match_target_section(rows, request.target_section_key, intent)
+    excerpt = _section_excerpt(target) if target else ""
+    context_summary = _context_summary(target, excerpt)
+    suggested_block_index = _suggested_block_index(target)
+    chart_asset = _chart_asset(assets, request.source_asset_refs)
+    selected_kind, reason, warnings = _select_draft_kind(
+        request.kind,
+        intent,
+        chart_asset=chart_asset,
+        ai_images_enabled=api_settings().ai_images_enabled,
+    )
+    target_key = target.section_key if target else request.target_section_key
+
+    if selected_kind == "chart" and chart_asset is not None:
+        return _deterministic_chart_draft(
+            chart_asset,
+            intent,
+            target_section_key=target_key,
+            suggested_block_index=suggested_block_index,
+            reason=reason,
+            context_summary=context_summary,
+            warnings=warnings,
+        )
+
+    section_list = "\n".join(
+        f"- [{row.section_key}] {row.title}: {_section_excerpt(row)[:320]}" for row in rows[:12]
+    )
+    context = (
+        f"Matched section content:\n{excerpt[:3000]}\n\nOther sections:\n{section_list}"
+        if rows
+        else "No paper body is available yet."
+    )
 
     runner = LLMRunner(api_settings().llm_config())
     if runner.enabled:
@@ -188,9 +238,9 @@ async def draft_visual(
             system_prompt=_DRAFT_PROMPT,
             user_prompt=(
                 f"Paper title: {project.title}\n"
-                f"Requested kind: {request.kind}\n"
-                f"Target section: {request.target_section_key or 'unspecified'}\n"
-                f"Sections:\n{context}\n\n"
+                f"Requested kind: {selected_kind}\n"
+                f"Target section: {target_key or 'unspecified'}\n"
+                f"Paper context:\n{context}\n\n"
                 f"What the author wants to show: {intent}"
             ),
             max_output_tokens=1200,
@@ -198,51 +248,102 @@ async def draft_visual(
             metadata={"stage": "visual_draft"},
         )
         if result.ok and isinstance(result.value, dict):
-            drafted = _draft_from(result.value, request.kind)
+            drafted = _draft_from(
+                result.value,
+                selected_kind,
+                target_section_key=target_key,
+                suggested_block_index=suggested_block_index,
+                reason=reason,
+                context_summary=context_summary,
+                warnings=warnings,
+            )
             if drafted is not None:
                 drafted.generator = f"llm:{result.model}"
                 return drafted
 
     # 模型不可用时仍然给一份能提交的草稿——用户的意图原样落进描述里，
     # 而不是把他弹回一张空表单。
-    return _deterministic_draft(request.kind, intent)
+    return _deterministic_draft(
+        selected_kind,
+        intent,
+        target_section_key=target_key,
+        suggested_block_index=suggested_block_index,
+        reason=reason,
+        context_summary=context_summary,
+        warnings=[*warnings, "智能规格暂不可用，已提供可编辑的确定性草稿。"],
+    )
 
 
-def _draft_from(payload: dict[str, Any], kind: str) -> DraftVisualResponse | None:
+def _draft_from(
+    payload: dict[str, Any],
+    kind: str,
+    *,
+    target_section_key: str | None,
+    suggested_block_index: int | None,
+    reason: str,
+    context_summary: str,
+    warnings: list[str],
+) -> DraftVisualResponse | None:
     from paperforge_worker.pipelines.visual_planner import _ai_image_spec, _diagram_spec
 
     caption = str(payload.get("caption") or "").strip()
     alt_text = str(payload.get("alt_text") or "").strip() or caption
     if not caption:
         return None
-    spec = _ai_image_spec(payload.get("ai_image")) if kind == "ai_image" else _diagram_spec(
-        payload.get("diagram")
+    spec = (
+        _ai_image_spec(payload.get("ai_image"))
+        if kind == "ai_image"
+        else _diagram_spec(payload.get("diagram"))
     )
     if spec is None:
         return None
     return DraftVisualResponse(
+        kind=kind,  # type: ignore[arg-type]
         title=str(payload.get("title") or caption)[:120],
         caption=caption,
         alt_text=alt_text,
         spec=spec,
+        target_section_key=target_section_key,
+        suggested_block_index=suggested_block_index,
+        reason=reason,
+        context_summary=context_summary,
+        warnings=warnings,
     )
 
 
-def _deterministic_draft(kind: str, intent: str) -> DraftVisualResponse:
+def _deterministic_draft(
+    kind: str,
+    intent: str,
+    *,
+    target_section_key: str | None,
+    suggested_block_index: int | None,
+    reason: str,
+    context_summary: str,
+    warnings: list[str],
+) -> DraftVisualResponse:
     from visuals import AIImageSemantics, AIImageSpec, DiagramSpec
 
     if kind == "diagram":
         spec = DiagramSpec(
             direction="LR",
-            nodes=[{"id": "n1", "label": "输入"}, {"id": "n2", "label": "处理"},
-                   {"id": "n3", "label": "输出"}],
+            nodes=[
+                {"id": "n1", "label": "输入"},
+                {"id": "n2", "label": "处理"},
+                {"id": "n3", "label": "输出"},
+            ],
             edges=[{"source": "n1", "target": "n2"}, {"source": "n2", "target": "n3"}],
         ).model_dump(mode="json")
         return DraftVisualResponse(
+            kind="diagram",
             title=intent[:60],
             caption=intent[:200],
             alt_text=f"{intent[:150]}的示意图",
             spec=spec,
+            target_section_key=target_section_key,
+            suggested_block_index=suggested_block_index,
+            reason=reason,
+            context_summary=context_summary,
+            warnings=warnings,
         )
     try:
         spec = AIImageSpec(
@@ -259,11 +360,182 @@ def _deterministic_draft(kind: str, intent: str) -> DraftVisualResponse:
             )
         ).model_dump(mode="json")
     return DraftVisualResponse(
+        kind="ai_image",
         title=intent[:60],
         caption=intent[:200],
         alt_text=f"{intent[:150]}的概念插图",
         spec=spec,
+        target_section_key=target_section_key,
+        suggested_block_index=suggested_block_index,
+        reason=reason,
+        context_summary=context_summary,
+        warnings=warnings,
     )
+
+
+def _select_draft_kind(
+    requested: str,
+    intent: str,
+    *,
+    chart_asset: Any | None,
+    ai_images_enabled: bool,
+) -> tuple[str, str, list[str]]:
+    warnings: list[str] = []
+    if requested == "chart":
+        if chart_asset is not None:
+            return "chart", "已使用项目中可溯源的数值素材生成数据图表。", warnings
+        warnings.append("没有找到可作图的数值素材；为避免编造数据，已改为示意图草稿。")
+        return "diagram", "数据图表必须来自已解析的项目素材。", warnings
+    if requested in {"diagram", "ai_image"}:
+        if requested == "ai_image" and not ai_images_enabled:
+            warnings.append("AI 插图生成当前未启用；草稿仍可保存，外部生成保持不可用。")
+        return (
+            requested,
+            (
+                "这类意图需要表达概念氛围，适合概念插图。"
+                if requested == "ai_image"
+                else "这类意图主要表达流程或关系，适合学术示意图。"
+            ),
+            warnings,
+        )
+    if chart_asset is not None and _QUANTITATIVE_INTENT.search(intent):
+        return "chart", "检测到比较、趋势或分布意图，并找到可溯源的数值素材。", warnings
+    if _RELATIONAL_INTENT.search(intent):
+        return "diagram", "检测到流程、分类、组件或关系意图，示意图更准确。", warnings
+    if _CONCEPTUAL_INTENT.search(intent) and ai_images_enabled:
+        return "ai_image", "意图是非精确的概念表达，适合概念插图。", warnings
+    return "diagram", "未发现需要精确数据的信号，先用可编辑的示意图表达结构。", warnings
+
+
+def _chart_asset(assets: list[Any], requested_refs: list[str]) -> Any | None:
+    requested = {value.removeprefix("ua_") for value in requested_refs}
+    for asset in assets:
+        if requested and not any(str(asset.id).startswith(prefix) for prefix in requested):
+            continue
+        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
+        headers = [str(value) for value in parsed.get("headers") or []]
+        rows = parsed.get("rows") or []
+        if len(headers) >= 2 and rows and _numeric_columns(headers, rows):
+            return asset
+    return None
+
+
+def _numeric_columns(headers: list[str], rows: list[Any]) -> list[str]:
+    numeric: list[str] = []
+    for index, header in enumerate(headers):
+        values = [row[index] for row in rows[:100] if isinstance(row, list) and index < len(row)]
+        present = [value for value in values if value is not None and value != ""]
+        if present and sum(_is_number(value) for value in present) / len(present) >= 0.8:
+            numeric.append(header)
+    return numeric
+
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _deterministic_chart_draft(
+    asset: Any,
+    intent: str,
+    *,
+    target_section_key: str | None,
+    suggested_block_index: int | None,
+    reason: str,
+    context_summary: str,
+    warnings: list[str],
+) -> DraftVisualResponse:
+    parsed = asset.parsed_json
+    headers = [str(value) for value in parsed.get("headers") or []]
+    rows = parsed.get("rows") or []
+    numeric = _numeric_columns(headers, rows)
+    x = next((header for header in headers if header not in numeric), headers[0])
+    y = next((header for header in numeric if header != x), numeric[0])
+    chart_type = "line" if re.search(r"趋势|变化|随|trend|over time", intent, re.I) else "bar"
+    spec = ChartSpec(
+        chart_type=chart_type,
+        source_asset_ref=f"ua_{str(asset.id)[:8]}",
+        x=x,
+        y=[y],
+        x_label=x,
+        y_label=y,
+    ).model_dump(mode="json")
+    return DraftVisualResponse(
+        kind="chart",
+        title=(intent or f"{asset.title or '数据素材'}可视化")[:120],
+        caption=f"基于「{asset.title or '数据素材'}」展示 {y} 与 {x} 的关系",
+        alt_text=f"以 {x} 为横轴、{y} 为纵轴的{('折线' if chart_type == 'line' else '柱状')}图",
+        spec=spec,
+        target_section_key=target_section_key,
+        suggested_block_index=suggested_block_index,
+        reason=reason,
+        context_summary=context_summary,
+        warnings=warnings,
+        generator="deterministic",
+    )
+
+
+def _match_target_section(rows: list[Any], requested_key: str | None, intent: str) -> Any | None:
+    if requested_key:
+        exact = next((row for row in rows if row.section_key == requested_key), None)
+        if exact is not None:
+            return exact
+    tokens = _intent_tokens(intent)
+    if not rows or not tokens:
+        return rows[0] if rows else None
+    return max(
+        rows,
+        key=lambda row: sum(
+            3 if token in str(row.title).casefold() else 1
+            for token in tokens
+            if token in f"{row.title} {_section_excerpt(row)}".casefold()
+        ),
+    )
+
+
+def _intent_tokens(value: str) -> set[str]:
+    latin = {token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", value)}
+    # 中文没有空格，按整段截取会把“展示根系断裂机制”变成一个无法命中正文的长词。
+    # 取 2–4 字 n-gram，让“根系 / 断裂 / 防御方法”能稳定参与章节匹配。
+    cjk: set[str] = set()
+    for chunk in re.findall(r"[\u4e00-\u9fff]+", value):
+        for size in (2, 3, 4):
+            cjk.update(chunk[index : index + size] for index in range(len(chunk) - size + 1))
+    return latin | cjk
+
+
+def _section_excerpt(row: Any | None) -> str:
+    if row is None:
+        return ""
+    body = row.body_ir_json or {}
+    parts: list[str] = []
+    for block in body.get("blocks") or []:
+        if not isinstance(block, dict):
+            continue
+        for run in block.get("runs") or []:
+            if isinstance(run, dict):
+                value = run.get("v") if isinstance(run.get("v"), str) else run.get("text")
+                if isinstance(value, str):
+                    parts.append(value)
+        if isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return " ".join(parts).strip()
+
+
+def _context_summary(row: Any | None, excerpt: str) -> str:
+    if row is None:
+        return "尚无正文，草稿仅依据论文题目与当前意图。"
+    compact = " ".join(excerpt.split())
+    return f"已匹配章节「{row.title}」" + (f"：{compact[:240]}" if compact else "（正文为空）")
+
+
+def _suggested_block_index(row: Any | None) -> int | None:
+    if row is None or not isinstance(row.body_ir_json, dict):
+        return None
+    return len(row.body_ir_json.get("blocks") or [])
 
 
 @router.post(
@@ -513,7 +785,13 @@ async def regenerate(
 ) -> VisualResponse:
     project = await _require_project(session, project_id)
     old = await _require_visual(session, project.id, visual_id)
-    payload = request.spec or old.spec_json
+    payload = deepcopy(request.spec or old.spec_json)
+    if request.revision_instruction and request.revision_instruction.strip():
+        payload = _apply_revision_instruction(
+            payload,
+            old.kind,
+            request.revision_instruction.strip(),
+        )
     try:
         spec = parse_visual_spec(payload)
     except Exception as error:  # noqa: BLE001
@@ -539,6 +817,56 @@ async def regenerate(
         asset, digest = await _resolve_chart_source(session, project.id, spec.source_asset_ref)
         await add_visual_source(session, visual_id=new.id, user_asset=asset, source_hash=digest)
     return _visual_response(project.id, new)
+
+
+def _apply_revision_instruction(
+    payload: dict[str, Any], kind: str, instruction: str
+) -> dict[str, Any]:
+    """Apply common natural-language revisions while preserving deterministic data boundaries."""
+    lowered = instruction.casefold()
+    if kind == "diagram":
+        if re.search(r"横向|从左到右|horizontal|left.to.right", lowered):
+            payload["direction"] = "LR"
+        elif re.search(r"纵向|从上到下|vertical|top.to.bottom", lowered):
+            payload["direction"] = "TB"
+        if re.search(r"减少节点|更简洁|精简|fewer nodes|simpl", lowered):
+            nodes = payload.get("nodes") if isinstance(payload.get("nodes"), list) else []
+            if len(nodes) > 4:
+                keep = nodes[:3] + nodes[-1:]
+                ids = {node.get("id") for node in keep if isinstance(node, dict)}
+                payload["nodes"] = keep
+                payload["edges"] = [
+                    edge
+                    for edge in (payload.get("edges") or [])
+                    if isinstance(edge, dict)
+                    and edge.get("source") in ids
+                    and edge.get("target") in ids
+                ]
+        emphasis = re.search(
+            r"(?:突出|强调|emphasize|highlight)\s*[：:]?\s*([^，,。.;]{1,40})",
+            instruction,
+            re.I,
+        )
+        if emphasis:
+            term = emphasis.group(1).strip().casefold()
+            for node in payload.get("nodes") or []:
+                if isinstance(node, dict) and term in str(node.get("label") or "").casefold():
+                    node["shape"] = "diamond"
+    elif kind == "chart":
+        if re.search(r"趋势|折线|line|trend", lowered):
+            payload["chart_type"] = "line"
+        elif re.search(r"比较|柱状|bar|compare", lowered):
+            payload["chart_type"] = "bar"
+        if re.search(r"黑白|灰度|grayscale|monochrome", lowered):
+            payload["palette"] = "grayscale"
+        if re.search(r"通栏|更宽|full.width|wide", lowered):
+            payload["width"] = "full"
+        # Deliberately never change source_asset_ref/x/y or any data value from prose.
+    elif kind == "ai_image":
+        style = str(payload.get("style") or "clean academic conceptual illustration")
+        candidate = f"{style}; {instruction}"[:160]
+        payload["style"] = candidate
+    return payload
 
 
 @router.get("/projects/{project_id}/visuals/{visual_id}/renditions/{format}")

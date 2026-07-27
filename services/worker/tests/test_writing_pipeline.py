@@ -446,6 +446,40 @@ async def test_review_outline_adds_comparison_limitations_and_conflict_synthesis
     assert synthesis["inline_tables"][0]["rows"][0][-1] == "Located full text"
 
 
+async def test_review_synthesis_keeps_complete_titles_and_removes_source_markup() -> None:
+    title = (
+        "AI-assisted isolation of bioactive Dipyrimicins from "
+        "<i>Amycolatopsis azurea</i> and identification of their complete activity profile"
+    )
+    method = "A deliberately detailed method description " * 5
+    outcome = await generate_outline(
+        topic="Evidence synthesis",
+        research_question="What agrees?",
+        cards=[
+            CardBrief(
+                cite_key="a",
+                title=title,
+                year=2025,
+                methods=(method,),
+                fulltext_used=True,
+            ),
+            CardBrief(cite_key="b", title="Comparison study", year=2024),
+        ],
+        whitelist={"a", "b"},
+        runner=None,
+    )
+
+    synthesis = next(
+        section
+        for section in outcome.tree["sections"]
+        if section.get("synthesis_kind") == "comparison_limitations_conflicts"
+    )
+    row = synthesis["inline_tables"][0]["rows"][0]
+    assert row[0] == title.replace("<i>", "").replace("</i>", "")
+    assert row[1] == "2025"
+    assert row[2] == method.strip()
+
+
 async def test_review_synthesis_table_becomes_inline_table_ir() -> None:
     section = {
         "key": "synthesis",

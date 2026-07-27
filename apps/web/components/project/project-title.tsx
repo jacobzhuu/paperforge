@@ -81,7 +81,7 @@ export function ProjectTitle({
           onClick={() => setEditing(true)}
           aria-label="修改论文题目"
           className={cn(
-            'mt-1 shrink-0 rounded p-1 text-muted-foreground transition-opacity transition-colors',
+            'flex h-11 w-11 shrink-0 items-center justify-center rounded text-muted-foreground transition-opacity transition-colors',
             'hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
             // 常驻但压暗，hover/聚焦时补满。
             //

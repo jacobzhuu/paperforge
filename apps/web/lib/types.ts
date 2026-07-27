@@ -7,6 +7,15 @@ export type CitationStyle = 'author_year' | 'gbt7714' | 'ieee' | 'apa';
 export type QualityProfile = 'draft' | 'submission';
 export type ReviewStyle = 'narrative' | 'systematic';
 
+export interface AuthorDetail {
+  id: string;
+  name: string;
+  affiliations: string[];
+  email?: string | null;
+  orcid?: string | null;
+  corresponding: boolean;
+}
+
 export type ProjectStatus =
   | 'draft'
   | 'scoping'
@@ -30,6 +39,7 @@ export interface Project {
   contribution_points?: string[];
   publication_title?: string | null;
   authors?: string[];
+  author_details?: AuthorDetail[];
   keywords?: string[];
   metadata_confirmed?: boolean;
   library_count?: number;
@@ -49,6 +59,7 @@ export interface CreateProjectRequest {
   contribution_points?: string[];
   publication_title?: string;
   authors?: string[];
+  author_details?: AuthorDetail[];
   keywords?: string[];
 }
 
@@ -72,6 +83,7 @@ export interface UpdateProjectRequest {
   contribution_points?: string[];
   publication_title?: string | null;
   authors?: string[];
+  author_details?: AuthorDetail[];
   keywords?: string[];
   metadata_confirmed?: boolean;
 }
@@ -564,10 +576,16 @@ export interface VisualAsset {
 
 /** 模型补全出来的视觉草稿；用户确认后才变成真正的资产。 */
 export interface VisualDraft {
+  kind: VisualKind;
   title: string;
   caption: string;
   alt_text: string;
   spec: Record<string, unknown>;
+  target_section_key?: string | null;
+  suggested_block_index?: number | null;
+  reason: string;
+  context_summary: string;
+  warnings: string[];
   /** `llm:<model>` 或 `deterministic`。 */
   generator: string;
 }
@@ -592,6 +610,10 @@ export interface CreateVisualRequest {
   alt_text?: string;
   target_section_key?: string | null;
   suggested_block_index?: number | null;
+}
+
+export interface RegenerateVisualRequest extends Partial<CreateVisualRequest> {
+  revision_instruction?: string;
 }
 
 export interface NumLintFinding {
@@ -755,6 +777,10 @@ export interface AuthUser {
   email: string;
   display_name?: string | null;
   email_verified: boolean;
+}
+
+export interface AcademicProfile {
+  profile: AuthorDetail | null;
 }
 
 export interface CostByRole {

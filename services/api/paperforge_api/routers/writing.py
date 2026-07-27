@@ -338,8 +338,11 @@ async def markdown_preview(project_id: str, session: SessionDep) -> MarkdownResp
 
     ir = PaperIR(
         meta=PaperMeta(
-            title=project.title,
+            title=project.publication_title or project.title,
+            authors=project.authors_json or [],
+            author_details=getattr(project, "author_details_json", None) or [],
             abstract=abstract_text,
+            keywords=project.keywords_json or [],
             language=project.language,  # type: ignore[arg-type]
         ),
         sections=body_sections,
@@ -481,9 +484,7 @@ async def start_export(
     if request.quality_profile == "submission":
         blockers: list[dict[str, Any]] = []
         if quality_report is None:
-            blockers.append(
-                {"code": "quality_report_missing", "message": "请先生成投稿质量报告"}
-            )
+            blockers.append({"code": "quality_report_missing", "message": "请先生成投稿质量报告"})
         else:
             stale = quality_report.stale or quality_report.paper_snapshot_hash != snapshot_hash
             if stale:

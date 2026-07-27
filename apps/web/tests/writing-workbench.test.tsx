@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fail, makeSection, makeToastSpy, makeVisual, mockProjectContext, ok } from './helpers';
@@ -76,6 +76,12 @@ function dirtyDraft(key: string, title: string) {
   };
 }
 
+async function insertCurrentVisual() {
+  await userEvent.click(await screen.findByRole('button', { name: /^插入论文$/ }));
+  const dialog = await screen.findByRole('dialog');
+  await userEvent.click(within(dialog).getByRole('button', { name: /^插入论文$/ }));
+}
+
 describe('写作工作台', () => {
   beforeEach(() => {
     projectCtx.current = mockProjectContext();
@@ -127,7 +133,7 @@ describe('写作工作台', () => {
     // 草稿确实被恢复了（也就是说它真的与服务端不同）。
     await waitFor(() => expect(window.localStorage.getItem(DRAFT_KEY)).not.toBeNull());
 
-    await userEvent.click(await screen.findByRole('button', { name: /批准并插入/ }));
+    await insertCurrentVisual();
 
     // 顺序是关键：先把用户的修改落盘，再让插图改写这一节。
     await waitFor(() => expect(updateSection).toHaveBeenCalled());
@@ -143,7 +149,7 @@ describe('写作工作台', () => {
     render(<WritingWorkbench />);
 
     await waitFor(() => expect(window.localStorage.getItem(DRAFT_KEY)).not.toBeNull());
-    await userEvent.click(await screen.findByRole('button', { name: /批准并插入/ }));
+    await insertCurrentVisual();
 
     await waitFor(() => expect(updateSection).toHaveBeenCalled());
     expect(approveVisual).not.toHaveBeenCalled();
@@ -163,7 +169,7 @@ describe('写作工作台', () => {
     window.localStorage.setItem(otherKey, JSON.stringify(dirtyDraft('results', '实验结果')));
 
     render(<WritingWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /批准并插入/ }));
+    await insertCurrentVisual();
 
     await waitFor(() => expect(approveVisual).toHaveBeenCalled());
     // 当前节没有草稿，所以不该走保存路径。
@@ -173,7 +179,7 @@ describe('写作工作台', () => {
 
   it('批准时带上章节 updated_at 做乐观并发', async () => {
     render(<WritingWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /批准并插入/ }));
+    await insertCurrentVisual();
     await waitFor(() =>
       expect(approveVisual).toHaveBeenCalledWith(
         'p1',
@@ -191,9 +197,10 @@ describe('写作工作台', () => {
     expect(link).toHaveAttribute('href', '/projects/p1/visuals');
   });
 
-  it('写作台里能直接「调整」——不再被迫跳去素材中心', async () => {
+  it('写作台里能从次级菜单直接调整——不再被迫跳去素材中心', async () => {
     render(<WritingWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: '调整' }));
+    await userEvent.click(await screen.findByRole('button', { name: '更多' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /调整视觉/ }));
     expect(await screen.findByText('调整视觉')).toBeInTheDocument();
   });
 });

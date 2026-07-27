@@ -38,7 +38,7 @@ export function ProjectHeader({
     <div className="space-y-2">
       <Link
         href="/projects"
-        className="inline-flex items-center gap-1 rounded text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="inline-flex min-h-11 items-center gap-1 rounded text-xs text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <ChevronLeft className="h-3.5 w-3.5" /> 全部项目
       </Link>

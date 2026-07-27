@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 # PaperIR：结构化论文中间表示（方案 §4.5）。
 # 继承旧系统「渲染器只消费 IR、不消费 LLM 原始输出」的原则，面向 LaTeX 重新设计。
@@ -141,13 +141,40 @@ class Section(BaseModel):
     citation_warnings: list[CitationWarning] = Field(default_factory=list)
 
 
+class PaperAuthor(BaseModel):
+    id: str
+    name: str
+    affiliations: list[str] = Field(default_factory=list)
+    email: EmailStr | None = None
+    orcid: str | None = None
+    corresponding: bool = False
+
+    @model_validator(mode="after")
+    def corresponding_has_email(self) -> PaperAuthor:
+        if self.corresponding and self.email is None:
+            raise ValueError("a corresponding author must have an email address")
+        return self
+
+
 class PaperMeta(BaseModel):
     title: str
     authors: list[str] = Field(default_factory=list)
+    author_details: list[PaperAuthor] = Field(default_factory=list)
     abstract: str = ""
     keywords: list[str] = Field(default_factory=list)
     language: Literal["zh", "en"] = "en"
     venue_template: str | None = None
+
+    @model_validator(mode="after")
+    def keep_legacy_authors_in_sync(self) -> PaperMeta:
+        if self.author_details:
+            self.authors = [author.name for author in self.author_details]
+        elif self.authors:
+            self.author_details = [
+                PaperAuthor(id=f"legacy-{index + 1}", name=name)
+                for index, name in enumerate(self.authors)
+            ]
+        return self
 
 
 class Bibliography(BaseModel):

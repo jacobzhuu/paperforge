@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -332,9 +334,7 @@ def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") ->
     )
     rows: list[list[str]] = []
     for card in cards[:20]:
-        method = (
-            _clean(card.methods[0])[:100] if card.methods else ("未报告" if zh else "Not reported")
-        )
+        method = _clean(card.methods[0]) if card.methods else ("未报告" if zh else "Not reported")
         evidence = (
             "已定位全文"
             if zh and card.fulltext_used
@@ -346,7 +346,7 @@ def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") ->
         )
         rows.append(
             [
-                _clean(card.title)[:90],
+                _clean(card.title),
                 str(card.year) if card.year else ("未注明" if zh else "n.d."),
                 method,
                 evidence,
@@ -495,4 +495,7 @@ def _as_list(value: Any) -> list[Any]:
 def _clean(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    return " ".join(value.split())
+    # Crossref 等来源的题名可能带 <i>/<sub> 一类轻量标记。它们不是 PaperIR
+    # 的结构化富文本，既不应原样印进 PDF，也不能为了控制表格高度截断题名。
+    without_tags = re.sub(r"<[^>]+>", "", html.unescape(value))
+    return " ".join(without_tags.split())

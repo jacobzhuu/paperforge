@@ -79,7 +79,7 @@ export function ProjectPipelineNav({
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-h-11 items-center gap-2 rounded-md px-2 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <StepDot done={completion[activeStep.id]} active running={running === activeStep.id} />
           <span className="font-medium text-foreground">{activeStep.label}</span>

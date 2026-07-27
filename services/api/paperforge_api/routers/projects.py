@@ -76,6 +76,8 @@ async def create_project_endpoint(
     session: SessionDep,
     user: CurrentUserDep,
 ) -> ProjectResponse:
+    if {"authors", "author_details"} <= request.model_fields_set:
+        raise HTTPException(status_code=422, detail="send authors or author_details, not both")
     try:
         project = await create_project(
             session,
@@ -89,6 +91,11 @@ async def create_project_endpoint(
             contribution_points=request.contribution_points,
             publication_title=request.publication_title,
             authors=request.authors,
+            author_details=(
+                [item.model_dump(mode="json") for item in request.author_details]
+                if request.author_details is not None
+                else None
+            ),
             keywords=request.keywords,
             owner_id=user.id,
         )
@@ -134,8 +141,16 @@ async def update_project_endpoint(
     """
     project = await _require_project(session, project_id)
     sent = request.model_fields_set
+    if {"authors", "author_details"} <= sent:
+        raise HTTPException(status_code=422, detail="send authors or author_details, not both")
     patch: dict[str, Any] = {
-        name: getattr(request, name) for name in sent if hasattr(request, name)
+        name: (
+            [item.model_dump(mode="json") for item in getattr(request, name)]
+            if name == "author_details" and getattr(request, name) is not None
+            else getattr(request, name)
+        )
+        for name in sent
+        if hasattr(request, name)
     }
     try:
         await update_project(session, project, **patch)
@@ -472,6 +487,16 @@ def _project_response(project: PaperProject, counters: dict[str, int]) -> Projec
         contribution_points=scope.get("contribution_points") or [],
         publication_title=project.publication_title,
         authors=project.authors_json or [],
+        author_details=getattr(project, "author_details_json", None)
+        or [
+            {
+                "id": f"legacy-{index + 1}",
+                "name": name,
+                "affiliations": [],
+                "corresponding": False,
+            }
+            for index, name in enumerate(project.authors_json or [])
+        ],
         keywords=project.keywords_json or [],
         metadata_confirmed=project.metadata_confirmed_at is not None,
         library_count=counters.get("library_count", 0),

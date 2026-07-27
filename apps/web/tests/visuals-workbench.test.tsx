@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fail, makeSection, makeToastSpy, makeVisual, mockProjectContext, ok } from './helpers';
@@ -30,6 +30,7 @@ const generateVisual = vi.fn();
 const approveVisual = vi.fn();
 const createVisual = vi.fn();
 const draftVisual = vi.fn();
+const regenerateVisual = vi.fn();
 
 vi.mock('@/lib/api', () => ({
   listVisuals: (...a: unknown[]) => listVisuals(...a),
@@ -41,7 +42,7 @@ vi.mock('@/lib/api', () => ({
   createVisual: (...a: unknown[]) => createVisual(...a),
   draftVisual: (...a: unknown[]) => draftVisual(...a),
   updateVisual: vi.fn(),
-  regenerateVisual: vi.fn(),
+  regenerateVisual: (...a: unknown[]) => regenerateVisual(...a),
   rejectVisual: vi.fn(() => ok(undefined)),
   suggestVisuals: vi.fn(() => ok({ id: 'job-1' })),
   visualRenditionUrl: () => '#',
@@ -78,8 +79,10 @@ describe('视觉工作台', () => {
     generateVisual.mockReturnValue(ok({ id: 'job-1', kind: 'visual' }));
     approveVisual.mockReturnValue(ok(makeVisual({ id: 'v1', review_status: 'approved' })));
     createVisual.mockReturnValue(ok(makeVisual({ id: 'new1' })));
+    regenerateVisual.mockReturnValue(ok(makeVisual({ id: 'v2', version: 2, generation_status: 'proposed' })));
     draftVisual.mockReturnValue(
       ok({
+        kind: 'ai_image',
         title: '根系断裂过程',
         caption: '根系受力后从裂纹萌生到断裂的过程',
         alt_text: '从受力到断裂的四阶段示意',
@@ -88,6 +91,11 @@ describe('视觉工作台', () => {
           prompt: 'root fracture progression, abstract academic illustration',
         },
         generator: 'llm:stub',
+        target_section_key: 'introduction',
+        suggested_block_index: 1,
+        reason: '意图是非精确的概念表达，适合概念插图。',
+        context_summary: '已匹配章节「引言」',
+        warnings: [],
       }),
     );
     listVisuals.mockReturnValue(ok([makeVisual({ id: 'v1' })]));
@@ -166,7 +174,7 @@ describe('视觉工作台', () => {
     expect(screen.queryByText('调用外部图像服务生成插图？')).not.toBeInTheDocument();
   });
 
-  it('Cloudflare 不显示尺寸承诺——它根本不接受尺寸参数', async () => {
+  it('专业设置默认收起，厂商提示词不会挤占卡片主路径', async () => {
     listVisuals.mockReturnValue(
       ok([
         makeVisual({
@@ -179,17 +187,18 @@ describe('视觉工作台', () => {
     );
     render(<VisualsWorkbench />);
 
-    await userEvent.click(await screen.findByRole('button', { name: '调整' }));
-    // 尺寸/质量属于协议细节，默认折叠——展开才看得到。
-    await userEvent.click(await screen.findByRole('button', { name: /高级选项/ }));
-    expect(await screen.findByText('由提供商决定')).toBeInTheDocument();
-    // 旧界面里那三个不会生效的选项必须消失。
+    await userEvent.click(await screen.findByRole('button', { name: '更多' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /调整视觉/ }));
+    expect(await screen.findByRole('heading', { name: '调整视觉' })).toBeInTheDocument();
+    expect(screen.getByText('专业检查器')).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /横向 3:2/ })).not.toBeInTheDocument();
   });
 
   it('批准时带上章节的 updated_at 做乐观并发', async () => {
     render(<VisualsWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /批准并插入/ }));
+    await userEvent.click(await screen.findByRole('button', { name: /^插入论文$/ }));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: /^插入论文$/ }));
     await waitFor(() =>
       expect(approveVisual).toHaveBeenCalledWith(
         'p1',
@@ -219,7 +228,7 @@ describe('视觉工作台', () => {
     render(<VisualsWorkbench />);
 
     expect(await screen.findByText(/触发了图像服务的内容检查/)).toBeInTheDocument();
-    expect(screen.getByText(/重试不会改变结果/)).toBeInTheDocument();
+    expect(screen.getByText(/需要先调整描述/)).toBeInTheDocument();
     expect(screen.getByText('cf-ray-123')).toBeInTheDocument();
   });
 
@@ -277,110 +286,95 @@ describe('视觉工作台', () => {
     });
   });
 
-  it('能自己新建一张视觉——不只是被动接受建议', async () => {
-    /*
-     * 回归防线：把旧的 visuals-gallery 删掉时，连同它的「新建」对话框一起没了，
-     * 于是用户只能处理规划器提出的建议，想自己加一张图完全无路可走。
-     */
+  it('一句意图直接形成视觉，不出现图注、alt、节点或连线表单', async () => {
+    draftVisual.mockReturnValue(
+      ok({
+        kind: 'diagram',
+        title: '证据整合流程',
+        caption: '证据整合流程',
+        alt_text: '从检索到整合的流程图',
+        spec: { kind: 'diagram', direction: 'LR', nodes: [{ id: 'n1', label: '检索' }] },
+        generator: 'deterministic',
+        target_section_key: 'introduction',
+        suggested_block_index: 1,
+        reason: '检测到流程意图，示意图更准确。',
+        context_summary: '已匹配章节「引言」',
+        warnings: [],
+      }),
+    );
     render(<VisualsWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /新建视觉/ }));
-
-    // 用 heading 定位抽屉标题：页面上还有一个同名的按钮。
-    expect(await screen.findByRole('heading', { name: '新建视觉' })).toBeInTheDocument();
-
-    /*
-     * 用 fireEvent.change 直接赋值，而不是逐键 type：抽屉打开时的焦点陷阱会在
-     * 一个 requestAnimationFrame 后把焦点移到首个可聚焦元素，逐键输入会在那一刻
-     * 被打断。真实浏览器里这个 rAF 在开屏 ~16ms 内就跑完了，人不可能打得那么快；
-     * 这里要验的是「表单能提交成什么」，不是输入法时序。
-     */
-    fireEvent.change(screen.getByLabelText('图注'), { target: { value: '手工示意图' } });
-    fireEvent.change(screen.getByLabelText('替代文本（alt）'), {
-      target: { value: '手工画的流程' },
+    expect(screen.queryByLabelText('图注')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/替代文本/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/节点/)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('视觉意图'), {
+      target: { value: '展示检索、筛选和证据整合流程' },
     });
-    fireEvent.change(screen.getByLabelText('节点（每行一个）'), {
-      target: { value: '输入\n输出' },
-    });
-    await userEvent.click(screen.getByRole('button', { name: '创建' }));
+    await userEvent.click(screen.getByRole('button', { name: '开始创作' }));
 
     await waitFor(() => expect(createVisual).toHaveBeenCalled());
     const payload = createVisual.mock.calls[0][1] as { spec: { kind: string } };
     expect(payload.spec.kind).toBe('diagram');
+    expect(generateVisual).toHaveBeenCalledWith('p1', 'new1');
   });
 
-  it('AI 生图不可用时说明原因，而不是让选项凭空消失', async () => {
+  it('AI 生图不可用时说明原因，并保留禁用的类型覆盖选项', async () => {
     getRuntimeSettings.mockReturnValue(
       ok({ ai_images_enabled: false, image_provider_configured: false, image_capabilities: null }),
     );
     render(<VisualsWorkbench />);
 
-    expect(await screen.findByText(/AI_IMAGES_ENABLED/)).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole('button', { name: /新建视觉/ }));
-    const aiOption = await screen.findByRole('button', { name: /AI 概念插图/ });
+    expect(await screen.findByText(/AI 概念插图当前不可用/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /限定范围或覆盖类型/ }));
+    const aiOption = await screen.findByRole('button', { name: '概念插图' });
     expect(aiOption).toBeDisabled();
-    expect(aiOption).toHaveAccessibleName(/未启用|未配置/);
   });
 
-  it('AI 可用时新建里的插图选项是开放的', async () => {
+  it('AI 可用时类型覆盖选项开放', async () => {
     render(<VisualsWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /新建视觉/ }));
-    expect(await screen.findByRole('button', { name: /AI 概念插图/ })).toBeEnabled();
-    expect(screen.queryByText(/AI_IMAGES_ENABLED/)).not.toBeInTheDocument();
+    await userEvent.click(await screen.findByRole('button', { name: /限定范围或覆盖类型/ }));
+    expect(await screen.findByRole('button', { name: '概念插图' })).toBeEnabled();
   });
 
-  it('AI 插图只问一句话，图注与描述由模型补全', async () => {
-    /*
-     * 此前新建一张 AI 插图要手写图注、替代文本、构图描述三段文本，还得自己避开
-     * 会触发内容审核的词——那是把提示词工程外包给了作者。
-     */
+  it('AI 插图只问一句话，草稿创建后不自动调用外部图像服务', async () => {
     render(<VisualsWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /新建视觉/ }));
-    await userEvent.click(await screen.findByRole('button', { name: /AI 概念插图/ }));
-
-    fireEvent.change(screen.getByLabelText('想画什么？'), {
+    await userEvent.click(await screen.findByRole('button', { name: /限定范围或覆盖类型/ }));
+    await userEvent.click(await screen.findByRole('button', { name: '概念插图' }));
+    fireEvent.change(screen.getByLabelText('视觉意图'), {
       target: { value: '根系受力后的断裂过程' },
     });
-    await userEvent.click(screen.getByRole('button', { name: /让 AI 补全/ }));
+    await userEvent.click(screen.getByRole('button', { name: '开始创作' }));
 
     await waitFor(() =>
       expect(draftVisual).toHaveBeenCalledWith('p1', {
         kind: 'ai_image',
         intent: '根系受力后的断裂过程',
-        target_section_key: 'introduction',
+        target_section_key: null,
+        source_asset_refs: [],
       }),
     );
-    // 三个字段都被填好，用户不必自己写。
-    await waitFor(() =>
-      expect((screen.getByLabelText('图注') as HTMLInputElement).value).toBe(
-        '根系受力后从裂纹萌生到断裂的过程',
-      ),
-    );
-    expect((screen.getByLabelText('替代文本（alt）') as HTMLInputElement).value).toBe(
-      '从受力到断裂的四阶段示意',
-    );
-    expect((screen.getByLabelText('概念描述') as HTMLTextAreaElement).value).toContain(
-      'root fracture progression',
-    );
+    expect(createVisual).toHaveBeenCalled();
+    expect(generateVisual).not.toHaveBeenCalled();
   });
 
-  it('厂商型号与尺寸质量默认折叠——那是协议细节，不是创作决定', async () => {
+  it('默认显示需要处理，已插入和已拒绝进入历史', async () => {
+    listVisuals.mockReturnValue(ok([
+      makeVisual({ id: 'pending', title: '待处理图' }),
+      makeVisual({ id: 'approved', title: '已插入图', review_status: 'approved' }),
+      makeVisual({ id: 'rejected', title: '已拒绝图', review_status: 'rejected' }),
+    ]));
     render(<VisualsWorkbench />);
-    await userEvent.click(await screen.findByRole('button', { name: /新建视觉/ }));
-    await userEvent.click(await screen.findByRole('button', { name: /AI 概念插图/ }));
-
-    expect(screen.queryByText(/flux-1-schnell/)).not.toBeInTheDocument();
-    expect(screen.queryByText('由提供商决定')).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole('button', { name: /高级选项/ }));
-    expect(await screen.findByText(/flux-1-schnell/)).toBeInTheDocument();
+    expect(await screen.findByText('待处理图')).toBeInTheDocument();
+    expect(screen.queryByText('已插入图')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /历史/ }));
+    expect(await screen.findByText('已插入图')).toBeInTheDocument();
+    expect(screen.getByText('已拒绝图')).toBeInTheDocument();
   });
 
-  it('建议基于旧版正文时给出提示，但不删除资产', async () => {
+  it('陈旧上下文合并为页面级提醒，但不删除资产', async () => {
     listVisuals.mockReturnValue(ok([makeVisual({ id: 'v1', stale: true })]));
     render(<VisualsWorkbench />);
 
-    expect(await screen.findByText(/建议基于旧版正文/)).toBeInTheDocument();
+    expect(await screen.findByText(/1 张视觉基于旧版正文/)).toBeInTheDocument();
     expect(screen.getByTestId('visual-card')).toBeInTheDocument();
   });
 });

@@ -17,6 +17,7 @@ from db import (
     create_outline,
     create_project,
     create_user,
+    get_project,
     list_sections,
     upsert_entry,
     upsert_work,
@@ -112,7 +113,7 @@ def _context(project_id: uuid.UUID, session_factory) -> JobContext:
     return JobContext(
         project_id=project_id,
         job_id=None,  # 无 job 时 emit 只打日志，测试不必造 generation_job
-        settings=WorkerSettings(),
+        settings=WorkerSettings(llm_default_provider="noop"),
         session_factory=session_factory,
         http_client=httpx.Client(),
         scholar_cache=InMemoryHttpCache(),
@@ -127,7 +128,12 @@ def _draft_writer(cite_key: str, *, cancel_at: str | None = None):
         if key == cancel_at:
             raise asyncio.CancelledError
         draft = SectionDraft(section_key=key, title=str(section.get("title") or key))
-        draft.paragraphs = [{"text": f"{key} body.", "cite_keys": [cite_key]}]
+        text = (
+            "Poisoning attacks in sequential recommenders."
+            if key == "abstract"
+            else f"{key} body."
+        )
+        draft.paragraphs = [{"text": text, "cite_keys": [cite_key]}]
         draft.generator = "llm:test-model"
         draft.model = "test-model"
         return draft
@@ -228,3 +234,38 @@ async def test_completed_write_persists_every_section_in_outline_order(
         rows = await list_sections(session, document.id)
     assert [row.section_key for row in rows] == ["abstract", "s1", "s2", "s3"]
     assert [row.order_no for row in rows] == [0, 1, 2, 3]
+    async with session_factory() as session:
+        project = await get_project(session, project_id)
+        assert project is not None
+        assert project.publication_title == "Poisoning review"
+        assert "poisoning" in (project.keywords_json or [])
+
+
+async def test_generated_metadata_does_not_overwrite_manual_edits(
+    session_factory,
+    monkeypatch,
+) -> None:
+    project_id, cite_key = await _seed(session_factory)
+    async with session_factory() as session:
+        project = await get_project(session, project_id)
+        assert project is not None
+        project.publication_title = "A manually refined title"
+        project.keywords_json = ["hand-picked keyword"]
+        await session.commit()
+    monkeypatch.setattr(
+        "paperforge_worker.pipelines.document.write_section",
+        _draft_writer(cite_key),
+    )
+
+    await write_document(
+        _context(project_id, session_factory),
+        language="en",
+        title="T",
+        coherence=False,
+    )
+
+    async with session_factory() as session:
+        project = await get_project(session, project_id)
+        assert project is not None
+        assert project.publication_title == "A manually refined title"
+        assert project.keywords_json == ["hand-picked keyword"]

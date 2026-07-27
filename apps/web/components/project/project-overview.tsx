@@ -13,8 +13,6 @@ import {
   Rocket,
 } from 'lucide-react';
 import { Button, buttonVariants } from '@/components/ui/button';
-import { Checkbox } from '@/components/ui/checkbox';
-import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToast } from '@/components/ui/toast';
@@ -28,7 +26,6 @@ import {
   getVersionHistory,
   listExports,
   listJobs,
-  updateProject,
 } from '@/lib/api';
 import { describeError } from '@/lib/errors';
 import { stageLabel } from '@/lib/labels';
@@ -47,6 +44,7 @@ import type {
   VersionHistory,
 } from '@/lib/types';
 import { formatDate } from '@/lib/utils';
+import { PublicationMetadata } from './publication-metadata';
 
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
@@ -331,7 +329,7 @@ export function ProjectOverview() {
         )}
       </section>
 
-      {project && <PublicationMetadata project={project} onSaved={reload} />}
+      {project && <PublicationMetadata project={project} onSaved={reload} collapsedByDefault />}
 
       <div className="grid gap-10 md:grid-cols-2">
         <RecentJobs jobs={jobs} />
@@ -433,79 +431,6 @@ function runAllButton({
     disabled: false,
     spinning: false,
   };
-}
-
-function PublicationMetadata({ project, onSaved }: { project: Project; onSaved: () => void }) {
-  const { toast } = useToast();
-  const [title, setTitle] = React.useState(project.publication_title ?? '');
-  const [authors, setAuthors] = React.useState((project.authors ?? []).join('; '));
-  const [keywords, setKeywords] = React.useState((project.keywords ?? []).join('; '));
-  const [confirmed, setConfirmed] = React.useState(project.metadata_confirmed ?? false);
-  const [saving, setSaving] = React.useState(false);
-
-  React.useEffect(() => {
-    setTitle(project.publication_title ?? '');
-    setAuthors((project.authors ?? []).join('; '));
-    setKeywords((project.keywords ?? []).join('; '));
-    setConfirmed(project.metadata_confirmed ?? false);
-  }, [project]);
-
-  const split = (value: string) => value.split(/[;,，；\n]/).map((item) => item.trim()).filter(Boolean);
-  const save = async () => {
-    const authorList = split(authors);
-    const keywordList = split(keywords);
-    if (!title.trim() || authorList.length === 0 || keywordList.length === 0) {
-      toast({ title: '请完整填写发表题名、作者和关键词', variant: 'error' });
-      return;
-    }
-    setSaving(true);
-    try {
-      await updateProject(project.id, {
-        publication_title: title.trim(),
-        authors: authorList,
-        keywords: keywordList,
-        metadata_confirmed: confirmed,
-      });
-      onSaved();
-      toast({ title: confirmed ? '投稿元数据已确认' : '投稿元数据已保存', variant: 'success' });
-    } catch (err) {
-      toast({ title: '投稿元数据未保存', description: describeError(err), variant: 'error' });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <section className="space-y-3 border-t pt-8">
-      <SectionTitle>投稿元数据</SectionTitle>
-      <p className="text-sm text-muted-foreground">
-        项目内部名称不会再自动充当发表题名；投稿模式会检查题名、作者、关键词和语言脚本是否已确认。
-      </p>
-      <div className="grid gap-3 md:grid-cols-3">
-        <label className="space-y-1 text-xs text-muted-foreground">
-          发表题名
-          <Input value={title} onChange={(event) => { setTitle(event.target.value); setConfirmed(false); }} />
-        </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          作者（分号分隔）
-          <Input value={authors} onChange={(event) => { setAuthors(event.target.value); setConfirmed(false); }} />
-        </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          关键词（分号分隔）
-          <Input value={keywords} onChange={(event) => { setKeywords(event.target.value); setConfirmed(false); }} />
-        </label>
-      </div>
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <label className="flex items-center gap-2 text-sm">
-          <Checkbox checked={confirmed} onCheckedChange={setConfirmed} />
-          已核对题名、作者、关键词与当前论文语言
-        </label>
-        <Button variant="outline" onClick={() => void save()} disabled={saving}>
-          {saving ? '保存中…' : '保存投稿元数据'}
-        </Button>
-      </div>
-    </section>
-  );
 }
 
 /** 分组标题：小号、字距略开的 sans，靠留白与下方内容拉开层级，不加边框。 */

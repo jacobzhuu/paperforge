@@ -163,7 +163,7 @@ export function Sidebar() {
           onClick={() => setMobileOpen(true)}
           aria-label="打开导航"
           aria-expanded={mobileOpen}
-          className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <Menu className="h-5 w-5" />
         </button>

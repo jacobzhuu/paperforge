@@ -27,7 +27,7 @@
     "sha256": "86f4ba47e65102b7610a5289b3718e317ff4d73b8752d5f466c34b7c686ca8bf",
     "compile_log": "data/objects/users/00000000-0000-4000-8000-000000000001/projects/958e9e5a-b763-4b3a-a658-c0585117f29e/exports/v1/compile_log-f3e929408783.log",
     "expected_figure_count": 3,
-    "expected_pdf_blockers": ["figure_caption_count_mismatch"],
+    "expected_pdf_blockers": ["figure_caption_count_mismatch", "text_bounds_violation"],
     "observed_readiness_score": 42,
     "observed_pages": 9,
     "expected_blockers": [
@@ -35,7 +35,8 @@
       "core_claim_fulltext_missing",
       "sections_unapproved",
       "figures_after_references",
-      "figure_caption_count_mismatch"
+      "figure_caption_count_mismatch",
+      "text_bounds_violation"
     ]
   }
 ]

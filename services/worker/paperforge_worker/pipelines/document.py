@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from db import (
+    apply_generated_publication_metadata,
     create_document,
     get_cards,
+    get_project,
     get_writing_whitelist,
     latest_outline,
     list_entries,
@@ -37,6 +39,7 @@ from paper_ir import (
 from paper_ir.schema import Section as IRSection
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.pipelines.publication_metadata import generate_publication_metadata
 from paperforge_worker.pipelines.writing import (
     SectionDraft,
     WritingContext,
@@ -76,6 +79,7 @@ class WriteOutcome:
     polished_count: int = 0
     polish_pending_count: int = 0
     polish_skipped: bool = False
+    publication_metadata_generator: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -94,6 +98,7 @@ class WriteOutcome:
             # 否则「这稿为什么读起来不如上次连贯」将无从追溯。
             "polish_pending_count": self.polish_pending_count,
             "polish_skipped": self.polish_skipped,
+            "publication_metadata_generator": self.publication_metadata_generator,
         }
 
 
@@ -260,6 +265,56 @@ async def write_document(
                 order_no=order_no,
                 body_ir=ir_section.model_dump(mode="json") if ir_section else None,
                 whitelist=whitelist,
+            )
+
+    # 摘要在正文之后生成，并可能经过连贯性润色；必须使用这里的最终版本，避免
+    # 题名与关键词基于旧摘要。已有值视为用户编辑，自动流程只补空白，不覆盖。
+    abstract_draft = drafts.get("abstract")
+    abstract_text = (
+        " ".join(paragraph.get("text", "") for paragraph in abstract_draft.paragraphs).strip()
+        if abstract_draft is not None
+        else ""
+    )
+    if abstract_text:
+        async with context.session() as session:
+            project = await get_project(session, context.project_id)
+            needs_metadata = bool(
+                project
+                and (
+                    not (project.publication_title or "").strip()
+                    or not (project.keywords_json or [])
+                )
+            )
+            scope = {**outline, **dict(project.scope_json or {})} if project else dict(outline)
+            working_title = project.title if project else title
+        if needs_metadata:
+            generated = await generate_publication_metadata(
+                abstract=abstract_text,
+                project_title=working_title,
+                scope=scope,
+                language=language,
+                runner=runner,
+            )
+            async with context.session() as session:
+                project = await get_project(session, context.project_id)
+                if project is not None:
+                    title_added, keywords_added = await apply_generated_publication_metadata(
+                        session,
+                        project,
+                        title=generated.title,
+                        keywords=generated.keywords,
+                    )
+                else:
+                    title_added = keywords_added = False
+            outcome.publication_metadata_generator = generated.generator
+            await context.emit(
+                "publication_metadata.generated",
+                {
+                    "title_added": title_added,
+                    "keywords_added": keywords_added,
+                    "keyword_count": len(generated.keywords),
+                    "generator": generated.generator,
+                },
             )
 
     outcome.section_count = len(ordered)

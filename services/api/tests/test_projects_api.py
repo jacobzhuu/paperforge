@@ -256,6 +256,88 @@ def test_publication_metadata_is_separate_from_internal_project_title(client: Te
     assert changed.json()["metadata_confirmed"] is False
 
 
+def test_structured_authors_preserve_order_and_derive_legacy_names(client: TestClient) -> None:
+    project = _create_project(client)
+    details = [
+        {
+            "id": "grace",
+            "name": "Grace Hopper",
+            "affiliations": ["Yale University"],
+            "email": "grace@example.org",
+            "orcid": "0000-0002-1825-0097",
+            "corresponding": True,
+        },
+        {
+            "id": "ada",
+            "name": "Ada Lovelace",
+            "affiliations": ["Analytical Engine Lab"],
+            "corresponding": False,
+        },
+    ]
+    response = client.patch(
+        f"/api/v1/projects/{project['id']}",
+        json={"author_details": details, "metadata_confirmed": True},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["authors"] == ["Grace Hopper", "Ada Lovelace"]
+    assert [author["id"] for author in body["author_details"]] == ["grace", "ada"]
+    assert body["author_details"][0]["orcid"] == "0000-0002-1825-0097"
+
+    fetched = client.get(f"/api/v1/projects/{project['id']}").json()
+    assert fetched["authors"] == ["Grace Hopper", "Ada Lovelace"]
+    assert [author["name"] for author in fetched["author_details"]] == fetched["authors"]
+
+
+def test_project_rejects_conflicting_or_invalid_author_sources(client: TestClient) -> None:
+    project = _create_project(client)
+    both = client.patch(
+        f"/api/v1/projects/{project['id']}",
+        json={
+            "authors": ["Legacy Name"],
+            "author_details": [{"id": "new", "name": "Structured Name"}],
+        },
+    )
+    assert both.status_code == 422
+
+    missing_email = client.patch(
+        f"/api/v1/projects/{project['id']}",
+        json={
+            "author_details": [{"id": "corresponding", "name": "No Email", "corresponding": True}]
+        },
+    )
+    assert missing_email.status_code == 422
+
+    invalid_orcid = client.patch(
+        f"/api/v1/projects/{project['id']}",
+        json={
+            "author_details": [
+                {"id": "bad-orcid", "name": "Invalid", "orcid": "0000-0000-0000-0000"}
+            ]
+        },
+    )
+    assert invalid_orcid.status_code == 422
+
+
+def test_academic_profile_is_reusable_account_data(client: TestClient) -> None:
+    assert client.get("/api/v1/auth/me/academic-profile").json() == {"profile": None}
+    profile = {
+        "id": "identity",
+        "name": "Test Researcher",
+        "affiliations": ["Paper Forge Lab"],
+        "email": "researcher@example.org",
+        "orcid": "0000-0002-1825-0097",
+        "corresponding": True,
+    }
+    saved = client.patch(
+        "/api/v1/auth/me/academic-profile",
+        json={"profile": profile},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["profile"] == profile
+    assert client.get("/api/v1/auth/me/academic-profile").json()["profile"] == profile
+
+
 def test_claim_evidence_rejects_malformed_report_id(client: TestClient) -> None:
     project = _create_project(client)
     response = client.get(
@@ -374,9 +456,7 @@ def test_submission_quality_report_becomes_stale_after_section_edit(
                 "key": "s1",
                 "level": 1,
                 "title": "Body",
-                "blocks": [
-                    {"type": "paragraph", "runs": [{"t": "text", "v": "Revised body"}]}
-                ],
+                "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": "Revised body"}]}],
             },
             "expected_updated_at": updated_at.isoformat(),
         },
@@ -502,9 +582,7 @@ def test_skip_polish_flags_the_running_job(client: TestClient) -> None:
         json={"providers": ["openalex"]},
     ).json()
 
-    response = client.post(
-        f"/api/v1/projects/{project['id']}/jobs/{started['id']}/polish/skip"
-    )
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['id']}/polish/skip")
     assert response.status_code == 200
     assert response.json()["checkpoint"]["polish_skip"] is True
     # 幂等：重复点击不该报错。
@@ -515,9 +593,10 @@ def test_skip_polish_flags_the_running_job(client: TestClient) -> None:
         == 200
     )
     # 任务状态不变——跳过的是一道工序，不是取消任务。
-    assert client.get(f"/api/v1/projects/{project['id']}/jobs/{started['id']}").json()[
-        "status"
-    ] == "queued"
+    assert (
+        client.get(f"/api/v1/projects/{project['id']}/jobs/{started['id']}").json()["status"]
+        == "queued"
+    )
 
 
 def test_skip_polish_rejects_finished_and_foreign_jobs(
@@ -549,15 +628,11 @@ def test_skip_polish_rejects_finished_and_foreign_jobs(
 
     # 别的项目的任务不可跨项目操作。
     assert (
-        client.post(
-            f"/api/v1/projects/{other['id']}/jobs/{started['id']}/polish/skip"
-        ).status_code
+        client.post(f"/api/v1/projects/{other['id']}/jobs/{started['id']}/polish/skip").status_code
         == 404
     )
     assert (
-        client.post(
-            f"/api/v1/projects/{project['id']}/jobs/{uuid.uuid4()}/polish/skip"
-        ).status_code
+        client.post(f"/api/v1/projects/{project['id']}/jobs/{uuid.uuid4()}/polish/skip").status_code
         == 404
     )
 
@@ -1197,3 +1272,111 @@ def test_visual_draft_survives_intents_that_hit_the_ai_image_guardrail(
     )
     assert response.status_code == 200, response.text
     assert response.json()["spec"]["kind"] == "ai_image"
+
+
+def test_visual_draft_matches_real_section_content_instead_of_first_section(
+    client: TestClient, clean_pg_database_url
+) -> None:
+    project = _create_project(client)
+
+    async def _seed_sections(session):
+        document = await create_document(
+            session, project_id=uuid.UUID(project["id"]), outline_id=None
+        )
+        for order, key, title, body_text in [
+            (0, "background", "研究背景", "这里讨论文献范围和研究问题。"),
+            (1, "mechanism", "作用机制", "根系断裂后，防御方法会改变应力传递路径。"),
+        ]:
+            await upsert_section(
+                session,
+                document_id=document.id,
+                section_key=key,
+                title=title,
+                order_no=order,
+                body_ir={
+                    "key": key,
+                    "level": 1,
+                    "title": title,
+                    "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": body_text}]}],
+                },
+                cite_keys=[],
+            )
+
+    seed(clean_pg_database_url, _seed_sections)
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/draft",
+        json={"kind": "auto", "intent": "展示根系断裂与防御方法的关系"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["target_section_key"] == "mechanism"
+    assert "根系断裂" in body["context_summary"]
+    assert body["suggested_block_index"] == 1
+    assert body["kind"] == "diagram"
+
+
+def test_visual_auto_selects_traceable_chart_but_never_invents_one_without_data(
+    client: TestClient, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("STORAGE_FS_ROOT", str(tmp_path))
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    with_data = _create_project(client, paper_type="original")
+    upload = client.post(
+        f"/api/v1/projects/{with_data['id']}/assets",
+        files={"file": ("results.csv", b"method,score\nA,0.8\nB,0.9\n", "text/csv")},
+    )
+    assert upload.status_code == 201, upload.text
+    chart = client.post(
+        f"/api/v1/projects/{with_data['id']}/visuals/draft",
+        json={"kind": "auto", "intent": "比较不同方法的性能"},
+    )
+    assert chart.status_code == 200, chart.text
+    assert chart.json()["kind"] == "chart"
+    assert chart.json()["spec"]["source_asset_ref"] == upload.json()["asset_ref"]
+
+    without_data = _create_project(client, title="No data")
+    fallback = client.post(
+        f"/api/v1/projects/{without_data['id']}/visuals/draft",
+        json={"kind": "chart", "intent": "比较不同方法的性能"},
+    )
+    assert fallback.status_code == 200, fallback.text
+    assert fallback.json()["kind"] == "diagram"
+    assert "避免编造数据" in fallback.json()["warnings"][0]
+
+
+def test_visual_natural_language_revision_creates_a_new_version(client: TestClient) -> None:
+    project = _create_project(client)
+    original = client.post(
+        f"/api/v1/projects/{project['id']}/visuals",
+        json={
+            "title": "研究流程",
+            "caption": "研究流程",
+            "alt_text": "三阶段研究流程",
+            "spec": {
+                "kind": "diagram",
+                "direction": "TB",
+                "nodes": [
+                    {"id": "n1", "label": "输入"},
+                    {"id": "n2", "label": "处理"},
+                    {"id": "n3", "label": "输出"},
+                ],
+                "edges": [
+                    {"source": "n1", "target": "n2"},
+                    {"source": "n2", "target": "n3"},
+                ],
+            },
+        },
+    )
+    assert original.status_code == 201, original.text
+    revised = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/{original.json()['id']}/regenerate",
+        json={"revision_instruction": "改成横向"},
+    )
+    assert revised.status_code == 201, revised.text
+    body = revised.json()
+    assert body["id"] != original.json()["id"]
+    assert body["version"] == original.json()["version"] + 1
+    assert body["supersedes_id"] == original.json()["id"]
+    assert body["spec"]["direction"] == "LR"

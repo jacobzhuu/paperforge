@@ -58,6 +58,20 @@ def render_markdown(
     parts: list[str] = [f"# {ir.meta.title}".rstrip()]
     if ir.meta.authors:
         parts.append("*" + ", ".join(ir.meta.authors) + "*")
+    affiliations: list[str] = []
+    for author in ir.meta.author_details:
+        for affiliation in author.affiliations:
+            if affiliation not in affiliations:
+                affiliations.append(affiliation)
+    if affiliations:
+        parts.append("<small>" + " · ".join(affiliations) + "</small>")
+    corresponding = [
+        f"{author.name} ({author.email})"
+        for author in ir.meta.author_details
+        if author.corresponding and author.email
+    ]
+    if corresponding:
+        parts.append("<small>Corresponding author: " + ", ".join(corresponding) + "</small>")
     if ir.meta.abstract:
         heading = "摘要" if ir.meta.language == "zh" else "Abstract"
         parts.append(f"**{heading}**　{ir.meta.abstract}")
