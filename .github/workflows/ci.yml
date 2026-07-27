@@ -26,6 +26,10 @@ jobs:
       PAPERFORGE_TEST_DATABASE_URL: postgresql+asyncpg://paperforge:paperforge@localhost:5432/paperforge_test
     steps:
       - uses: actions/checkout@v4
+      # visuald 用 graphviz 渲染示意图。不装的话 test_grouped_diagram_renders_all_formats
+      # 会一直静默 skip——「带分组的示意图生成非法 DOT」正是这样躲过 CI 的。
+      - name: Install graphviz
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends graphviz
       - name: Install uv
         uses: astral-sh/setup-uv@v3
         with:

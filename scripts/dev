@@ -9,6 +9,7 @@ LOG_DIR="${STATE_DIR}/logs"
 WEB_URL="${PAPERFORGE_WEB_URL:-http://localhost:3000}"
 API_URL="${PAPERFORGE_API_URL:-http://localhost:8080}"
 TEXD_URL="${PAPERFORGE_TEXD_URL:-http://localhost:8081}"
+VISUALD_URL="${PAPERFORGE_VISUALD_URL:-http://localhost:8082}"
 POSTGRES_HOST_PORT="${PAPERFORGE_POSTGRES_PORT:-15432}"
 REDIS_HOST_PORT="${PAPERFORGE_REDIS_PORT:-16379}"
 MINIO_API_HOST_PORT="${PAPERFORGE_MINIO_API_PORT:-19000}"
@@ -264,6 +265,16 @@ up() {
   echo "Starting Docker services..."
   "${COMPOSE[@]}" up -d --build
 
+  # Host services must never start against an older schema: the API can otherwise boot and
+  # fail only when a newly added endpoint first touches its table (for example account signup).
+  wait_postgres
+  echo "Applying database migrations..."
+  (
+    cd "${ROOT_DIR}"
+    DATABASE_URL="postgresql+asyncpg://paperforge:paperforge@localhost:${POSTGRES_HOST_PORT}/paperforge" \
+      uv run alembic upgrade head
+  )
+
   start_process api "${ROOT_DIR}" \
     env \
       API_HOST=127.0.0.1 \
@@ -271,18 +282,19 @@ up() {
       DATABASE_URL="postgresql+asyncpg://paperforge:paperforge@localhost:${POSTGRES_HOST_PORT}/paperforge" \
       REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" \
       MINIO_ENDPOINT="localhost:${MINIO_API_HOST_PORT}" \
+      VISUALD_URL="${VISUALD_URL}" \
       uv run paperforge-api
   start_process worker "${ROOT_DIR}" \
-    env REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" \
+    env REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" VISUALD_URL="${VISUALD_URL}" \
       uv run arq paperforge_worker.worker.WorkerSettings
   start_process web "${ROOT_DIR}/apps/web" \
     "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port 3000
 
   echo "Waiting for health checks..."
-  wait_postgres
   wait_redis
   wait_http minio "${MINIO_API_URL}/minio/health/live"
   wait_http texd "${TEXD_URL}/healthz"
+  wait_http visuald "${VISUALD_URL}/healthz"
   wait_http api "${API_URL}/healthz"
   wait_http web "${WEB_URL}"
   managed_process_is_running worker
@@ -294,6 +306,7 @@ up() {
   echo "API:     ${API_URL}"
   echo "Metrics: ${API_URL}/metrics"
   echo "MinIO:   ${MINIO_CONSOLE_URL}"
+  echo "Visuals: ${VISUALD_URL}"
   echo
   echo "Stop everything with: ./scripts/dev down"
   echo "Inspect status with:   ./scripts/dev status"

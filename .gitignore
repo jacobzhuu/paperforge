@@ -35,3 +35,6 @@ progress.md
 findings.md
 _tmp_*
 apps/web/_tmp_*
+
+# Local research notes / tool outputs (not project code)
+本周研究汇报_*.md

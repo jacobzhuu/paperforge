@@ -1,5 +1,5 @@
 # PaperForge 基建编排（裁剪自 DeepSearch infra：去 OpenSearch/SearXNG/caddy/grafana）
-# 用途：本地一键起 postgres + redis + minio + texd。应用服务(api/worker)本地运行或另行容器化。
+# 用途：本地一键起 postgres + redis + minio + texd + visuald。应用服务(api/worker)本地运行或另行容器化。
 name: paperforge
 
 services:
@@ -59,11 +59,40 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      # Tectonic 的包缓存必须可写。read_only 根文件系统下，缓存**未命中**时
+      # Tectonic 连临时文件都建不了，于是 BibTeX 打不开 .bst——PDF 照样产出，
+      # 但全文引用变成 [?]，日志里只有一行 warning。命名卷首次挂载会用镜像里
+      # 构建期预热好的缓存做种，因此既保住预热成果，又让未命中不再是硬失败。
+      - texdcache:/root/.cache/Tectonic
+      # fontconfig 同样要写缓存（否则每次编译刷四行 "No writable cache directories"）。
+      - texdfontcache:/var/cache/fontconfig
     networks:
       - texd_isolated
       - texd_ingress
     mem_limit: 1g
     cpus: 1.0
+
+  # 结构化视觉渲染沙箱：只接受 ChartSpec/DiagramSpec/图片字节，不执行用户代码。
+  visuald:
+    build:
+      context: ..
+      dockerfile: services/visuald/Dockerfile
+    ports:
+      - "127.0.0.1:8082:8082"
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - visuald_isolated
+      - visuald_ingress
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 networks:
   texd_isolated:
@@ -75,8 +104,17 @@ networks:
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
       com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+  visuald_isolated:
+    internal: true
+  visuald_ingress:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
 
 volumes:
   pgdata:
   redisdata:
   miniodata:
+  texdcache:
+  texdfontcache:

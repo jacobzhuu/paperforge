@@ -1,0 +1,19 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": [
+        "--dir",
+        "apps/web",
+        "dev"
+      ],
+      "port": 3000,
+      "autoPort": true,
+      "env": {
+        "NEXT_PUBLIC_API_BASE": "http://localhost:8090"
+      }
+    }
+  ]
+}
