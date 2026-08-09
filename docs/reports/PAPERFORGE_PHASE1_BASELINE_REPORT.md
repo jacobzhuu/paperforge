@@ -326,7 +326,13 @@ in §10 with a ready-to-apply remedy.
 
 ## 10. Remaining blockers
 
-### B-1 — `alembic check` fails on pre-existing index drift *(must fix before CI can be green)*
+> **Status update (2026-08-09, Phase 1.5 baseline closure).**
+> **B-1 is RESOLVED** by migration `0022_index_alignment` (commit `4451d46`); `alembic check` now
+> exits 0. The analysis below is retained as the historical record of how the drift was found.
+> **B-2 remains open** — see §10.B-2 for its current state.
+> **B-3** stays withdrawn. **B-4** remains an open observation tracked as plan item P1-1.
+
+### B-1 — `alembic check` fails on pre-existing index drift *(RESOLVED — see §15)*
 
 **Owner:** engineering. **Effort:** ~2 hours.
 
@@ -465,5 +471,77 @@ image was rebuilt. The stack running now is the same one that was running before
 ## 14. Recommended next step
 
 Fix **B-1** (index drift) and resolve **B-2** (remote), then confirm CI green. Only then start
-Phase 2 (LLM structured extraction) — it introduces migration `0022`, and starting it while
+Phase 2 (LLM structured extraction) — it introduces a new migration, and starting it while
 `alembic check` is red would make future drift indistinguishable from the pre-existing kind.
+
+*(B-1 was subsequently closed — see §15.)*
+
+---
+
+## 15. Phase 1.5 — baseline closure (2026-08-09)
+
+A follow-up pass addressing only the two blockers above. No pipeline behaviour changed.
+
+### 15.1 B-1 — index drift: RESOLVED
+
+Migration **`0022_index_alignment`** (commit `4451d46`), 7 index operations, nothing else.
+
+Autogenerate proposed exactly the 7 drift operations and no extras, confirming the drift was
+index-only. The generated file was then rewritten by hand to (a) use `ALTER INDEX … RENAME` for the
+name-only mismatch instead of drop + recreate, (b) guard every statement with `IF EXISTS` /
+`IF NOT EXISTS` for blue/green safety, and (c) document the reasoning per item.
+
+| # | Operation | Why |
+|---|---|---|
+| 1 | rename `ix_claim_evidence_user_asset_id` → `ix_claim_evidence_anchor_user_asset_id` | name-only mismatch; the model's `index=True` auto-names after the table, and the six sibling indexes already follow that convention. Renamed, not rebuilt — identical definition, atomic catalog op. |
+| 2 | create `ix_eligibility_decision_project_id` | CASCADE FK; migration `0012` created only the composite + unique constraint |
+| 3 | create `ix_eligibility_decision_work_id` | CASCADE FK with **no** covering index at all |
+| 4 | drop `ix_evidence_unit_task_topical` | serves no query — `topical_status` never appears in a WHERE clause, and `EvidenceUnit.task_id` is filtered in Python by `qmatrix._rank_candidates`, not SQL. Dropping also removes write amplification during bulk EVIDENCE inserts. |
+| 5 | create `ix_evidence_unit_task_id` | the single-column FK index the model actually declares |
+| 6 | create `ix_research_question_task_id` | declared by the model, never created; 52 rows so near-free |
+
+Plain `CREATE INDEX`, not `CONCURRENTLY`: the affected tables hold 5,190 / 5,966 / 7,328 / 52 rows,
+so creation is milliseconds, whereas `CONCURRENTLY` requires escaping the migration transaction and
+can leave `INVALID` indexes behind.
+
+**Verification**
+
+| Check | Result |
+|---|---|
+| `alembic upgrade head` | exit 0 |
+| `alembic check` | **exit 0 — "No new upgrade operations detected"** |
+| `alembic downgrade -1` | exit 0; restores exactly `ix_claim_evidence_user_asset_id` + `ix_evidence_unit_task_topical` and nothing else |
+| re-`upgrade` after downgrade | exit 0, check still clean (guards are idempotent) |
+| `upgrade head` from an **empty** database | 22 migrations, check clean |
+| `pytest` | **764 passed, 4 skipped** — byte-identical to the Phase 1 baseline |
+| `vitest` / `tsc` / `ruff` / ontology lint | 129 passed / exit 0 / exit 0 / exit 0 |
+
+Production was never contacted; all verification ran on a disposable `postgres:16-alpine`
+(`pf-p15-db`, `127.0.0.1:15433`, no bind mounts, removed afterwards).
+
+**Numbering note.** This migration took revision `0022`, which
+`docs/plans/PAPERFORGE_P0_REMEDIATION_PLAN.md` had reserved for Phase 2. The plan was updated: Phase
+2–5 now allocate `0023`–`0026`.
+
+**Rollback:** `alembic downgrade 0021_question_locking`, then `git revert 4451d46`. Verified to
+restore the exact prior index set.
+
+### 15.2 B-2 — remote and CI: still open
+
+Re-checked on 2026-08-09; the prerequisites are unchanged:
+
+| Prerequisite | State |
+|---|---|
+| `git remote` | none configured |
+| `gh` CLI | **not installed** |
+| SSH keys | none |
+| Credential helper | none |
+| `GH_TOKEN` / `GITHUB_TOKEN` | not set |
+| Outbound to GitHub | **OK** — `github.com` and `api.github.com` both return 200, and `git ls-remote` over HTTPS succeeds, via the proxy already configured in the environment |
+
+So the network path is fine; only the identity is missing. Agreed approach: the operator installs
+and authenticates `gh`, supplies the URL of an existing **public** repository, and the push is then
+performed from this session. Public visibility means CI status can be read back through the
+unauthenticated GitHub Actions API.
+
+Nothing about B-2 has been faked: no remote was added, no push attempted, no CI run claimed.

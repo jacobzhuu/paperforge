@@ -90,7 +90,7 @@ Every phase must preserve, and each phase's tests must assert, the following:
 | **Export pipeline** | `export.py`, `ExportArtifact` binding | No phase changes `export_document`, IR shape, or artifact binding. |
 | **Blue/green safety** | `AGENTS.md`, `models/paper.py:555` | All migrations additive with server defaults; an older worker must remain able to write. No column drops in P0. |
 
-**Migration numbering.** Head is `0021_question_locking`. This plan allocates `0022`…`0025`.
+**Migration numbering.** Head is `0022_index_alignment` (the Phase 1.5 baseline-closure migration, which took the number this plan originally reserved for Phase 2). This plan allocates `0023`…`0026`.
 
 **LLM role registration.** New roles are a data change: add to `DEFAULT_ROLE_MODELS` and `ROLE_MODEL_FALLBACKS` in `llm_runtime/config.py`, following the existing `evidence_classifier` / `evidence_classifier_fallback` precedent (`config.py:18-29`). No env-file change is required for existing deployments.
 
@@ -202,7 +202,7 @@ The regex extractor never sets `split` and rarely sets `task`. Therefore essenti
 | `packages/db/db/repositories/evidence.py` | `upsert_evidence_measurement` gains `extraction_source` and `protocol` passthrough (already accepts `protocol`) |
 | `services/worker/paperforge_worker/config.py` | flags (§2.7) |
 | `services/worker/paperforge_worker/worker.py` | `_STAGE_PROGRESS` unchanged — extraction runs *inside* the existing `evidence` stage |
-| `packages/db/migrations/versions/0022_experiment_extraction_provenance.py` | new |
+| `packages/db/migrations/versions/0023_experiment_extraction_provenance.py` | new |
 
 ### 2.3 Components reused
 
@@ -216,7 +216,7 @@ The regex extractor never sets `split` and rarely sets `task`. Therefore essenti
 | `comparability_key` | unchanged — it becomes *effective* once dimensions are filled |
 | `_fulltext_grade` | remains the sole grade authority |
 
-### 2.4 Schema / migration changes — `0022_experiment_extraction_provenance`
+### 2.4 Schema / migration changes — `0023_experiment_extraction_provenance`
 
 All additive, all nullable, all safe for an older worker:
 
@@ -342,7 +342,7 @@ Cells failing 1 or 2 are **discarded** into `rejected`. Cells failing 3 are pers
 
 ### 2.8 Migration and rollout
 
-1. Ship migration `0022` and the code with `EXPERIMENT_EXTRACTION_MODE=off`. Verify zero behaviour change (regression suite).
+1. Ship migration `0023` and the code with `EXPERIMENT_EXTRACTION_MODE=off`. Verify zero behaviour change (regression suite).
 2. Flip to `shadow` on the deployment. Run ≥5 review projects across ≥3 domains.
 3. Measure (SQL over `experiment_result`): locator-verification rate, cells/work, `task`+`dataset`+`split` completeness, conflict rate.
 4. Gate: proceed only if **locator-verified ≥ 80%** and **hard value conflicts < 2%**.
@@ -360,7 +360,7 @@ Cells failing 1 or 2 are **discarded** into `rejected`. Cells failing 3 are pers
 
 ### 2.10 Rollback
 
-Set `EXPERIMENT_EXTRACTION_MODE=off` and re-roll. No data cleanup required: `experiment_v3_llm` rows are inert when the flag is off because `EvidenceMeasurement` writes revert to the regex path. Migration `0022` is additive with defaults and need not be reversed. If a full revert is wanted, `DELETE FROM structured_extraction WHERE schema_version='experiment_v3_llm'` cascades to its `ExperimentResult` rows.
+Set `EXPERIMENT_EXTRACTION_MODE=off` and re-roll. No data cleanup required: `experiment_v3_llm` rows are inert when the flag is off because `EvidenceMeasurement` writes revert to the regex path. Migration `0023` is additive with defaults and need not be reversed. If a full revert is wanted, `DELETE FROM structured_extraction WHERE schema_version='experiment_v3_llm'` cascades to its `ExperimentResult` rows.
 
 ### 2.11 Scope
 
@@ -384,7 +384,7 @@ Set `EXPERIMENT_EXTRACTION_MODE=off` and re-roll. No data cleanup required: `exp
 | `services/api/paperforge_api/admin.py` | `paperforge-admin tasks {list,upsert,export}` |
 | **new** `packages/db/db/seeds/task_definitions.json` | canonical seed, loaded by the admin CLI |
 | `scripts/ontology_literal_lint.py` | extend `FORBIDDEN`; add `evidence.py`'s vocabulary sites to `TARGETS` |
-| `packages/db/migrations/versions/0023_task_vocabulary.py` | new |
+| `packages/db/migrations/versions/0024_task_vocabulary.py` | new |
 
 ### 3.2 Components reused
 
@@ -394,7 +394,7 @@ Set `EXPERIMENT_EXTRACTION_MODE=off` and re-roll. No data cleanup required: `exp
 - `replace_project_task_profile` (`questions.py:169`) — already written; wire it to the profile-assignment path.
 - `infer_task_id` / `topical_status` — unchanged.
 
-### 3.3 Schema / migration changes — `0023_task_vocabulary`
+### 3.3 Schema / migration changes — `0024_task_vocabulary`
 
 ```
 ALTER TABLE task_definition
@@ -467,7 +467,7 @@ The vocabulary extraction itself needs no flag — it is a pure refactor from li
 
 ### 3.7 Migration and rollout
 
-1. Ship `0023` with backfill and the `generic.scholarly` row.
+1. Ship `0024` with backfill and the `generic.scholarly` row.
 2. Ship the vocabulary refactor with `TASK_PROFILE_FALLBACK=all_tasks`. Assert equivalence: for a project bound to the recsys tasks, `_structured_payload` output is identical pre/post refactor (golden-file test).
 3. Ship the admin CLI; export current state to `packages/db/db/seeds/task_definitions.json` and commit it.
 4. Extend the ontology lint; make it blocking in CI.
@@ -485,7 +485,7 @@ The vocabulary extraction itself needs no flag — it is a pure refactor from li
 
 ### 3.9 Rollback
 
-- Vocabulary refactor: revert the commit; `0023`'s column becomes unread. No data loss.
+- Vocabulary refactor: revert the commit; `0024`'s column becomes unread. No data loss.
 - `TASK_PROFILE_FALLBACK`: flip back to `all_tasks` — pure config, no re-roll of data.
 - The `generic.scholarly` row is inert under `all_tasks`.
 
@@ -516,7 +516,7 @@ This preserves `readiness.py`'s inputs exactly — `evaluate_evidence_readiness`
 | `packages/llm_runtime/llm_runtime/config.py` | role `synthesizer` (fallback `planner`) |
 | `services/worker/paperforge_worker/pipelines/outline.py` | `question_driven_sections` passes `synthesis_narrative` into section payload |
 | `services/worker/paperforge_worker/pipelines/writing.py` | `_evidence_context_block` renders the narrative as a `[SYNTHESIS]` block |
-| `packages/db/migrations/versions/0024_question_synthesis.py` | new |
+| `packages/db/migrations/versions/0025_question_synthesis.py` | new |
 | `services/worker/paperforge_worker/config.py` | flag |
 
 ### 4.3 Components reused
@@ -529,7 +529,7 @@ This preserves `readiness.py`'s inputs exactly — `evaluate_evidence_readiness`
 | `outline.question_driven_sections` | already carries `stance_summary`, `comparison_clusters`, `not_comparable_groups` per section |
 | `_run_stage("synth", …)` | unchanged; enrichment happens inside |
 
-### 4.4 Schema / migration changes — `0024_question_synthesis`
+### 4.4 Schema / migration changes — `0025_question_synthesis`
 
 ```
 CREATE TABLE question_synthesis (
@@ -612,7 +612,7 @@ Off ⇒ `_synthesize_bundle` output is byte-identical to today.
 
 ### 4.8 Migration and rollout
 
-1. Ship `0024` + code, flag off. Regression suite must show zero diff.
+1. Ship `0025` + code, flag off. Regression suite must show zero diff.
 2. Enable on the deployment for review projects. Inspect `question_synthesis` rows manually for 3 topics against their bundles — specifically: does any `conflict` entry survive validation, and is it a real conflict?
 3. Compare prose before/after on the same library (the `evals/review_depth` `g3_ablation_manifest.json` already defines `legacy` vs `problem_driven` conditions for exactly this comparison).
 4. Enable by default once cluster-level conflict assertions are verified sound.
@@ -661,11 +661,11 @@ The work is: **widen the gate, add demotion, add caching, add observability.**
 | `services/worker/paperforge_worker/pipelines/quality.py` | generalize the verifier; `_cross_language_evidence_candidates` → `_entailment_candidates`; `_support_score` demoted to pre-filter; wire demotion |
 | `services/worker/paperforge_worker/worker.py` | `_quality` calls the generalized verifier; emit `quality.entailment_verification` |
 | `packages/db/db/repositories/quality.py` | verdict cache read/write |
-| `packages/db/migrations/versions/0025_claim_entailment.py` | new |
+| `packages/db/migrations/versions/0026_claim_entailment.py` | new |
 | `services/worker/paperforge_worker/config.py` | flags |
 | `apps/web/components/writing/validation-panel.tsx`, `apps/web/lib/types.ts` | surface verdict + reason |
 
-### 5.3 Schema / migration changes — `0025_claim_entailment`
+### 5.3 Schema / migration changes — `0026_claim_entailment`
 
 ```
 ALTER TABLE claim_evidence_anchor
@@ -768,7 +768,7 @@ In `enforce` mode, `supported` requires `located ∧ grade_ok ∧ comparability_
 
 ### 5.8 Migration and rollout
 
-1. Ship `0025` + generalized verifier with `CLAIM_ENTAILMENT_MODE=off`. Regression: identical behaviour, including the existing cross-language promotion tests (which must still pass through the generalized path).
+1. Ship `0026` + generalized verifier with `CLAIM_ENTAILMENT_MODE=off`. Regression: identical behaviour, including the existing cross-language promotion tests (which must still pass through the generalized path).
 2. `shadow` on the deployment. Collect ≥500 verdicts across ≥10 projects.
 3. **Measure the disagreement rate** — the key number this whole plan turns on: of anchors currently `supported` by the 12% lexical rule, what fraction does the verifier judge `unsupported`/`contradicted` at ≥0.85 confidence? Publish it. It quantifies §4.1's severity with real data.
 4. `promote_only` (default). Verify no regression in `readiness_status` distribution.
@@ -791,7 +791,7 @@ In `enforce` mode, `supported` requires `located ∧ grade_ok ∧ comparability_
 
 - `enforce` → `promote_only` is a config flip, no re-roll of data. Reports already written keep their `readiness_status`; they are snapshot-bound and remain internally consistent.
 - Full disable: `off`. Anchor columns become null-filled; the Validation Panel already renders optional fields.
-- `0025` is additive; no reversal needed.
+- `0026` is additive; no reversal needed.
 
 ### 5.11 Scope
 
