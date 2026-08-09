@@ -435,6 +435,12 @@ class ExperimentResult(Base, TimestampMixin):
     __tablename__ = "experiment_result"
     __table_args__ = (
         Index("ix_experiment_result_comparability", "comparability_key"),
+        # 影子模式按 (抽取, 来源) 统计定位核验率，这是唯一的查询形状。
+        Index(
+            "ix_experiment_result_extraction_source",
+            "structured_extraction_id",
+            "extraction_source",
+        ),
         UniqueConstraint(
             "structured_extraction_id",
             "metric_name",
@@ -498,6 +504,13 @@ class ExperimentResult(Base, TimestampMixin):
     comparability_key: Mapped[str] = mapped_column(String(40), nullable=False)
     source_location: Mapped[str] = mapped_column(Text, nullable=False)
     anchor_strength: Mapped[str | None] = mapped_column(String(24))
+    # regex | llm | reconciled —— 这一行的维度是谁读出来的。
+    extraction_source: Mapped[str | None] = mapped_column(String(24))
+    # source_location 是否真的落在本文档的某个 DocumentChunk 上。
+    # 模型回填的定位符可能指向不存在的页/表；未核验的单元格不得进入跨研究比较。
+    locator_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # {字段: {"regex": x, "llm": y}}——两条抽取路径对同一格给出不同维度时的留痕。
+    extraction_conflict_json: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class EvidenceUnit(Base, TimestampMixin):
@@ -583,3 +596,6 @@ class EvidenceMeasurement(Base, TimestampMixin):
     sample_size: Mapped[int | None] = mapped_column(Integer)
     split: Mapped[str | None] = mapped_column(String(128))
     comparability_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    # 与 ExperimentResult 同义：维度来源，以及定位符是否核验过。
+    extraction_source: Mapped[str | None] = mapped_column(String(24))
+    locator_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

@@ -217,6 +217,8 @@ async def upsert_evidence_measurement(
     victim_model: str | None = None,
     attack_budget: dict | None = None,
     protocol: dict | None = None,
+    extraction_source: str | None = None,
+    locator_verified: bool = False,
 ) -> EvidenceMeasurement:
     key = comparability_key(
         task=task,
@@ -272,6 +274,8 @@ async def upsert_evidence_measurement(
     measurement.sample_size = sample_size
     measurement.split = split
     measurement.comparability_key = key
+    measurement.extraction_source = extraction_source
+    measurement.locator_verified = locator_verified
     await session.flush()
     return measurement
 
@@ -334,6 +338,8 @@ def evidence_payload(
                     "sample_size",
                     "split",
                     "comparability_key",
+                    "extraction_source",
+                    "locator_verified",
                 )
             }
             for item in measurements or []

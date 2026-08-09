@@ -17,6 +17,7 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
     "verifier": "gpt-4o-mini",
     "evidence_classifier": "gpt-4o-mini",
     "evidence_classifier_fallback": "gpt-4o",
+    "experiment_extractor": "gpt-4o-mini",
 }
 
 # New semantic roles inherit the deployment's existing model tiers unless an
@@ -26,6 +27,9 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
 ROLE_MODEL_FALLBACKS: dict[str, str] = {
     "evidence_classifier": "extractor",
     "evidence_classifier_fallback": "planner",
+    # 结构化实验抽取和卡片抽取一样是「按封闭 schema 读文本」，不是规划或写作，
+    # 因此沿用部署已有的 extractor 档位，旧 env 文件无需改动。
+    "experiment_extractor": "extractor",
 }
 
 # DeepSeek V4 defaults to high-effort thinking.  That is useful for planning and

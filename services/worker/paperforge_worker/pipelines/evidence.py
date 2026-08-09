@@ -17,6 +17,7 @@ from db import (
     upsert_evidence_unit,
 )
 from db.models.library import (
+    DocumentChunk,
     DocumentFile,
     DocumentParse,
     ExperimentResult,
@@ -37,6 +38,13 @@ from ingest import classify_content_role, parse_markdown_table
 from sqlalchemy import select
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.pipelines.experiment_extraction import (
+    ExperimentExtraction,
+    ExtractedResultCell,
+    build_locator_index,
+    extract_experiment_results,
+    reconcile,
+)
 from paperforge_worker.pipelines.fulltext import load_persisted_fulltext_sources
 
 MAX_EVIDENCE_UNITS_PER_WORK = 32
@@ -104,6 +112,13 @@ class EvidenceOutcome:
     reused: int = 0
     measurements: int = 0
     grades: dict[str, int] = field(default_factory=dict)
+    # LLM 结构化抽取（Phase 2）。off 档下全部为零，payload 形状不变。
+    llm_extraction_works: int = 0
+    llm_cells_accepted: int = 0
+    llm_cells_locator_verified: int = 0
+    llm_cells_rejected: int = 0
+    llm_value_conflicts: int = 0
+    llm_budget_skipped: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -122,6 +137,19 @@ class EvidenceOutcome:
             "reused": self.reused,
             "measurements": self.measurements,
             "grades": self.grades,
+            "llm_extraction": {
+                "works": self.llm_extraction_works,
+                "cells_accepted": self.llm_cells_accepted,
+                "cells_locator_verified": self.llm_cells_locator_verified,
+                "cells_rejected": self.llm_cells_rejected,
+                "value_conflicts": self.llm_value_conflicts,
+                "budget_skipped": self.llm_budget_skipped,
+                "locator_verification_rate": (
+                    self.llm_cells_locator_verified / self.llm_cells_accepted
+                    if self.llm_cells_accepted
+                    else 0.0
+                ),
+            },
         }
 
 
@@ -171,6 +199,12 @@ async def extract_evidence_units(
         task_specs = await list_project_task_specs(session, context.project_id)
     metric_pattern = compile_metric_pattern(metrics_for_tasks(task_specs))
     dataset_pattern = compile_dataset_pattern(datasets_for_tasks(task_specs))
+    # LLM 抽取按 job 计预算，用完的文献静默退回纯正则路径（并计数留痕）。
+    llm_budget = (
+        int(context.settings.experiment_extraction_max_works)
+        if context.settings.experiment_extraction_enabled
+        else 0
+    )
     for index, (_entry, work) in enumerate(entries):
         fulltext = fulltexts.get(str(work.id))
         persisted_source = persisted_sources.get(str(work.id))
@@ -189,6 +223,7 @@ async def extract_evidence_units(
                 tasks=task_specs,
                 metric_pattern=metric_pattern,
                 dataset_pattern=dataset_pattern,
+                llm_budget_remaining=llm_budget,
             )
         except Exception as error:  # noqa: BLE001 - one bad paper must not abort evidence coverage
             outcome.works_failed += 1
@@ -204,6 +239,7 @@ async def extract_evidence_units(
             )
         else:
             _merge_evidence_outcome(outcome, work_outcome)
+            llm_budget = max(0, llm_budget - work_outcome.llm_extraction_works)
         if index % 5 == 0:
             await context.emit(
                 "evidence.progress",
@@ -229,6 +265,12 @@ def _merge_evidence_outcome(target: EvidenceOutcome, source: EvidenceOutcome) ->
     target.created += source.created
     target.reused += source.reused
     target.measurements += source.measurements
+    target.llm_extraction_works += source.llm_extraction_works
+    target.llm_cells_accepted += source.llm_cells_accepted
+    target.llm_cells_locator_verified += source.llm_cells_locator_verified
+    target.llm_cells_rejected += source.llm_cells_rejected
+    target.llm_value_conflicts += source.llm_value_conflicts
+    target.llm_budget_skipped += source.llm_budget_skipped
     for grade, count in source.grades.items():
         target.grades[grade] = target.grades.get(grade, 0) + count
 
@@ -243,6 +285,7 @@ async def _extract_work_evidence(
     tasks: list[TaskSpec],
     metric_pattern: re.Pattern[str],
     dataset_pattern: re.Pattern[str] | None,
+    llm_budget_remaining: int = 0,
 ) -> EvidenceOutcome:
     """Extract one work in isolation so a malformed source cannot stop the stage."""
     outcome = EvidenceOutcome()
@@ -307,6 +350,7 @@ async def _extract_work_evidence(
                     task=measurement.task,
                     sample_size=measurement.sample_size,
                     split=measurement.split,
+                    extraction_source="regex",
                 )
                 outcome.measurements += 1
         outcome.units += 1
@@ -320,19 +364,175 @@ async def _extract_work_evidence(
         }:
             outcome.usable_units += 1
     outcome.usable_works = int(outcome.usable_units > 0)
-    if document is not None and fulltext:
-        await _persist_structured_experiment_data(
+    if document is None or not fulltext:
+        return outcome
+
+    extraction: ExperimentExtraction | None = None
+    settings = context.settings
+    if settings.experiment_extraction_enabled:
+        if llm_budget_remaining <= 0:
+            outcome.llm_budget_skipped = 1
+        else:
+            extraction = await _llm_structured_extraction(
+                context,
+                document=document,
+                fulltext=fulltext,
+            )
+            if extraction is not None:
+                outcome.llm_extraction_works = 1
+                outcome.llm_cells_accepted = extraction.accepted_count
+                outcome.llm_cells_locator_verified = extraction.verified_count
+                outcome.llm_cells_rejected = len(extraction.rejected)
+                if extraction.rejected and not extraction.cells:
+                    context.warn(
+                        "evidence.llm_extraction_rejected",
+                        "all_cells_rejected",
+                        {
+                            "work_id": str(work.id),
+                            "reasons": extraction.to_payload()["rejection_reasons"],
+                        },
+                    )
+
+    conflicts = await _persist_structured_experiment_data(
+        context,
+        work_id=work.id,
+        document=document,
+        fulltext=fulltext,
+        candidates=candidates[:MAX_EVIDENCE_UNITS_PER_WORK],
+        evidence_unit_ids=unit_ids_by_text,
+        tasks=tasks,
+        metric_pattern=metric_pattern,
+        dataset_pattern=dataset_pattern,
+        llm_extraction=extraction,
+    )
+    outcome.llm_value_conflicts = len(conflicts)
+    if conflicts:
+        await context.emit(
+            "evidence.extraction_conflict",
+            {"work_id": str(work.id), "conflicts": conflicts[:5], "total": len(conflicts)},
+            stage="evidence",
+        )
+
+    # ``on`` 档才让模型读出的维度进入 EvidenceMeasurement——那是 comparability_key
+    # 的输入，也就是唯一会改变 SYNTH 与正文的地方。shadow 档到此为止。
+    if extraction is not None and settings.experiment_extraction_authoritative:
+        outcome.measurements += await _apply_llm_measurements(
             context,
-            work_id=work.id,
-            document=document,
-            fulltext=fulltext,
+            extraction=extraction,
             candidates=candidates[:MAX_EVIDENCE_UNITS_PER_WORK],
             evidence_unit_ids=unit_ids_by_text,
-            tasks=tasks,
-            metric_pattern=metric_pattern,
-            dataset_pattern=dataset_pattern,
         )
     return outcome
+
+
+async def _llm_structured_extraction(
+    context: JobContext,
+    *,
+    document: DocumentFile,
+    fulltext: str,
+) -> ExperimentExtraction | None:
+    """跑一次模型抽取，定位面取自本文档真实的 chunk 行。"""
+    async with context.session() as session:
+        parsed = await session.scalar(
+            select(DocumentParse)
+            .where(DocumentParse.document_file_id == document.id)
+            .order_by(DocumentParse.created_at.desc())
+            .limit(1)
+        )
+        chunks = (
+            list(
+                (
+                    await session.scalars(
+                        select(DocumentChunk).where(DocumentChunk.document_parse_id == parsed.id)
+                    )
+                ).all()
+            )
+            if parsed is not None
+            else []
+        )
+        structured_objects = (
+            list((parsed.metadata_json or {}).get("structured_objects") or []) if parsed else []
+        )
+    locators = build_locator_index(chunks=chunks, structured_objects=structured_objects)
+    return await extract_experiment_results(
+        fulltext=fulltext,
+        locators=locators,
+        runner=context.llm_runner(),
+        max_chars=int(context.settings.experiment_extraction_max_chars),
+        parse_locator=_parse_locator,
+        normalize_metric=_normalize_metric,
+    )
+
+
+async def _apply_llm_measurements(
+    context: JobContext,
+    *,
+    extraction: ExperimentExtraction,
+    candidates: list[EvidenceCandidate],
+    evidence_unit_ids: dict[str, Any],
+) -> int:
+    """把模型读出的维度写成 EvidenceMeasurement，绑定到最贴近的证据单元。
+
+    只有定位核验过的单元格参与：未核验的格子进不了跨研究比较，写进来只会
+    污染 comparability_key。
+    """
+    if not extraction.cells:
+        return 0
+    by_location: dict[str, Any] = {}
+    for candidate in candidates:
+        unit_id = evidence_unit_ids.get(candidate.text)
+        if unit_id is not None:
+            by_location.setdefault(_source_location(candidate), unit_id)
+
+    written = 0
+    async with context.session() as session:
+        for cell in extraction.cells:
+            if not cell.locator_verified:
+                continue
+            unit_id = by_location.get(cell.source_location) or _unit_for_span(
+                cell.verbatim_span,
+                candidates=candidates,
+                evidence_unit_ids=evidence_unit_ids,
+            )
+            if unit_id is None:
+                continue
+            await upsert_evidence_measurement(
+                session,
+                evidence_unit_id=unit_id,
+                metric_name=cell.metric_name,
+                value=cell.value,
+                unit=cell.unit,
+                dataset=cell.dataset,
+                task=extraction.task,
+                model_family=cell.model_family,
+                sample_size=cell.sample_size,
+                split=cell.split,
+                ci_low=cell.ci_low,
+                ci_high=cell.ci_high,
+                std=cell.std,
+                protocol=extraction.protocol or None,
+                extraction_source="llm",
+                locator_verified=True,
+            )
+            written += 1
+    return written
+
+
+def _unit_for_span(
+    span: str,
+    *,
+    candidates: list[EvidenceCandidate],
+    evidence_unit_ids: dict[str, Any],
+) -> Any | None:
+    """定位对不上时的兜底：找一条正文包含该引文片段的证据单元。"""
+    needle = " ".join((span or "").split())
+    if len(needle) < 12:
+        return None
+    for candidate in candidates:
+        haystack = " ".join(candidate.text.split())
+        if needle in haystack or haystack in needle:
+            return evidence_unit_ids.get(candidate.text)
+    return None
 
 
 STRUCTURED_EXTRACTION_SCHEMA = "experiment_v2"
@@ -349,13 +549,20 @@ async def _persist_structured_experiment_data(
     tasks: list[TaskSpec],
     metric_pattern: re.Pattern[str],
     dataset_pattern: re.Pattern[str] | None,
-) -> None:
+    llm_extraction: ExperimentExtraction | None = None,
+) -> list[dict[str, Any]]:
     """Persist a conservative, source-addressable experiment schema.
 
     The deterministic pass intentionally leaves unknown fields empty instead of
     inventing protocol values.  Every emitted numerical cell keeps a page /
     section / object source location, so the evidence matrix can distinguish
     comparable results from merely nearby numbers.
+
+    ``extraction`` 非空时，额外写一份 ``experiment_v3_llm``：正则与模型对账之后的
+    结果，带来源与定位核验标记。**v2 那一份保持逐字不变**——这样 off 档下这个函数
+    的行为与引入 Phase 2 之前完全一致，是"零行为变化"最容易验证的形式。
+
+    返回硬数值冲突列表（同一定位两条路径给出不同数字），供调用方发事件。
     """
     async with context.session() as session:
         parsed = await session.scalar(
@@ -470,8 +677,151 @@ async def _persist_structured_experiment_data(
                     ),
                     source_location=record["source_location"],
                     anchor_strength=record["anchor_strength"],
+                    extraction_source="regex",
+                    locator_verified=record["source_location"] != "fulltext:unlocated",
                 )
             )
+
+    if llm_extraction is None:
+        return []
+    return await _persist_reconciled_experiment_data(
+        context,
+        work_id=work_id,
+        document=document,
+        fulltext=fulltext,
+        regex_records=records,
+        extraction=llm_extraction,
+    )
+
+
+LLM_STRUCTURED_EXTRACTION_SCHEMA = "experiment_v3_llm"
+
+
+async def _persist_reconciled_experiment_data(
+    context: JobContext,
+    *,
+    work_id: Any,
+    document: DocumentFile,
+    fulltext: str,
+    regex_records: list[dict[str, Any]],
+    extraction: ExperimentExtraction,
+) -> list[dict[str, Any]]:
+    """写 experiment_v3_llm：正则 × 模型对账后的结果表。"""
+    regex_cells = tuple(
+        ExtractedResultCell(
+            metric_name=str(record["metric_name"]),
+            value=float(record["value"]),
+            unit=record["unit"],
+            dataset=record["dataset"],
+            source_location=str(record["source_location"]),
+            locator_verified=record["source_location"] != "fulltext:unlocated",
+        )
+        for record in regex_records
+    )
+    merged, conflicts = reconcile(llm_cells=extraction.cells, regex_cells=regex_cells)
+    unit_by_location = {
+        str(record["source_location"]): record["evidence_unit_id"] for record in regex_records
+    }
+
+    async with context.session() as session:
+        row = await session.scalar(
+            select(StructuredExtraction).where(
+                StructuredExtraction.work_id == work_id,
+                StructuredExtraction.document_file_id == document.id,
+                StructuredExtraction.schema_version == LLM_STRUCTURED_EXTRACTION_SCHEMA,
+            )
+        )
+        if row is None:
+            row = StructuredExtraction(
+                work_id=work_id,
+                document_file_id=document.id,
+                schema_version=LLM_STRUCTURED_EXTRACTION_SCHEMA,
+                status="parsed",
+            )
+            session.add(row)
+            await session.flush()
+        row.status = "parsed"
+        row.source_hash = hashlib.sha256(fulltext.encode("utf-8")).hexdigest()[:40]
+        row.extraction_model = extraction.model or "llm_experiment_v3"
+        row.payload_json = _json_safe(
+            {
+                "schema": LLM_STRUCTURED_EXTRACTION_SCHEMA,
+                "task": extraction.task,
+                "task_variant": extraction.task_variant,
+                "protocol": extraction.protocol,
+                "results": [
+                    {
+                        "metric_name": item.cell.metric_name,
+                        "value": item.cell.value,
+                        "unit": item.cell.unit,
+                        "dataset": item.cell.dataset,
+                        "split": item.cell.split,
+                        "model_family": item.cell.model_family,
+                        "source_location": item.cell.source_location,
+                        "locator_verified": item.cell.locator_verified,
+                        "extraction_source": item.extraction_source,
+                        "conflict": item.conflict,
+                    }
+                    for item in merged
+                ],
+            }
+        )
+        row.validation_json = {
+            **extraction.to_payload(),
+            "merged_cells": len(merged),
+            "value_conflicts": len(conflicts),
+            "conflicts": conflicts[:20],
+        }
+        for stale in (
+            await session.scalars(
+                select(ExperimentResult).where(
+                    ExperimentResult.structured_extraction_id == row.id
+                )
+            )
+        ).all():
+            await session.delete(stale)
+        for item in merged:
+            cell = item.cell
+            session.add(
+                ExperimentResult(
+                    structured_extraction_id=row.id,
+                    evidence_unit_id=unit_by_location.get(cell.source_location),
+                    task_id=None,
+                    task=extraction.task,
+                    task_variant=extraction.task_variant,
+                    dataset=cell.dataset,
+                    split_strategy=cell.split or extraction.protocol.get("split_strategy"),
+                    model_family=cell.model_family,
+                    loss_function=extraction.protocol.get("loss_function"),
+                    optimizer=extraction.protocol.get("optimizer"),
+                    learning_rate=extraction.protocol.get("learning_rate"),
+                    batch_size=extraction.protocol.get("batch_size"),
+                    epochs=extraction.protocol.get("epochs"),
+                    metric_name=cell.metric_name,
+                    value=cell.value,
+                    unit=cell.unit,
+                    ci_low=cell.ci_low,
+                    ci_high=cell.ci_high,
+                    std=cell.std,
+                    baseline_name=cell.baseline_name,
+                    baseline_value=cell.baseline_value,
+                    # 维度齐全时 comparability_key 才稳定；缺任一维度仍按未知加盐，
+                    # 语义与正则通道一致，只是现在维度真的填得上了。
+                    comparability_key=comparability_key(
+                        task=extraction.task,
+                        dataset=cell.dataset,
+                        metric_name=cell.metric_name,
+                        split=cell.split,
+                        unknown_salt=cell.source_location,
+                    ),
+                    source_location=cell.source_location,
+                    anchor_strength=None,
+                    extraction_source=item.extraction_source,
+                    locator_verified=cell.locator_verified,
+                    extraction_conflict_json=item.conflict,
+                )
+            )
+    return conflicts
 
 
 def _structured_payload(

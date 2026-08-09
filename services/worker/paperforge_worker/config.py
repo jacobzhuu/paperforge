@@ -35,6 +35,25 @@ class WorkerSettings(BaseSettings):
     card_concurrency: int = 6
     qmatrix_concurrency: int = 4
 
+    # LLM 结构化实验抽取（P0-3 / Phase 2）。
+    #   off    —— 完全不调用，行为与引入前逐字节相同（默认）。
+    #   shadow —— 调用并把结果落成 experiment_v3_llm 的 ExperimentResult 行，
+    #             但 EvidenceMeasurement 仍只由正则通道写入，于是
+    #             comparability_key / SYNTH / 正文全都不变，只积累抽取质量数据。
+    #   on     —— 对账后的维度进入 EvidenceMeasurement，comparability_key 才真正生效。
+    experiment_extraction_mode: str = "off"
+    experiment_extraction_max_works: int = 20
+    experiment_extraction_max_chars: int = 60_000
+
+    @property
+    def experiment_extraction_enabled(self) -> bool:
+        return self.experiment_extraction_mode.strip().lower() in {"shadow", "on"}
+
+    @property
+    def experiment_extraction_authoritative(self) -> bool:
+        """维度是否可以进入 EvidenceMeasurement（即影响可比性与正文）。"""
+        return self.experiment_extraction_mode.strip().lower() == "on"
+
     scholar_contact_email: str = ""
     scholar_user_agent: str = "PaperForge/0.1"
     openalex_api_key: str = ""
