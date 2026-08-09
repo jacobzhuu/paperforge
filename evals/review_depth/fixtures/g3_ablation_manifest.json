@@ -1,0 +1,17 @@
+[
+  {"topic_id":"g2-01","condition":"legacy","path":"g2-01/legacy.md"},
+  {"topic_id":"g2-01","condition":"fulltext_only","path":"g2-01/fulltext_only.md"},
+  {"topic_id":"g2-01","condition":"problem_driven","path":"g2-01/problem_driven.md"},
+  {"topic_id":"g2-02","condition":"legacy","path":"g2-02/legacy.md"},
+  {"topic_id":"g2-02","condition":"fulltext_only","path":"g2-02/fulltext_only.md"},
+  {"topic_id":"g2-02","condition":"problem_driven","path":"g2-02/problem_driven.md"},
+  {"topic_id":"g2-03","condition":"legacy","path":"g2-03/legacy.md"},
+  {"topic_id":"g2-03","condition":"fulltext_only","path":"g2-03/fulltext_only.md"},
+  {"topic_id":"g2-03","condition":"problem_driven","path":"g2-03/problem_driven.md"},
+  {"topic_id":"g2-04","condition":"legacy","path":"g2-04/legacy.md"},
+  {"topic_id":"g2-04","condition":"fulltext_only","path":"g2-04/fulltext_only.md"},
+  {"topic_id":"g2-04","condition":"problem_driven","path":"g2-04/problem_driven.md"},
+  {"topic_id":"g2-05","condition":"legacy","path":"g2-05/legacy.md"},
+  {"topic_id":"g2-05","condition":"fulltext_only","path":"g2-05/fulltext_only.md"},
+  {"topic_id":"g2-05","condition":"problem_driven","path":"g2-05/problem_driven.md"}
+]

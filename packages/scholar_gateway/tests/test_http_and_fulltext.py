@@ -12,8 +12,11 @@ from scholar_gateway import (
     OaFulltextTarget,
     SafeHttpClient,
     acquire_oa_fulltext,
+    discover_doaj_links,
+    discover_unpaywall_links,
     plan_oa_fulltext,
 )
+from scholar_gateway.fulltext import _looks_like_xml
 from scholar_gateway.http import BLOCKED_HOSTNAMES, is_blocked_ip
 
 PDF_BYTES = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n"
@@ -108,7 +111,7 @@ def test_is_blocked_ip_rejects_non_global_addresses() -> None:
     assert not is_blocked_ip("93.184.216.34")
 
 
-def test_plan_orders_persisted_pdf_then_arxiv_then_pmc() -> None:
+def test_plan_prefers_structured_sources_before_pdf_fallbacks() -> None:
     target = OaFulltextTarget(
         work_id="w-1",
         arxiv_id="2401.01234",
@@ -118,6 +121,7 @@ def test_plan_orders_persisted_pdf_then_arxiv_then_pmc() -> None:
                 "url": "https://example.org/best-oa.pdf",
                 "url_type": "pdf",
                 "source_name": "openalex",
+                "is_oa": True,
             },
             {"url": "https://example.org/landing", "url_type": "landing_page"},
         ),
@@ -125,6 +129,9 @@ def test_plan_orders_persisted_pdf_then_arxiv_then_pmc() -> None:
     plan = plan_oa_fulltext([target])
     urls = [candidate.url for candidate in plan.candidates]
     assert urls == [
+        "https://pmc.ncbi.nlm.nih.gov/api/oai/v1/mh/"
+        "?verb=GetRecord&identifier=oai:pubmedcentral.nih.gov:7654321&metadataPrefix=pmc",
+        "https://arxiv.org/e-print/2401.01234",
         "https://example.org/best-oa.pdf",
         "https://arxiv.org/pdf/2401.01234.pdf",
         "https://europepmc.org/articles/PMC7654321?pdf=render",
@@ -173,6 +180,40 @@ def test_acquire_falls_back_to_next_url_then_records_failure() -> None:
     # Draft-first：抓不到只记 failure，管线继续走摘要级降级。
     assert result.documents == ()
     assert result.failures == ({"work_id": "w-1", "reason": "all_oa_urls_failed"},)
+    assert result.attempts
+    assert all(item.status == "failed" for item in result.attempts)
+
+
+def test_jats_bytes_are_detected_and_a_failed_work_does_not_abort_the_batch() -> None:
+    assert _looks_like_xml(b"  <?xml version='1.0'?><article><body>ok</body></article>")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "2401.00001" in str(request.url):
+            return httpx.Response(200, content=b"<html>not a paper</html>")
+        return httpx.Response(
+            200,
+            content=b"<?xml version='1.0'?><article><body>JATS text</body></article>",
+            headers={"content-type": "application/xml"},
+        )
+
+    plan = plan_oa_fulltext(
+        [
+            OaFulltextTarget(work_id="bad", arxiv_id="2401.00001"),
+            OaFulltextTarget(work_id="good", pmcid="PMC123"),
+        ]
+    )
+    result = acquire_oa_fulltext(
+        plan,
+        http_client=_client(
+            handler,
+            resolver=_StubResolver(
+                {"arxiv.org": ("151.101.3.42",), "europepmc.org": ("193.62.193.80",)}
+            ),
+        ),
+    )
+    assert [item.work_id for item in result.documents] == ["good"]
+    assert any(item.work_id == "bad" and item.status != "acquired" for item in result.attempts)
+    assert any(item.work_id == "good" and item.status == "acquired" for item in result.attempts)
 
 
 def test_non_fulltext_mime_is_discarded() -> None:
@@ -190,4 +231,109 @@ def test_non_fulltext_mime_is_discarded() -> None:
 @pytest.mark.parametrize("pmcid", ["7654321", "PMC7654321"])
 def test_pmcid_normalization_in_plan(pmcid: str) -> None:
     plan = plan_oa_fulltext([OaFulltextTarget(work_id="w", pmcid=pmcid)])
-    assert plan.candidates[0].url == "https://europepmc.org/articles/PMC7654321?pdf=render"
+    assert "identifier=oai:pubmedcentral.nih.gov:7654321" in plan.candidates[0].url
+    assert plan.candidates[0].url_type == "jats"
+
+
+def test_fulltext_budget_prefers_relevance_then_influential_citations() -> None:
+    targets = [
+        OaFulltextTarget(
+            work_id="low",
+            arxiv_id="1",
+            relevance_score=0.2,
+            influential_citation_count=100,
+        ),
+        OaFulltextTarget(
+            work_id="relevant",
+            arxiv_id="2",
+            relevance_score=0.9,
+            influential_citation_count=1,
+        ),
+        OaFulltextTarget(
+            work_id="tie-break",
+            arxiv_id="3",
+            relevance_score=0.9,
+            influential_citation_count=10,
+        ),
+    ]
+    plan = plan_oa_fulltext(targets, max_works=2)
+    ordered_works = list(dict.fromkeys(candidate.work_id for candidate in plan.candidates))
+    assert ordered_works == ["tie-break", "relevant"]
+
+
+def test_unpaywall_discovery_uses_best_oa_pdf_and_license() -> None:
+    client = _client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "best_oa_location": {
+                    "url_for_pdf": "https://example.org/open.pdf",
+                    "license": "cc-by",
+                },
+                "oa_locations": [],
+            },
+        ),
+        resolver=_StubResolver({"api.unpaywall.org": ("104.20.42.59",)}),
+    )
+    links = discover_unpaywall_links(
+        OaFulltextTarget(work_id="w", doi="10.1000/example"),
+        http_client=client,
+        contact_email="researcher@example.org",
+    )
+    assert links == (
+        {
+            "url": "https://example.org/open.pdf",
+            "url_type": "pdf",
+            "source_name": "unpaywall",
+            "is_oa": True,
+            "license": "cc-by",
+        },
+    )
+
+
+def test_arxiv_source_archive_is_classified_for_latex_parser() -> None:
+    archive = b"\x1f\x8b" + b"source-bytes"
+    plan = plan_oa_fulltext([OaFulltextTarget(work_id="w", arxiv_id="2401.1")])
+    result = acquire_oa_fulltext(
+        plan,
+        http_client=_client(
+            lambda request: httpx.Response(
+                200,
+                content=archive,
+                headers={"content-type": "application/octet-stream"},
+            ),
+            resolver=_StubResolver({"arxiv.org": ("151.101.3.42",)}),
+        ),
+    )
+    assert result.documents[0].mime_type == "application/x-arxiv-source"
+
+
+def test_doaj_discovery_reads_fulltext_url_and_license() -> None:
+    client = _client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "bibjson": {
+                            "link": [
+                                {
+                                    "url": "https://journal.example/article.pdf",
+                                    "type": "fulltext",
+                                    "content_type": "application/pdf",
+                                }
+                            ],
+                            "license": [{"title": "CC BY"}],
+                        }
+                    }
+                ]
+            },
+        ),
+        resolver=_StubResolver({"doaj.org": ("104.20.8.99",)}),
+    )
+    links = discover_doaj_links(
+        OaFulltextTarget(work_id="w", doi="10.1000/example"),
+        http_client=client,
+    )
+    assert links[0]["url"] == "https://journal.example/article.pdf"
+    assert links[0]["license"] == "CC BY"

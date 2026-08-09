@@ -109,6 +109,10 @@ class OpenAICompatibleLLMProvider:
             ),
             "temperature": request.temperature,
         }
+        if request.json_output:
+            payload["response_format"] = {"type": "json_object"}
+        if request.thinking_mode in {"enabled", "disabled"} and _is_deepseek_v4(model_name):
+            payload["thinking"] = {"type": request.thinking_mode}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -317,7 +321,10 @@ class OpenAICompatibleLLMProvider:
                         "LLM produced no content before hitting max_tokens "
                         "(reasoning models spend the same budget on thinking)."
                     ),
-                    retryable=True,
+                    # Repeating the same max_tokens budget deterministically
+                    # truncates again.  Let LLMRunner double the budget once
+                    # instead of spending provider retries on identical calls.
+                    retryable=False,
                 )
             raise LLMError(
                 provider=self.name,
@@ -350,6 +357,10 @@ def _classify_http_status(status_code: int) -> tuple[str, bool]:
     if status_code >= 500:
         return "server_error", True
     return "http_error", False
+
+
+def _is_deepseek_v4(model: str) -> bool:
+    return model.strip().lower().startswith("deepseek-v4-")
 
 
 def sanitize_openai_compatible_base_url(base_url: str) -> str:

@@ -1,0 +1,303 @@
+"""SCREEN stage: auditable topic eligibility before expensive full-text work."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from db import list_entries, set_entry_status, upsert_eligibility_decision
+
+from paperforge_worker.context import JobContext
+
+# Isolated from CARDS/EVIDENCE until a human promotes them (N3 / N-RC6).
+UNCERTAIN_STATUS = "candidate_uncertain"
+# SEARCH can retain more than the repository's UI-oriented default page of
+# 500 candidates.  SCREEN is a batch stage and must evaluate the whole pool.
+SCREEN_CANDIDATE_LIMIT = 5_000
+
+
+@dataclass
+class ScreenOutcome:
+    included: int = 0
+    excluded: int = 0
+    uncertain: int = 0
+    pinned_preserved: int = 0
+    selected: int = 0
+    budget_limited: int = 0
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "included": self.included,
+            "excluded": self.excluded,
+            "uncertain": self.uncertain,
+            "pinned_preserved": self.pinned_preserved,
+            "selected": self.selected,
+            "budget_limited": self.budget_limited,
+            "decisions": self.decisions[:30],
+        }
+
+
+async def screen_eligibility(
+    context: JobContext,
+    *,
+    scope: dict[str, Any],
+    focus_questions: list[dict[str, Any]] | None = None,
+    preserve_selected: bool = False,
+    additional_budget: int = 0,
+    deprioritize_work_ids: set[Any] | None = None,
+) -> ScreenOutcome:
+    """把候选池筛成写作语料。
+
+    ``deprioritize_work_ids`` 是「已经链到目标问题」的文献。定向补证要买的是
+    *第二个独立来源*，如果追加预算又被同一批文献占满，补证就等于没做——所以
+    这些文献在配额轮询里排到最后。
+    """
+    criteria = dict(scope.get("eligibility_criteria") or {})
+    anchor_groups = _anchor_groups(criteria)
+    anchors = _phrases(criteria.get("required_anchor_facets"))
+    if not anchor_groups and not anchors:
+        anchors = _first_facet(scope)
+    exclusions = _phrases(criteria.get("exclusion_domains"))
+    outcome = ScreenOutcome()
+    # SEARCH 的 top-K 是全自动写作语料预算。SCREEN 可以用结构化条件替换
+    # top-K 中不合格的条目，但不能把整个候选池都晋升后交给 CARDS/EVIDENCE。
+    # 用户显式 pin/core 的条目不受自动预算限制。
+    selected_budget = max(
+        0,
+        int(
+            getattr(
+                getattr(context, "settings", None),
+                "search_auto_select_top_k",
+                30,
+            )
+        ),
+    )
+    async with context.session() as session:
+        rows = [
+            *await list_entries(session, context.project_id, status="selected"),
+            *await list_entries(session, context.project_id, status=UNCERTAIN_STATUS),
+            # SEARCH keeps non-top-K results as candidates.  A structured
+            # eligibility screen is stronger evidence than the retrieval rank,
+            # so matching candidates must be able to enter the evidence corpus;
+            # otherwise refining the scope can only remove papers, never recover
+            # a relevant lower-ranked defense/benchmark paper.
+            *await list_entries(
+                session,
+                context.project_id,
+                status="candidate",
+                limit=SCREEN_CANDIDATE_LIMIT,
+            ),
+        ]
+        entries = list({work.id: (entry, work) for entry, work in rows}.values())
+        records: list[dict[str, Any]] = []
+        for entry, work in entries:
+            text = " ".join(f"{work.canonical_title}\n{work.abstract or ''}".casefold().split())
+            group_hits = {
+                group["name"]: [
+                    phrase for phrase in group["terms"] if _phrase_in_text(text, phrase)
+                ]
+                for group in anchor_groups
+            }
+            grouped_anchor_hit = bool(anchor_groups) and all(group_hits.values())
+            legacy_anchor_hit = (
+                any(_phrase_in_text(text, phrase) for phrase in anchors) if anchors else False
+            )
+            anchor_hit = grouped_anchor_hit if anchor_groups else legacy_anchor_hit
+            exclusion_hits = [phrase for phrase in exclusions if _phrase_in_text(text, phrase)]
+            if exclusion_hits:
+                decision, reason = "exclude", "matched exclusion domain"
+            elif (anchor_groups or anchors) and anchor_hit:
+                decision, reason = "include", "matched required anchor facet"
+            elif not anchor_groups and not anchors:
+                # No structured criteria → keep selected but mark uncertain for audit.
+                decision, reason = "uncertain", "no required anchor facet configured"
+            else:
+                decision, reason = "uncertain", "no required anchor facet matched"
+            await upsert_eligibility_decision(
+                session,
+                project_id=context.project_id,
+                work_id=work.id,
+                decision=decision,
+                criterion_hits={
+                    "anchors": [phrase for phrase in anchors if _phrase_in_text(text, phrase)],
+                    "anchor_groups": group_hits,
+                    "exclusions": exclusion_hits,
+                },
+                anchor_facet_hit=anchor_hit,
+                reason=reason,
+            )
+            count_attr = f"{decision}d" if decision != "uncertain" else "uncertain"
+            setattr(outcome, count_attr, getattr(outcome, count_attr) + 1)
+            records.append(
+                {
+                    "entry": entry,
+                    "work": work,
+                    "decision": decision,
+                    "anchor_facet_hit": anchor_hit,
+                    "pinned": bool(
+                        entry.user_pinned or getattr(entry, "literature_role", "general") == "core"
+                    ),
+                    "focus_scores": _focus_scores(text, focus_questions or []),
+                }
+            )
+
+        pinned_ids = {record["work"].id for record in records if record["pinned"]}
+        preserved_ids = {
+            record["work"].id
+            for record in records
+            if preserve_selected
+            and record["entry"].status == "selected"
+            and record["decision"] == "include"
+        }
+        selection_ids = pinned_ids | preserved_ids
+        effective_budget = max(
+            selected_budget,
+            len(selection_ids) + max(0, int(additional_budget)),
+        )
+        remaining = max(0, effective_budget - len(selection_ids))
+        included = [
+            record for record in records if record["decision"] == "include" and not record["pinned"]
+        ]
+        if focus_questions and remaining:
+            # Round-robin question quotas prevent a broad global Top-K from
+            # spending the entire corpus budget on the easiest sub-question.
+            demoted = deprioritize_work_ids or set()
+            pools = [
+                sorted(
+                    (record for record in included if record["focus_scores"][index] > 0),
+                    key=lambda record: (
+                        record["work"].id not in demoted,
+                        record["focus_scores"][index],
+                        float(getattr(record["entry"], "relevance_score", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                for index in range(len(focus_questions))
+            ]
+            cursor = 0
+            while remaining and any(pools):
+                pool = pools[cursor % len(pools)]
+                while pool and pool[0]["work"].id in selection_ids:
+                    pool.pop(0)
+                if pool:
+                    selection_ids.add(pool.pop(0)["work"].id)
+                    remaining -= 1
+                cursor += 1
+        if remaining:
+            for record in sorted(
+                included,
+                key=lambda item: float(getattr(item["entry"], "relevance_score", 0.0) or 0.0),
+                reverse=True,
+            ):
+                if record["work"].id in selection_ids:
+                    continue
+                selection_ids.add(record["work"].id)
+                remaining -= 1
+                if not remaining:
+                    break
+
+        for record in records:
+            entry = record["entry"]
+            work = record["work"]
+            decision = record["decision"]
+            if record["pinned"]:
+                outcome.pinned_preserved += 1
+                await set_entry_status(session, entry, "selected")
+            elif decision == "exclude":
+                await set_entry_status(session, entry, "excluded")
+            elif decision == "uncertain":
+                if entry.status == "selected":
+                    await set_entry_status(session, entry, UNCERTAIN_STATUS)
+            elif work.id in selection_ids:
+                await set_entry_status(session, entry, "selected")
+            else:
+                await set_entry_status(session, entry, "candidate")
+                outcome.budget_limited += 1
+            outcome.decisions.append(
+                {
+                    "work_id": str(work.id),
+                    "decision": decision,
+                    "anchor_facet_hit": record["anchor_facet_hit"],
+                }
+            )
+        outcome.selected = len(selection_ids)
+    return outcome
+
+
+def _focus_scores(text: str, questions: list[dict[str, Any]]) -> list[float]:
+    have = _routing_terms(text)
+    scores: list[float] = []
+    for question in questions:
+        aliases = question.get("term_aliases") or {}
+        alias_values = (
+            [value for values in aliases.values() for value in values]
+            if isinstance(aliases, dict)
+            else []
+        )
+        query = " ".join(
+            str(value or "")
+            for value in (
+                question.get("search_query"),
+                question.get("text"),
+                *alias_values,
+            )
+        )
+        wanted = _routing_terms(query)
+        scores.append(len(have & wanted) / max(1, len(wanted)))
+    return scores
+
+
+def _routing_terms(text: str) -> set[str]:
+    latin = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9-]{1,}", text.casefold())
+        if token not in {"the", "and", "for", "with", "from", "what", "how"}
+    }
+    runs = re.findall(r"[\u3400-\u9fff]+", text)
+    return latin | {run[index : index + 2] for run in runs for index in range(len(run) - 1)}
+
+
+def _phrases(values: Any) -> list[str]:
+    return [" ".join(str(value).casefold().split()) for value in values or [] if str(value).strip()]
+
+
+def _phrase_in_text(text: str, phrase: str) -> bool:
+    """Match short ASCII acronyms as tokens, not arbitrary substrings.
+
+    In particular, the eligibility alias ``AI`` must not match ``domain``,
+    ``chain`` or ``training`` and accidentally admit most of a search corpus.
+    Longer phrases retain substring matching so Chinese and inflected prose keep
+    the existing recall characteristics.
+    """
+    if re.fullmatch(r"[a-z0-9]+", phrase) and len(phrase) <= 3:
+        return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text) is not None
+    return phrase in text
+
+
+def _first_facet(scope: dict[str, Any]) -> list[str]:
+    groups = scope.get("keyword_groups") or []
+    if not groups or not isinstance(groups[0], dict):
+        return []
+    return _phrases(groups[0].get("keywords"))
+
+
+def _anchor_groups(criteria: dict[str, Any]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for index, item in enumerate(criteria.get("required_anchor_groups") or []):
+        if not isinstance(item, dict):
+            continue
+        terms = _phrases(item.get("terms"))
+        if not terms:
+            continue
+        groups.append(
+            {
+                "name": " ".join(str(item.get("name") or f"group_{index + 1}").split()),
+                "terms": terms,
+            }
+        )
+    return groups
+
+
+__all__ = ["ScreenOutcome", "screen_eligibility", "UNCERTAIN_STATUS"]

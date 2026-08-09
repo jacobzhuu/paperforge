@@ -1,6 +1,7 @@
 import { Info } from 'lucide-react';
 import type { DataSource } from '@/lib/types';
 import { cn } from '@/lib/utils';
+import { Callout } from '@/components/ui/callout';
 
 export function DataSourceBanner({
   source,
@@ -13,10 +14,11 @@ export function DataSourceBanner({
 }) {
   if (source !== 'mock') return null;
   return (
-    <div
+    <Callout
+      variant="warning"
       role="status"
       className={cn(
-        'flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground',
+        'flex items-start gap-2',
         className,
       )}
     >
@@ -26,6 +28,6 @@ export function DataSourceBanner({
         示例数据预览：{note ?? '后端不可用'}。当前展示的<strong className="font-semibold">不是</strong>
         你的真实数据，后端恢复后刷新即可。
       </span>
-    </div>
+    </Callout>
   );
 }

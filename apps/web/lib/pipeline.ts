@@ -19,6 +19,8 @@ export type PipelineStepId =
   | 'scope'
   | 'assets'
   | 'library'
+  | 'questions'
+  | 'evidence'
   | 'outline'
   | 'write'
   | 'visuals'
@@ -41,6 +43,18 @@ const STEP: Record<PipelineStepId, PipelineStep> = {
   scope: { id: 'scope', segment: 'scope', label: '研究范围', hint: '关键词组与研究问题，驱动检索' },
   assets: { id: 'assets', segment: 'assets', label: '素材中心', hint: '结果表格/图/笔记——正文数字的唯一出处' },
   library: { id: 'library', segment: 'library', label: '文献工作台', hint: '检索、分诊、入库核验' },
+  questions: {
+    id: 'questions',
+    segment: 'questions',
+    label: '研究问题',
+    hint: '编辑子问题、比较维度与预期证据',
+  },
+  evidence: {
+    id: 'evidence',
+    segment: 'evidence',
+    label: '证据矩阵',
+    hint: '核对问题—证据立场、等级与可比较性',
+  },
   outline: { id: 'outline', segment: 'outline', label: '大纲编辑器', hint: '章节结构与文献分配' },
   write: { id: 'write', segment: 'write', label: '写作工作台', hint: '正文起草与修订' },
   visuals: { id: 'visuals', segment: 'visuals', label: '视觉工作台', hint: '图表、示意图与 AI 插图的生成、审核与插入' },
@@ -51,6 +65,8 @@ const REVIEW_FLOW: PipelineStepId[] = [
   'overview',
   'scope',
   'library',
+  'questions',
+  'evidence',
   'outline',
   'write',
   'visuals',
@@ -103,6 +119,7 @@ export function pipelineNeighbors(
 const STAGE_TO_STEP: Record<string, PipelineStepId> = {
   scope: 'scope',
   search: 'library',
+  screen: 'library',
   curate: 'library',
   ingest: 'library',
   snowball: 'library',
@@ -110,6 +127,10 @@ const STAGE_TO_STEP: Record<string, PipelineStepId> = {
   import: 'library',
   import_doi: 'library',
   import_bibtex: 'library',
+  qdecomp: 'questions',
+  evidence: 'evidence',
+  qmatrix: 'evidence',
+  synth: 'evidence',
   outline: 'outline',
   write: 'write',
   // 润色是写作步骤的收尾工序，导航上仍属「写作」——但进度条上是独立阶段名，
@@ -117,6 +138,10 @@ const STAGE_TO_STEP: Record<string, PipelineStepId> = {
   polish: 'write',
   citecheck: 'write',
   quality: 'write',
+  repair_search: 'library',
+  repair_ingest: 'library',
+  quality_repair: 'write',
+  quality_recheck: 'write',
   // 视觉阶段此前不在这张表里：视觉任务在跑时导航上没有任何一步会亮起。
   visual_plan: 'visuals',
   visual_generate: 'visuals',
@@ -136,3 +161,24 @@ export function stepFromPathname(pathname: string, projectId: string): PipelineS
   const match = (Object.keys(STEP) as PipelineStepId[]).find((id) => STEP[id].segment === rest);
   return match ?? 'overview';
 }
+/** Stages with a dedicated API endpoint that can be retried independently. */
+export type RetryableStage =
+  | 'search'
+  | 'ingest'
+  | 'snowball'
+  | 'cards'
+  | 'quality'
+  | 'outline'
+  | 'write'
+  | 'render';
+
+export const RETRYABLE_STAGES = new Set<string>([
+  'search',
+  'ingest',
+  'snowball',
+  'cards',
+  'quality',
+  'outline',
+  'write',
+  'render',
+]);

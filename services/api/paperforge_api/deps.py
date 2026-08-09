@@ -28,7 +28,7 @@ def get_session_factory():
     global _engine, _session_factory
     if _session_factory is None:
         settings = get_settings()
-        _engine = make_engine(settings.database_url)
+        _engine = make_engine(settings.database_url, application_name="paperforge-api")
         _session_factory = make_session_factory(_engine)
     return _session_factory
 
@@ -77,9 +77,7 @@ async def get_current_auth(
     session: Annotated[AsyncSession, Depends(get_session)],
     settings: Annotated[Settings, Depends(get_settings)],
     session_token: Annotated[str | None, Cookie(alias="paperforge_session")] = None,
-    secure_session_token: Annotated[
-        str | None, Cookie(alias="__Host-paperforge_session")
-    ] = None,
+    secure_session_token: Annotated[str | None, Cookie(alias="__Host-paperforge_session")] = None,
 ) -> AuthContext:
     token = secure_session_token if settings.auth_cookie_secure else session_token
     if not token:
@@ -132,7 +130,10 @@ async def authorize_project_request(
         project_uuid = uuid.UUID(project_id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail="project not found") from error
-    project = await get_owned_project(session, project_uuid, auth.user.id)
+    # 已软删除的项目也在这里取回来（include_deleted=True），但**不**放行：
+    # 过滤留给 get_authorized_project。否则「恢复」端点自己就 404 了，
+    # 回收站里的项目再也捞不回来。
+    project = await get_owned_project(session, project_uuid, auth.user.id, include_deleted=True)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     request.state.owned_project = project
@@ -140,11 +141,19 @@ async def authorize_project_request(
     return auth
 
 
-async def get_authorized_project(session: AsyncSession, project_id: str) -> PaperProject:
+async def get_authorized_project(
+    session: AsyncSession,
+    project_id: str,
+    *,
+    include_deleted: bool = False,
+) -> PaperProject:
     """Return only the project already authorized for this request.
 
     Business routers deliberately cannot fall back to a project-id-only database lookup.
     The router dependency above is the sole place that resolves ownership.
+
+    软删除在这里收口：除了「恢复」这类必须看见墓碑的端点，其余一律当作不存在——
+    删掉的项目，它的每一个子路由都应该 404，而不是各路由自己记得判一次。
     """
     try:
         project_uuid = uuid.UUID(project_id)
@@ -152,6 +161,8 @@ async def get_authorized_project(session: AsyncSession, project_id: str) -> Pape
         raise HTTPException(status_code=404, detail="project not found") from error
     project = session.info.get("paperforge_owned_project")
     if not isinstance(project, PaperProject) or project.id != project_uuid:
+        raise HTTPException(status_code=404, detail="project not found")
+    if project.deleted_at is not None and not include_deleted:
         raise HTTPException(status_code=404, detail="project not found")
     return project
 

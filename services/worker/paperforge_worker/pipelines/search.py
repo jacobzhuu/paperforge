@@ -1,6 +1,6 @@
-"""SEARCH 阶段：五源并行检索 → 规范化 → 去重 → 排序 → 入库候选。
+"""SEARCH 阶段：多源并行检索 → 规范化 → 去重 → 排序 → 入库候选。
 
-设计 §4.4.1：`五源并行检索 → 规范化 → 去重 → 相关性排序（确定性分 + LLM top-N 重排）`。
+设计 §4.4.1：`多源并行检索 → 规范化 → 去重 → 相关性排序（确定性分 + LLM top-N 重排）`。
 每个 provider 的结果都记 `search_run`（轻量复现留痕，非守恒账本，§3.3）。
 
 Draft-first：任一 provider 失败只记 search_run(status=failed) + 降级标记，
@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from db import record_search_run, upsert_entry, upsert_work
+from db import list_research_questions, record_search_run, upsert_entry, upsert_work
 from observability import get_logger, record_scholar_provider
 from scholar_gateway import (
     DEFAULT_PROVIDER_ORDER,
@@ -47,6 +47,8 @@ class SearchOutcome:
     canonical_candidate_count: int = 0
     duplicates_merged: int = 0
     persisted_entry_count: int = 0
+    new_work_count: int = 0
+    new_entry_count: int = 0
     selected_count: int = 0
     provider_stats: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[dict[str, Any]] = field(default_factory=list)
@@ -57,10 +59,25 @@ class SearchOutcome:
             "canonical_candidate_count": self.canonical_candidate_count,
             "duplicates_merged": self.duplicates_merged,
             "persisted_entry_count": self.persisted_entry_count,
+            "new_work_count": self.new_work_count,
+            "new_entry_count": self.new_entry_count,
             "selected_count": self.selected_count,
             "provider_stats": self.provider_stats,
             "warnings": self.warnings,
         }
+
+
+async def _sub_question_queries(context: JobContext) -> list[str] | None:
+    """子问题检索面的单一真源是 ``research_question`` 表，不是 ``scope_json``。
+
+    返回 ``None`` 表示这个项目根本没有问题树（original 论文不跑 QDECOMP），
+    此时由 :func:`search_queries` 回落到 scope 里的副本。
+    """
+    async with context.session() as session:
+        questions = await list_research_questions(session, context.project_id, kind="sub")
+    if not questions:
+        return None
+    return [question.search_query or "" for question in questions]
 
 
 async def run_search(
@@ -70,12 +87,18 @@ async def run_search(
     providers: list[str] | None = None,
     limit_per_provider: int | None = None,
     auto_select_top_k: int | None = None,
+    query_texts: list[str] | None = None,
 ) -> SearchOutcome:
     """执行一轮检索并把候选写入项目文献库。"""
     settings = context.settings
     provider_names = [p for p in (providers or list(DEFAULT_PROVIDER_ORDER)) if p]
     limit = limit_per_provider or settings.search_limit_per_provider
-    queries = search_queries(scope)
+    queries = list(dict.fromkeys(query.strip() for query in (query_texts or []) if query.strip()))
+    if query_texts is None:
+        queries = search_queries(
+            scope,
+            sub_question_queries=await _sub_question_queries(context),
+        )
     filters = scope_filters(scope)
     outcome = SearchOutcome()
 
@@ -159,7 +182,12 @@ async def run_search(
     )
 
     top_k = settings.search_auto_select_top_k if auto_select_top_k is None else auto_select_top_k
-    outcome.persisted_entry_count, outcome.selected_count = await _persist(
+    (
+        outcome.persisted_entry_count,
+        outcome.selected_count,
+        outcome.new_work_count,
+        outcome.new_entry_count,
+    ) = await _persist(
         context,
         ranked=ranked,
         auto_select_top_k=top_k,
@@ -232,7 +260,7 @@ async def _persist(
     *,
     ranked: list[RankedCandidate],
     auto_select_top_k: int,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     """写 scholarly_work + library_entry。
 
     R1：这些候选来自 provider 真实响应，因此以 ``verified=True`` 入库；
@@ -245,13 +273,15 @@ async def _persist(
     """
     persisted = 0
     selected = 0
+    new_works = 0
+    new_entries = 0
     selected_indices = balanced_selection_indices(ranked, limit=auto_select_top_k)
     async with context.session() as session:
         for index, item in enumerate(ranked):
-            work, _created = await upsert_work(session, item.candidate)
+            work, work_created = await upsert_work(session, item.candidate)
             relevant = topic_evidence(item) >= AUTO_SELECT_MIN_TOPIC_EVIDENCE
             status = "selected" if index in selected_indices and relevant else "candidate"
-            entry, _entry_created = await upsert_entry(
+            entry, entry_created = await upsert_entry(
                 session,
                 project_id=context.project_id,
                 work_id=work.id,
@@ -264,8 +294,7 @@ async def _persist(
                     "provider_record_id": item.candidate.provider_record_id,
                     "selection_stratum": (
                         "foundational"
-                        if (item.candidate.publication_year or 9999)
-                        <= datetime.now(UTC).year - 6
+                        if (item.candidate.publication_year or 9999) <= datetime.now(UTC).year - 6
                         else "recent"
                     ),
                     "fulltext_available": bool(
@@ -278,9 +307,11 @@ async def _persist(
                 verified=True,
             )
             persisted += 1
+            new_works += int(work_created)
+            new_entries += int(entry_created)
             if entry.status == "selected":
                 selected += 1
-    return persisted, selected
+    return persisted, selected, new_works, new_entries
 
 
 async def ensure_bibtex_keys(context: JobContext, project_id: uuid.UUID | None = None) -> int:

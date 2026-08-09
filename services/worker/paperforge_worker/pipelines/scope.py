@@ -18,24 +18,47 @@ from llm_runtime import LLMRunner
 MAX_KEYWORD_GROUPS = 6
 MAX_KEYWORDS_PER_GROUP = 8
 MAX_SUBTOPICS = 8
+MAX_SUBQUESTIONS = 6
 DEFAULT_YEAR_SPAN = 6
 
 _SYSTEM_PROMPT_ZH = """你是科研文献调研的规划助手。根据论文主题输出检索范围规划。
 只输出 JSON，不要解释。字段：
 {
   "research_question": "一句话研究问题",
+  "sub_questions": [
+    {
+      "text": "可由证据回答的子问题",
+      "search_query": "compact English retrieval query for this sub-question",
+      "task_id": "optional task slug if known",
+      "comparison_dimensions": ["任务", "数据集", "评价指标", "样本/规模"],
+      "expected_evidence_kinds": ["experimental_fact", "author_conclusion"],
+      "term_aliases": {"投毒攻击": ["poisoning attack", "data poisoning"]}
+    }
+  ],
   "scope_summary": "2-3 句范围说明（包含/排除什么）",
   "keyword_groups": [{"name": "概念名", "keywords": ["term1", "term2"]}],
+  "eligibility_criteria": {
+    "required_anchor_groups": [
+      {"name": "研究领域", "terms": ["domain synonym 1", "domain synonym 2"]},
+      {"name": "核心主题", "terms": ["topic synonym 1", "topic synonym 2"]}
+    ],
+    "exclusion_domains": ["明确排除的英文领域词"]
+  },
   "subtopics": ["子主题1", "子主题2"],
   "time_range": {"start_year": 2019, "end_year": 2025},
   "inclusion_notes": ["纳入偏好"],
   "exclusion_notes": ["排除偏好"]
 }
 要求：keyword_groups 覆盖主题的正交概念面（方法/任务/领域/评价），每组给同义词与常见缩写；
+把核心问题拆成 3-6 个互不重复、可由文献证据回答的子问题，并为每个子问题列出横向比较维度；
+**每个子问题必须给出纯英文 search_query**（供跨语言证据路由与检索），comparison_dimensions
+中尽量包含英文数据集名/指标名（如 MovieLens、NDCG、HR@K）；
 不要编造不存在的专有名词；时间窗按领域节奏给出合理区间。
 
 **keywords 必须全部是英文检索词**（name 与其余叙述字段用中文）。
-检索面向的是 OpenAlex / arXiv / Semantic Scholar / Crossref / Europe PMC，
+eligibility_criteria 至少给出“研究领域”和“核心主题”两组英文锚点；组内任一词命中即可，
+但两组都必须命中才可自动纳入。exclusion_domains 只列明确离题领域。
+检索面向的是 OpenAlex / arXiv / Crossref / Europe PMC，
 它们只索引英文题录：中文检索词几乎必然零召回，或召回完全无关的中文期刊文献。
 请把主题翻译成该领域论文实际使用的英文术语，例如
 「序列推荐系统的投毒攻击」→ "sequential recommendation"、"poisoning attack"、
@@ -45,8 +68,25 @@ _SYSTEM_PROMPT_EN = """You plan literature searches for research papers. Given a
 output a search scope plan. Output JSON only, no commentary. Fields:
 {
   "research_question": "one-sentence research question",
+  "sub_questions": [
+    {
+      "text": "an evidence-answerable sub-question",
+      "search_query": "compact English retrieval query for this sub-question",
+      "task_id": "optional task slug if known",
+      "comparison_dimensions": ["task", "dataset", "metric", "sample/scale"],
+      "expected_evidence_kinds": ["experimental_fact", "author_conclusion"],
+      "term_aliases": {"投毒攻击": ["poisoning attack", "data poisoning"]}
+    }
+  ],
   "scope_summary": "2-3 sentences on what is in and out of scope",
   "keyword_groups": [{"name": "concept", "keywords": ["synonym1", "synonym2"]}],
+  "eligibility_criteria": {
+    "required_anchor_groups": [
+      {"name": "domain", "terms": ["domain synonym 1", "domain synonym 2"]},
+      {"name": "topic", "terms": ["topic synonym 1", "topic synonym 2"]}
+    ],
+    "exclusion_domains": ["explicitly excluded domain term"]
+  },
   "subtopics": ["subtopic1", "subtopic2"],
   "time_range": {"start_year": 2019, "end_year": 2025},
   "inclusion_notes": ["inclusion preference"],
@@ -54,10 +94,16 @@ output a search scope plan. Output JSON only, no commentary. Fields:
 }
 Requirements: keyword_groups must cover orthogonal facets (method/task/domain/evaluation)
 with synonyms and common abbreviations; never invent proper nouns that do not exist.
+Decompose the core question into 3-6 non-overlapping, evidence-answerable sub-questions and
+list the comparison dimensions needed for each.
+**Every sub-question MUST include a pure-English search_query** used for retrieval and
+cross-language evidence routing; put English dataset/metric names in comparison_dimensions.
 
 **Every keyword must be English**, even when the topic is written in another language.
-The providers behind this plan (OpenAlex / arXiv / Semantic Scholar / Crossref /
-Europe PMC) index English metadata only, so non-English keywords either return
+Provide at least two eligibility anchor groups (domain and topic). A work must match at
+least one English term in every group to be auto-included.
+The providers behind this plan (OpenAlex / arXiv / Crossref / Europe PMC) index
+English metadata only, so non-English keywords either return
 nothing or return unrelated foreign-language articles. Translate the topic into the
 English terminology the field actually publishes under."""
 
@@ -163,6 +209,10 @@ def normalize_scope(
     subtopics = [text for text in (_clean_text(s) for s in _as_list(raw.get("subtopics"))) if text][
         :MAX_SUBTOPICS
     ]
+    sub_questions = _normalize_sub_questions(
+        raw.get("sub_questions"),
+        fallback=fallback["sub_questions"],
+    )
 
     return {
         "topic": topic,
@@ -172,7 +222,12 @@ def normalize_scope(
         ),
         "scope_summary": _clean_text(raw.get("scope_summary")) or fallback["scope_summary"],
         "keyword_groups": groups,
+        "eligibility_criteria": _normalize_eligibility_criteria(
+            raw.get("eligibility_criteria"),
+            fallback=fallback.get("eligibility_criteria"),
+        ),
         "subtopics": subtopics or fallback["subtopics"],
+        "sub_questions": sub_questions,
         "time_range": _normalize_time_range(raw.get("time_range"), fallback["time_range"]),
         "inclusion_notes": [
             text for text in (_clean_text(s) for s in _as_list(raw.get("inclusion_notes"))) if text
@@ -207,18 +262,71 @@ def deterministic_scope(
             f"Search peer-reviewed literature and preprints on {topic} "
             f"published between {start_year} and {end_year}."
         )
+    subtopics = terms[:MAX_SUBTOPICS] or [topic]
     return {
         "topic": topic,
         "language": language,
         "research_question": question,
         "scope_summary": summary,
         "keyword_groups": groups,
-        "subtopics": terms[:MAX_SUBTOPICS] or [topic],
+        "eligibility_criteria": None,
+        "subtopics": subtopics,
+        "sub_questions": [
+            {
+                "text": (
+                    f"{subtopic} 对核心研究问题提供了哪些证据？"
+                    if language == "zh"
+                    else f"What evidence does {subtopic} provide for the core question?"
+                ),
+                "comparison_dimensions": (
+                    ["任务", "数据集", "评价指标", "样本或规模"]
+                    if language == "zh"
+                    else ["task", "dataset", "metric", "sample or scale"]
+                ),
+                "expected_evidence_kinds": [
+                    "experimental_fact",
+                    "author_conclusion",
+                ],
+            }
+            for subtopic in subtopics[:MAX_SUBQUESTIONS]
+        ],
         "time_range": {"start_year": start_year, "end_year": end_year},
         "inclusion_notes": [],
         "exclusion_notes": [],
         "generator": "deterministic",
         "generated_at": clock.isoformat(),
+    }
+
+
+def _normalize_eligibility_criteria(
+    value: Any,
+    *,
+    fallback: Any = None,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return fallback if isinstance(fallback, dict) else None
+    groups: list[dict[str, Any]] = []
+    for item in _as_list(value.get("required_anchor_groups"))[:4]:
+        if not isinstance(item, dict):
+            continue
+        name = _clean_text(item.get("name"))
+        terms = [
+            term
+            for raw in _as_list(item.get("terms"))[:12]
+            if (term := _clean_text(raw)) and _is_english_query(term)
+        ]
+        if name and terms:
+            groups.append({"name": name, "terms": list(dict.fromkeys(terms))})
+    exclusions = [
+        term
+        for raw in _as_list(value.get("exclusion_domains"))[:24]
+        if (term := _clean_text(raw)) and _is_english_query(term)
+    ]
+    if len(groups) < 2:
+        return fallback if isinstance(fallback, dict) else None
+    return {
+        "required_anchor_groups": groups,
+        "exclusion_domains": list(dict.fromkeys(exclusions)),
     }
 
 
@@ -239,6 +347,60 @@ def topic_terms(topic: str) -> list[str]:
             seen.add(lowered)
             terms.append(term)
     return terms
+
+
+def _normalize_sub_questions(value: Any, *, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    questions: list[dict[str, Any]] = []
+    for item in _as_list(value)[:MAX_SUBQUESTIONS]:
+        if isinstance(item, str):
+            text = _clean_text(item)
+            dimensions: list[str] = []
+            evidence_kinds: list[str] = []
+            search_query = ""
+            task_id = ""
+            term_aliases: Any = None
+        elif isinstance(item, dict):
+            text = _clean_text(item.get("text"))
+            dimensions = _clean_string_list(item.get("comparison_dimensions"), limit=8)
+            evidence_kinds = [
+                kind
+                for kind in _clean_string_list(item.get("expected_evidence_kinds"), limit=5)
+                if kind
+                in {
+                    "experimental_fact",
+                    "theoretical_derivation",
+                    "author_conclusion",
+                    "review_restatement",
+                    "model_inference",
+                }
+            ]
+            search_query = _clean_text(item.get("search_query") or item.get("english_query"))
+            if search_query and not _is_english_query(search_query):
+                search_query = ""
+            task_id = _clean_text(item.get("task_id"))
+            term_aliases = item.get("term_aliases") or item.get("term_aliases_json")
+        else:
+            continue
+        if text:
+            entry: dict[str, Any] = {
+                "text": text,
+                "comparison_dimensions": dimensions,
+                "expected_evidence_kinds": evidence_kinds,
+            }
+            if search_query:
+                entry["search_query"] = search_query
+            if task_id:
+                entry["task_id"] = task_id
+            if term_aliases:
+                entry["term_aliases"] = term_aliases
+            questions.append(entry)
+    return questions or fallback
+
+
+def _clean_string_list(value: Any, *, limit: int) -> list[str]:
+    return list(
+        dict.fromkeys(text for item in _as_list(value)[:limit] if (text := _clean_text(item)))
+    )
 
 
 def _is_cjk(token: str) -> bool:
@@ -267,13 +429,23 @@ def _split_cjk_run(run: str) -> list[str]:
     return trimmed or ([run] if len(run) >= 2 else [])
 
 
-def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
+def search_queries(
+    scope: dict[str, Any],
+    *,
+    max_queries: int = 12,
+    sub_question_queries: list[str] | None = None,
+) -> list[str]:
     """由 scope 生成检索式：主查询 + 各概念面组合（provider 侧还会各自净化语法）。
 
     主查询优先用英文：五个检索源都只索引英文题录，把中文标题原样发出去要么零召回，
     要么召回中文期刊里字面碰巧重合的无关文献（曾经用「序列推荐系统的投毒攻击」
     检索，Europe PMC 返回的全是中文医学论文）。因此当主题不含拉丁字母时，
     改用 scope 里的英文关键词组当主查询，中文原标题只在没有英文关键词时才兜底。
+
+    ``sub_question_queries`` 是 ``research_question`` 表里的检索面（问题的单一真源）。
+    调用方拿得到 DB 就必须传：只读 ``scope_json['sub_questions']`` 会让用户在问题
+    工作台上的修改对检索完全不起作用。没有问题树的管线（original 论文、纯单测）
+    才回落到 scope 里的副本。
     """
     topic = _clean_text(scope.get("topic")) or ""
     groups = [group for group in _as_list(scope.get("keyword_groups")) if isinstance(group, dict)]
@@ -283,22 +455,28 @@ def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
         queries.append(lead)
     if groups:
         joined = " AND ".join(
-            "(" + " OR ".join(f'"{kw}"' for kw in _as_list(group.get("keywords"))[:4]) + ")"
+            "(" + " OR ".join(f'"{kw}"' for kw in _english_keywords(group)[:4]) + ")"
             for group in groups[:3]
-            if _as_list(group.get("keywords"))
+            if _english_keywords(group)
         )
         if joined:
             queries.append(joined)
-    lead_is_latin = _has_latin(lead)
-    for subtopic in _as_list(scope.get("subtopics"))[:2]:
-        text = _clean_text(subtopic)
-        if not text or text.lower() in topic.lower():
-            # 确定性回退的 subtopics 就是主题切词，单独成查询只会稀释召回。
-            continue
-        if _has_latin(text) != lead_is_latin:
-            # 中英混排的检索式两边都不讨好：任何一个源都只按字面匹配其中一半。
-            continue
-        queries.append(f"{lead} {text}" if lead else text)
+    # Each decomposition question gets a compact English query.  Do not send
+    # mixed CJK/Latin strings to providers that only index English metadata.
+    if sub_question_queries is None:
+        sub_question_queries = [
+            _clean_text(item.get("search_query") or item.get("english_query") or "")
+            for item in _as_list(scope.get("sub_questions"))
+            if isinstance(item, dict)
+        ]
+    for text in sub_question_queries:
+        cleaned = _clean_text(text)
+        if _is_english_query(cleaned):
+            queries.append(cleaned)
+    for group in groups:
+        keywords = _english_keywords(group)
+        if len(keywords) >= 2:
+            queries.append(" ".join(keywords[:2]))
     deduped: list[str] = []
     seen: set[str] = set()
     for query in queries:
@@ -311,6 +489,18 @@ def search_queries(scope: dict[str, Any], *, max_queries: int = 4) -> list[str]:
 
 def _has_latin(text: str) -> bool:
     return bool(_LATIN_CHAR_RE.search(text or ""))
+
+
+def _is_english_query(text: str) -> bool:
+    return bool(text and _has_latin(text) and not _CJK_CHAR_RE.search(text))
+
+
+def _english_keywords(group: dict[str, Any]) -> list[str]:
+    return [
+        text
+        for keyword in _as_list(group.get("keywords"))
+        if _is_english_query(text := _clean_text(keyword))
+    ]
 
 
 def _primary_query(topic: str, groups: list[dict[str, Any]]) -> str:

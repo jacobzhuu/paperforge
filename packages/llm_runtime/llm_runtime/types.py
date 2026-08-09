@@ -13,6 +13,8 @@ class LLMRequest:
     model: str
     max_output_tokens: int
     temperature: float = 0.0
+    json_output: bool = False
+    thinking_mode: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

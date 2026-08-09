@@ -1,6 +1,5 @@
 'use client';
 
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { CheckboxIndicator } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
@@ -23,11 +22,11 @@ export function ProviderFilter({
   const providers = providersFromCapabilities(selected);
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm">检索源能力</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
+    <section>
+      <header className="pb-3">
+        <h3 className="text-body">检索源能力</h3>
+      </header>
+      <div className="space-y-2">
         {SOURCE_CAPABILITIES.map((cap) => {
           const active = selected.includes(cap.id);
           return (
@@ -45,25 +44,25 @@ export function ProviderFilter({
               {/* 整行已是 checkbox 控件，方框只做展示——避免 button 嵌套 button。 */}
               <CheckboxIndicator checked={active} className="mt-0.5" />
               <div className="min-w-0">
-                <div className="text-sm font-medium">{cap.label}</div>
-                <div className="text-xs text-muted-foreground">{cap.description}</div>
+                <div className="text-body font-medium">{cap.label}</div>
+                <div className="text-meta text-muted-foreground">{cap.description}</div>
               </div>
             </button>
           );
         })}
         <div className="flex flex-wrap gap-1 border-t pt-3">
           {providers.length === 0 ? (
-            <span className="text-xs text-muted-foreground">未选择检索源</span>
+            <span className="text-meta text-muted-foreground">未选择检索源</span>
           ) : (
             providers.map((p) => (
-              // 最小字号统一到 12px（text-xs）；此前这里是 text-[10px]。
-              <Badge key={p} variant="secondary" className="font-mono text-xs">
+              // 最小字号统一到 12px（text-meta）；此前这里是 text-[10px]。
+              <Badge key={p} variant="secondary" className="font-mono text-meta">
                 {p}
               </Badge>
             ))
           )}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }

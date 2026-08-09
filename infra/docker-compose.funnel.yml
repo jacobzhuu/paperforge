@@ -1,0 +1,116 @@
+# Public HTTPS entry point used only behind Tailscale Funnel.
+#
+# This runs a separate API/Web pair on 127.0.0.1:3001 so the existing local
+# stack does not need to be stopped or recreated by the constrained Snap
+# Docker daemon. The pair shares the restored PostgreSQL, Redis, MinIO, texd,
+# visuald, and worker services through their existing private networks.
+
+name: paperforge-funnel
+
+services:
+  funnel-api:
+    image: paperforge-api:local
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    environment:
+      AUTH_COOKIE_SECURE: "true"
+      AUTH_DEV_LOGIN_ENABLED: "false"
+      AUTH_EMAIL_MODE: smtp
+      CORS_ALLOW_ORIGINS: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+    networks:
+      core: {}
+      texd: {}
+      visuald: {}
+      funnel-ingress:
+        aliases:
+          - api
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+  funnel-web:
+    image: paperforge-web:local
+    environment:
+      PAPERFORGE_API_INTERNAL_BASE: http://funnel-api:8080
+      PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+    depends_on:
+      funnel-api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PAPERFORGE_FUNNEL_BACKEND_PORT:-3001}:3000"
+    networks:
+      - core
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+  # The production Web image bakes the internal API hostname "api" into its
+  # Next.js rewrite table. This isolated network maps that name exclusively to
+  # the hardened Funnel API, avoiding the localhost-development API on the
+  # shared core network.
+  funnel-web-secure:
+    image: paperforge-web:local
+    environment:
+      PAPERFORGE_API_INTERNAL_BASE: http://api:8080
+      PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_FUNNEL_URL:-https://paperforge-linux.tail53ab99.ts.net}
+    ports:
+      - "127.0.0.1:${PAPERFORGE_FUNNEL_SECURE_BACKEND_PORT:-3002}:3000"
+    networks:
+      - funnel-ingress
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+networks:
+  core:
+    external: true
+    name: paperforge-prod_core
+  texd:
+    external: true
+    name: paperforge-prod_texd_isolated
+  visuald:
+    external: true
+    name: paperforge-prod_visuald_isolated
+  funnel-ingress:
+    external: true
+    name: paperforge-funnel_ingress

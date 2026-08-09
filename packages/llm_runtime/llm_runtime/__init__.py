@@ -4,7 +4,7 @@
 """
 
 from llm_runtime.client import create_llm_provider, preflight_llm_provider
-from llm_runtime.config import DEFAULT_ROLE_MODELS, LLMConfig, Role
+from llm_runtime.config import DEFAULT_ROLE_MODELS, DEFAULT_ROLE_THINKING, LLMConfig, Role
 from llm_runtime.json_utils import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 from llm_runtime.providers import (
     LLMProvider,
@@ -20,6 +20,7 @@ from llm_runtime.types import LLMError, LLMRequest, LLMResponse
 
 __all__ = [
     "DEFAULT_ROLE_MODELS",
+    "DEFAULT_ROLE_THINKING",
     "CiteKeyViolation",
     "LLMConfig",
     "LLMError",

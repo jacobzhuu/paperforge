@@ -1,0 +1,218 @@
+# Blue/green application deployment for the constrained local Snap Docker
+# runtime. Each deployment gets isolated API/Web/Worker/rendering containers
+# while reusing the restored PostgreSQL, Redis, and MinIO services.
+#
+# PAPERFORGE_DEPLOY_REDIS_DB gives each deployment its own Redis database index,
+# which is what keeps generations on new code. The previous deployment's worker
+# cannot be stopped on this host (Snap Docker denies signals), so it keeps
+# polling; sharing one queue would hand roughly half of every generation to the
+# old image, and the symptom — a feature that works only sometimes — looks like
+# a bug in the feature rather than a deployment artefact. In-flight jobs stay on
+# the old index and are finished by the old worker.
+
+name: ${PAPERFORGE_DEPLOY_PROJECT:?set PAPERFORGE_DEPLOY_PROJECT}
+
+services:
+  texd:
+    image: ${PAPERFORGE_DEPLOY_TEXD_IMAGE:?set PAPERFORGE_DEPLOY_TEXD_IMAGE}
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - texdcache:/root/.cache/Tectonic
+      - texdfontcache:/var/cache/fontconfig
+    networks:
+      - runtime
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+  visuald:
+    image: ${PAPERFORGE_DEPLOY_VISUALD_IMAGE:?set PAPERFORGE_DEPLOY_VISUALD_IMAGE}
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - runtime
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  migrate:
+    image: ${PAPERFORGE_DEPLOY_API_IMAGE:?set PAPERFORGE_DEPLOY_API_IMAGE}
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - core
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    restart: "no"
+
+  api:
+    image: ${PAPERFORGE_DEPLOY_API_IMAGE:?set PAPERFORGE_DEPLOY_API_IMAGE}
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    environment:
+      AUTH_COOKIE_SECURE: "true"
+      AUTH_DEV_LOGIN_ENABLED: "false"
+      AUTH_EMAIL_MODE: smtp
+      CORS_ALLOW_ORIGINS: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      # 必须与本项目的 worker 用同一个库号，否则任务入队后没人消费。
+      REDIS_URL: ${PAPERFORGE_DEPLOY_REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      texd:
+        condition: service_healthy
+      visuald:
+        condition: service_healthy
+    networks:
+      core: {}
+      runtime: {}
+      ingress:
+        aliases:
+          - api
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+  # The host proxy is deliberately loopback-only.  This relay runs in the host
+  # network namespace but binds solely to this deployment's private runtime
+  # gateway, so the worker can reach Yunwu without exposing a proxy publicly.
+  proxy-relay:
+    image: ${PAPERFORGE_DEPLOY_WORKER_IMAGE:?set PAPERFORGE_DEPLOY_WORKER_IMAGE}
+    profiles: ["worker"]
+    network_mode: host
+    environment:
+      PAPERFORGE_PROXY_RELAY_LISTEN_HOST: ${PAPERFORGE_DEPLOY_RUNTIME_GATEWAY:?set PAPERFORGE_DEPLOY_RUNTIME_GATEWAY}
+      PAPERFORGE_PROXY_RELAY_LISTEN_PORT: ${PAPERFORGE_DEPLOY_PROXY_RELAY_PORT:-38888}
+      PAPERFORGE_PROXY_RELAY_UPSTREAM_HOST: 127.0.0.1
+      PAPERFORGE_PROXY_RELAY_UPSTREAM_PORT: ${PAPERFORGE_HOST_PROXY_PORT:-38888}
+    command: ["python", "-m", "paperforge_worker.proxy_relay"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    restart: unless-stopped
+
+  worker:
+    image: ${PAPERFORGE_DEPLOY_WORKER_IMAGE:?set PAPERFORGE_DEPLOY_WORKER_IMAGE}
+    profiles: ["worker"]
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    environment:
+      REDIS_URL: ${PAPERFORGE_DEPLOY_REDIS_URL:-redis://redis:6379/0}
+      HTTPS_PROXY: http://${PAPERFORGE_DEPLOY_RUNTIME_GATEWAY:?set PAPERFORGE_DEPLOY_RUNTIME_GATEWAY}:${PAPERFORGE_DEPLOY_PROXY_RELAY_PORT:-38888}
+      NO_PROXY: 127.0.0.1,localhost,postgres,redis,minio,texd,visuald
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      texd:
+        condition: service_healthy
+      visuald:
+        condition: service_healthy
+      proxy-relay:
+        condition: service_started
+    networks:
+      - core
+      - runtime
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,socket; from urllib.parse import urlparse; u=urlparse(os.environ['REDIS_URL']); socket.create_connection((u.hostname, u.port or 6379), timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    restart: unless-stopped
+
+  web:
+    image: ${PAPERFORGE_DEPLOY_WEB_IMAGE:?set PAPERFORGE_DEPLOY_WEB_IMAGE}
+    environment:
+      PAPERFORGE_API_INTERNAL_BASE: http://api:8080
+      PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PAPERFORGE_DEPLOY_WEB_PORT:?set PAPERFORGE_DEPLOY_WEB_PORT}:3000"
+    networks:
+      - ingress
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+networks:
+  core:
+    external: true
+    name: paperforge-prod_core
+  runtime:
+    internal: true
+    # The host retains old blue/green stacks while Snap Docker refuses to stop
+    # them.  Explicit per-deployment subnets avoid exhausting Docker's small
+    # implicit address pool before a safe rollout can be completed.
+    ipam:
+      config:
+        - subnet: ${PAPERFORGE_DEPLOY_RUNTIME_SUBNET:?set PAPERFORGE_DEPLOY_RUNTIME_SUBNET}
+  ingress:
+    ipam:
+      config:
+        - subnet: ${PAPERFORGE_DEPLOY_INGRESS_SUBNET:?set PAPERFORGE_DEPLOY_INGRESS_SUBNET}
+
+volumes:
+  texdcache:
+  texdfontcache:

@@ -4,6 +4,7 @@ import { AppShell } from '@/components/auth/app-shell';
 import { AuthProvider } from '@/components/auth/auth-provider';
 import { ThemeProvider, THEME_INIT_SCRIPT } from '@/components/theme-provider';
 import { ToastProvider } from '@/components/ui/toast';
+import { WebVitalsReporter } from '@/components/performance/web-vitals';
 
 export const metadata = {
   title: 'PaperForge',
@@ -18,6 +19,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
       <body>
+        <WebVitalsReporter />
         <ThemeProvider>
           <ToastProvider>
             <AuthProvider>

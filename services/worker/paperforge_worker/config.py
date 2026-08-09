@@ -7,6 +7,7 @@ import json
 from llm_runtime import LLMConfig
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from scholar_gateway.providers import ProviderConfig
+from visuals import ImageProviderConfig
 
 
 class WorkerSettings(BaseSettings):
@@ -27,10 +28,15 @@ class WorkerSettings(BaseSettings):
     llm_openai_base_url: str = "https://api.openai.com/v1"
     llm_openai_api_key: str = ""
     llm_role_models: str = "{}"
+    llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled"}'
+
+    # Independent structured tasks can safely share the provider concurrently.
+    # Keep the bounds below the default SQLAlchemy overflow capacity.
+    card_concurrency: int = 6
+    qmatrix_concurrency: int = 4
 
     scholar_contact_email: str = ""
     scholar_user_agent: str = "PaperForge/0.1"
-    semantic_scholar_api_key: str = ""
     openalex_api_key: str = ""
     scholar_timeout_seconds: float = 20.0
     scholar_cache_ttl_hours: float = 72.0
@@ -39,20 +45,28 @@ class WorkerSettings(BaseSettings):
     search_limit_per_provider: int = 25
     search_auto_select_top_k: int = 30
     rerank_top_n: int = 40
+    # 一键综述默认尝试前 40 篇 OA 全文；仍可按部署成本下调。
+    fulltext_max_works: int = 40
 
     texd_url: str = "http://localhost:8081"
     texd_timeout_seconds: int = 120
     visuals_enabled: bool = True
-    ai_images_enabled: bool = False
+    ai_images_enabled: bool = True
     visuald_url: str = "http://localhost:8082"
     visuald_timeout_seconds: int = 30
-    image_provider: str = "cloudflare"
+    #: 默认走 Yunwu 的 OpenAI-compatible Images API：它接受尺寸与质量参数，
+    #: 而 Cloudflare FLUX 只接受提示词与步数。`IMAGE_*` 仍是其他 provider 的配置源。
+    image_provider: str = "yunwu"
     image_base_url: str = "https://api.cloudflare.com/client/v4"
     image_api_key: str = ""
     image_model: str = "@cf/black-forest-labs/flux-1-schnell"
     image_account_id: str = ""
     image_timeout_seconds: float = 180.0
     image_max_retries: int = 2
+    yunwu_api_base_url: str = ""
+    yunwu_api_key: str = ""
+    yunwu_image_model: str = ""
+    yunwu_image_timeout_seconds: float | None = None
     log_level: str = "INFO"
 
     def llm_config(self) -> LLMConfig:
@@ -60,11 +74,16 @@ class WorkerSettings(BaseSettings):
             role_models = json.loads(self.llm_role_models) if self.llm_role_models else {}
         except json.JSONDecodeError:
             role_models = {}
+        try:
+            role_thinking = json.loads(self.llm_role_thinking) if self.llm_role_thinking else {}
+        except json.JSONDecodeError:
+            role_thinking = {}
         return LLMConfig(
             provider=self.llm_default_provider,
             base_url=self.llm_openai_base_url,
             api_key=self.llm_openai_api_key,
             role_models=role_models if isinstance(role_models, dict) else {},
+            role_thinking=role_thinking if isinstance(role_thinking, dict) else {},
         )
 
     def user_agent(self) -> str:
@@ -74,12 +93,40 @@ class WorkerSettings(BaseSettings):
             return f"{agent} (mailto:{email})"
         return agent
 
+    def image_provider_config(self, provider_override: str | None = None) -> ImageProviderConfig:
+        """解析生效的图像配置；Yunwu 凭据不与其他 provider 混用。
+
+        普通生图使用 ``IMAGE_PROVIDER``；全流程论文摘要图显式传 ``yunwu``，
+        从而不会被一个旧的 Cloudflare 环境变量悄悄改走其他供应商。
+        """
+        provider = (provider_override or self.image_provider).strip().lower()
+        if provider == "yunwu":
+            return ImageProviderConfig(
+                provider=provider,
+                api_key=self.yunwu_api_key or self.image_api_key,
+                model=self.yunwu_image_model or "gpt-image-1",
+                base_url=self.yunwu_api_base_url or "https://yunwu.ai/v1",
+                timeout_seconds=(
+                    self.yunwu_image_timeout_seconds
+                    if self.yunwu_image_timeout_seconds is not None
+                    else self.image_timeout_seconds
+                ),
+                max_retries=self.image_max_retries,
+            )
+        return ImageProviderConfig(
+            provider=provider,
+            api_key=self.image_api_key,
+            model=self.image_model,
+            base_url=self.image_base_url,
+            account_id=self.image_account_id,
+            timeout_seconds=self.image_timeout_seconds,
+            max_retries=self.image_max_retries,
+        )
+
     def provider_config(self, provider_name: str) -> ProviderConfig:
         """按 provider 注入凭据与礼貌配置（凭据只在请求时使用，不进缓存键）。"""
         api_key = ""
-        if provider_name == "semantic_scholar":
-            api_key = self.semantic_scholar_api_key
-        elif provider_name == "openalex":
+        if provider_name == "openalex":
             api_key = self.openalex_api_key
         return ProviderConfig(
             api_key=api_key or None,

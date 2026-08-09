@@ -1,7 +1,13 @@
 'use client';
 
 import * as React from 'react';
-import { listJobs, skipPolish as apiSkipPolish, subscribeJobEvents } from './api';
+import {
+  cancelJob as apiCancelJob,
+  listJobs,
+  pauseJob as apiPauseJob,
+  skipPolish as apiSkipPolish,
+  subscribeJobEvents,
+} from './api';
 import { stageLabel } from './labels';
 import type { Job, JobEvent, JobKind } from './types';
 
@@ -24,9 +30,15 @@ export interface TrackedJob {
   degradedToPolling: boolean;
   /** 用户已请求跳过润色（或后端已确认跳过）：按钮据此变成不可再点。 */
   polishSkipRequested: boolean;
+  /**
+   * 用户已请求停止（'cancel' | 'pause'）。协作式停止要等当前这一步跑完，
+   * 中间可能还有一两分钟，按钮不能在这期间看着像没反应。
+   */
+  stopRequested: 'cancel' | 'pause' | null;
 }
 
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
+// paused 也算终态：这一轮停了，进度条要收；「继续」会另起一个 job。
+const TERMINAL = new Set(['paused', 'succeeded', 'failed', 'cancelled', 'needs_input']);
 
 /**
  * 卡片级任务（视觉生成）与项目级任务（全文管线）的区分。
@@ -176,6 +188,13 @@ function applyEvent(prev: TrackedJob, event: JobEvent): TrackedJob {
     warnings,
     reconnecting: false,
     polishSkipRequested: prev.polishSkipRequested || event.type === 'polish.skipped',
+    // 后端确认停止后按钮保持禁用态直到任务离开追踪列表，避免「已请求」闪回可点。
+    stopRequested:
+      event.type === 'job.cancelled'
+        ? 'cancel'
+        : event.type === 'job.paused'
+          ? 'pause'
+          : prev.stopRequested,
   };
 }
 
@@ -189,11 +208,22 @@ function newTracked(job: Job): TrackedJob {
     degradedToPolling: false,
     // 刷新页面后按钮不该「复活」：跳过标记本身就存在 job.checkpoint 上。
     polishSkipRequested: Boolean(job.checkpoint?.[POLISH_SKIP_KEY]),
+    stopRequested: readStopMode(job),
   };
 }
 
 /** 与 db.repositories.jobs::POLISH_SKIP_KEY 同名。 */
 const POLISH_SKIP_KEY = 'polish_skip';
+/** 与 db.repositories.jobs::JOB_CONTROL_KEY 同名。 */
+const JOB_CONTROL_KEY = 'control';
+
+/** 停止标记同样存在 job.checkpoint 上，刷新页面后按钮不该「复活」。 */
+function readStopMode(job: Job): 'cancel' | 'pause' | null {
+  const mode = job.checkpoint?.[JOB_CONTROL_KEY];
+  if (mode === 'cancel') return 'cancel';
+  if (mode === 'pause') return 'pause';
+  return null;
+}
 
 export interface JobTracker {
   /** 项目级主任务（全文管线）。视觉任务不会占用这个槽位。 */
@@ -214,6 +244,13 @@ export interface JobTracker {
    * 是否润色本就该由用户说了算——默认开着，但不该只能干等。
    */
   skipPolish: (jobId: string) => Promise<void>;
+  /**
+   * 取消任务。协作式停止：当前这一步（阶段 / 章节 / 条目）跑完才真的退出，
+   * 已产出的内容全部保留。
+   */
+  cancel: (jobId: string) => Promise<void>;
+  /** 暂停任务。停在最近的安全点，之后可从断点继续。 */
+  pause: (jobId: string) => Promise<void>;
 }
 
 /**
@@ -233,6 +270,8 @@ export function useJobTracker(
 ): JobTracker {
   const { onFinished, onEvent } = options;
   const [jobs, setJobs] = React.useState<Record<string, TrackedJob>>({});
+  const jobsRef = React.useRef(jobs);
+  jobsRef.current = jobs;
   const [message, setMessage] = React.useState<string | null>(null);
 
   // 回调放进 ref，避免调用方每次渲染新建函数导致重新订阅（会重开 EventSource）。
@@ -298,15 +337,17 @@ export function useJobTracker(
           });
         },
         onClose: () => {
-          let finished: Job | undefined;
+          // React does not guarantee that a functional state updater executes
+          // before the next statement.  Reading `finished` from inside that
+          // updater made onFinished race with rendering; in production the
+          // quality job could finish without the writing page ever reloading.
+          const finished = jobsRef.current[jobId]?.job;
           setJobs((prev) => {
-            finished = prev[jobId]?.job;
-            if (!finished) return prev;
+            if (!prev[jobId]) return prev;
             const next = { ...prev };
             delete next[jobId];
             return next;
           });
-          // setJobs 的 updater 在 React 18 里同步执行，finished 此时已就位。
           if (finished) onFinishedRef.current?.(finished);
         },
       }),
@@ -347,6 +388,39 @@ export function useJobTracker(
     [projectId],
   );
 
+  /**
+   * 取消 / 暂停共用一份：两者的交互形状完全一样——乐观置位、失败回滚、
+   * 真正的退出发生在 worker 的下一个安全点。
+   */
+  const requestStop = React.useCallback(
+    async (jobId: string, mode: 'cancel' | 'pause') => {
+      const call = mode === 'cancel' ? apiCancelJob : apiPauseJob;
+      const label = mode === 'cancel' ? '取消' : '暂停';
+      setJobs((prev) => {
+        const current = prev[jobId];
+        if (!current) return prev;
+        return { ...prev, [jobId]: { ...current, stopRequested: mode } };
+      });
+      try {
+        await call(projectId, jobId);
+      } catch (error) {
+        setJobs((prev) => {
+          const current = prev[jobId];
+          if (!current) return prev;
+          return { ...prev, [jobId]: { ...current, stopRequested: null } };
+        });
+        setMessage(error instanceof Error ? error.message : `${label}任务失败，请重试`);
+      }
+    },
+    [projectId],
+  );
+
+  const cancel = React.useCallback(
+    (jobId: string) => requestStop(jobId, 'cancel'),
+    [requestStop],
+  );
+  const pause = React.useCallback((jobId: string) => requestStop(jobId, 'pause'), [requestStop]);
+
   // 项目级主任务：视觉任务不占这个槽位，否则点一次生图就把正在跑的全文任务
   // 从进度条上挤掉。同时有多个项目级任务时取最早启动的那个（通常就是唯一的那个）。
   const projectJobs = Object.values(jobs).filter((item) => !isCardScoped(item.job.kind));
@@ -361,5 +435,7 @@ export function useJobTracker(
     setMessage,
     start,
     skipPolish,
+    cancel,
+    pause,
   };
 }

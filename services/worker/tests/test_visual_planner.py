@@ -18,6 +18,7 @@ from paperforge_worker.pipelines.visual_planner import (
     SectionBrief,
     plan_visuals,
 )
+from visuals import parse_visual_spec
 
 
 @dataclass
@@ -28,15 +29,28 @@ class _Result:
 
 
 class _Runner:
-    """最小的 LLMRunner 替身；记录被问了什么。"""
+    """最小的 LLMRunner 替身；记录被问了什么。
 
-    def __init__(self, value: Any, *, ok: bool = True, enabled: bool = True) -> None:
+    规划与提示词润色走不同的 role，`role_values` 因此按 role 给不同的返回值。
+    """
+
+    def __init__(
+        self,
+        value: Any,
+        *,
+        ok: bool = True,
+        enabled: bool = True,
+        role_values: dict[str, Any] | None = None,
+    ) -> None:
         self._result = _Result(ok=ok, value=value)
+        self._role_values = role_values or {}
         self.enabled = enabled
         self.calls: list[dict[str, Any]] = []
 
     async def agenerate_json(self, role: str, **kwargs: Any) -> _Result:
         self.calls.append({"role": role, **kwargs})
+        if role in self._role_values:
+            return _Result(ok=True, value=self._role_values[role])
         return self._result
 
 
@@ -44,6 +58,22 @@ SECTIONS = [
     SectionBrief(key="introduction", title="引言", excerpt="推荐系统在交互序列上排序。"),
     SectionBrief(key="method", title="方法", excerpt="模型先编码交互，再打分。"),
 ]
+
+
+def _ai_image_proposal(**overrides: Any) -> dict[str, Any]:
+    payload = {
+        "kind": "ai_image",
+        "target_section_key": "method",
+        "caption": "概念插图",
+        "alt_text": "概念插图的替代文本",
+        "ai_image": {
+            "subject": "sequential recommendation robustness",
+            "composition": "left-to-right conceptual process",
+            "elements": ["interactions", "ranking"],
+        },
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _diagram_proposal(**overrides: Any) -> dict[str, Any]:
@@ -208,9 +238,50 @@ async def test_ai_image_semantics_are_carried_into_the_spec() -> None:
     spec = planned[0].spec
     # 语义层是提供商无关的描述，适配器负责转成厂商请求。
     assert spec["semantics"]["subject"] == "sequential recommendation robustness"
-    assert spec["semantics"]["text_policy"] == "none"
+    # 画面里要不要文字交给润色阶段按题材判断，规划层不再一律禁字。
+    assert spec["semantics"]["text_policy"] == "auto"
     # prompt 仍然写满：下游（历史数据、导出）都还依赖它。
     assert "sequential recommendation robustness" in spec["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_ai_image_prompts_are_refined_by_the_text_model() -> None:
+    """插图提示词由文本模型写成，而不是字段拼接的产物。
+
+    润色发生在**规划**阶段并落进 spec：确认框展示的与 worker 发出去的因此仍是
+    同一个字符串（都走 `AIImageSpec.render_prompt()`）。
+    """
+    refined = (
+        "A wide conceptual illustration of a recommendation pipeline, interaction traces "
+        "flowing left to right into a ranked list, restrained palette, soft even lighting, "
+        "publication quality."
+    )
+    runner = _Runner(
+        {"proposals": [_ai_image_proposal()]},
+        role_values={"polisher": {"prompt": refined}},
+    )
+    planned, _ = await plan_visuals(sections=SECTIONS, runner=runner, allow_ai_images=True)
+
+    spec = planned[0].spec
+    assert spec["refined_prompt"] == refined
+    assert parse_visual_spec(spec).render_prompt() == refined
+    # 润色是独立一次调用，规划本身仍然只发一次。
+    assert [call["role"] for call in runner.calls] == ["planner", "polisher"]
+
+
+@pytest.mark.asyncio
+async def test_unusable_refinements_fall_back_to_the_assembled_prompt() -> None:
+    """润色失败不能拖垮建议——插图照样能生成（draft-first）。"""
+    runner = _Runner(
+        {"proposals": [_ai_image_proposal()]},
+        # 太短，多半是模型原样回抄而不是真的润色过。
+        role_values={"polisher": {"prompt": "an illustration"}},
+    )
+    planned, _ = await plan_visuals(sections=SECTIONS, runner=runner, allow_ai_images=True)
+
+    spec = planned[0].spec
+    assert spec["refined_prompt"] is None
+    assert "sequential recommendation robustness" in parse_visual_spec(spec).render_prompt()
 
 
 @pytest.mark.asyncio
@@ -266,3 +337,38 @@ def test_short_review_detection_suppresses_generic_visual_fallbacks() -> None:
     assert _is_short_review("review", short) is True
     assert _is_short_review("review", long) is False
     assert _is_short_review("original", short) is False
+
+
+def test_full_pipeline_summary_proposal_is_one_landscape_ai_image() -> None:
+    from types import SimpleNamespace
+
+    from paperforge_worker.pipelines.visuals import _summary_visual_proposal
+
+    abstract = SimpleNamespace(
+        section_key="abstract",
+        body_ir_json={
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "runs": [
+                        {
+                            "t": "text",
+                            "v": "本文综述根系损伤检测的核心问题、技术路径与主要结论。",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    proposal = _summary_visual_proposal(
+        "根系损伤检测综述",
+        abstract_section=abstract,
+        body_sections=[],
+    )
+    assert proposal.kind == "ai_image"
+    assert proposal.title == "论文摘要图"
+    assert proposal.target_section_key == "abstract"
+    assert proposal.spec["size"] == "1536x1024"
+    assert proposal.spec["semantics"]["aspect_ratio"] == "3:2"
+    assert proposal.spec["semantics"]["text_policy"] == "auto"
+    assert proposal.spec["quality"] == "high"

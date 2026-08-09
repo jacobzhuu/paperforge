@@ -18,6 +18,28 @@ PASSWORD = "correct horse battery staple"
 NEW_PASSWORD = "a much better replacement passphrase"
 
 
+def test_api_settings_resolve_yunwu_specific_image_credentials() -> None:
+    from paperforge_api.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        image_provider="yunwu",
+        image_api_key="cloudflare-key",
+        image_model="@cf/model",
+        image_base_url="https://api.cloudflare.com/client/v4",
+        yunwu_api_key="yunwu-key",
+        yunwu_image_model="gpt-image-1",
+        yunwu_api_base_url="https://yunwu.ai/v1",
+        yunwu_image_timeout_seconds=240,
+    )
+    config = settings.image_provider_config()
+    assert config.provider == "yunwu"
+    assert config.api_key == "yunwu-key"
+    assert config.model == "gpt-image-1"
+    assert config.base_url == "https://yunwu.ai/v1"
+    assert config.timeout_seconds == 240
+
+
 class _Queue:
     async def enqueue_job(self, *_args: Any, **_kwargs: Any) -> None:
         return None
@@ -157,9 +179,7 @@ def test_register_verify_login_me_and_logout(auth_client: TestClient) -> None:
 
 
 def test_development_admin_login_uses_a_real_scoped_session(auth_client: TestClient) -> None:
-    login = auth_client.post(
-        "/api/v1/auth/login", json={"email": "admin", "password": "123456"}
-    )
+    login = auth_client.post("/api/v1/auth/login", json={"email": "admin", "password": "123456"})
     assert login.status_code == 200, login.text
     user = login.json()["user"]
     uuid.UUID(user["id"])
@@ -176,9 +196,7 @@ def test_development_admin_login_uses_a_real_scoped_session(auth_client: TestCli
 
 
 def test_development_admin_login_rejects_wrong_password(auth_client: TestClient) -> None:
-    response = auth_client.post(
-        "/api/v1/auth/login", json={"email": "admin", "password": "wrong"}
-    )
+    response = auth_client.post("/api/v1/auth/login", json={"email": "admin", "password": "wrong"})
     assert response.status_code == 401
     assert response.json()["detail"]["code"] == "invalid_credentials"
 
@@ -223,8 +241,8 @@ def test_settings_exposes_status_not_internal_addresses(auth_client: TestClient)
     assert "image_account_id" not in payload
     assert "scholar_contact_email" not in payload
     assert isinstance(payload["scholar_contact_email_configured"], bool)
-    assert payload["image_provider"] == "cloudflare"
-    assert payload["image_model"] == "@cf/black-forest-labs/flux-1-schnell"
+    assert payload["image_provider"] == "yunwu"
+    assert payload["image_model"] == "gpt-image-1"
     assert payload["image_provider_configured"] is False
 
 
@@ -250,7 +268,7 @@ def test_password_policy_allows_unicode_and_spaces_but_blocks_common_passwords(
 ) -> None:
     accepted = auth_client.post(
         "/api/v1/auth/register",
-        json={"email": "unicode@example.com", "password": "中文 12345"},
+        json={"email": "unicode@example.com", "password": "中文密码 可以包含空格 123456"},
     )
     assert accepted.status_code == 202
     too_short = auth_client.post(
@@ -411,7 +429,9 @@ def test_foreign_project_is_hidden_across_all_routers(
     ).json()
     foreign_token = "foreign-session-token"
     _seed_session(
-        auth_client.database_url, "foreign@example.com", foreign_token  # type: ignore[attr-defined]
+        auth_client.database_url,
+        "foreign@example.com",
+        foreign_token,  # type: ignore[attr-defined]
     )
     auth_client.cookies.clear()
     auth_client.cookies.set("paperforge_session", foreign_token)

@@ -125,14 +125,26 @@ async def apply_generated_publication_metadata(
 
 
 async def get_owned_project(
-    session: AsyncSession, project_id: uuid.UUID, owner_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    owner_id: uuid.UUID,
+    *,
+    include_deleted: bool = False,
 ) -> PaperProject | None:
-    return await session.scalar(
-        select(PaperProject).where(
-            PaperProject.id == project_id,
-            PaperProject.owner_id == owner_id,
-        )
+    """按 owner 取项目。
+
+    **软删除的收口点**：API 的 `authorize_project_request` 是 router 级依赖，
+    所有 project 作用域路由都经过它，所以在这里过滤一次，等于删除后整个项目的
+    每一个端点自动 404。只有「恢复」「彻底删除」这类必须看见墓碑的路径才传
+    ``include_deleted=True``。
+    """
+    stmt = select(PaperProject).where(
+        PaperProject.id == project_id,
+        PaperProject.owner_id == owner_id,
     )
+    if not include_deleted:
+        stmt = stmt.where(PaperProject.deleted_at.is_(None))
+    return await session.scalar(stmt)
 
 
 async def list_projects(
@@ -140,10 +152,78 @@ async def list_projects(
     *,
     owner_id: uuid.UUID,
     limit: int = 100,
+    deleted: bool = False,
 ) -> list[PaperProject]:
-    stmt = select(PaperProject).order_by(PaperProject.created_at.desc()).limit(limit)
-    stmt = stmt.where(PaperProject.owner_id == owner_id)
-    return list((await session.scalars(stmt)).all())
+    """项目列表。``deleted=True`` 取回收站（只列已软删除的）。"""
+    stmt = select(PaperProject).where(PaperProject.owner_id == owner_id)
+    stmt = stmt.where(
+        PaperProject.deleted_at.is_not(None) if deleted else PaperProject.deleted_at.is_(None)
+    )
+    # 回收站按删除时间排：用户找的是「刚才误删的那个」。
+    order = PaperProject.deleted_at.desc() if deleted else PaperProject.created_at.desc()
+    return list((await session.scalars(stmt.order_by(order).limit(limit))).all())
+
+
+async def soft_delete_project(session: AsyncSession, project: PaperProject) -> PaperProject:
+    """软删除：项目立刻从列表与所有路由上消失，产物一件不动。幂等。"""
+    if project.deleted_at is None:
+        project.deleted_at = datetime.now(UTC)
+        await session.flush()
+        await _refresh_server_defaults(session, project)
+    return project
+
+
+async def restore_project(session: AsyncSession, project: PaperProject) -> PaperProject:
+    """从回收站恢复。幂等。"""
+    if project.deleted_at is not None:
+        project.deleted_at = None
+        await session.flush()
+        await _refresh_server_defaults(session, project)
+    return project
+
+
+async def _refresh_server_defaults(session: AsyncSession, project: PaperProject) -> None:
+    """把 flush 之后失效的服务端列读回来。
+
+    `updated_at` 是 `onupdate=func.now()`，值由数据库算，flush 发出 UPDATE 之后这一列
+    就被标记为过期。之后第一次读它会触发一次隐式 SELECT——而读它的
+    `_project_response` 是个同步函数，同步上下文里发不出 IO，于是抛
+    `MissingGreenlet`，恢复接口直接 500：回收站里的「恢复」按钮点了就报错。
+    在这里用异步的方式读回来，同步的响应构造就不会再碰 IO。
+    """
+    await session.refresh(project)
+
+
+async def list_purgeable_projects(
+    session: AsyncSession,
+    *,
+    before: datetime,
+    limit: int = 500,
+) -> list[PaperProject]:
+    """保留期已过、可以真删的项目。供 `paperforge-admin purge-projects` 使用。"""
+    return list(
+        (
+            await session.scalars(
+                select(PaperProject)
+                .where(
+                    PaperProject.deleted_at.is_not(None),
+                    PaperProject.deleted_at < before,
+                )
+                .order_by(PaperProject.deleted_at)
+                .limit(limit)
+            )
+        ).all()
+    )
+
+
+async def purge_project(session: AsyncSession, project: PaperProject) -> None:
+    """真删行。所有 project 关联表都是 ON DELETE CASCADE（含 0008 补的成本台账）。
+
+    对象存储不在事务里，调用方必须**先**删对象再调它——反过来的话一旦删行成功、
+    删对象失败，object_key 就再也查不出来了，存储里留下永远没人认领的垃圾。
+    """
+    await session.delete(project)
+    await session.flush()
 
 
 #: `update_project` 里「不传就是不改」的哨兵。

@@ -17,6 +17,15 @@ apps/web/out/
 .env
 .env.*
 !.env.example
+!.env.production.example
+# 生产凭据始终放在仓库之外（scripts/ops 强制 PAPERFORGE_ENV_FILE 指向外部路径），
+# 这几条只是防手滑：任何私钥/证书/凭据目录都不应该出现在树里。
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+secrets/
 
 # Data / artifacts / build
 data/
@@ -28,6 +37,19 @@ artifacts/
 .minio/
 .pg/
 .paperforge/
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+
+# 评测产物：生成的稿件与盲评映射表（analysis.py / anonymize.py 的输出）。
+# 盲评 key 按 README 要求落在仓库外，但生成目录默认就在这里。
+evals/review_depth/generated/
+evals/review_depth/blind/
+evals/review_depth/results/
+
+# 本机 Claude Code 权限配置（launch.json 可共享，settings.local.json 不行）
+.claude/settings.local.json
 
 # Local planning/session notes
 task_plan.md

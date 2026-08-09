@@ -24,10 +24,12 @@ vi.mock('@/components/ui/toast', () => ({
 
 const listAssets = vi.fn();
 const getNumLint = vi.fn();
+const getMaterialPreflight = vi.fn();
 
 vi.mock('@/lib/api', () => ({
   listAssets: (...args: unknown[]) => listAssets(...args),
   getNumLint: (...args: unknown[]) => getNumLint(...args),
+  getMaterialPreflight: (...args: unknown[]) => getMaterialPreflight(...args),
   deleteAsset: vi.fn(),
   uploadAsset: vi.fn(),
   assetDownloadUrl: () => '#',
@@ -53,6 +55,7 @@ describe('素材中心', () => {
       ]),
     );
     getNumLint.mockReturnValue(ok({ consistent: true, checked_count: 3, sourced_count: 3 }));
+    getMaterialPreflight.mockResolvedValue({ ready: true, issues: [] });
   });
 
   it('NUMLINT 失败时素材列表仍然渲染——这是 P0 的核心验收', async () => {

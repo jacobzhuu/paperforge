@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,16 +20,28 @@ from db import (
     create_quality_report,
     create_user,
     create_user_session,
+    get_job,
+    replace_citation_usage,
+    update_job,
     upsert_entry,
     upsert_section,
     upsert_work,
 )
+from db.models.library import (
+    DocumentFile,
+    DocumentParse,
+    LiteraturePdfUpload,
+    ScholarlyWork,
+)
+from db.models.paper import GenerationJob
+from db.repositories.evidence import upsert_evidence_unit
 from db.repositories.visuals import document_snapshot_hash
 from db.session import make_engine, make_session_factory
 from fastapi.testclient import TestClient
 from paperforge_api.deps import get_queue
 from paperforge_api.main import create_app
 from paperforge_api.schemas import LiteratureCardResponse
+from sqlalchemy import select
 
 from conftest import run_async
 
@@ -76,6 +90,66 @@ class _FakeQueue:
 
     async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((function, args, kwargs))
+
+
+class _FailingQueue:
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> None:
+        raise ConnectionError("queue unavailable during dispatch")
+
+
+def _install_deepseek_image_stub(monkeypatch, *, captured: list[dict[str, Any]] | None = None):
+    """让 AI 草稿测试验证全文链路，但绝不访问真实 DeepSeek。"""
+
+    class StubRunner:
+        enabled = True
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def agenerate_json(self, role: str, **kwargs: Any):
+            if captured is not None:
+                captured.append({"role": role, **kwargs})
+            return SimpleNamespace(
+                ok=True,
+                model="deepseek-test",
+                value={
+                    "title": "论文级综述图",
+                    "caption": "结合论文全文呈现核心机制、方法分类与开放问题。",
+                    "alt_text": "横向综述图展示核心机制、方法分类、防御与开放问题。",
+                    "subject": "论文全文的核心研究主题与证据综合",
+                    "composition": "横向阅读，中心主题连接方法分类、机制、防御和未来方向",
+                    "elements": ["核心问题", "方法分类", "攻击机制", "防御策略", "开放问题"],
+                    "text_policy": "auto",
+                    "prompt": (
+                        "Create a publication-ready horizontal graphical abstract grounded in "
+                        "the complete paper. Organize the central research theme with clearly "
+                        "connected method, mechanism, defense, and future-direction groups. Use "
+                        "a restrained scientific palette, crisp journal-quality rendering, and "
+                        "only the requested correctly spelled labels."
+                    ),
+                },
+            )
+
+    import llm_runtime
+
+    monkeypatch.setattr(llm_runtime, "LLMRunner", StubRunner)
+
+
+def _pdf_bytes() -> bytes:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    writer.add_metadata(
+        {
+            "/Title": "Retrieval Augmented Generation",
+            "/Author": "Ada Lovelace",
+            "/Subject": "doi:10.1000/rag",
+        }
+    )
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 def test_literature_card_response_preserves_structured_fulltext_locator() -> None:
@@ -166,6 +240,38 @@ def seed(database_url: str, coro_factory):
             await engine.dispose()
 
     return run_async(_run())
+
+
+def drain_jobs(database_url: str, project_id: str) -> int:
+    """把该项目所有排队中的任务标成 succeeded，替代不存在的 worker。
+
+    并发任务槽（``paperforge_api.jobs.ensure_project_job_slot``）按设计拒绝同项目的
+    第二条产物任务——生产里这是对的，上一条真的还在跑。但测试用的是只记录调用的
+    假队列，任务永远停在 ``queued``，于是「PDF 匹配失败后重试」「首稿完成后再起
+    一轮」这类本来合法的第二步全被 409 挡掉，断言还没走到就先炸了。
+
+    这个 helper 只做 worker 迟早会做的事：把上一条任务收尾。它显式调用而不是做成
+    autouse fixture——并发槽本身的行为由 test_job_serialization.py 直接断言，
+    而这里每一次调用都标出了「现实中这一步之前上一条任务已经跑完了」，
+    自动排空会把这个前提藏起来。
+
+    返回收尾的任务条数，便于调用方确认自己排空的正是预期的那一条。
+    """
+
+    async def _finish(session):
+        rows = (
+            await session.scalars(
+                select(GenerationJob).where(
+                    GenerationJob.project_id == uuid.UUID(project_id),
+                    GenerationJob.status.in_({"queued", "running"}),
+                )
+            )
+        ).all()
+        for job in rows:
+            job.status = "succeeded"
+        return len(rows)
+
+    return seed(database_url, _finish)
 
 
 def _create_project(client: TestClient, **overrides: Any) -> dict[str, Any]:
@@ -359,6 +465,151 @@ def test_full_generation_accepts_quality_and_review_modes(client: TestClient) ->
     assert kwargs == {"quality_profile": "submission", "review_style": "systematic"}
 
 
+def test_full_generation_defaults_to_delivering_a_draft(client: TestClient) -> None:
+    """不带 options 的 /generate 必须默认 draft。
+
+    共用的 GenerationOptionsRequest 默认 scholarly，对单跑质量端点是对的，
+    对全管线不是：scholarly 会在写完后追加收敛循环，而且没过质量门连导出都不做，
+    于是「跑通全流程」默认可能不产出任何稿件。
+    """
+    project = _create_project(client)
+    assert client.post(f"/api/v1/projects/{project['id']}/generate").status_code == 202
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_full_pipeline"
+    assert kwargs == {"quality_profile": "draft", "review_style": "narrative"}
+
+
+def test_delivered_full_job_can_start_or_skip_quality_repair(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    """质量修复和润色同形：交付之后由用户决定，且只消费一次。"""
+    project = _create_project(client)
+    started = client.post(
+        f"/api/v1/projects/{project['id']}/generate",
+        json={"quality_profile": "draft", "review_style": "systematic"},
+    ).json()
+
+    async def _deliver_with_findings(session):
+        job = await get_job(session, uuid.UUID(started["id"]))
+        await create_document(session, project_id=uuid.UUID(project["id"]), outline_id=None)
+        await update_job(
+            session,
+            job,
+            status="succeeded",
+            checkpoint={"quality_repair_decision": "pending", "quality_finding_count": 3},
+        )
+
+    seed(clean_pg_database_url, _deliver_with_findings)
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair"
+    )
+    assert response.status_code == 202, response.text
+    repair = response.json()
+    assert repair["kind"] == "write"
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_quality_repair_pipeline"
+    # 档位固定 scholarly：全流程用 draft 跑完，发现项还挂在 warnings 上，
+    # 只有按严谨档重评它们才会变成阻断项、进而驱动收敛器重写章节。
+    assert kwargs == {
+        "source_job_id": started["id"],
+        "quality_profile": "scholarly",
+        "review_style": "systematic",
+    }
+    source = client.get(f"/api/v1/projects/{project['id']}/jobs/{started['id']}").json()
+    assert source["checkpoint"]["quality_repair_decision"] == "started"
+    assert source["checkpoint"]["quality_repair_job_id"] == repair["id"]
+    assert (
+        client.post(
+            f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair"
+        ).status_code
+        == 409
+    )
+
+    # 第二个项目而不是同一个项目再跑一次 /generate：并发任务槽只允许一条在飞的
+    # 产物任务，而测试里没有 worker 去把上一条排空，同项目的第二次 enqueue 会 409。
+    other = _create_project(client)
+    skipped_source = client.post(f"/api/v1/projects/{other['id']}/generate").json()
+
+    async def _deliver_for_skip(session):
+        job = await get_job(session, uuid.UUID(skipped_source["id"]))
+        await update_job(
+            session,
+            job,
+            status="succeeded",
+            checkpoint={"quality_repair_decision": "pending", "quality_finding_count": 1},
+        )
+
+    seed(clean_pg_database_url, _deliver_for_skip)
+    skipped = client.post(
+        f"/api/v1/projects/{other['id']}/jobs/{skipped_source['id']}/quality-repair/skip"
+    )
+    assert skipped.status_code == 200
+    assert skipped.json()["checkpoint"]["quality_repair_decision"] == "skipped"
+
+
+def test_quality_repair_enqueues_bounded_repair_pipeline(client: TestClient) -> None:
+    project = _create_project(client)
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/quality/repair",
+        json={"quality_profile": "scholarly", "review_style": "narrative"},
+    )
+    assert response.status_code == 202, response.text
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_quality_repair_pipeline"
+    assert kwargs == {"quality_profile": "scholarly", "review_style": "narrative"}
+
+
+def test_original_full_generation_requires_parseable_method_and_result_materials(
+    client: TestClient,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("STORAGE_FS_ROOT", str(tmp_path))
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    project = _create_project(client, paper_type="original")
+    endpoint = f"/api/v1/projects/{project['id']}/generate"
+
+    missing = client.post(endpoint, json={})
+    assert missing.status_code == 409
+    detail = missing.json()["detail"]
+    assert detail["code"] == "original_materials_required"
+    assert {issue["code"] for issue in detail["issues"]} == {
+        "result_material_missing",
+        "method_material_missing",
+    }
+
+    table = client.post(
+        f"/api/v1/projects/{project['id']}/assets",
+        files={"file": ("results.csv", b"model,accuracy\nA,92.5%\n", "text/csv")},
+    )
+    assert table.status_code == 201, table.text
+    still_missing = client.post(endpoint, json={})
+    assert still_missing.status_code == 409
+    assert [issue["code"] for issue in still_missing.json()["detail"]["issues"]] == [
+        "method_material_missing"
+    ]
+
+    method = client.post(
+        f"/api/v1/projects/{project['id']}/assets",
+        files={
+            "file": (
+                "method.md",
+                b"Samples were normalized before model training and evaluation.",
+                "text/markdown",
+            )
+        },
+    )
+    assert method.status_code == 201, method.text
+    started = client.post(endpoint, json={})
+    assert started.status_code == 202, started.text
+    assert started.json()["kind"] == "full"
+    blocked_delete = client.delete(f"/api/v1/projects/{project['id']}/assets/{method.json()['id']}")
+    assert blocked_delete.status_code == 409
+
+
 def test_submission_export_without_current_quality_report_is_blocked(
     client: TestClient,
     clean_pg_database_url: str,
@@ -393,7 +644,7 @@ def test_submission_export_without_current_quality_report_is_blocked(
     )
     assert response.status_code == 409
     detail = response.json()["detail"]
-    assert detail["code"] == "submission_quality_gate_failed"
+    assert detail["code"] == "quality_gate_failed"
     assert detail["blockers"][0]["code"] == "quality_report_missing"
     assert client.get(f"/api/v1/projects/{project['id']}/exports").json() == []
 
@@ -637,6 +888,77 @@ def test_skip_polish_rejects_finished_and_foreign_jobs(
     )
 
 
+def test_finished_full_job_can_start_or_skip_optional_polish(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    """首稿完成后由用户二选一；润色作为独立任务，不重跑全文管线。"""
+    project = _create_project(client)
+    started = client.post(
+        f"/api/v1/projects/{project['id']}/generate",
+        json={"quality_profile": "submission", "review_style": "systematic"},
+    ).json()
+
+    async def _finish_with_first_draft(session):
+        job = await get_job(session, uuid.UUID(started["id"]))
+        document = await create_document(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            outline_id=None,
+        )
+        await update_job(
+            session,
+            job,
+            status="succeeded",
+            checkpoint={
+                "polish_decision": "pending",
+                "write_document_id": str(document.id),
+            },
+        )
+        return str(document.id)
+
+    document_id = seed(clean_pg_database_url, _finish_with_first_draft)
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['id']}/polish")
+    assert response.status_code == 202, response.text
+    polished = response.json()
+    assert polished["kind"] == "write"
+    assert polished["checkpoint"]["write_document_id"] == document_id
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_polish_pipeline"
+    assert kwargs == {
+        "source_job_id": started["id"],
+        "quality_profile": "submission",
+        "review_style": "systematic",
+    }
+    source = client.get(f"/api/v1/projects/{project['id']}/jobs/{started['id']}").json()
+    assert source["checkpoint"]["polish_decision"] == "started"
+    assert source["checkpoint"]["polish_job_id"] == polished["id"]
+    assert (
+        client.post(f"/api/v1/projects/{project['id']}/jobs/{started['id']}/polish").status_code
+        == 409
+    )
+
+    # 起第二轮之前，用户显式启动的那条润色任务在现实里已经跑完了。
+    assert drain_jobs(clean_pg_database_url, project["id"]) == 1
+    skipped_source = client.post(f"/api/v1/projects/{project['id']}/generate").json()
+
+    async def _finish_for_skip(session):
+        job = await get_job(session, uuid.UUID(skipped_source["id"]))
+        await update_job(
+            session,
+            job,
+            status="succeeded",
+            checkpoint={"polish_decision": "pending"},
+        )
+
+    seed(clean_pg_database_url, _finish_for_skip)
+    skipped = client.post(
+        f"/api/v1/projects/{project['id']}/jobs/{skipped_source['id']}/polish/skip"
+    )
+    assert skipped.status_code == 200
+    assert skipped.json()["checkpoint"]["polish_decision"] == "skipped"
+
+
 def test_import_requires_dois_or_bibtex(client: TestClient) -> None:
     project = _create_project(client)
     response = client.post(f"/api/v1/projects/{project['id']}/library/import", json={})
@@ -654,6 +976,474 @@ def test_import_enqueues_verification_job(client: TestClient) -> None:
     # R1：导入必须走反查任务，API 不直接写库。
     assert function == "run_import_pipeline"
     assert kwargs["dois"] == ["10.1000/rag"]
+
+
+def test_pdf_upload_is_private_and_enqueues_matching(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client)
+    uploaded = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads",
+        files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
+    )
+    assert uploaded.status_code == 202, uploaded.text
+    body = uploaded.json()
+    assert body["upload"]["status"] == "matching"
+    assert body["upload"]["filename"] == "paper.pdf"
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_pdf_match_pipeline"
+    assert kwargs["upload_id"] == body["upload"]["id"]
+    assert kwargs["_job_id"] == body["job"]["id"]
+
+    async def _load(session):
+        row = await session.get(LiteraturePdfUpload, uuid.UUID(body["upload"]["id"]))
+        return row.project_id, row.object_key
+
+    owner_project_id, object_key = seed(clean_pg_database_url, _load)
+    assert owner_project_id == uuid.UUID(project["id"])
+    assert object_key.startswith(
+        f"users/{client.owner_id}/projects/{project['id']}/literature/"  # type: ignore[attr-defined]
+    )
+
+    other = _create_project(client, title="Other project")
+    assert client.get(f"/api/v1/projects/{other['id']}/library/pdf-uploads").json() == []
+    assert (
+        client.get(
+            f"/api/v1/projects/{other['id']}/library/pdf-uploads/{body['upload']['id']}/download"
+        ).status_code
+        == 404
+    )
+
+    async def _fail_match(session):
+        row = await session.get(LiteraturePdfUpload, uuid.UUID(body["upload"]["id"]))
+        row.status = "match_failed"
+        row.error_json = {"reason": "verification_failed"}
+
+    seed(clean_pg_database_url, _fail_match)
+    # 匹配任务失败之后才谈得上重试；这里替 worker 把它收尾。
+    assert drain_jobs(clean_pg_database_url, project["id"]) == 1
+    retried = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{body['upload']['id']}/retry"
+    )
+    assert retried.status_code == 202, retried.text
+    retried_body = retried.json()
+    assert retried_body["upload"]["status"] == "matching"
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_pdf_match_pipeline"
+    assert kwargs["upload_id"] == body["upload"]["id"]
+    assert kwargs["_job_id"] == retried_body["job"]["id"]
+
+
+def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client, title="Recoverable PDF dispatch")
+    client.app.dependency_overrides[get_queue] = lambda: _FailingQueue()
+
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads",
+        files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
+    )
+    assert response.status_code == 503, response.text
+
+    uploads = client.get(f"/api/v1/projects/{project['id']}/library/pdf-uploads").json()
+    assert len(uploads) == 1
+    assert uploads[0]["status"] == "match_failed"
+    assert uploads[0]["error"]["reason"] == "task_enqueue_failed"
+    downloaded = client.get(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploads[0]['id']}/download"
+    )
+    assert downloaded.status_code == 200
+
+    async def _job_state(session):
+        row = await session.scalar(
+            select(GenerationJob).where(GenerationJob.project_id == uuid.UUID(project["id"]))
+        )
+        return row.status, row.error_json
+
+    job_status, error = seed(clean_pg_database_url, _job_state)
+    assert job_status == "failed"
+    assert error["reason"] == "task_enqueue_failed"
+
+
+def test_cancelling_queued_pdf_job_makes_upload_retryable(client: TestClient) -> None:
+    project = _create_project(client, title="Cancelled PDF match")
+    started = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads",
+        files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
+    ).json()
+
+    cancelled = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['job']['id']}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+
+    uploads = client.get(f"/api/v1/projects/{project['id']}/library/pdf-uploads").json()
+    assert uploads[0]["status"] == "match_failed"
+    assert uploads[0]["error"] == {
+        "reason": "job_cancelled",
+        "job_id": started["job"]["id"],
+    }
+    retried = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{started['upload']['id']}/retry"
+    )
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["upload"]["status"] == "matching"
+
+
+def test_running_pdf_job_cannot_be_paused(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client, title="Atomic PDF match")
+    started = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads",
+        files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
+    ).json()
+
+    async def _run(session):
+        row = await get_job(session, uuid.UUID(started["job"]["id"]))
+        await update_job(session, row, status="running")
+
+    seed(clean_pg_database_url, _run)
+    paused = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['job']['id']}/pause")
+    assert paused.status_code == 409
+    assert "retry the upload" in paused.json()["detail"]
+
+
+def test_confirmed_pdf_binds_private_document_and_enters_library(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client)
+    uploaded = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads",
+        files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
+    ).json()["upload"]
+
+    async def _match(session):
+        work, _ = await upsert_work(session, _Candidate())
+        # Confirming a PDF is an explicit re-admission action, even if this
+        # scholarly work had previously been excluded from the project.
+        await upsert_entry(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            work_id=work.id,
+            added_via="pdf_upload",
+            status="excluded",
+            verified=True,
+        )
+        row = await session.get(LiteraturePdfUpload, uuid.UUID(uploaded["id"]))
+        row.matched_work_id = work.id
+        row.match_method = "doi_existing"
+        row.match_confidence = 1.0
+        row.extracted_metadata_json = {
+            "doi": "10.1000/rag",
+            "title": "Retrieval Augmented Generation",
+            "authors": ["Ada Lovelace"],
+            "publication_year": 2023,
+        }
+        # A re-upload of identical bytes must repair/rebind the existing
+        # project-private document instead of creating a duplicate or parsing
+        # a stale/missing object.
+        session.add(
+            DocumentFile(
+                project_id=uuid.UUID(project["id"]),
+                access_scope="private",
+                work_id=work.id,
+                kind="uploaded_pdf",
+                object_key="users/stale/missing.pdf",
+                mime="application/pdf",
+                bytes=row.bytes,
+                content_hash=row.content_hash,
+            )
+        )
+        row.status = "needs_confirmation"
+        return str(work.id), row.object_key
+
+    work_id, uploaded_object_key = seed(clean_pg_database_url, _match)
+    # 现实里这一步之前匹配任务已经跑完（upload.status 才会走到 needs_confirmation）。
+    assert drain_jobs(clean_pg_database_url, project["id"]) == 1
+    confirmed = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploaded['id']}/confirm",
+        json={"literature_role": "core"},
+    )
+    assert confirmed.status_code == 202, confirmed.text
+    confirmed_body = confirmed.json()
+    assert confirmed_body["upload"]["status"] == "parsing"
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_uploaded_pdf_pipeline"
+    assert kwargs["upload_id"] == uploaded["id"]
+    assert kwargs["_job_id"] == confirmed_body["job"]["id"]
+
+    library = client.get(f"/api/v1/projects/{project['id']}/library").json()
+    assert len(library) == 1
+    assert library[0]["work"]["id"] == work_id
+    assert library[0]["status"] == "selected"
+    assert library[0]["added_via"] == "pdf_upload"
+    assert library[0]["literature_role"] == "core"
+    assert library[0]["bibtex_key"]
+    assert library[0]["utilization"]["fulltext_status"] == "parsing"
+    assert library[0]["utilization"]["fulltext_source"] == "user_pdf"
+
+    async def _document_scope(session):
+        documents = list(
+            (
+                await session.scalars(
+                    select(DocumentFile).where(DocumentFile.project_id == uuid.UUID(project["id"]))
+                )
+            ).all()
+        )
+        return (
+            len(documents),
+            documents[0].access_scope,
+            documents[0].work_id,
+            documents[0].object_key,
+        )
+
+    document_count, access_scope, bound_work_id, object_key = seed(
+        clean_pg_database_url,
+        _document_scope,
+    )
+    assert document_count == 1
+    assert access_scope == "private"
+    assert bound_work_id == uuid.UUID(work_id)
+    assert object_key == uploaded_object_key
+    downloaded = client.get(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploaded['id']}/download"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content.startswith(b"%PDF-")
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
+
+    async def _fail_parse(session):
+        row = await session.get(LiteraturePdfUpload, uuid.UUID(uploaded["id"]))
+        row.status = "parse_failed"
+        row.error_json = {"reason": "temporary_parser_failure"}
+
+    seed(clean_pg_database_url, _fail_parse)
+    # 解析任务失败之后才谈得上重试；这里替 worker 把它收尾。
+    assert drain_jobs(clean_pg_database_url, project["id"]) == 1
+    retried = client.post(
+        f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploaded['id']}/retry"
+    )
+    assert retried.status_code == 202, retried.text
+    retried_body = retried.json()
+    assert retried_body["upload"]["status"] == "parsing"
+    function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
+    assert function == "run_uploaded_pdf_pipeline"
+    assert kwargs["upload_id"] == uploaded["id"]
+    assert kwargs["_job_id"] == retried_body["job"]["id"]
+
+
+def test_private_pdf_utilization_does_not_leak_to_another_project(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    first = _create_project(client, title="Private source owner")
+    second = _create_project(client, title="Same work without private source")
+
+    async def _seed(session):
+        work, _ = await upsert_work(session, _Candidate())
+        for project in (first, second):
+            await upsert_entry(
+                session,
+                project_id=uuid.UUID(project["id"]),
+                work_id=work.id,
+                added_via="search",
+                status="selected",
+                verified=True,
+            )
+        document = DocumentFile(
+            project_id=uuid.UUID(first["id"]),
+            access_scope="private",
+            work_id=work.id,
+            kind="uploaded_pdf",
+            object_key=(
+                f"users/{client.owner_id}/projects/{first['id']}/literature/private.pdf"  # type: ignore[attr-defined]
+            ),
+            mime="application/pdf",
+            bytes=12,
+            content_hash="a" * 64,
+        )
+        session.add(document)
+        await session.flush()
+        session.add(
+            DocumentParse(
+                document_file_id=document.id,
+                parser_version="ingest_fulltext_v2",
+                status="parsed",
+                extracted_text="Private full-text evidence.",
+            )
+        )
+        await upsert_evidence_unit(
+            session,
+            work_id=work.id,
+            project_id=uuid.UUID(first["id"]),
+            kind="experimental_fact",
+            grade="B_located_prose",
+            text="Private full-text evidence.",
+            text_hash="b" * 64,
+            source_document_file_id=document.id,
+        )
+        return str(work.id)
+
+    work_id = seed(clean_pg_database_url, _seed)
+    first_entry = next(
+        item
+        for item in client.get(f"/api/v1/projects/{first['id']}/library").json()
+        if item["work"]["id"] == work_id
+    )
+    second_entry = next(
+        item
+        for item in client.get(f"/api/v1/projects/{second['id']}/library").json()
+        if item["work"]["id"] == work_id
+    )
+
+    assert first_entry["utilization"]["fulltext_status"] == "available"
+    assert first_entry["utilization"]["fulltext_source"] == "user_pdf"
+    assert first_entry["utilization"]["evidence_count"] == 1
+    assert second_entry["utilization"]["fulltext_status"] == "abstract_only"
+    assert second_entry["utilization"]["fulltext_source"] == "none"
+    assert second_entry["utilization"]["evidence_count"] == 0
+
+
+def test_library_utilization_counts_only_the_latest_document(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client, title="Current manuscript utilization")
+
+    async def _seed(session):
+        work, _ = await upsert_work(session, _Candidate())
+        entry, _ = await upsert_entry(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            work_id=work.id,
+            added_via="search",
+            status="selected",
+            verified=True,
+        )
+        entry.bibtex_key = "lovelace2023rag"
+        old_document = await create_document(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            outline_id=None,
+        )
+        old_section = await upsert_section(
+            session,
+            document_id=old_document.id,
+            section_key="old",
+            title="Old draft",
+            order_no=1,
+            body_ir={"blocks": []},
+            cite_keys=[entry.bibtex_key],
+        )
+        await replace_citation_usage(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            section_id=old_section.id,
+            usages=[
+                {
+                    "work_id": work.id,
+                    "cite_key": entry.bibtex_key,
+                    "context_snippet": "Only the old draft cited this work.",
+                }
+            ],
+        )
+        current_document = await create_document(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            outline_id=None,
+        )
+        await upsert_section(
+            session,
+            document_id=current_document.id,
+            section_key="current",
+            title="Current draft",
+            order_no=1,
+            body_ir={"blocks": []},
+            cite_keys=[],
+        )
+        return str(work.id)
+
+    work_id = seed(clean_pg_database_url, _seed)
+    entry = next(
+        item
+        for item in client.get(f"/api/v1/projects/{project['id']}/library").json()
+        if item["work"]["id"] == work_id
+    )
+    assert entry["utilization"]["usage_evaluated"] is True
+    assert entry["utilization"]["citation_status"] == "not_cited"
+    assert entry["utilization"]["citation_count"] == 0
+    assert entry["utilization"]["unused_reason"] == "只有摘要，建议上传 PDF 全文"
+
+
+def test_fulltext_status_keeps_source_and_progress_from_the_same_document_class(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    project = _create_project(client, title="Mixed full-text sources")
+
+    async def _seed(session):
+        work = ScholarlyWork(
+            canonical_title="Mixed private and shared source",
+            is_retracted=False,
+        )
+        session.add(work)
+        await session.flush()
+        await upsert_entry(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            work_id=work.id,
+            added_via="search",
+            status="selected",
+            verified=True,
+        )
+        shared = DocumentFile(
+            project_id=None,
+            access_scope="shared",
+            work_id=work.id,
+            kind="oa_pdf",
+            object_key=f"shared/oa/works/{work.id}/failed.pdf",
+            mime="application/pdf",
+            bytes=10,
+            content_hash="c" * 64,
+        )
+        private = DocumentFile(
+            project_id=uuid.UUID(project["id"]),
+            access_scope="private",
+            work_id=work.id,
+            kind="uploaded_pdf",
+            object_key=(
+                f"users/{client.owner_id}/projects/{project['id']}/literature/pending.pdf"  # type: ignore[attr-defined]
+            ),
+            mime="application/pdf",
+            bytes=10,
+            content_hash="d" * 64,
+        )
+        session.add_all([shared, private])
+        await session.flush()
+        session.add(
+            DocumentParse(
+                document_file_id=shared.id,
+                parser_version="ingest_fulltext_v2",
+                status="failed",
+                error_json={"reason": "bad OA copy"},
+            )
+        )
+        return str(work.id)
+
+    work_id = seed(clean_pg_database_url, _seed)
+    entry = next(
+        item
+        for item in client.get(f"/api/v1/projects/{project['id']}/library").json()
+        if item["work"]["id"] == work_id
+    )
+    assert entry["utilization"]["fulltext_status"] == "parsing"
+    assert entry["utilization"]["fulltext_source"] == "user_pdf"
 
 
 def test_library_selection_assigns_keys_and_populates_whitelist(
@@ -691,10 +1481,70 @@ def test_library_selection_assigns_keys_and_populates_whitelist(
         json={"work_ids": [work_id], "status": "selected"},
     )
     assert selected.status_code == 200
+    assert selected.json()[0]["user_pinned"] is True
 
     whitelist = client.get(f"/api/v1/projects/{project['id']}/library/whitelist").json()
     assert len(whitelist["cite_keys"]) == 1
     assert whitelist["cite_keys"][0].startswith("lovelace2023")
+
+
+def test_evidence_endpoints_expose_selected_work_titles(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    """证据视图的题名取自 ScholarlyWork.canonical_title。
+
+    该模型没有 ``title`` 字段，早期实现读错字段名，导致项目一旦有 selected 文献，
+    证据单元与证据矩阵两个端点就整体 500——前端只能显示模块级报错。
+    """
+    project = _create_project(client)
+
+    async def _seed(session):
+        work, _ = await upsert_work(session, _Candidate())
+        await upsert_entry(
+            session,
+            project_id=uuid.UUID(project["id"]),
+            work_id=work.id,
+            added_via="search",
+            status="candidate",
+            relevance_score=0.8,
+            verified=True,
+        )
+        return str(work.id)
+
+    work_id = seed(clean_pg_database_url, _seed)
+    assert (
+        client.post(
+            f"/api/v1/projects/{project['id']}/library/entries",
+            json={"work_ids": [work_id], "status": "selected"},
+        ).status_code
+        == 200
+    )
+
+    async def _seed_evidence(session):
+        await upsert_evidence_unit(
+            session,
+            work_id=uuid.UUID(work_id),
+            project_id=uuid.UUID(project["id"]),
+            kind="experimental_fact",
+            grade="B_located_prose",
+            text="RAG improves factuality by 12 points.",
+            text_hash="hash-evidence-1",
+            page=4,
+        )
+
+    seed(clean_pg_database_url, _seed_evidence)
+
+    units = client.get(f"/api/v1/projects/{project['id']}/evidence-units")
+    assert units.status_code == 200, units.text
+    assert [item["title"] for item in units.json()] == ["Retrieval Augmented Generation"]
+    assert units.json()[0]["cite_key"].startswith("lovelace2023")
+
+    matrix = client.get(f"/api/v1/projects/{project['id']}/evidence-matrix")
+    assert matrix.status_code == 200, matrix.text
+    body = matrix.json()
+    assert [item["title"] for item in body["evidence"]] == ["Retrieval Augmented Generation"]
+    assert body["diagnostics"]["evidence_unit_count"] == 1
 
 
 def test_selecting_unknown_work_is_rejected(client: TestClient) -> None:
@@ -1062,6 +1912,25 @@ def test_visual_summary_counts_without_loading_the_whole_list(
     # 没有文稿就谈不上「基于旧版正文」。
     assert body["stale"] == 0
 
+    # v1 的失败是历史审计记录；v2 成功后，导航汇总必须与工作台的版本折叠一致，
+    # 不能继续显示一个永远消不掉的失败红点。
+    revised = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/{failed['id']}/regenerate",
+        json={},
+    )
+    assert revised.status_code == 201, revised.text
+
+    async def _ready_revision(session):
+        from db import get_visual
+
+        row = await get_visual(session, uuid.UUID(revised.json()["id"]))
+        row.generation_status = "ready"
+
+    seed(clean_pg_database_url, _ready_revision)
+    body = client.get(f"/api/v1/projects/{project['id']}/visuals/summary").json()
+    assert body["ready"] == 2
+    assert body["failed"] == 0
+
 
 def test_visual_response_translates_legacy_error_codes_and_adds_advice(
     client: TestClient, clean_pg_database_url, tmp_path, monkeypatch
@@ -1096,6 +1965,44 @@ def test_visual_response_translates_legacy_error_codes_and_adds_advice(
     assert "ValueError" not in target["error"]["message"]
     # 平铺字段在过渡期保持原样，前端切换完再废弃。
     assert target["error_code"] == "ValueError"
+
+
+def test_visual_list_exposes_successful_generation_time_and_method(
+    client: TestClient, clean_pg_database_url, tmp_path, monkeypatch
+) -> None:
+    """建议创建时间与图片生成时间必须分开，方式取实际 attempt 而非当前配置。"""
+    monkeypatch.setenv("STORAGE_FS_ROOT", str(tmp_path))
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    project = _create_project(client, paper_type="original")
+    upload = client.post(
+        f"/api/v1/projects/{project['id']}/assets",
+        files={"file": ("results.csv", b"method,score\nA,0.8\n", "text/csv")},
+    ).json()
+    visual = _create_chart_visual(client, project["id"], upload["asset_ref"])
+
+    async def _record_success(session):
+        from db import get_visual, record_visual_attempt
+
+        row = await get_visual(session, uuid.UUID(visual["id"]))
+        row.generation_status = "ready"
+        row.provider = "visuald"
+        await record_visual_attempt(
+            session,
+            visual_id=row.id,
+            provider="visuald",
+            model=None,
+            output_width=1200,
+            output_height=800,
+        )
+
+    seed(clean_pg_database_url, _record_success)
+    rows = client.get(f"/api/v1/projects/{project['id']}/visuals").json()
+    target = next(row for row in rows if row["id"] == visual["id"])
+    assert target["generated_at"]
+    assert target["created_at"]
+    assert target["provider"] == "visuald"
 
 
 def test_approve_rejects_a_stale_section_version(
@@ -1213,10 +2120,12 @@ def test_settings_exposes_provider_capabilities_without_any_credentials(
         body = response.json()
         capabilities = body["image_capabilities"]
         assert capabilities["provider"] == "cloudflare"
-        # Cloudflare FLUX 只接受 prompt 与 steps：不得声明任何尺寸，
+        # Cloudflare FLUX 接受 prompt、steps 与 seed，但不接受尺寸：
         # 否则界面又会给出不会生效的比例下拉框。
         assert capabilities["supported_sizes"] == []
         assert capabilities["quality_modes"] == ["low", "medium", "high"]
+        assert capabilities["supports_seed"] is True
+        assert capabilities["supports_negative_prompt"] is False
 
         serialized = response.text
         assert "cf-secret-token" not in serialized
@@ -1225,11 +2134,14 @@ def test_settings_exposes_provider_capabilities_without_any_credentials(
         api_config._settings = None
 
 
-def test_visual_draft_fills_the_whole_spec_from_one_sentence(client: TestClient) -> None:
+def test_visual_draft_fills_the_whole_spec_from_one_sentence(
+    client: TestClient, monkeypatch
+) -> None:
     """新建 AI 插图不该要求用户手写图注、替代文本和构图三段文本。
 
-    没有配置文本模型时也必须给一份**能直接提交**的草稿，而不是把用户弹回空表单。
+    用户的一句话必须先由 DeepSeek 结合全文扩展，不能直接变成 Yunwu 提示词。
     """
+    _install_deepseek_image_stub(monkeypatch)
     project = _create_project(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/visuals/draft",
@@ -1240,9 +2152,129 @@ def test_visual_draft_fills_the_whole_spec_from_one_sentence(client: TestClient)
     assert body["caption"]
     assert body["alt_text"]
     assert body["spec"]["kind"] == "ai_image"
-    # 用户的意图原样进了描述，而不是被丢掉。
-    assert "根系受力后的断裂过程" in body["spec"]["prompt"]
-    assert body["generator"] == "deterministic"
+    assert body["spec"]["refined_prompt"] == body["spec"]["prompt"]
+    assert "publication-ready" in body["spec"]["refined_prompt"]
+    assert body["spec"]["semantics"]["elements"]
+    assert body["spec"]["quality"] == "high"
+    assert body["generator"] == "llm:deepseek-test"
+
+
+def test_ai_image_draft_fails_closed_when_deepseek_is_unavailable(client: TestClient) -> None:
+    project = _create_project(client)
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/draft",
+        json={"kind": "ai_image", "intent": "生成全文综述图"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "deepseek_image_prompt_failed"
+
+
+def test_yunwu_ai_draft_requires_deepseek_full_paper_analysis(
+    client: TestClient, monkeypatch
+) -> None:
+    """“开始创作”先经 DeepSeek，Yunwu 只能拿到分析后的成品提示词。"""
+
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_PROVIDER", "yunwu")
+    monkeypatch.setenv("YUNWU_API_KEY", "yunwu-test-key")
+    import paperforge_api.config as api_config
+
+    calls: list[dict[str, Any]] = []
+    _install_deepseek_image_stub(monkeypatch, captured=calls)
+    api_config._settings = None
+    try:
+        project = _create_project(client, title="循证研究自动化")
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/draft",
+            json={"kind": "ai_image", "intent": "摘要图"},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["kind"] == "ai_image"
+        assert body["generator"] == "llm:deepseek-test"
+        assert body["spec"]["refined_prompt"]
+        assert body["spec"]["semantics"]["aspect_ratio"] == "3:2"
+        assert calls[0]["role"] == "polisher"
+        assert "COMPLETE PAPER" in calls[0]["user_prompt"]
+        assert "循证研究自动化" in calls[0]["user_prompt"]
+    finally:
+        api_config._settings = None
+
+
+def test_old_ai_draft_is_analyzed_against_full_paper_before_generation(
+    client: TestClient, monkeypatch, clean_pg_database_url
+) -> None:
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_PROVIDER", "yunwu")
+    monkeypatch.setenv("YUNWU_API_KEY", "yunwu-test-key")
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    calls: list[dict[str, Any]] = []
+    _install_deepseek_image_stub(monkeypatch, captured=calls)
+    try:
+        project = _create_project(client, title="序列推荐攻击综述")
+
+        async def _seed_full_paper(session):
+            document = await create_document(
+                session, project_id=uuid.UUID(project["id"]), outline_id=None
+            )
+            for order, key, title, text in [
+                (0, "introduction", "引言", "序列推荐攻击的研究背景。"),
+                (1, "conclusion", "结论", "全文结论末尾标记 FULL-PAPER-SENTINEL。"),
+            ]:
+                await upsert_section(
+                    session,
+                    document_id=document.id,
+                    section_key=key,
+                    title=title,
+                    order_no=order,
+                    body_ir={
+                        "key": key,
+                        "level": 1,
+                        "title": title,
+                        "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": text}]}],
+                    },
+                    cite_keys=[],
+                )
+
+        seed(clean_pg_database_url, _seed_full_paper)
+        old = client.post(
+            f"/api/v1/projects/{project['id']}/visuals",
+            json={
+                "title": "全文综述图",
+                "caption": "全文综述图",
+                "alt_text": "全文综述图",
+                "spec": {
+                    "kind": "ai_image",
+                    "prompt": "A generic academic overview illustration",
+                    "quality": "high",
+                },
+            },
+        )
+        assert old.status_code == 201, old.text
+
+        blocked = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/generate"
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"]["code"] == "ai_prompt_requires_deepseek"
+
+        prepared = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/prepare-generation"
+        )
+        assert prepared.status_code == 200, prepared.text
+        body = prepared.json()
+        assert body["spec"]["refined_prompt"] == body["resolved_prompt"]
+        assert body["paper_snapshot_hash"]
+        assert "FULL-PAPER-SENTINEL" in calls[0]["user_prompt"]
+
+        generated = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/generate"
+        )
+        assert generated.status_code == 202, generated.text
+    finally:
+        api_config._settings = None
 
 
 def test_visual_draft_never_touches_the_image_provider_or_the_database(
@@ -1261,17 +2293,23 @@ def test_visual_draft_never_touches_the_image_provider_or_the_database(
     assert client.get(f"/api/v1/projects/{project['id']}/visuals").json() == []
 
 
-def test_visual_draft_survives_intents_that_hit_the_ai_image_guardrail(
-    client: TestClient,
+def test_visual_draft_survives_intents_that_cannot_go_into_a_prompt(
+    client: TestClient, monkeypatch
 ) -> None:
-    """意图里带量化表述会被 AIImageSpec 拒绝——不能把这个错误甩回界面。"""
+    """意图里带 URL 会被 AIImageSpec 拒绝——不能把这个错误甩回界面。
+
+    题材本身不再是拒绝理由：量化表述曾经会撞上一份关键字黑名单，现在只有
+    注入类内容（URL、代码片段）进不了提示词。
+    """
+    _install_deepseek_image_stub(monkeypatch)
     project = _create_project(client)
-    response = client.post(
-        f"/api/v1/projects/{project['id']}/visuals/draft",
-        json={"kind": "ai_image", "intent": "准确率 95% 的对比柱状图"},
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["spec"]["kind"] == "ai_image"
+    for intent in ("准确率 95% 的对比示意", "参照 https://example.com/figure.png 的构图"):
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/draft",
+            json={"kind": "ai_image", "intent": intent},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["spec"]["kind"] == "ai_image"
 
 
 def test_visual_draft_matches_real_section_content_instead_of_first_section(
@@ -1346,6 +2384,81 @@ def test_visual_auto_selects_traceable_chart_but_never_invents_one_without_data(
     assert "避免编造数据" in fallback.json()["warnings"][0]
 
 
+def test_visual_auto_respects_explicit_colorful_icon_style(client: TestClient, monkeypatch) -> None:
+    """“技术流程”命中关系词，但彩色 icon 是明确的 AI 插图风格要求。
+
+    这条分支只在 AI 插图开启时成立——`client` 夹具默认把它关掉（免得本机配置
+    影响断言），所以这里必须自己打开并重置配置缓存。此前没开，用例断言的
+    ai_image 永远拿不到，只能得到兜底的示意图。
+    """
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("YUNWU_API_KEY", "yunwu-test-key")
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    try:
+        _install_deepseek_image_stub(monkeypatch)
+        project = _create_project(client)
+        response = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/draft",
+            json={"kind": "auto", "intent": "生成彩色的带有 icon 图标示意的技术发展图"},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["kind"] == "ai_image"
+        assert body["spec"]["kind"] == "ai_image"
+        assert "图标化视觉风格" in body["reason"]
+    finally:
+        api_config._settings = None
+
+
+def test_visual_auto_prefers_configured_yunwu_over_graphviz_for_process_intent(
+    client: TestClient, monkeypatch
+) -> None:
+    """自动模式默认用已配置的 Yunwu；Graphviz 只在显式选 diagram 时使用。"""
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_PROVIDER", "yunwu")
+    monkeypatch.setenv("YUNWU_API_KEY", "yunwu-test-key")
+    import paperforge_api.config as api_config
+
+    api_config._settings = None
+    try:
+        _install_deepseek_image_stub(monkeypatch)
+        project = _create_project(client)
+        automatic = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/draft",
+            json={"kind": "auto", "intent": "展示检索、筛选和证据整合流程"},
+        )
+        assert automatic.status_code == 200, automatic.text
+        assert automatic.json()["kind"] == "ai_image"
+        assert "AI 生成" in automatic.json()["reason"]
+
+        local = client.post(
+            f"/api/v1/projects/{project['id']}/visuals/draft",
+            json={"kind": "diagram", "intent": "展示检索、筛选和证据整合流程"},
+        )
+        assert local.status_code == 200, local.text
+        assert local.json()["kind"] == "diagram"
+    finally:
+        api_config._settings = None
+
+
+def test_visual_auto_falls_back_to_a_diagram_when_ai_images_are_off(
+    client: TestClient,
+) -> None:
+    """AI 插图关闭时，「auto」不能选一种根本生成不了的类型。
+
+    否则用户会拿到一张永远点不动的卡片——生成按钮禁用，却看不出是功能没开还是坏了。
+    """
+    project = _create_project(client)
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/draft",
+        json={"kind": "auto", "intent": "生成彩色的带有 icon 图标示意的技术发展图"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["kind"] == "diagram"
+
+
 def test_visual_natural_language_revision_creates_a_new_version(client: TestClient) -> None:
     project = _create_project(client)
     original = client.post(
@@ -1380,3 +2493,197 @@ def test_visual_natural_language_revision_creates_a_new_version(client: TestClie
     assert body["version"] == original.json()["version"] + 1
     assert body["supersedes_id"] == original.json()["id"]
     assert body["spec"]["direction"] == "LR"
+
+
+def test_ai_image_revision_is_replanned_by_deepseek_instead_of_appended_to_style(
+    client: TestClient, monkeypatch, clean_pg_database_url
+) -> None:
+    calls: list[dict[str, Any]] = []
+    _install_deepseek_image_stub(monkeypatch, captured=calls)
+    project = _create_project(client, title="序列推荐攻击综述")
+
+    async def _seed_section(session):
+        document = await create_document(
+            session, project_id=uuid.UUID(project["id"]), outline_id=None
+        )
+        await upsert_section(
+            session,
+            document_id=document.id,
+            section_key="conclusion",
+            title="结论",
+            order_no=1,
+            body_ir={
+                "key": "conclusion",
+                "level": 1,
+                "title": "结论",
+                "blocks": [
+                    {
+                        "type": "paragraph",
+                        "runs": [{"t": "text", "v": "防御、评测基准与未来方向。"}],
+                    }
+                ],
+            },
+            cite_keys=[],
+        )
+
+    seed(clean_pg_database_url, _seed_section)
+    original = client.post(
+        f"/api/v1/projects/{project['id']}/visuals",
+        json={
+            "title": "全文综述图",
+            "caption": "旧图注",
+            "alt_text": "旧替代文本",
+            "spec": {
+                "kind": "ai_image",
+                "prompt": "A generic academic overview illustration",
+                "refined_prompt": "A generic academic overview illustration",
+                "style": "clean academic conceptual illustration",
+            },
+        },
+    )
+    revised = client.post(
+        f"/api/v1/projects/{project['id']}/visuals/{original.json()['id']}/regenerate",
+        json={"revision_instruction": "太简陋了，分析全文并生成真正能放入论文中的综述图"},
+    )
+
+    assert revised.status_code == 201, revised.text
+    body = revised.json()
+    assert body["spec"]["style"] == "clean academic conceptual illustration"
+    assert body["spec"]["refined_prompt"] == body["resolved_prompt"]
+    assert "太简陋了" in calls[0]["user_prompt"]
+    assert "防御、评测基准与未来方向" in calls[0]["user_prompt"]
+
+
+# ---- 任务控制与项目删除 ----
+
+
+def _start_full_job(client: TestClient, project: dict[str, Any]) -> dict[str, Any]:
+    response = client.post(f"/api/v1/projects/{project['id']}/generate", json={})
+    assert response.status_code == 202, response.text
+    return response.json()
+
+
+def test_started_job_records_how_to_replay_itself(client: TestClient) -> None:
+    """建 job 时就要记下管线与参数——「继续」事后无从推断当初跑的是什么。"""
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+    assert job["checkpoint"]["resume"] == {
+        "function": "run_full_pipeline",
+        "kwargs": {"quality_profile": "draft", "review_style": "narrative"},
+    }
+
+
+def test_cancel_marks_a_queued_job_cancelled_immediately(client: TestClient) -> None:
+    """还没被 worker 捡走的任务立刻落终态，用户不用盯着一个僵尸「排队中」。"""
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/cancel")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "cancelled"
+    assert body["checkpoint"]["control"] == "cancel"
+
+
+def test_cancel_rejects_an_already_finished_job(client: TestClient) -> None:
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+    client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/cancel")
+    again = client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/cancel")
+    assert again.status_code == 409
+
+
+def test_pause_requires_a_running_job(client: TestClient) -> None:
+    """排队中的任务只能取消：还没开始跑，没有断点可留。"""
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/pause")
+    assert response.status_code == 409
+
+
+def test_resume_creates_a_new_job_seeded_with_the_checkpoint(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    """继续 = 新建 job + 播种断点；上一轮的停止开关不能被继承。"""
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+
+    async def _pause(session):
+        row = await get_job(session, uuid.UUID(job["id"]))
+        await update_job(
+            session,
+            row,
+            status="paused",
+            checkpoint={"control": "pause", "outline": {"section_count": 4}},
+        )
+
+    seed(clean_pg_database_url, _pause)
+
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/resume")
+    assert response.status_code == 202, response.text
+    resumed = response.json()
+    assert resumed["id"] != job["id"]
+    assert resumed["status"] == "queued"
+    # 断点带过来了，停止开关没有——否则续跑的 job 一启动就把自己停了。
+    assert resumed["checkpoint"]["outline"] == {"section_count": 4}
+    assert "control" not in resumed["checkpoint"]
+    assert resumed["checkpoint"]["resumed_from"] == job["id"]
+    assert client.queue.calls[-1][0] == "run_full_pipeline"
+
+
+def test_resume_rejects_a_job_that_is_not_paused(client: TestClient) -> None:
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{job['id']}/resume")
+    assert response.status_code == 409
+
+
+def test_deleting_a_project_cancels_its_running_jobs(
+    client: TestClient,
+    clean_pg_database_url: str,
+) -> None:
+    """删除意味着「这些都不要了」，不该再要求用户先手动取消一遍。"""
+    project = _create_project(client)
+    job = _start_full_job(client, project)
+
+    async def _run(session):
+        row = await get_job(session, uuid.UUID(job["id"]))
+        await update_job(session, row, status="running")
+
+    seed(clean_pg_database_url, _run)
+
+    assert client.delete(f"/api/v1/projects/{project['id']}").status_code == 204
+
+    async def _read(session):
+        row = await get_job(session, uuid.UUID(job["id"]))
+        return row.status, (row.checkpoint_json or {}).get("control")
+
+    status_value, control = seed(clean_pg_database_url, _read)
+    assert status_value == "cancelled"
+    assert control == "cancel"
+
+
+def test_deleted_project_disappears_from_every_route(client: TestClient) -> None:
+    """软删除收口在授权依赖上：删掉之后整个项目的每个端点都该 404。"""
+    project = _create_project(client)
+    assert client.delete(f"/api/v1/projects/{project['id']}").status_code == 204
+
+    assert client.get("/api/v1/projects").json() == []
+    for path in ("", "/scope", "/library", "/jobs", "/cost"):
+        response = client.get(f"/api/v1/projects/{project['id']}{path}")
+        assert response.status_code == 404, f"{path} 仍然可访问：{response.status_code}"
+
+
+def test_deleted_project_can_be_restored(client: TestClient) -> None:
+    project = _create_project(client)
+    client.delete(f"/api/v1/projects/{project['id']}")
+
+    listed = client.get("/api/v1/projects?deleted=true").json()
+    assert [item["id"] for item in listed] == [project["id"]]
+    assert listed[0]["deleted_at"] is not None
+
+    restored = client.post(f"/api/v1/projects/{project['id']}/restore")
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["deleted_at"] is None
+    assert [item["id"] for item in client.get("/api/v1/projects").json()] == [project["id"]]
+    assert client.get("/api/v1/projects?deleted=true").json() == []

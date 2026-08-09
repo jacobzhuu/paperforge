@@ -65,8 +65,16 @@ def semantic_projection(value: Any) -> Any:
     return value
 
 
+#: 参与「这条建议是不是已经提过了」判断的字段之外的措辞类字段。
+#:
+#: `refined_prompt` 是文本模型对同一份语义的润色结果，每次规划的用词都不一样。
+#: 把它算进哈希，等于每轮 visual_plan 都会把同一张插图重新提一遍。
+_VOLATILE_SPEC_KEYS = ("refined_prompt",)
+
+
 def visual_input_hash(spec: dict[str, Any]) -> str:
-    projected = semantic_projection(spec) or {}
+    stable = {key: value for key, value in spec.items() if key not in _VOLATILE_SPEC_KEYS}
+    projected = semantic_projection(stable) or {}
     encoded = json.dumps(
         projected, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode()
@@ -271,3 +279,35 @@ async def record_visual_attempt(
     session.add(attempt)
     await session.flush()
     return attempt
+
+
+async def latest_successful_visual_attempts(
+    session: AsyncSession,
+    visual_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, VisualGenerationAttempt]:
+    """批量返回每张视觉最近一次成功生成记录，供列表展示准确生成时间。
+
+    不能用 ``visual_asset.updated_at``：批准插入、修改标题等操作都会刷新它，
+    那不是图片真正完成生成的时间。
+    """
+    if not visual_ids:
+        return {}
+    rows = list(
+        (
+            await session.scalars(
+                select(VisualGenerationAttempt)
+                .where(
+                    VisualGenerationAttempt.visual_id.in_(visual_ids),
+                    VisualGenerationAttempt.error_code.is_(None),
+                )
+                .order_by(
+                    VisualGenerationAttempt.created_at.desc(),
+                    VisualGenerationAttempt.id.desc(),
+                )
+            )
+        ).all()
+    )
+    latest: dict[uuid.UUID, VisualGenerationAttempt] = {}
+    for row in rows:
+        latest.setdefault(row.visual_id, row)
+    return latest

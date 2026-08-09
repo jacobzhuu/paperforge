@@ -544,3 +544,95 @@ CI 增装 graphviz——否则 `skipif(dot 不存在)` 会永远静默跳过，�
   迁移与 Alembic 无漂移检查。
 - 当前开发数据库仍在 0003；上线需按 `docs/getting-started.md §5.1` 先备份，再由指定管理员
   显式执行升级、认领和对象迁移。
+
+---
+
+## M16 macOS / Ubuntu 20.04 / 22.04 双基线生产化（2026-07-28）
+
+- 新增 Python 3.12 API/Worker 与 Node 20 Web 多阶段非 root 镜像，Worker 内置 Pandoc；
+  Buildx CI 同时构建 `linux/amd64` 和 `linux/arm64`。
+- 新增独立 `paperforge-prod` Compose 栈：迁移成功后才启动 API/Worker，长期服务带健康检查、
+  资源限制与自动重启；宿主只发布 `127.0.0.1:3000`。
+- 新增 `scripts/ops` 的预检、启停、状态、日志、PostgreSQL custom dump、对象归档、空卷恢复及
+  全量表计数/对象 SHA-256 校验；生产配置必须位于仓库外且权限为 `0600`。
+- 新增 Ubuntu 安装脚本。Jammy 使用 Docker 官方 apt 仓库；Focal 强制 Ubuntu Pro 的
+  `esm-infra`/`esm-apps` 与 Ubuntu `docker.io` Engine 26，并按 SHA-256 固定 Compose 2.35.1、
+  Buildx 0.23.0。
+- 新增 filesystem → MinIO 幂等迁移 CLI，支持生成清单、`--dry-run`、上传回读、严格
+  `--verify-only`；不删除源文件。
+- CI 增加 macOS 宿主流程、前端 67 个测试、多架构镜像，以及 Focal/Jammy LXD 嵌套 Docker
+  的同套测试、生产冒烟、备份恢复、重启与端口暴露检查。
+
+---
+
+## M17 任务中断控制与项目删除（2026-07-28）
+
+此前所有长任务一经触发就只能等它跑完或跑挂：`generation_job.status` 的 `cancelled` 在
+数据层、API 终态集与前端终态集里都躺着，却**全仓库没有任何一处写入**；`checkpoint_json`
+每个阶段都写、`update_job` 还特意做了合并语义并注释「断点续跑要能看到此前所有阶段的
+产物」，却**没有任何编排代码读它**。项目也无法删除——`DELETE /projects/{id}` 从来不存在。
+
+### 停止：协作式，不打断已经付过钱的调用
+
+- 真正的进程级冻结做不到：LLM / 检索 / 编译调用全部在 `asyncio.to_thread` 里，掐掉
+  await 点停不掉底层线程，只会把那次调用白丢。因此沿用仓库里已经跑通的 `polish_skip`
+  模式——API 写标记（`checkpoint_json.control ∈ {cancel, pause}`），worker 在安全点轮询
+  （2 秒节流），当前这一步做完再退出。
+- 检查点埋在四处：`_run_stage` 的阶段边界、`document.py` 的正文分节循环与框架章节循环
+  （均在 `_persist_draft` 之后）、润色循环、`cards.py` 的逐条循环。最坏等待 = 当前这一节
+  跑完，约 1–3 分钟。
+- 停止信号走 `JobStopped`，并在 `_run_stage` 的兜底 `except Exception` **之前**显式重抛：
+  否则会被 draft-first 的降级路径吞掉，管线接着跑下一阶段，用户点的取消毫无效果。
+- `job_context` 捕获 `JobStopped` 后**不重抛**——用户主动停止不是失败，抛出去会让 arq 记
+  错误栈、也会让 `_mark_interrupted` 把任务改写成 failed。异常被吞后各 `run_*_pipeline`
+  返回 `None`，`run_full_pipeline` 据此在文献段之后早退（它分两段开 `job_context`，
+  不早退就会在用户点了停止之后照跑 outline/write 这两个最贵的阶段）。
+- 新增 `paused` 状态并进入所有终态集（`FINISHED_JOB_STATUSES` 为唯一定义，API 与前端
+  取别名）：这一轮确实停了，SSE 流要收口，续跑另起一个 job。
+
+### 继续：真正读断点
+
+- `JobContext` 启动时把 job 的 `checkpoint_json` 读进内存（此前只写不读），`_run_stage`
+  据此跳过已完成阶段并发 `{stage}.skipped`；`{stage}_failed` 不算完成，降级过的阶段会重跑。
+- 跳过的阶段没有 outcome 对象，下游的 `persisted_entry_count` / `section_count` /
+  `readiness_status` 改由 `_stage_scalar` 回落到 checkpoint payload（`to_payload()` 的键名
+  与属性名一一对应）。
+- write 阶段内部续跑：建档后立刻单独落一次 `write_document_id`（阶段没跑完就没有阶段
+  checkpoint，而暂停恰恰发生在没跑完的时候），续跑时复用同一 document、跳过已落库章节
+  并把它们注册进滚动摘要。已润色章节按 `write_polished_keys` 名单排除，不重复付钱。
+- 从 `body_ir` 还原章节时**必须**还原 `sentences`：收尾的全量 upsert 会用
+  `draft.to_ir_section()` 重建 body_ir，还原成纯文本段落会把续跑章节的引用全部抹掉（R2）。
+- 入队统一走新的 `paperforge_api.jobs.start_job`，建 job 时就把 function/kwargs 写进
+  `checkpoint_json.resume`——「继续」需要知道当初跑的是什么，事后无从推断。
+
+### 端点与前端
+
+- `POST /projects/{id}/jobs/{jid}/{cancel,pause,resume}`；resume 新建 job 并播种断点，
+  刻意剥掉上一轮的 `control` 与 `polish_skip`（不剥的话续跑一启动就把自己停了）。
+- 进度卡常驻「暂停 / 取消」，请求后禁用并解释「当前这一步完成后停止」；暂停的任务离开
+  进度条，改由 project shell 的「已暂停」横幅提供「继续 / 放弃」。
+
+### 项目删除：软删除 + 延迟硬删除
+
+- `paper_project.deleted_at`；过滤收口在 `get_owned_project`，而它是 router 级依赖
+  `authorize_project_request` 的唯一入口——删除后整个项目的每个端点自动 404。
+- `DELETE` 先把项目里 queued/running 的任务写停止标记并置 cancelled，再软删除：删除的
+  意图本身已经说明「这些都不要了」，不该再要求用户先手动取消一遍。
+- 0008 迁移把 `llm_call_log` 的 `project_id` / `job_id` 外键补成 CASCADE——其余所有
+  project 关联表本来就是 CASCADE，唯独成本台账默认 NO ACTION，保留期后的真删会被它顶回来。
+- `paperforge-admin purge-projects --days N`（`scripts/ops purge-projects`）按保留期真删并
+  回收对象：逐条从库里枚举 `user_asset` / `visual_asset` / `export_artifact` 的 key，
+  **先删对象后删行**（反过来一旦行删成功、对象删失败就再也查不出 key），
+  且 `shared/oa/...` 的跨项目全文一律不碰。
+
+### 验收状态
+
+- 新增 `services/worker/tests/test_job_control.py`（7 例）：阶段边界取消、停止不被降级路径
+  吞掉、写作途中暂停后已写章节仍在库且落 paused、终态任务不被改写、续跑跳过已完成阶段、
+  降级阶段仍重跑、续跑不重写已落库章节。
+- `services/api/tests/test_projects_api.py` 增补 10 例：resume 元信息落库、queued 取消立即
+  终态、409 边界、删除连带取消在跑任务、删除后全部子路由 404、回收站与恢复。
+- 前端 `job-progress-card.test.tsx` 增补 5 例（暂停/取消入口、禁用态与文案差异）。
+- **未在本机执行**：本 checkout 没有 Python 虚拟环境（无 `.venv`、无 `uv`）也没有
+  `node_modules`，`pytest` / `ruff` / `alembic check` / `pnpm test` 均需在装好依赖的环境
+  复跑，尤其是 0008 迁移与 `alembic check` 漂移门禁。

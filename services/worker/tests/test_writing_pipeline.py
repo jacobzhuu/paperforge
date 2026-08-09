@@ -25,6 +25,8 @@ from paperforge_worker.pipelines.writing import (
     coherence_pass,
     count_words,
     deterministic_paragraphs,
+    enforce_sentence_evidence_rules,
+    enforce_sentence_grounding_rules,
     extract_numbers,
     normalize_paragraphs,
     summarize_paragraphs,
@@ -76,6 +78,24 @@ def _runner(payloads: list[Any]) -> tuple[LLMRunner, _StubProvider]:
         ),
         provider,
     )
+
+
+def test_evidence_downgrade_keeps_audit_reason_out_of_body_prose() -> None:
+    paragraphs = [
+        {
+            "sentences": [
+                {
+                    "text": "The method improves all recommender systems by 30%.",
+                    "cite_keys": ["lewis2020retrieval"],
+                    "evidence_ids": [],
+                }
+            ]
+        }
+    ]
+    result = enforce_sentence_evidence_rules(paragraphs, evidence_by_id={}, language="zh")
+    assert result[0]["sentences"] == []
+    assert result[0]["downgraded_sentences"][0]["downgraded_reason"] == "R6_locator_missing"
+    assert result[0]["text"] == ""
 
 
 def _context() -> WritingContext:
@@ -418,6 +438,49 @@ def test_deterministic_body_sections_cover_every_card() -> None:
     assert assigned == {"a", "b"}
 
 
+async def test_question_driven_outline_uses_subquestions_not_publication_years() -> None:
+    bundles = [
+        {
+            "question_id": "q-1",
+            "question": "Under which datasets does the effect hold?",
+            "answer_status": "answered",
+            "stance_summary": "consistent",
+            "evidence": [
+                {"evidence_id": "e-1", "cite_key": "a"},
+                {"evidence_id": "e-2", "cite_key": "b"},
+            ],
+            "comparison_clusters": [
+                {
+                    "comparability_key": "same-key",
+                    "classification": "consistent",
+                    "evidence_ids": ["e-1", "e-2"],
+                }
+            ],
+            "not_comparable_groups": [],
+            "evidence_gap": None,
+        }
+    ]
+    outcome = await generate_outline(
+        topic="Evidence synthesis",
+        research_question="What agrees?",
+        cards=[
+            CardBrief(cite_key="a", title="Old study", year=1999),
+            CardBrief(cite_key="b", title="New study", year=2026),
+        ],
+        whitelist={"a", "b"},
+        runner=None,
+        sub_question_bundles=bundles,
+    )
+    body = [section for section in outcome.tree["sections"] if section.get("question_id") == "q-1"][
+        0
+    ]
+    assert body["title"] == bundles[0]["question"]
+    assert body["stance_summary"] == "consistent"
+    assert body["evidence_ids"] == ["e-1", "e-2"]
+    assert outcome.generator == "question_evidence_matrix"
+    assert all("Earlier" not in section["title"] for section in outcome.tree["sections"])
+
+
 async def test_review_outline_adds_comparison_limitations_and_conflict_synthesis() -> None:
     cards = [
         CardBrief(
@@ -442,8 +505,9 @@ async def test_review_outline_adds_comparison_limitations_and_conflict_synthesis
         for section in outcome.tree["sections"]
         if section.get("synthesis_kind") == "comparison_limitations_conflicts"
     )
-    assert synthesis["cite_keys"] == ["a", "b"]
-    assert synthesis["inline_tables"][0]["rows"][0][-1] == "Located full text"
+    assert synthesis["cite_keys"] == []
+    assert synthesis["evidence_gap"] is True
+    assert synthesis["inline_tables"] == []
 
 
 async def test_review_synthesis_keeps_complete_titles_and_removes_source_markup() -> None:
@@ -474,10 +538,8 @@ async def test_review_synthesis_keeps_complete_titles_and_removes_source_markup(
         for section in outcome.tree["sections"]
         if section.get("synthesis_kind") == "comparison_limitations_conflicts"
     )
-    row = synthesis["inline_tables"][0]["rows"][0]
-    assert row[0] == title.replace("<i>", "").replace("</i>", "")
-    assert row[1] == "2025"
-    assert row[2] == method.strip()
+    assert synthesis["inline_tables"] == []
+    assert synthesis["cite_keys"] == []
 
 
 async def test_review_synthesis_table_becomes_inline_table_ir() -> None:
@@ -505,6 +567,42 @@ async def test_review_synthesis_table_becomes_inline_table_ir() -> None:
     assert table.type == "table"
     assert table.source.kind == "inline"
     assert table.source.data == {"headers": ["Study", "Evidence"], "rows": [["A", "Full text"]]}
+
+
+async def test_evidence_ledger_is_appendix_only_and_deduplicates_units() -> None:
+    bundles = [
+        {
+            "evidence": [
+                {
+                    "evidence_id": "e-1",
+                    "cite_key": "a",
+                    "title": "Study A",
+                    "year": 2024,
+                    "text": "Located result.",
+                    "task_id": "bgc.identification",
+                    "grade": "B_located_prose",
+                    "locator_display": "p.2",
+                },
+                {"evidence_id": "e-1", "cite_key": "a", "text": "duplicate"},
+            ]
+        }
+    ]
+    outcome = await generate_outline(
+        topic="BGC",
+        research_question="What works?",
+        cards=[CardBrief(cite_key="a", title="Study A"), CardBrief(cite_key="b", title="Study B")],
+        whitelist={"a", "b"},
+        runner=None,
+        sub_question_bundles=bundles,
+    )
+    ledger = next(
+        section
+        for section in outcome.tree["sections"]
+        if section.get("synthesis_kind") == "evidence_ledger"
+    )
+    assert ledger["appendix"] is True
+    assert ledger["cite_keys"] == ["a"]
+    assert len(ledger["inline_tables"][0]["rows"]) == 1
 
 
 # ---- 工具函数 ----
@@ -546,6 +644,129 @@ def test_sentence_level_citations_are_interleaved_in_ir() -> None:
     assert paragraphs[0]["cite_keys"] == ["lewis2020retrieval"]
 
 
+def test_original_sentence_grounding_is_interleaved_in_ir() -> None:
+    paragraphs = normalize_paragraphs(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "The recorded accuracy was 92.5%.",
+                        "cite_keys": [],
+                        "source_refs": ["ua_12345678"],
+                    }
+                ]
+            }
+        ],
+        allowed=set(),
+        allowed_source_refs={"ua_12345678"},
+    )
+    draft = SectionDraft(section_key="s4", title="Results", paragraphs=paragraphs)
+    runs = draft.to_ir_section().blocks[0].runs
+    assert [run.t for run in runs] == ["text", "grounding"]
+    assert runs[-1].source_refs == ["ua_12345678"]
+
+
+def test_original_result_grounding_requires_a_value_from_the_bound_table() -> None:
+    assets = {
+        "ua_12345678": {
+            "type": "table",
+            "numeric_cells": {"model::accuracy": "92.5%"},
+            "numbers": ["92.5%"],
+        }
+    }
+    qualitative = enforce_sentence_grounding_rules(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "The proposed method clearly outperformed the baseline.",
+                        "source_refs": ["ua_12345678"],
+                    }
+                ]
+            }
+        ],
+        assets_by_ref=assets,
+        require_grounding=True,
+        require_numeric=True,
+    )
+    assert qualitative == []
+
+    mislabeled = enforce_sentence_grounding_rules(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "The recorded recall was 92.5%.",
+                        "source_refs": ["ua_12345678"],
+                    }
+                ]
+            }
+        ],
+        assets_by_ref=assets,
+        require_grounding=True,
+        require_numeric=True,
+    )
+    assert mislabeled == []
+
+    grounded = enforce_sentence_grounding_rules(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "The recorded accuracy was 92.5%.",
+                        "source_refs": ["ua_12345678"],
+                    }
+                ]
+            }
+        ],
+        assets_by_ref=assets,
+        require_grounding=True,
+        require_numeric=True,
+    )
+    assert grounded[0]["sentences"][0]["source_refs"] == ["ua_12345678"]
+
+
+def test_original_method_grounding_requires_content_from_the_bound_note() -> None:
+    assets = {
+        "ua_method": {
+            "type": "note",
+            "text": "Samples were normalized before model training and evaluation.",
+            "numbers": [],
+        }
+    }
+    unsupported = enforce_sentence_grounding_rules(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "A proprietary optimizer selected every hyperparameter.",
+                        "source_refs": ["ua_method"],
+                    }
+                ]
+            }
+        ],
+        assets_by_ref=assets,
+        require_grounding=True,
+    )
+    assert unsupported == []
+
+    supported = enforce_sentence_grounding_rules(
+        [
+            {
+                "sentences": [
+                    {
+                        "text": "Samples were normalized before model training.",
+                        "source_refs": ["ua_method"],
+                    }
+                ]
+            }
+        ],
+        assets_by_ref=assets,
+        require_grounding=True,
+    )
+    assert supported[0]["sentences"]
+
+
 def test_count_words_handles_chinese_and_english() -> None:
     assert count_words("检索增强生成") == 6
     assert count_words("retrieval augmented generation") == 3
@@ -564,11 +785,25 @@ def test_summarize_paragraphs_takes_first_sentences() -> None:
     assert "Supporting detail" not in summary
 
 
-def test_deterministic_paragraphs_never_invent_content() -> None:
+def test_deterministic_paragraphs_without_evidence_never_reuses_unscoped_cards() -> None:
     paragraphs = deterministic_paragraphs(SECTION, CARDS, {"lewis2020retrieval"})
     texts = " ".join(p["text"] for p in paragraphs)
-    assert "Introduces RAG combining a retriever with a generator." in texts
+    assert "no evidence meeting" in texts
+    assert "Introduces RAG combining a retriever with a generator." not in texts
     assert "gao2023survey" not in texts
+
+
+def test_deterministic_paragraphs_without_evidence_exposes_a_gap_not_library_cards() -> None:
+    paragraphs = deterministic_paragraphs(
+        {"title": "跨研究比较"},
+        CARDS,
+        {"lewis2020retrieval", "gao2023survey"},
+        evidence=[],
+        language="zh",
+    )
+    texts = " ".join(p["text"] for p in paragraphs)
+    assert "尚无满足定位与可比性要求的证据" in texts
+    assert "Introduces RAG" not in texts
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -583,3 +818,41 @@ async def test_section_prompt_language_switches(language: str) -> None:
         runner=runner,
     )
     assert ("只输出 JSON" in provider.requests[0].system_prompt) is (language == "zh")
+
+
+def test_single_source_section_is_flagged_and_written_under_an_explicit_limit() -> None:
+    """分级门禁放行的稿子里，只有一个来源的子问题不能写成综述结论。"""
+    from paperforge_worker.pipelines.outline import question_driven_sections
+    from paperforge_worker.pipelines.writing import _evidence_limitation_line
+
+    one_source = {
+        "question_id": "q-one",
+        "question": "Does X hold?",
+        "answer_status": "partial",
+        "evidence": [
+            {"evidence_id": "e1", "work_id": "w1", "cite_key": "a2024"},
+            {"evidence_id": "e2", "work_id": "w1", "cite_key": "a2024"},
+        ],
+    }
+    two_sources = {
+        "question_id": "q-two",
+        "question": "Does Y hold?",
+        "answer_status": "answered",
+        "evidence": [
+            {"evidence_id": "e3", "work_id": "w1", "cite_key": "a2024"},
+            {"evidence_id": "e4", "work_id": "w2", "cite_key": "b2024"},
+        ],
+    }
+    sections = question_driven_sections(
+        [one_source, two_sources],
+        language="zh",
+        allowed={"a2024", "b2024"},
+    )
+    assert sections[0]["evidence_limited"] is True
+    assert sections[0]["distinct_source_count"] == 1
+    assert sections[1]["evidence_limited"] is False
+
+    limited = _evidence_limitation_line(sections[0], language="zh")
+    assert "仅来自 1 篇独立文献" in limited
+    assert "不得推广" in limited
+    assert _evidence_limitation_line(sections[1], language="zh") == ""

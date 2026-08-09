@@ -14,6 +14,8 @@ import { CITE_NODE } from '@/lib/ir-serde';
 export interface CiteChipOptions {
   /** 语义软校验判定为弱相关的 key，渲染成琥珀色。 */
   weakKeys: Set<string>;
+  /** EvidenceUnit id → 可读原文与定位；用于引用 chip 悬停溯源。 */
+  evidenceLabels: Record<string, string>;
 }
 
 export const CiteChip = Node.create<CiteChipOptions>({
@@ -24,7 +26,7 @@ export const CiteChip = Node.create<CiteChipOptions>({
   selectable: true,
 
   addOptions() {
-    return { weakKeys: new Set<string>() };
+    return { weakKeys: new Set<string>(), evidenceLabels: {} };
   },
 
   addAttributes() {
@@ -39,6 +41,16 @@ export const CiteChip = Node.create<CiteChipOptions>({
           'data-keys': ((attributes.keys as string[]) ?? []).join(','),
         }),
       },
+      evidenceIds: {
+        default: [] as string[],
+        parseHTML: (element) => {
+          const raw = element.getAttribute('data-evidence-ids') ?? '';
+          return raw ? raw.split(',') : [];
+        },
+        renderHTML: (attributes) => ({
+          'data-evidence-ids': ((attributes.evidenceIds as string[]) ?? []).join(','),
+        }),
+      },
     };
   },
 
@@ -48,7 +60,12 @@ export const CiteChip = Node.create<CiteChipOptions>({
 
   renderHTML({ node, HTMLAttributes }) {
     const keys = (node.attrs.keys as string[]) ?? [];
+    const evidenceIds = (node.attrs.evidenceIds as string[]) ?? [];
     const weak = keys.some((key) => this.options.weakKeys.has(key));
+    const evidence = evidenceIds
+      .map((id) => this.options.evidenceLabels[id])
+      .filter(Boolean)
+      .join('\n\n');
     return [
       'span',
       mergeAttributes(HTMLAttributes, {
@@ -61,9 +78,11 @@ export const CiteChip = Node.create<CiteChipOptions>({
             ? 'border-warning/50 bg-warning/15 text-warning-foreground'
             : 'border-success/50 bg-success/15 text-success-strong',
         ].join(' '),
-        title: weak
-          ? `语义软校验：与该处论述相关性偏低（${keys.join(', ')}）`
-          : keys.join(', '),
+        title:
+          evidence ||
+          (weak
+            ? `语义软校验：与该处论述相关性偏低（${keys.join(', ')}）`
+            : keys.join(', ')),
         contenteditable: 'false',
       }),
       keys.join('; '),

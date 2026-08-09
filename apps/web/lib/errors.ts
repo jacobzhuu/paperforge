@@ -9,11 +9,44 @@ export function describeError(err: unknown): string {
       return detail ? `${base}（${truncate(detail)}）` : base;
     }
     if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError')) {
-      return '无法连接后端 API，请确认 ./scripts/dev up 已启动。';
+      return networkHelp();
     }
     return err.message || '发生了未知错误。';
   }
+  // 浏览器代理、跨 realm Error 和部分 fetch/polyfill 会抛出“长得像 Error”
+  // 的普通对象。不能因为 instanceof 失效就把真实原因抹成“未知错误”。
+  if (typeof err === 'string' && err.trim()) return err.trim();
+  if (err && typeof err === 'object') {
+    const candidate = err as {
+      message?: unknown;
+      status?: unknown;
+      detail?: unknown;
+      code?: unknown;
+    };
+    const message = typeof candidate.message === 'string' ? candidate.message.trim() : '';
+    if (message) return message;
+    const detail =
+      typeof candidate.detail === 'string'
+        ? candidate.detail.trim()
+        : candidate.detail && typeof candidate.detail === 'object'
+          ? JSON.stringify(candidate.detail)
+          : '';
+    if (detail) return truncate(detail);
+    if (typeof candidate.status === 'number') {
+      return HTTP_HINT[candidate.status] ?? `后端返回 ${candidate.status}`;
+    }
+    if (typeof candidate.code === 'string' && candidate.code.trim()) {
+      return `请求失败（${candidate.code.trim()}）`;
+    }
+  }
   return '发生了未知错误。';
+}
+
+/** 生产界面不泄露仓库命令和本机路径。 */
+export function networkHelp(): string {
+  return process.env.NODE_ENV === 'production'
+    ? '服务暂时不可用，请稍后重试或联系管理员。'
+    : '无法连接后端 API，请确认 ./scripts/dev up 已启动。';
 }
 
 /**

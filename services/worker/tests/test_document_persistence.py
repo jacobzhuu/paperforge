@@ -129,9 +129,7 @@ def _draft_writer(cite_key: str, *, cancel_at: str | None = None):
             raise asyncio.CancelledError
         draft = SectionDraft(section_key=key, title=str(section.get("title") or key))
         text = (
-            "Poisoning attacks in sequential recommenders."
-            if key == "abstract"
-            else f"{key} body."
+            "Poisoning attacks in sequential recommenders." if key == "abstract" else f"{key} body."
         )
         draft.paragraphs = [{"text": text, "cite_keys": [cite_key]}]
         draft.generator = "llm:test-model"

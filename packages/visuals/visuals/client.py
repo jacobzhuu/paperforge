@@ -64,13 +64,21 @@ class VisualdClient:
     def render_diagram_result(self, spec: dict[str, Any]) -> RenderResult:
         return self._request("/render/diagram", {"spec": spec})
 
-    def normalize(self, image: bytes) -> list[Rendition]:
-        return self.normalize_result(image).renditions
+    def normalize(self, image: bytes, *, target_size: str | None = None) -> list[Rendition]:
+        return self.normalize_result(image, target_size=target_size).renditions
 
-    def normalize_result(self, image: bytes) -> RenderResult:
+    def normalize_result(
+        self,
+        image: bytes,
+        *,
+        target_size: str | None = None,
+    ) -> RenderResult:
         return self._request(
             "/normalize",
-            {"image_base64": base64.b64encode(image).decode("ascii")},
+            {
+                "image_base64": base64.b64encode(image).decode("ascii"),
+                "target_size": target_size,
+            },
         )
 
     def _request(self, path: str, payload: dict[str, Any]) -> RenderResult:

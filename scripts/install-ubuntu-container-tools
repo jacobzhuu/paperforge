@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+COMPOSE_VERSION="2.35.1"
+BUILDX_VERSION="0.23.0"
+COMPOSE_SHA_AMD64="7bdb2ce2916e5dd0354e5d129892bf96fdcdb1a9ab8eed69b9173e131db4c230"
+COMPOSE_SHA_ARM64="a91e930a076b91e6c69f11d1dbe3c06729ae765fb9dbb3f97cb808e784647399"
+BUILDX_SHA_AMD64="55838fdd095084e158e06a63635a07fe8a8bc6cb4db507f203394dc1ffa7fb8b"
+BUILDX_SHA_ARM64="50b0b14770127b292e3e2f756d0137152b08afc1d7daa09f49d2b6e6fa1b1b81"
+PLUGIN_DIR="/usr/local/lib/docker/cli-plugins"
+
+say() {
+  printf '[paperforge-install] %s\n' "$*"
+}
+
+die() {
+  printf '[paperforge-install] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[ "$(id -u)" -eq 0 ] || die "run this installer as root"
+[ -r /etc/os-release ] || die "cannot read /etc/os-release"
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "${ID:-}" = "ubuntu" ] || die "this installer only supports Ubuntu"
+case "${VERSION_ID:-}" in 20.04|22.04) ;; *) die "supported Ubuntu releases are 20.04 and 22.04" ;; esac
+
+case "$(uname -m)" in
+  x86_64)
+    COMPOSE_ARCH="x86_64"
+    BUILDX_ARCH="amd64"
+    COMPOSE_SHA="${COMPOSE_SHA_AMD64}"
+    BUILDX_SHA="${BUILDX_SHA_AMD64}"
+    ;;
+  aarch64|arm64)
+    COMPOSE_ARCH="aarch64"
+    BUILDX_ARCH="arm64"
+    COMPOSE_SHA="${COMPOSE_SHA_ARM64}"
+    BUILDX_SHA="${BUILDX_SHA_ARM64}"
+    ;;
+  *) die "unsupported CPU architecture: $(uname -m)" ;;
+esac
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/paperforge-install.XXXXXX")"
+cleanup() {
+  find "${TMP_DIR}" -type f -delete 2>/dev/null || true
+  rmdir "${TMP_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+download_verified() {
+  local url="$1" expected="$2" target="$3" actual
+  curl --fail --location --retry 3 --output "${target}" "${url}"
+  actual="$(sha256sum "${target}" | awk '{print $1}')"
+  [ "${actual}" = "${expected}" ] || die "SHA-256 mismatch for ${url}"
+}
+
+check_esm() {
+  local status
+  command -v pro >/dev/null 2>&1 || die "Ubuntu Pro client is required on 20.04"
+  status="$(pro status 2>/dev/null)" || die "Ubuntu Pro status could not be read"
+  printf '%s\n' "${status}" | grep -Eq '^esm-infra[[:space:]]+yes[[:space:]]+enabled' || \
+    die "enable esm-infra before installing the Focal runtime"
+  printf '%s\n' "${status}" | grep -Eq '^esm-apps[[:space:]]+yes[[:space:]]+enabled' || \
+    die "enable esm-apps before installing the Focal runtime"
+}
+
+install_focal() {
+  local docker_version
+  say "installing Ubuntu/ESM docker.io for Ubuntu 20.04"
+  check_esm
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl docker.io
+  docker_version="$(docker --version | awk '{print $3}' | tr -d ',')"
+  [ "${docker_version%%.*}" = "26" ] || \
+    die "Focal must resolve docker.io 26.x from Ubuntu/ESM (found ${docker_version})"
+
+  install -d -m 0755 "${PLUGIN_DIR}"
+  download_verified \
+    "https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+    "${COMPOSE_SHA}" "${TMP_DIR}/docker-compose"
+  download_verified \
+    "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-${BUILDX_ARCH}" \
+    "${BUILDX_SHA}" "${TMP_DIR}/docker-buildx"
+  install -m 0755 "${TMP_DIR}/docker-compose" "${PLUGIN_DIR}/docker-compose"
+  install -m 0755 "${TMP_DIR}/docker-buildx" "${PLUGIN_DIR}/docker-buildx"
+}
+
+install_jammy() {
+  local keyring architecture
+  say "installing Docker Engine from Docker's official Ubuntu repository"
+  if dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q 'ok installed'; then
+    die "docker.io is already installed; remove the conflicting package before switching repositories"
+  fi
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl
+  install -d -m 0755 /etc/apt/keyrings
+  keyring="${TMP_DIR}/docker.asc"
+  curl --fail --location --retry 3 --output "${keyring}" https://download.docker.com/linux/ubuntu/gpg
+  install -m 0644 "${keyring}" /etc/apt/keyrings/docker.asc
+  architecture="$(dpkg --print-architecture)"
+  printf '%s\n' \
+    "deb [arch=${architecture} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu jammy stable" \
+    >/etc/apt/sources.list.d/docker.list
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+if [ "${VERSION_ID}" = "20.04" ]; then
+  install_focal
+else
+  install_jammy
+fi
+
+systemctl enable --now docker
+docker info >/dev/null
+docker compose version
+docker buildx version
+
+DOCKER_USER="${PAPERFORGE_DOCKER_USER:-${SUDO_USER:-}}"
+if [ -n "${DOCKER_USER}" ] && [ "${DOCKER_USER}" != "root" ]; then
+  id "${DOCKER_USER}" >/dev/null 2>&1 || die "requested Docker user does not exist: ${DOCKER_USER}"
+  usermod -aG docker "${DOCKER_USER}"
+  say "added ${DOCKER_USER} to the docker group; a new login session is required"
+fi
+
+say "container runtime installation complete"

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RELEASE="${1:-}"
+RUN_SUFFIX="${GITHUB_RUN_ID:-local}-$(date +%s)"
+RUN_SUFFIX="$(printf '%s' "${RUN_SUFFIX}" | tr -cd 'a-zA-Z0-9-' | cut -c1-36)"
+
+case "${RELEASE}" in
+  20.04) IMAGE="ubuntu:20.04"; NAME="paperforge-focal-${RUN_SUFFIX}" ;;
+  22.04) IMAGE="ubuntu:22.04"; NAME="paperforge-jammy-${RUN_SUFFIX}" ;;
+  *) printf 'Usage: %s 20.04|22.04\n' "$0" >&2; exit 2 ;;
+esac
+
+say() {
+  printf '[paperforge-lxd] %s\n' "$*"
+}
+
+cleanup() {
+  lxc delete --force "${NAME}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+command -v lxc >/dev/null 2>&1 || { printf 'lxc is required\n' >&2; exit 1; }
+if [ "${RELEASE}" = "20.04" ] && [ -z "${UBUNTU_PRO_TOKEN:-}" ]; then
+  printf 'UBUNTU_PRO_TOKEN is required for the Ubuntu 20.04 ESM compatibility job\n' >&2
+  exit 1
+fi
+
+say "launching nested Ubuntu ${RELEASE}"
+lxc launch "${IMAGE}" "${NAME}" \
+  -c security.nesting=true \
+  -c security.syscalls.intercept.mknod=true \
+  -c security.syscalls.intercept.setxattr=true
+lxc exec "${NAME}" -- cloud-init status --wait
+
+if [ "${RELEASE}" = "20.04" ]; then
+  say "attaching the disposable Focal instance to Ubuntu Pro"
+  lxc exec "${NAME}" --env UBUNTU_PRO_TOKEN="${UBUNTU_PRO_TOKEN}" -- \
+    bash -lc 'pro attach "$UBUNTU_PRO_TOKEN"'
+  lxc exec "${NAME}" -- pro enable esm-infra
+  lxc exec "${NAME}" -- pro enable esm-apps
+fi
+
+say "copying the checked-out revision into the instance"
+lxc exec "${NAME}" -- mkdir -p /root/paper-forge
+tar -C "${ROOT_DIR}" \
+  --exclude=.git --exclude=.venv --exclude=node_modules --exclude=.next \
+  --exclude=.paperforge -cf - . | \
+  lxc exec "${NAME}" -- tar -C /root/paper-forge -xf -
+
+say "installing the release-specific Docker toolchain"
+lxc exec "${NAME}" -- bash -lc \
+  'cd /root/paper-forge && PAPERFORGE_DOCKER_USER=root ./scripts/install-ubuntu-container-tools'
+lxc exec "${NAME}" -- bash -lc \
+  'apt-get update && apt-get install -y --no-install-recommends python3-pip graphviz && python3 -m pip install uv==0.9.16'
+
+say "running the shared backend and frontend acceptance suites"
+lxc exec "${NAME}" -- bash -lc \
+  'cd /root/paper-forge && docker compose -f infra/docker-compose.yml up -d postgres redis minio'
+lxc exec "${NAME}" -- bash -lc \
+  'cd /root/paper-forge && uv sync --all-packages --frozen && uv run ruff check . && PAPERFORGE_TEST_DATABASE_URL=postgresql+asyncpg://paperforge:paperforge@127.0.0.1:15432/paperforge_test uv run pytest -q'
+lxc exec "${NAME}" -- bash -lc \
+  'cd /root/paper-forge && docker run --rm -v "$PWD:/repo" -w /repo/apps/web node:20-bookworm-slim bash -lc "npm install -g pnpm@9.15.9 && pnpm install --frozen-lockfile && pnpm lint && pnpm test && pnpm build"'
+lxc exec "${NAME}" -- bash -lc \
+  'cd /root/paper-forge && docker compose -f infra/docker-compose.yml down --remove-orphans'
+
+say "preparing an external production configuration"
+lxc exec "${NAME}" -- bash -lc '
+  cp /root/paper-forge/.env.production.example /root/paperforge-ci.env
+  sed -i "s/CHANGE_ME/configured/g" /root/paperforge-ci.env
+  printf "PAPERFORGE_COMPOSE_PROJECT=paperforge-ci\n" >>/root/paperforge-ci.env
+  chmod 600 /root/paperforge-ci.env
+'
+
+say "running full Compose, migration, export, backup, and restore smoke checks"
+lxc exec "${NAME}" --env PAPERFORGE_ENV_FILE=/root/paperforge-ci.env \
+  --env CI=true --env PAPERFORGE_CI_ALLOW_LOW_RESOURCES=1 -- bash -lc \
+  'cd /root/paper-forge && ./scripts/compat/compose-smoke'
+
+say "rebooting the instance to verify automatic service recovery"
+lxc restart "${NAME}"
+lxc exec "${NAME}" -- cloud-init status --wait
+lxc exec "${NAME}" -- bash -lc '
+  for attempt in $(seq 1 60); do
+    if curl -fsS http://127.0.0.1:3000/login >/dev/null; then exit 0; fi
+    sleep 2
+  done
+  exit 1
+'
+say "Ubuntu ${RELEASE} compatibility suite passed"

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.paper import ClaimEvidenceAnchor, QualityReportRecord
 
-QUALITY_PROFILES = frozenset({"draft", "submission"})
+QUALITY_PROFILES = frozenset({"draft", "scholarly", "submission"})
 REVIEW_STYLES = frozenset({"narrative", "systematic"})
 READINESS_STATUSES = frozenset(
     {"draft", "needs_revision", "preflight_ready", "submission_ready", "unassessed"}
@@ -126,7 +126,12 @@ async def replace_claim_evidence(
             ClaimEvidenceAnchor.quality_report_id == quality_report_id
         )
     )
-    for anchor in anchors:
+    # A sentence can legitimately be reached through more than one section of
+    # the quality pass.  The table is deliberately unique per claim/citation;
+    # dedupe before flush so one repeated anchor cannot roll back the complete
+    # quality report.
+    unique_anchors = _dedupe_claim_evidence_anchors(anchors)
+    for anchor in unique_anchors:
         session.add(
             ClaimEvidenceAnchor(
                 quality_report_id=quality_report_id,
@@ -136,7 +141,25 @@ async def replace_claim_evidence(
             )
         )
     await session.flush()
-    return len(anchors)
+    return len(unique_anchors)
+
+
+def _dedupe_claim_evidence_anchors(anchors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first anchor for each database-unique claim/citation pair."""
+    unique_anchors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for anchor in anchors:
+        source_key = str(
+            anchor.get("source_key")
+            or (f"cite:{anchor['cite_key']}" if anchor.get("cite_key") else "none")
+        )
+        anchor["source_key"] = source_key
+        key = (str(anchor.get("claim_hash") or ""), source_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_anchors.append(anchor)
+    return unique_anchors
 
 
 async def list_claim_evidence(
@@ -170,6 +193,22 @@ async def set_claim_manual_status(
 ) -> ClaimEvidenceAnchor:
     if status not in {"unreviewed", "confirmed", "rejected"}:
         raise ValueError(f"unsupported manual status: {status}")
+    # A quality recheck creates a new report and therefore new anchor ids.  The
+    # browser can still be showing the preceding report for a brief moment when
+    # the user reviews evidence.  Apply the decision to every *identical*
+    # claim/source/excerpt tuple in this project so a click on that stale view is
+    # not silently lost.  Evidence hash remains part of the identity: a changed
+    # excerpt must be reviewed again rather than inheriting trust.
+    await session.execute(
+        update(ClaimEvidenceAnchor)
+        .where(
+            ClaimEvidenceAnchor.project_id == anchor.project_id,
+            ClaimEvidenceAnchor.claim_hash == anchor.claim_hash,
+            ClaimEvidenceAnchor.source_key == anchor.source_key,
+            ClaimEvidenceAnchor.evidence_hash.is_not_distinct_from(anchor.evidence_hash),
+        )
+        .values(manual_status=status)
+    )
     anchor.manual_status = status
     await session.flush()
     return anchor

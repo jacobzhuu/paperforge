@@ -2,38 +2,56 @@
 
 from __future__ import annotations
 
+import io
 import re
 import uuid
+import zipfile
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from arq.connections import ArqRedis
 from db import (
-    create_job,
+    create_document,
     document_snapshot_hash,
+    evidence_payload,
     get_cards,
     get_section,
     get_writing_whitelist,
+    job_resume_spec,
     latest_document,
     latest_outline,
     latest_quality_report,
+    latest_stage_event_payload,
     list_assets,
     list_citation_usage,
     list_claim_evidence,
     list_entries,
+    list_evidence_measurements,
+    list_evidence_units,
+    list_question_evidence_links,
+    list_research_questions,
     list_sections,
     list_visuals,
     reference_metadata_payload,
     replace_citation_usage,
     update_outline_tree,
+    upsert_question_evidence_link,
     upsert_section,
 )
-from db.models.paper import ClaimEvidenceAnchor, ExportArtifact
+from db.models.paper import (
+    ClaimEvidenceAnchor,
+    ExportArtifact,
+    GenerationJob,
+    JobEvent,
+    QuestionEvidenceLink,
+    ResearchQuestion,
+)
 from db.repositories.exports import list_export_artifacts
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from paper_ir import Bibliography, PaperIR, PaperMeta, ReferenceMetadata, render_markdown
 from paper_ir.schema import Section as IRSection
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
 
@@ -45,25 +63,40 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
+from paperforge_api.jobs import start_job
 from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
+    AcceptSectionRewriteRequest,
+    AcceptSectionRewriteResponse,
     CitationAuditResponse,
     CitationAuditRow,
     ClaimEvidenceResponse,
+    EvidenceMatrixDiagnostics,
+    EvidenceMatrixPerQuestionDiagnostics,
+    EvidenceMatrixResponse,
+    EvidenceUnitResponse,
     ExportArtifactResponse,
     ExportRequest,
+    FullPipelineOptionsRequest,
     GenerationOptionsRequest,
     IngestRequest,
     JobResponse,
     MarkdownResponse,
     OutlineResponse,
     QualityResponse,
+    QuestionEvidenceLinkResponse,
     RefineRequest,
     RefineResponse,
+    ResearchQuestionResponse,
     ReviewClaimEvidenceRequest,
+    RewriteSectionCandidateResponse,
+    RewriteSectionRequest,
     SectionResponse,
     SnowballRequest,
+    SynthesisResponse,
     UpdateOutlineRequest,
+    UpdateQuestionEvidenceLinkRequest,
+    UpdateResearchQuestionRequest,
     UpdateSectionRequest,
     WriteRequest,
 )
@@ -90,8 +123,13 @@ async def generate_outline_endpoint(
     queue: QueueDep,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
-    job = await create_job(session, project_id=project.id, kind="outline")
-    await _enqueue(queue, "run_outline_pipeline", str(project.id), str(job.id))
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="outline",
+        function="run_outline_pipeline",
+    )
     return _job_response(job)
 
 
@@ -101,12 +139,23 @@ async def get_outline_endpoint(project_id: str, session: SessionDep) -> OutlineR
     outline = await latest_outline(session, project.id)
     if outline is None:
         return OutlineResponse(project_id=str(project.id), version=0, status="draft", tree={})
+    latest_synthesis_at = await session.scalar(
+        select(func.max(JobEvent.created_at))
+        .join(GenerationJob, GenerationJob.id == JobEvent.job_id)
+        .where(
+            GenerationJob.project_id == project.id,
+            JobEvent.event_type == "synth.completed",
+        )
+    )
+    stale = bool(latest_synthesis_at and latest_synthesis_at > outline.updated_at)
     return OutlineResponse(
         project_id=str(project.id),
         outline_id=str(outline.id),
         version=outline.version,
         status=outline.status,
         tree=outline.tree_json or {},
+        stale=stale,
+        stale_reason="evidence_synthesis_newer" if stale else None,
     )
 
 
@@ -137,6 +186,355 @@ async def put_outline(
     )
 
 
+# ---- 研究问题与证据矩阵 ----
+
+
+def _clean_string_list(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(cleaned for value in values if (cleaned := " ".join(value.split()))))
+
+
+def _question_response(row: ResearchQuestion) -> ResearchQuestionResponse:
+    return ResearchQuestionResponse(
+        id=str(row.id),
+        parent_id=str(row.parent_id) if row.parent_id else None,
+        text=row.text,
+        kind=row.kind,
+        order_index=row.order_index,
+        comparison_dimensions=row.comparison_dimensions_json or [],
+        expected_evidence_kinds=row.expected_evidence_kinds_json or [],
+        answer_status=row.answer_status,
+        generator=row.generator,
+        origin=row.origin if row.origin in {"auto", "user"} else "auto",
+        locked=row.locked,
+        task_id=row.task_id,
+        search_query=row.search_query,
+    )
+
+
+def _matrix_link_response(row: QuestionEvidenceLink) -> QuestionEvidenceLinkResponse:
+    return QuestionEvidenceLinkResponse(
+        id=str(row.id),
+        research_question_id=str(row.research_question_id),
+        evidence_unit_id=str(row.evidence_unit_id),
+        stance=row.stance,
+        condition_note=row.condition_note,
+        confidence=row.confidence,
+        manually_overridden=row.manually_overridden,
+    )
+
+
+async def _evidence_responses(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[EvidenceUnitResponse]:
+    units = await list_evidence_units(session, project_id)
+    measurements = await list_evidence_measurements(session, [row.id for row in units])
+    entries = await list_entries(session, project_id, status="selected")
+    metadata = {str(work.id): (entry.bibtex_key, work.canonical_title) for entry, work in entries}
+    responses: list[EvidenceUnitResponse] = []
+    for unit in units:
+        payload = evidence_payload(unit, measurements.get(unit.id))
+        cite_key, title = metadata.get(str(unit.work_id), (None, None))
+        responses.append(
+            EvidenceUnitResponse(
+                **payload,
+                cite_key=cite_key,
+                title=title,
+            )
+        )
+    return responses
+
+
+async def _matrix_diagnostics(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> EvidenceMatrixDiagnostics:
+    evidence = await list_evidence_units(session, project_id)
+    links = await list_question_evidence_links(session, project_id)
+    questions = await list_research_questions(session, project_id)
+    linked_ids = {row.evidence_unit_id for row in links}
+    diagnostics = EvidenceMatrixDiagnostics(
+        evidence_unit_count=len(evidence),
+        link_count=len(links),
+        question_count=len(questions),
+        unlinked_evidence_count=max(0, len(evidence) - len(linked_ids)),
+    )
+    payload = await latest_stage_event_payload(session, project_id, "qmatrix")
+    if not payload:
+        return diagnostics
+    if payload.get("rejected_by_lexical") is not None:
+        diagnostics.rejected_by_lexical = int(payload["rejected_by_lexical"])
+    if payload.get("rejected_by_task") is not None:
+        diagnostics.rejected_by_task = int(payload["rejected_by_task"])
+    if payload.get("zero_candidate_questions") is not None:
+        diagnostics.zero_candidate_questions = int(payload["zero_candidate_questions"])
+    bridge_sources = payload.get("bridge_sources")
+    if isinstance(bridge_sources, dict) and bridge_sources:
+        diagnostics.bridge_sources = {str(key): int(value) for key, value in bridge_sources.items()}
+    per_question = payload.get("diagnostics")
+    if isinstance(per_question, list) and per_question:
+        diagnostics.per_question = [
+            EvidenceMatrixPerQuestionDiagnostics.model_validate(item)
+            for item in per_question
+            if isinstance(item, dict)
+        ]
+    return diagnostics
+
+
+@router.get(
+    "/projects/{project_id}/questions",
+    response_model=list[ResearchQuestionResponse],
+)
+async def get_research_questions(
+    project_id: str,
+    session: SessionDep,
+) -> list[ResearchQuestionResponse]:
+    project = await _require_project(session, project_id)
+    return [_question_response(row) for row in await list_research_questions(session, project.id)]
+
+
+@router.post(
+    "/projects/{project_id}/questions/generate",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_research_questions(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+) -> JobResponse:
+    project = await _require_project(session, project_id)
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="qdecomp",
+        function="run_qdecomp_pipeline",
+    )
+    return _job_response(job)
+
+
+@router.patch(
+    "/projects/{project_id}/questions/{question_id}",
+    response_model=ResearchQuestionResponse,
+)
+async def patch_research_question(
+    project_id: str,
+    question_id: str,
+    request: UpdateResearchQuestionRequest,
+    session: SessionDep,
+) -> ResearchQuestionResponse:
+    project = await _require_project(session, project_id)
+    try:
+        row = await session.get(ResearchQuestion, uuid.UUID(question_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="research question not found") from exc
+    if row is None or row.project_id != project.id:
+        raise HTTPException(status_code=404, detail="research question not found")
+    changes = request.model_fields_set
+    if "text" in changes:
+        text = " ".join((request.text or "").split())
+        if not text:
+            raise HTTPException(status_code=422, detail="question text cannot be empty")
+        row.text = text
+    if "comparison_dimensions" in changes:
+        row.comparison_dimensions_json = _clean_string_list(request.comparison_dimensions or [])
+    if "expected_evidence_kinds" in changes:
+        row.expected_evidence_kinds_json = _clean_string_list(request.expected_evidence_kinds or [])
+    if "task_id" in changes:
+        row.task_id = " ".join((request.task_id or "").split()) or None
+    if "search_query" in changes:
+        row.search_query = " ".join((request.search_query or "").split()) or None
+    if request.answer_status is not None:
+        row.answer_status = request.answer_status
+    row.generator = "user"
+    # 改动了问题的定义（而不只是给矩阵结论打分）就锁定这一行：否则下一次 QDECOMP
+    # 会按 scope 重新生成，把用户刚写的问题覆盖掉。显式传 locked 时以它为准。
+    if changes & {"text", "comparison_dimensions", "expected_evidence_kinds", "search_query"}:
+        row.origin = "user"
+        row.locked = True
+    if request.locked is not None:
+        row.locked = request.locked
+    await session.flush()
+    return _question_response(row)
+
+
+@router.get(
+    "/projects/{project_id}/evidence-units",
+    response_model=list[EvidenceUnitResponse],
+)
+async def get_evidence_units(
+    project_id: str,
+    session: SessionDep,
+) -> list[EvidenceUnitResponse]:
+    project = await _require_project(session, project_id)
+    return await _evidence_responses(session, project.id)
+
+
+@router.post(
+    "/projects/{project_id}/evidence-units/generate",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_evidence_units(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+) -> JobResponse:
+    project = await _require_project(session, project_id)
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="evidence",
+        function="run_evidence_pipeline",
+    )
+    return _job_response(job)
+
+
+@router.get(
+    "/projects/{project_id}/evidence-matrix",
+    response_model=EvidenceMatrixResponse,
+)
+async def get_evidence_matrix(
+    project_id: str,
+    session: SessionDep,
+) -> EvidenceMatrixResponse:
+    project = await _require_project(session, project_id)
+    questions = await list_research_questions(session, project.id)
+    links = await list_question_evidence_links(session, project.id)
+    return EvidenceMatrixResponse(
+        questions=[_question_response(row) for row in questions],
+        evidence=await _evidence_responses(session, project.id),
+        links=[_matrix_link_response(row) for row in links],
+        diagnostics=await _matrix_diagnostics(session, project.id),
+    )
+
+
+@router.post(
+    "/projects/{project_id}/evidence-matrix/generate",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_evidence_matrix(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+) -> JobResponse:
+    project = await _require_project(session, project_id)
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="qmatrix",
+        function="run_alignment_pipeline",
+    )
+    return _job_response(job)
+
+
+@router.post(
+    "/projects/{project_id}/draft/rebuild",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rebuild_draft_from_latest_evidence(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+    request: GenerationOptionsRequest | None = None,
+) -> JobResponse:
+    project = await _require_project(session, project_id)
+    options = request or GenerationOptionsRequest()
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="write",
+        function="run_draft_rebuild_pipeline",
+        quality_profile=options.quality_profile,
+        review_style=options.review_style,
+    )
+    return _job_response(job)
+
+
+@router.post(
+    "/projects/{project_id}/synthesis/generate",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def generate_synthesis(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+) -> JobResponse:
+    project = await _require_project(session, project_id)
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="synth",
+        function="run_synthesis_pipeline",
+    )
+    return _job_response(job)
+
+
+@router.get(
+    "/projects/{project_id}/synthesis",
+    response_model=SynthesisResponse,
+)
+async def get_synthesis(
+    project_id: str,
+    session: SessionDep,
+) -> SynthesisResponse:
+    project = await _require_project(session, project_id)
+    questions = await list_research_questions(session, project.id)
+    synth_payload = await latest_stage_event_payload(session, project.id, "synth")
+    bundles: list[dict[str, Any]] | None = None
+    comparison_cluster_count = 0
+    if synth_payload:
+        raw_bundles = synth_payload.get("bundles")
+        if isinstance(raw_bundles, list):
+            bundles = [item for item in raw_bundles if isinstance(item, dict)]
+        comparison_cluster_count = int(synth_payload.get("comparison_clusters") or 0)
+    return SynthesisResponse(
+        questions=[_question_response(row) for row in questions],
+        bundles=bundles,
+        comparison_cluster_count=comparison_cluster_count,
+    )
+
+
+@router.patch(
+    "/projects/{project_id}/evidence-matrix/{link_id}",
+    response_model=QuestionEvidenceLinkResponse,
+)
+async def patch_evidence_matrix_link(
+    project_id: str,
+    link_id: str,
+    request: UpdateQuestionEvidenceLinkRequest,
+    session: SessionDep,
+) -> QuestionEvidenceLinkResponse:
+    project = await _require_project(session, project_id)
+    try:
+        link = await session.get(QuestionEvidenceLink, uuid.UUID(link_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="matrix link not found") from exc
+    question = (
+        await session.get(ResearchQuestion, link.research_question_id) if link is not None else None
+    )
+    if link is None or question is None or question.project_id != project.id:
+        raise HTTPException(status_code=404, detail="matrix link not found")
+    updated = await upsert_question_evidence_link(
+        session,
+        research_question_id=link.research_question_id,
+        evidence_unit_id=link.evidence_unit_id,
+        stance=request.stance,
+        condition_note=(request.condition_note or "").strip() or None,
+        confidence=link.confidence,
+        manually_overridden=True,
+    )
+    return _matrix_link_response(updated)
+
+
 # ---- 写作 ----
 
 
@@ -149,21 +547,65 @@ async def generate_full(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
-    request: GenerationOptionsRequest | None = None,
+    request: FullPipelineOptionsRequest | None = None,
 ) -> JobResponse:
     """一键全管线（kind=full）。"""
     project = await _require_project(session, project_id)
-    job = await create_job(session, project_id=project.id, kind="full")
-    options = request or GenerationOptionsRequest()
-    await _enqueue(
+    if project.paper_type == "original":
+        issues = _original_generation_prerequisites(await list_assets(session, project.id))
+        if issues:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "original_materials_required",
+                    "message": "原创论文全自动生成需要可核验的方法与结果素材",
+                    "issues": issues,
+                },
+            )
+    options = request or FullPipelineOptionsRequest()
+    job = await start_job(
+        session,
         queue,
-        "run_full_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="full",
+        function="run_full_pipeline",
         quality_profile=options.quality_profile,
         review_style=options.review_style,
     )
     return _job_response(job)
+
+
+def _original_generation_prerequisites(assets: list[Any]) -> list[dict[str, str]]:
+    """Return actionable, deterministic blockers before an expensive original-paper run."""
+    has_results = False
+    has_method = False
+    for asset in assets:
+        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
+        if asset.kind in {"dataset", "result_table"}:
+            has_results = (
+                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
+                or has_results
+            )
+        if asset.kind in {"method_note", "code"}:
+            has_method = (
+                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
+            )
+    issues: list[dict[str, str]] = []
+    if not has_results:
+        issues.append(
+            {
+                "code": "result_material_missing",
+                "message": "请上传包含数据行和可解析数值的结果表或数据集",
+            }
+        )
+    if not has_method:
+        issues.append(
+            {
+                "code": "method_material_missing",
+                "message": "请上传可解析的方法笔记或代码",
+            }
+        )
+    return issues
 
 
 @router.post(
@@ -181,12 +623,12 @@ async def generate_sections(
     outline = await latest_outline(session, project.id)
     if outline is None:
         raise HTTPException(status_code=409, detail="generate an outline first")
-    job = await create_job(session, project_id=project.id, kind="write")
-    await _enqueue(
+    job = await start_job(
+        session,
         queue,
-        "run_write_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="write",
+        function="run_write_pipeline",
         coherence=request.coherence,
     )
     return _job_response(job)
@@ -417,12 +859,17 @@ def _claim_evidence_response(row: ClaimEvidenceAnchor) -> ClaimEvidenceResponse:
         claim_kind=row.claim_kind,
         is_core=row.is_core,
         cite_key=row.cite_key,
+        source_key=row.source_key,
+        user_asset_id=str(row.user_asset_id) if row.user_asset_id else None,
         source_kind=row.source_kind,
         source_page=row.source_page,
         source_section=row.source_section,
         source_paragraph=row.source_paragraph,
         evidence_excerpt=row.evidence_excerpt,
         evidence_hash=row.evidence_hash,
+        evidence_unit_id=str(row.evidence_unit_id) if row.evidence_unit_id else None,
+        comparability_ok=row.comparability_ok,
+        grade_ok=row.grade_ok,
         support_status=row.support_status,
         support_score=row.support_score,
         manual_status=row.manual_status,
@@ -445,15 +892,6 @@ def _count_words(text: str) -> int:
     cjk = len(re.findall(r"[一-鿿]", text))
     latin = len(re.findall(r"[A-Za-z][A-Za-z'-]*", text))
     return cjk + latin
-
-
-async def _enqueue(queue: ArqRedis | None, function: str, *args: Any, **kwargs: Any) -> None:
-    if queue is None:
-        raise HTTPException(
-            status_code=503,
-            detail="task queue unavailable: worker Redis is not reachable",
-        )
-    await queue.enqueue_job(function, *args, **kwargs)
 
 
 # ---- 导出（M3） ----
@@ -481,7 +919,7 @@ async def start_export(
         project.id,
         quality_profile=request.quality_profile,
     )
-    if request.quality_profile == "submission":
+    if request.quality_profile != "draft":
         blockers: list[dict[str, Any]] = []
         if quality_report is None:
             blockers.append({"code": "quality_report_missing", "message": "请先生成投稿质量报告"})
@@ -501,19 +939,19 @@ async def start_export(
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "submission_quality_gate_failed",
+                    "code": "quality_gate_failed",
                     "readiness_status": (
                         quality_report.readiness_status if quality_report else "unassessed"
                     ),
                     "blockers": blockers,
                 },
             )
-    job = await create_job(session, project_id=project.id, kind="compile")
-    await _enqueue(
+    job = await start_job(
+        session,
         queue,
-        "run_export_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="compile",
+        function="run_export_pipeline",
         formats=request.formats,
         quality_profile=request.quality_profile,
         quality_report_id=str(quality_report.id) if quality_report else None,
@@ -540,9 +978,111 @@ async def list_exports(project_id: str, session: SessionDep) -> list[ExportArtif
             quality_profile=row.quality_profile,
             readiness_status=row.readiness_status,
             paper_snapshot_hash=row.paper_snapshot_hash,
+            export_run_id=str(row.export_run_id) if row.export_run_id else None,
         )
         for row in rows
     ]
+
+
+@router.get("/projects/{project_id}/exports/runs/{run_id}/download")
+async def download_export_run(project_id: str, run_id: str, session: SessionDep) -> Response:
+    """Download every surviving file from one real export run as a zip archive."""
+    project = await _require_project(session, project_id)
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="export run not found") from error
+    job = await session.get(GenerationJob, run_uuid)
+    if job is None or job.project_id != project.id or job.kind != "compile":
+        raise HTTPException(status_code=404, detail="export run not found")
+    artifacts = list(
+        (
+            await session.scalars(
+                select(ExportArtifact)
+                .where(
+                    ExportArtifact.project_id == project.id,
+                    ExportArtifact.export_run_id == job.id,
+                )
+                .order_by(ExportArtifact.created_at, ExportArtifact.id)
+            )
+        ).all()
+    )
+    if not artifacts:
+        raise HTTPException(status_code=409, detail="export run has no downloadable files")
+
+    store = make_object_store(get_settings())
+    archive = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for artifact in artifacts:
+            if not artifact.object_key:
+                continue
+            try:
+                payload = store.get(artifact.object_key)
+            except (FileNotFoundError, ValueError):
+                continue
+            _, suffix = _MEDIA_TYPES.get(artifact.format, ("application/octet-stream", "bin"))
+            bundle.writestr(
+                export_filename(
+                    project.title,
+                    fmt=artifact.format,
+                    suffix=suffix,
+                    document_version=artifact.document_version,
+                    created_at=artifact.created_at,
+                ),
+                payload,
+            )
+            written += 1
+    if written == 0:
+        raise HTTPException(status_code=410, detail="export run payloads are gone")
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": _content_disposition(
+                "attachment", f"{project.title}-export-run-{str(job.id)[:8]}.zip"
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post(
+    "/projects/{project_id}/exports/runs/{run_id}/retry",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_export_run(
+    project_id: str,
+    run_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+) -> JobResponse:
+    """Start a new export run with a failed/cancelled run's persisted parameters."""
+    project = await _require_project(session, project_id)
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="export run not found") from error
+    source = await session.get(GenerationJob, run_uuid)
+    if source is None or source.project_id != project.id or source.kind != "compile":
+        raise HTTPException(status_code=404, detail="export run not found")
+    if source.status not in {"failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="only a failed export run can be retried")
+    spec = job_resume_spec(source)
+    if spec is None or spec["function"] != "run_export_pipeline":
+        raise HTTPException(status_code=409, detail="export run has no retry parameters")
+    retried = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="compile",
+        function=spec["function"],
+        checkpoint={"retried_from": str(source.id)},
+        **spec["kwargs"],
+    )
+    return _job_response(retried)
 
 
 @router.get("/projects/{project_id}/exports/{artifact_id}/download")
@@ -692,12 +1232,12 @@ async def start_snowball(
 ) -> JobResponse:
     """引文雪球扩展：邻居入库为 candidate，需用户圈选后才进写作白名单。"""
     project = await _require_project(session, project_id)
-    job = await create_job(session, project_id=project.id, kind="search")
-    await _enqueue(
+    job = await start_job(
+        session,
         queue,
-        "run_snowball_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="search",
+        function="run_snowball_pipeline",
         direction=request.direction,
         max_seeds=request.max_seeds,
     )
@@ -717,12 +1257,12 @@ async def start_ingest(
 ) -> JobResponse:
     """OA 全文获取 → 解析 → 全文级卡片。只走 OA/官方渠道，不绕 paywall。"""
     project = await _require_project(session, project_id)
-    job = await create_job(session, project_id=project.id, kind="ingest")
-    await _enqueue(
+    job = await start_job(
+        session,
         queue,
-        "run_ingest_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="ingest",
+        function="run_ingest_pipeline",
         max_works=request.max_works,
     )
     return _job_response(job)
@@ -740,13 +1280,39 @@ async def start_quality(
     request: GenerationOptionsRequest | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
-    job = await create_job(session, project_id=project.id, kind="write")
     options = request or GenerationOptionsRequest()
-    await _enqueue(
+    job = await start_job(
+        session,
         queue,
-        "run_quality_pipeline",
-        str(project.id),
-        str(job.id),
+        project_id=project.id,
+        kind="write",
+        function="run_quality_pipeline",
+        quality_profile=options.quality_profile,
+        review_style=options.review_style,
+    )
+    return _job_response(job)
+
+
+@router.post(
+    "/projects/{project_id}/quality/repair",
+    response_model=JobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_quality_repair(
+    project_id: str,
+    session: SessionDep,
+    queue: QueueDep,
+    request: GenerationOptionsRequest | None = None,
+) -> JobResponse:
+    """重新评估并对未通过的论断做有界补证据与局部修订。"""
+    project = await _require_project(session, project_id)
+    options = request or GenerationOptionsRequest()
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="write",
+        function="run_quality_repair_pipeline",
         quality_profile=options.quality_profile,
         review_style=options.review_style,
     )
@@ -757,7 +1323,7 @@ async def start_quality(
 async def get_quality(
     project_id: str,
     session: SessionDep,
-    quality_profile: Literal["draft", "submission"] = Query(default="draft"),
+    quality_profile: Literal["draft", "scholarly", "submission"] = Query(default="scholarly"),
 ) -> QualityResponse:
     """同步计算质量报告的确定性部分（软校验需要 LLM，走任务）。"""
     from paperforge_worker.pipelines.quality import build_quality_report, count_words
@@ -961,3 +1527,214 @@ async def refine_text(
         refined=refined,
         changed=refined != original,
     )
+
+
+@router.post(
+    "/projects/{project_id}/sections/{section_key}/rewrite-candidate",
+    response_model=RewriteSectionCandidateResponse,
+)
+async def rewrite_section_candidate(
+    project_id: str,
+    section_key: str,
+    request: RewriteSectionRequest,
+    session: SessionDep,
+) -> RewriteSectionCandidateResponse:
+    """只生成候选，不写数据库；引用、数字与素材引用必须原样守恒。"""
+    from llm_runtime import LLMRunner
+    from paperforge_worker.pipelines.writing import extract_numbers
+
+    from paperforge_api.config import get_settings as api_settings
+
+    project = await _require_project(session, project_id)
+    document = await latest_document(session, project.id)
+    row = (
+        await get_section(session, document_id=document.id, section_key=section_key)
+        if document
+        else None
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="section not found")
+    require_section_unchanged(row, request.expected_updated_at)
+    original = IRSection(**(row.body_ir_json or {}))
+    runner = LLMRunner(api_settings().llm_config())
+    if not runner.enabled:
+        return RewriteSectionCandidateResponse(
+            section_key=section_key,
+            original_body_ir=original.model_dump(mode="json"),
+            candidate_body_ir=original.model_dump(mode="json"),
+            changed=False,
+            checks={"citations": "pass", "numbers": "pass", "assets": "pass"},
+            note="未配置 LLM provider，未生成候选",
+        )
+    response = await runner.agenerate_json(
+        "writer",
+        system_prompt=(
+            "你是学术论文单章重写助手。返回完整 Section JSON。只能修改 text run 的 v 字段；"
+            "所有 cite/grounding/xref/math_inline run、非文字 block、key、title 和结构必须保留。"
+            "禁止新增、删除或修改任何数字、引用键、证据 id、素材引用与图表。"
+        ),
+        user_prompt=(
+            f"用户要求：{request.instruction}\n"
+            f"允许的证据引用（仅作范围说明，不得新增）：{request.allowed_evidence_refs}\n"
+            f"原章节 JSON：{original.model_dump_json()}"
+        ),
+        max_output_tokens=8000,
+        temperature=0.2,
+        metadata={"stage": "rewrite_section", "section_key": section_key},
+    )
+    if not response.ok or not isinstance(response.value, dict):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "rewrite_generation_failed",
+                "message": response.error or "模型未返回有效候选",
+            },
+        )
+    try:
+        candidate = IRSection(**response.value)
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(
+            status_code=422, detail={"code": "rewrite_invalid_ir", "message": str(error)}
+        ) from error
+    checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
+    if any(value != "pass" for value in checks.values()):
+        raise HTTPException(
+            status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
+        )
+    return RewriteSectionCandidateResponse(
+        section_key=section_key,
+        original_body_ir=original.model_dump(mode="json"),
+        candidate_body_ir=candidate.model_dump(mode="json"),
+        changed=candidate != original,
+        checks=checks,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/sections/{section_key}/rewrite-accept",
+    response_model=AcceptSectionRewriteResponse,
+)
+async def accept_section_rewrite(
+    project_id: str,
+    section_key: str,
+    request: AcceptSectionRewriteRequest,
+    session: SessionDep,
+) -> AcceptSectionRewriteResponse:
+    """接受后复制整份文档到新版本；失败或冲突时当前版本完全不动。"""
+    from db import invalidate_quality_reports_for_project
+    from paperforge_worker.pipelines.writing import extract_numbers
+
+    project = await _require_project(session, project_id)
+    document = await latest_document(session, project.id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="document not generated yet")
+    source_rows = await list_sections(session, document.id)
+    source = next((item for item in source_rows if item.section_key == section_key), None)
+    if source is None:
+        raise HTTPException(status_code=404, detail="section not found")
+    require_section_unchanged(source, request.expected_updated_at)
+    original = IRSection(**(source.body_ir_json or {}))
+    try:
+        candidate = IRSection(**request.candidate_body_ir)
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=422, detail=f"invalid section IR: {error}") from error
+    checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
+    if any(value != "pass" for value in checks.values()):
+        raise HTTPException(
+            status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
+        )
+
+    whitelist = await get_writing_whitelist(session, project.id)
+    new_document = await create_document(
+        session,
+        project_id=project.id,
+        outline_id=document.outline_id,
+        status="draft",
+    )
+    accepted_row = None
+    for row in source_rows:
+        ir = candidate if row.section_key == section_key else IRSection(**(row.body_ir_json or {}))
+        cite_keys = sorted(
+            PaperIR(meta=PaperMeta(title=project.title), sections=[ir]).collect_cite_keys()
+        )
+        asset_refs = sorted(
+            PaperIR(meta=PaperMeta(title=project.title), sections=[ir]).collect_asset_refs()
+        )
+        copied = await upsert_section(
+            session,
+            document_id=new_document.id,
+            section_key=row.section_key,
+            title=ir.title,
+            parent_key=row.parent_key,
+            order_no=row.order_no,
+            body_ir=ir.model_dump(mode="json"),
+            cite_keys=cite_keys,
+            asset_refs=asset_refs,
+            status="edited" if row.section_key == section_key else row.status,
+            model=row.model,
+        )
+        await replace_citation_usage(
+            session,
+            project_id=project.id,
+            section_id=copied.id,
+            usages=[
+                {"work_id": whitelist[key], "cite_key": key, "context_snippet": None}
+                for key in cite_keys
+                if key in whitelist
+            ],
+        )
+        if row.section_key == section_key:
+            accepted_row = copied
+    await invalidate_quality_reports_for_project(session, project.id)
+    assert accepted_row is not None
+    return AcceptSectionRewriteResponse(
+        document_version=new_document.version, section=_section_response(accepted_row)
+    )
+
+
+def _rewrite_invariant_checks(
+    original: IRSection, candidate: IRSection, *, extract_numbers: Any
+) -> dict[str, str]:
+    original_ir = PaperIR(meta=PaperMeta(title="check"), sections=[original])
+    candidate_ir = PaperIR(meta=PaperMeta(title="check"), sections=[candidate])
+    original_payload = original.model_dump(mode="json")
+    candidate_payload = candidate.model_dump(mode="json")
+
+    def text_values(value: Any) -> list[str]:
+        if isinstance(value, dict):
+            own = [str(value.get("v") or "")] if value.get("t") == "text" else []
+            return own + [text for child in value.values() for text in text_values(child)]
+        if isinstance(value, list):
+            return [text for child in value for text in text_values(child)]
+        return []
+
+    def protected_shape(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: "<editable-text>"
+                if value.get("t") == "text" and key == "v"
+                else protected_shape(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [protected_shape(child) for child in value]
+        return value
+
+    original_text = " ".join(text_values(original_payload))
+    candidate_text = " ".join(text_values(candidate_payload))
+    return {
+        "structure": (
+            "pass"
+            if protected_shape(original_payload) == protected_shape(candidate_payload)
+            else "fail"
+        ),
+        "citations": "pass"
+        if original_ir.collect_cite_keys() == candidate_ir.collect_cite_keys()
+        else "fail",
+        "numbers": "pass"
+        if extract_numbers(original_text) == extract_numbers(candidate_text)
+        else "fail",
+        "assets": "pass"
+        if original_ir.collect_asset_refs() == candidate_ir.collect_asset_refs()
+        else "fail",
+    }

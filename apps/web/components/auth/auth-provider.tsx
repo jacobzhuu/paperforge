@@ -56,7 +56,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       alive = false;
     };
-  }, [pathname, publicPath, router]);
+    /*
+     * 只在「公开页 ↔ 受保护区」的边界上校验，不要跟随每一个 pathname。
+     *
+     * AuthProvider 位于根 layout，原先把 pathname 放在依赖里会让工作台间的每次
+     * 客户端导航都 setLoading(true)。AppShell 随即卸载整个应用树，换成
+     * 「正在验证会话…」，项目 Provider、任务订阅和页面缓存也一起丢失；等
+     * /auth/me 返回后再从头挂载，看起来就像浏览器整页刷新。
+     *
+     * 同一受保护区内会话失效仍由 paperforge:auth-expired 事件处理，因此不需要
+     * 逐路由重复请求 /auth/me。
+     */
+  }, [publicPath, router]);
 
   React.useEffect(() => {
     const onExpired = () => {

@@ -219,9 +219,7 @@ def test_long_single_column_table_compiles_across_pages_in_real_texd() -> None:
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(outcome.pdf))
-    text = " ".join(
-        " ".join((page.extract_text() or "").split()) for page in reader.pages
-    )
+    text = " ".join(" ".join((page.extract_text() or "").split()) for page in reader.pages)
     assert len(reader.pages) >= 2
     assert "LASTROW" in text
 
@@ -305,6 +303,127 @@ def test_whitelisted_environment_is_never_dropped() -> None:
     log = "LaTeX Error: Environment equation undefined"
     _repaired, actions = deterministic_repairs(files, log)
     assert actions == []
+
+
+def _table_project() -> dict[str, str]:
+    ir = PaperIR(
+        meta=PaperMeta(title="T", language="en"),
+        sections=[
+            Section(
+                key="s",
+                title="S",
+                blocks=[
+                    TableBlock(
+                        caption="Evidence",
+                        label="tab:e",
+                        source=TableSource(
+                            kind="inline",
+                            data={"headers": ["A", "B"], "rows": [["1", "2"], ["3", "4"]]},
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    return build_latex_project(ir, template="article").files
+
+
+def test_dropping_longtable_also_degrades_the_tables_that_need_it() -> None:
+    """注释掉宏包却留着依赖它的环境，等于保证下一轮必挂。
+
+    实测事故链：`longtable.sty` 不在 Tectonic 缓存 → 注释掉宏包 →
+    `Environment longtable undefined` → longtable 在白名单里被跳过 →
+    无动作 → 放弃。两件事必须在同一轮成对发生。
+    """
+    files = _table_project()
+    assert "\\begin{longtable}" in files["sections/00-s.tex"]
+
+    log = "error: main.tex:10: LaTeX Error: File `longtable.sty' not found."
+    repaired, actions = deterministic_repairs(files, log)
+
+    kinds = {action["kind"] for action in actions}
+    assert kinds == {"drop_missing_package", "degrade_syntax"}
+    section = repaired["sections/00-s.tex"]
+    assert "longtable" not in section
+    assert "\\begin{tabular}" in section
+    # 表头、数据、题注、标签一个都不能丢——降级不是删表。
+    assert r"\textbf{\tablename~\thetable: Evidence}" in section
+    assert "\\label{tab:e}" in section
+    for cell in ("A", "B", "1", "2", "3", "4"):
+        assert cell in section
+    # 续页脚手架在 tabular 里没有意义，必须切干净。
+    for marker in ("\\endfirsthead", "\\endhead", "\\endfoot", "\\endlastfoot"):
+        assert marker not in section
+
+
+def test_longtable_fallback_chunks_large_ledgers_instead_of_making_one_tall_box() -> None:
+    """缺少 longtable 时，大台账仍须能在小 tabular 之间分页。
+
+    旧降级把全部行放进单个 table/tabular；真实项目在第 60 多行触发
+    ``Dimension too large``，报错位置恰好是 ``\\end{table}``。
+    """
+    rows = [[f"study-{index}", "evidence " * 20] for index in range(9)]
+    ir = PaperIR(
+        meta=PaperMeta(title="T", language="en"),
+        sections=[
+            Section(
+                key="ledger",
+                title="Ledger",
+                blocks=[
+                    TableBlock(
+                        caption="Evidence ledger",
+                        label="tab:ledger",
+                        source=TableSource(
+                            kind="inline",
+                            data={"headers": ["Study", "Evidence"], "rows": rows},
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    files = build_latex_project(ir, template="article").files
+    repaired, _actions = deterministic_repairs(
+        files,
+        "error: main.tex:10: LaTeX Error: File `longtable.sty' not found.",
+    )
+    section = repaired["sections/00-ledger.tex"]
+
+    assert "\\begin{longtable}" not in section
+    assert "\\begin{table}" not in section
+    assert section.count("\\begin{tabular}") == 5
+    assert section.count("\\end{tabular}") == 5
+    assert section.count(r"{\raggedright\bfseries \hspace{0pt}Study\par}") == 5
+    assert r"\refstepcounter{table}\label{tab:ledger}" in section
+    for index in range(9):
+        assert f"study-\\allowbreak{{}}{index}" in section
+
+
+def test_undefined_longtable_environment_is_degraded_not_skipped() -> None:
+    """白名单管的是「LLM 能写什么」，不该拦住对真实缺失环境的修复。"""
+    files = _table_project()
+    log = "error: sections/00-s.tex:13: LaTeX Error: Environment longtable undefined."
+    repaired, actions = deterministic_repairs(files, log)
+
+    assert [action["kind"] for action in actions] == ["degrade_syntax"]
+    assert "\\begin{tabular}" in repaired["sections/00-s.tex"]
+    assert "\\begin{longtable}" not in repaired["sections/00-s.tex"]
+
+
+def test_dropping_graphicx_also_degrades_includegraphics() -> None:
+    files = {
+        "sections/00-s1.tex": "\\includegraphics[width=\\linewidth]{figures/va_1.png}",
+        "main.tex": "\\usepackage{graphicx}\n",
+    }
+    log = "LaTeX Error: File `graphicx.sty' not found."
+    repaired, actions = deterministic_repairs(files, log)
+    assert {action["kind"] for action in actions} == {"drop_missing_package", "degrade_syntax"}
+    section = repaired["sections/00-s1.tex"]
+    assert "\\includegraphics" not in section
+    # 可选参数不能漏进正文。
+    assert "width=" not in section
+    # 路径带 `_`，必须转义——否则占位符自己就会让编译挂掉。
+    assert r"figures/va\_1.png" in section
 
 
 def test_undefined_command_is_removed() -> None:
@@ -456,6 +575,7 @@ warning: errors were issued by BibTeX, but were ignored.
 
 def test_bibliography_broken_detects_bst_failure_and_undefined_citations() -> None:
     assert bibliography_broken(_BST_FAILURE_LOG)
+    assert bibliography_broken("note: downloading unsrt.bst\nwarning: open of input unsrt failed")
     assert bibliography_broken("LaTeX Warning: Citation `lewis2020retrieval' on page 3 undefined")
     assert bibliography_broken("I couldn't open style file unsrt.bst")
     assert not bibliography_broken("note: Running TeX ...\nnote: Writing `main.pdf`")

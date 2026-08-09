@@ -1,7 +1,6 @@
 'use client';
 
 import * as React from 'react';
-import { Card, CardContent } from '@/components/ui/card';
 import { API_BASE } from '@/lib/api';
 
 /**
@@ -20,25 +19,25 @@ export function MarkdownPreview({ markdown }: { markdown: string }) {
 
   if (!markdown.trim()) {
     return (
-      <Card>
-        <CardContent className="py-16 text-center text-sm text-muted-foreground">
+      <section>
+        <div className="py-16 text-center text-body text-muted-foreground">
           暂无预览。Markdown 预览在正文生成后自动产出。
-        </CardContent>
-      </Card>
+        </div>
+      </section>
     );
   }
 
   return (
-    <Card>
-      <CardContent className="max-h-[calc(100vh-16rem)] overflow-y-auto py-6 scrollbar-thin">
+    <section>
+      <div className="max-h-[calc(100vh-16rem)] overflow-y-auto py-6 scrollbar-thin">
         {/* pf-paper：全文预览是「读论文」的界面，走衬线；编辑器不加，见 globals.css。 */}
         <div className="pf-prose pf-paper">
           {blocks.map((block, index) => (
             <Block key={index} block={block} />
           ))}
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -219,7 +218,7 @@ function Block({ block }: { block: ParsedBlock }) {
     case 'table':
       return (
         <div className="mb-4 overflow-x-auto">
-          <table className="w-full border-collapse text-sm">
+          <table className="w-full border-collapse text-body">
             <thead>
               <tr className="border-b">
                 {block.header.map((cell, i) => (
@@ -245,9 +244,9 @@ function Block({ block }: { block: ParsedBlock }) {
       );
     case 'fence':
       return (
-        <pre className="mb-4 overflow-x-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed scrollbar-thin">
+        <pre className="mb-4 overflow-x-auto rounded-md border bg-muted/40 p-3 font-mono text-meta leading-relaxed scrollbar-thin">
           {block.lang === 'math' && (
-            <span className="mb-1 block text-xs text-muted-foreground">公式（LaTeX 源）</span>
+            <span className="mb-1 block text-meta text-muted-foreground">公式（LaTeX 源）</span>
           )}
           {block.text}
         </pre>
@@ -290,7 +289,7 @@ function Inline({ text }: { text: string }) {
         }
         if (part.startsWith('`') && part.endsWith('`')) {
           return (
-            <code key={i} className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+            <code key={i} className="rounded bg-muted px-1 py-0.5 font-mono text-meta">
               {part.slice(1, -1)}
             </code>
           );
@@ -299,7 +298,7 @@ function Inline({ text }: { text: string }) {
           return (
             <span
               key={i}
-              className="rounded border bg-muted px-1 font-mono text-xs"
+              className="rounded border bg-muted px-1 font-mono text-meta"
               title="行内公式（LaTeX 源）"
             >
               {part.slice(1, -1)}

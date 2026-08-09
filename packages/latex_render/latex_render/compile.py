@@ -16,6 +16,9 @@ from typing import Any
 
 import httpx
 
+from latex_render.escape import latex_escape
+from latex_render.renderer import FLOAT_PLACEMENT
+
 MAX_REPAIR_ROUNDS = 2
 
 # 允许 LLM 自由书写 LaTeX 的环境（设计 §4.5）；其余一律视为未定义环境处理。
@@ -59,7 +62,15 @@ ALLOWED_ENVIRONMENTS = frozenset(
 # PDF 里编号引用一切正常）。凭它降级会把投稿方 .bst 的排版换成内联兜底，
 # 还给用户挂上一个假的「降级」告警——比不修更糟。
 _BIBTEX_FAILURE_RES = (
-    re.compile(r"open of input \S*\.bst failed", re.IGNORECASE),
+    re.compile(r"open of input \S+\.bst failed", re.IGNORECASE),
+    # Tectonic 不同 bundle 版本的同一错误有两种形状：
+    # `open of input unsrt.bst failed` 与 `open of input unsrt failed`。
+    # 后一种省略扩展名，旧正则漏掉后会把“全文 [?]、无参考文献”误判为成功。
+    # 用前面的 downloading 行锁定 style 名，避免把其他输入文件失败误判成书目失败。
+    re.compile(
+        r"downloading ([^\s]+)\.bst.*?open of input \1 failed",
+        re.IGNORECASE | re.DOTALL,
+    ),
     re.compile(r"I couldn't open style file", re.IGNORECASE),
     re.compile(r"Citation [`'][^'\n]+' (?:on page \d+ )?undefined", re.IGNORECASE),
 )
@@ -84,6 +95,148 @@ _NATBIB_SHIM = """%% [paperforge] 内联书目兜底的 natbib 垫片：切到�
 """
 
 _MISSING_PACKAGE_RE = re.compile(r"LaTeX Error: File `([^']+)\.sty' not found", re.IGNORECASE)
+
+# 注释掉缺失宏包**并不能**让文档编出来：正文里依赖该宏包的语法还在原地。
+# 实测的死循环：`longtable.sty` 不在 Tectonic 缓存里 → 第 1 轮注释掉
+# `\usepackage{longtable}` → 第 2 轮报 `Environment longtable undefined` →
+# 而 `longtable` 在 ALLOWED_ENVIRONMENTS 里被跳过 → 无动作 → 放弃编译。
+# 所以「丢宏包」必须与「降级它提供的语法」成对发生，且要在同一轮完成。
+_LONGTABLE_RE = re.compile(
+    r"(?:\\begingroup[ \t]*\n)?"
+    r"(?:[ \t]*\\small[ \t]*\n)?"
+    r"[ \t]*\\begin\{longtable\}\{(?P<spec>(?:[^{}]|\{[^{}]*\})*)\}"
+    r"(?P<inner>.*?)"
+    r"\\end\{longtable\}"
+    r"(?:[ \t]*\n[ \t]*\\endgroup)?",
+    re.DOTALL,
+)
+# longtable 的续页表头脚手架。降级成 tabular 时它们全部无意义，必须切掉。
+_LONGTABLE_MARKERS = ("\\endlastfoot", "\\endfoot", "\\endhead", "\\endfirsthead")
+# `\caption{...}\label{...} \\`——longtable 里 caption 是表格的一「行」，
+# tabular 里它必须移到 table 浮动体上，行尾的 `\\` 也要一并去掉。
+_LONGTABLE_CAPTION_ROW_RE = re.compile(
+    r"[ \t]*\\caption\{(?:[^{}]|\{[^{}]*\})*\}"
+    r"(?:[ \t]*\\label\{[^{}]*\})?[ \t]*\\\\[ \t]*\n?"
+)
+_CAPTION_RE = re.compile(r"\\caption\{(?:[^{}]|\{[^{}]*\})*\}")
+_LABEL_RE = re.compile(r"\\label\{[^{}]*\}")
+_INCLUDEGRAPHICS_RE = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^{}]*)\}")
+_GENERATED_TABLE_ROW_RE = re.compile(r"(?m)^[ \t]*.+?\\\\[ \t]*$")
+_FALLBACK_TABLE_ROWS_PER_CHUNK = 2
+
+
+def degrade_longtable(text: str) -> tuple[str, int]:
+    """把 ``longtable`` 结构化降级为可分页的 ``tabular`` 小块。
+
+    宏包取不到时的兜底通路。**不是**删掉环境——那会把 ``&`` 与 ``\\\\`` 泼进
+    正常段落，照样编不出来。也不能把整张长表搬进一个 ``table/tabular``：证据台账
+    往往有数十行，单个不可分页盒子会在 ``\\end{table}`` 触发 ``Dimension too
+    large``。PaperForge 生成的每个数据行都独占一行源码，因此按两个数据行切成
+    多个普通 ``tabular``；TeX 可以在这些小盒子之间分页，同时保住全部数据与表头。
+
+    返回 ``(文本, 处理数)``。
+    """
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        inner = match.group("inner")
+        first = min(
+            (index for marker in _LONGTABLE_MARKERS if (index := inner.find(marker)) >= 0),
+            default=-1,
+        )
+        last = max(
+            (
+                index + len(marker)
+                for marker in _LONGTABLE_MARKERS
+                if (index := inner.rfind(marker)) >= 0
+            ),
+            default=-1,
+        )
+        if first >= 0:
+            head, body = inner[:first], inner[last:]
+        else:
+            head, body = "", inner
+        caption_match = _CAPTION_RE.search(inner)
+        label_match = _LABEL_RE.search(inner)
+        caption = caption_match.group(0) if caption_match else ""
+        label = label_match.group(0) if label_match else ""
+        head = _LONGTABLE_CAPTION_ROW_RE.sub("", head, count=1)
+        rows = _GENERATED_TABLE_ROW_RE.findall(body)
+        if not rows:
+            # 非 PaperForge 结构仍保留旧的单表降级语义；不能凭空删掉未知内容。
+            rows = [body.strip("\n")]
+        chunks = [
+            rows[index : index + _FALLBACK_TABLE_ROWS_PER_CHUNK]
+            for index in range(0, len(rows), _FALLBACK_TABLE_ROWS_PER_CHUNK)
+        ]
+        caption_text = caption[len("\\caption{") : -1] if caption else ""
+        caption_line = ""
+        if caption or label:
+            caption_line = (
+                "  \\refstepcounter{table}"
+                f"{label}\\par\\smallskip\\noindent"
+                f"\\textbf{{\\tablename~\\thetable: {caption_text}}}\\par\\smallskip"
+            )
+        tabulars = []
+        for chunk in chunks:
+            tabulars.append(
+                "\n".join(
+                    [
+                        "  \\noindent",
+                        f"  \\begin{{tabular}}{{{match.group('spec')}}}",
+                        head.strip("\n"),
+                        *chunk,
+                        "    \\bottomrule",
+                        "  \\end{tabular}",
+                        "  \\par\\smallskip",
+                    ]
+                )
+            )
+        return "\n".join(
+            part
+            for part in [
+                "\\begingroup",
+                "  \\small",
+                caption_line,
+                "\n".join(tabulars),
+                "\\endgroup",
+            ]
+            if part
+        )
+
+    return _LONGTABLE_RE.sub(replace, text), count
+
+
+def degrade_includegraphics(text: str) -> tuple[str, int]:
+    """graphicx 缺失时把 ``\\includegraphics`` 降级为占位符。
+
+    留着它等于让每张图都触发 `Undefined control sequence`，而通用的「删掉未定义
+    命令」会把 `[width=...]{path}` 这段可选参数原样漏进正文。
+    """
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        # 路径几乎必然带 `_`（figures/va_1.png），不转义就是 `Missing $ inserted`——
+        # 修复动作本身把编译搞挂，比不修还糟。
+        return f"\\todo{{图片无法嵌入（缺少 graphicx）：{latex_escape(match.group(1))}}}"
+
+    return _INCLUDEGRAPHICS_RE.sub(replace, text), count
+
+
+# 宏包 → 它提供的语法该如何降级。丢宏包时同轮执行。
+_PACKAGE_DEGRADERS: dict[str, Callable[[str], tuple[str, int]]] = {
+    "longtable": degrade_longtable,
+    "graphicx": degrade_includegraphics,
+}
+# 环境 → 降级函数。**优先于 ALLOWED_ENVIRONMENTS**：白名单管的是「LLM 可以
+# 写什么」，日志说某环境未定义时它就是真的不存在，白名单不该拦住修复。
+_ENVIRONMENT_DEGRADERS: dict[str, Callable[[str], tuple[str, int]]] = {
+    "longtable": degrade_longtable,
+}
 _UNDEFINED_ENV_RE = re.compile(r"LaTeX Error: Environment ([A-Za-z*]+) undefined", re.IGNORECASE)
 # 日志里的控制序列只有一个反斜杠：`l.5 \madeupcommand`。
 _UNDEFINED_CONTROL_RE = re.compile(r"Undefined control sequence.*?\\([A-Za-z@]+)", re.DOTALL)
@@ -92,6 +245,7 @@ _TECTONIC_ERROR_LINE_RE = re.compile(
     r"^error:\s+([^:\n]+):(\d+):\s*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
+_OVERFULL_HBOX_RE = re.compile(r"Overfull \\hbox \((?P<points>\d+(?:\.\d+)?)pt too wide\)")
 
 
 @dataclass
@@ -105,6 +259,7 @@ class CompileOutcome:
     # 书目是否真的排出来了。`ok=True` 不含这一层：BibTeX 失败会被 Tectonic
     # 降级为 warning，PDF 照样产出，只是每个引用都变成 `[?]`。
     bibliography_ok: bool = True
+    layout_checks: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -113,6 +268,7 @@ class CompileOutcome:
             "pdf_bytes": len(self.pdf) if self.pdf else 0,
             "repairs": self.repairs,
             "bibliography_ok": self.bibliography_ok,
+            "layout_checks": self.layout_checks,
             "log_tail": self.log[-2000:],
         }
 
@@ -120,6 +276,18 @@ class CompileOutcome:
 def bibliography_broken(log: str) -> bool:
     """日志是否表明书目没排出来（.bst 取不到 / 引用全未定义）。"""
     return any(pattern.search(log) for pattern in _BIBTEX_FAILURE_RES)
+
+
+def layout_checks(log: str, *, max_overfull_pt: float = 5.0) -> dict[str, Any]:
+    """Summarize layout warnings; scholarly export treats severe overflow as blocking."""
+    widths = [float(match.group("points")) for match in _OVERFULL_HBOX_RE.finditer(log)]
+    severe = [value for value in widths if value > max_overfull_pt]
+    return {
+        "overfull_count": len(widths),
+        "overfull_over_threshold": len(severe),
+        "max_overfull_pt": max(widths, default=0.0),
+        "passed": not severe,
+    }
 
 
 def with_inline_bibliography(
@@ -288,6 +456,7 @@ def _compile_once(
         outcome = client.compile(files, entrypoint=entrypoint)
     outcome.files = files
     outcome.bibliography_ok = not bibliography_broken(outcome.log)
+    outcome.layout_checks = layout_checks(outcome.log)
     return outcome
 
 
@@ -315,6 +484,22 @@ def _ensure_bibliography(
     return current, outcome
 
 
+def _apply_degrader(
+    repaired: dict[str, str],
+    degrader: Callable[[str], tuple[str, int]],
+    **action: Any,
+) -> list[dict[str, Any]]:
+    """就地对每个文件跑一次降级函数，返回实际发生的修复动作。"""
+    actions: list[dict[str, Any]] = []
+    for path, content in list(repaired.items()):
+        replaced, count = degrader(content)
+        if not count:
+            continue
+        repaired[path] = replaced
+        actions.append({"kind": "degrade_syntax", "file": path, "count": count, **action})
+    return actions
+
+
 def deterministic_repairs(
     files: dict[str, str],
     log: str,
@@ -336,8 +521,17 @@ def deterministic_repairs(
                 main,
             )
             actions.append({"kind": "drop_missing_package", "package": package})
+        # 同一轮里把依赖该宏包的语法一并降级。宏包行可能上一轮已被注释掉
+        # （此时上面的 `if` 不成立），但正文里的语法仍在——那正是必须处理的情形。
+        degrader = _PACKAGE_DEGRADERS.get(package)
+        if degrader is not None:
+            actions.extend(_apply_degrader(repaired, degrader, package=package))
 
     for env in dict.fromkeys(_UNDEFINED_ENV_RE.findall(log)):
+        degrader = _ENVIRONMENT_DEGRADERS.get(env)
+        if degrader is not None:
+            actions.extend(_apply_degrader(repaired, degrader, environment=env))
+            continue
         if env in ALLOWED_ENVIRONMENTS:
             continue
         for path, content in list(repaired.items()):
@@ -388,12 +582,16 @@ def error_context(log: str, *, max_items: int = 5) -> list[dict[str, Any]]:
 
 __all__ = [
     "ALLOWED_ENVIRONMENTS",
+    "FLOAT_PLACEMENT",
     "MAX_REPAIR_ROUNDS",
     "CompileOutcome",
     "TexdClient",
     "bibliography_broken",
     "compile_with_repair",
+    "degrade_includegraphics",
+    "degrade_longtable",
     "deterministic_repairs",
     "error_context",
+    "layout_checks",
     "with_inline_bibliography",
 ]

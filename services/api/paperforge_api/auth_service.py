@@ -37,8 +37,8 @@ def normalize_password(password: str) -> str:
 
 def validate_password(password: str) -> str:
     normalized = normalize_password(password)
-    if len(normalized) < 8:
-        raise ValueError("password must contain at least 8 characters")
+    if len(normalized) < 15:
+        raise ValueError("password must contain at least 15 characters")
     if len(normalized) > 128:
         raise ValueError("password must contain at most 128 characters")
     if normalized.casefold() in _COMMON_PASSWORDS:

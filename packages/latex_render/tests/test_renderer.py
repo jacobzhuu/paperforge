@@ -15,6 +15,35 @@ def test_escape_specials():
     assert latex_escape("a & b_c 100%") == r"a \& b\_c 100\%"
 
 
+def test_unicode_science_characters_survive_instead_of_being_dropped():
+    """Latin Modern 没有这些字形时 TeX **不报错**，只是把字符丢掉。
+
+    结果是「编译成功、PDF 拿得到、化学式和数字却错了」——
+    `H₂O` 变 `HO`，`10⁻³` 变 `10`。必须在渲染前换成等价 LaTeX。
+    """
+    assert latex_escape("H₂O") == "H$_{2}$O"
+    assert latex_escape("π/4") == r"$\pi$/4"
+    assert latex_escape("10⁻³ mol·L⁻¹") == r"10$^{-3}$ mol$\cdot$L$^{-1}$"
+    assert latex_escape("α ≈ 0.05 ± 0.01") == r"$\alpha$ $\approx$ 0.05 $\pm$ 0.01"
+
+
+def test_consecutive_subscripts_merge_into_one_group():
+    """逐字符替换会得到 `$_1$$_2$`——双下标，TeX 报 `Double subscript` 直接挂。"""
+    assert latex_escape("x₁₂") == "x$_{12}$"
+    assert latex_escape("y⁻¹") == "y$^{-1}$"
+
+
+def test_unicode_fallback_runs_after_escaping_not_before():
+    """兜底产出的 `$`/`\\`/`{}` 是最终 LaTeX，不能再被转义器当正文处理。"""
+    assert latex_escape("50% CO₂") == r"50\% CO$_{2}$"
+    # 反斜杠仍然按正文转义，没有被兜底的 `\alpha` 之类污染。
+    assert latex_escape("a\\b") == r"a\textbackslash{}b"
+
+
+def test_zero_width_characters_are_removed():
+    assert latex_escape("a​b﻿c") == "abc"
+
+
 def test_render_body_cites_and_equation():
     ir = PaperIR(
         meta=PaperMeta(title="T"),
@@ -41,6 +70,36 @@ def test_render_body_cites_and_equation():
     assert "\\cite{wang2023survey}" in body
     assert "\\begin{equation}" in body
     assert "\\label{eq:e}" in body
+
+
+def test_untitled_front_matter_renders_blocks_without_a_numbered_section() -> None:
+    from paper_ir.schema import FigureBlock
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="abstract-visuals",
+                title="",
+                blocks=[
+                    FigureBlock(
+                        asset_ref="va_summary",
+                        caption="摘要图",
+                        alt_text="论文摘要图",
+                        label="fig:summary",
+                        width="full",
+                    )
+                ],
+            )
+        ],
+    )
+    body = render_body(
+        ir,
+        {"va_summary": {"figure_path": "figures/va_summary.png"}},
+    )
+    assert "\\section{" not in body
+    assert "\\includegraphics" in body
+    assert "figures/va_summary.png" in body
 
 
 def test_todo_block_renders_placeholder_not_data():
@@ -358,8 +417,70 @@ def test_inline_literature_matrix_renders_without_external_asset():
     assert "Evidence matrix" in latex
     assert "Located full text" in latex
     assert "\\todo{" not in latex
-    assert "p{0.280\\linewidth}" in latex
+    assert "p{0.277\\linewidth}" in latex
     assert "\\begin{longtable}" in latex
+
+
+def test_six_column_longtable_reserves_intercolumn_spacing_and_keeps_all_rows():
+    from paper_ir.schema import TableBlock, TableSource
+
+    rows = [[f"Study {index}", "task", "data", "model", "F1", "p.2"] for index in range(45)]
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="ledger",
+                title="Evidence ledger",
+                blocks=[
+                    TableBlock(
+                        caption="Ledger",
+                        source=TableSource(
+                            kind="inline", data={"headers": list("ABCDEF"), "rows": rows}
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    latex = render_body(ir, {})
+    assert "p{0.200\\linewidth}" in latex
+    assert "Study 44" in latex
+
+
+def test_table_cells_add_safe_breakpoints_to_urls_paths_and_latex_source() -> None:
+    from paper_ir.schema import TableBlock, TableSource
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="ledger",
+                title="Ledger",
+                blocks=[
+                    TableBlock(
+                        caption="Evidence",
+                        source=TableSource(
+                            kind="inline",
+                            data={
+                                "headers": ["Study", "Locator"],
+                                "rows": [
+                                    [
+                                        "A",
+                                        r"https://example.org/very_long_path/file_name.tex\\alpha_beta",
+                                    ]
+                                ],
+                            },
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    latex = render_body(ir, {})
+
+    assert latex.count("\\allowbreak{}") >= 8
+    assert r"\textbackslash{}\allowbreak{}alpha\_\allowbreak{}beta" in latex
+    assert r"\hspace{0pt}https:\allowbreak{}" in latex
 
 
 def test_build_project_picks_column_layout_from_the_template():
@@ -411,3 +532,20 @@ def test_templates_flush_figures_before_bibliography():
         )
         main = project.files["main.tex"]
         assert main.index("\\clearpage") < main.index("\\bibliography{refs}")
+
+
+def test_appendix_sections_start_latex_appendix_once():
+    from latex_render.project import build_latex_project
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(key="body", title="Body"),
+            Section(key="ledger", title="Evidence ledger", appendix=True),
+            Section(key="notes", title="Additional notes", appendix=True),
+        ],
+    )
+    assert render_body(ir, {}).count("\\appendix") == 1
+    project = build_latex_project(ir, template="article")
+    sections = "".join(v for key, v in project.files.items() if key.startswith("sections/"))
+    assert sections.count("\\appendix") == 1

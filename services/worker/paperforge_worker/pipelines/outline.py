@@ -67,6 +67,7 @@ BACK_SECTION_KEYS = ("conclusion",)
 
 @dataclass
 class OutlineOutcome:
+    outline_id: str | None = None
     tree: dict[str, Any] = field(default_factory=dict)
     generator: str = "deterministic"
     section_count: int = 0
@@ -76,6 +77,7 @@ class OutlineOutcome:
 
     def to_payload(self) -> dict[str, Any]:
         return {
+            "outline_id": self.outline_id,
             "generator": self.generator,
             "section_count": self.section_count,
             "assigned_key_count": self.assigned_key_count,
@@ -110,6 +112,7 @@ async def generate_outline(
     runner: LLMRunner | None = None,
     review_style: str = "narrative",
     search_method: dict[str, Any] | None = None,
+    sub_question_bundles: list[dict[str, Any]] | None = None,
 ) -> OutlineOutcome:
     """产出章节树。永远返回合法大纲。"""
     allowed_cards = [card for card in cards if card.cite_key in whitelist]
@@ -117,6 +120,13 @@ async def generate_outline(
     if paper_type == "original":
         body = imrad_body_sections(sorted(allowed), language=language)
         generator = "imrad_template"
+    elif sub_question_bundles:
+        body = question_driven_sections(
+            sub_question_bundles,
+            language=language,
+            allowed=allowed,
+        )
+        generator = "question_evidence_matrix"
     else:
         body, generator = await _body_sections(
             topic=topic,
@@ -127,9 +137,25 @@ async def generate_outline(
             runner=runner,
         )
 
-    body = _reclaim_orphans(body, allowed)
+    # 问题驱动模式不把“不相关孤儿文献”硬塞进最后一个问题；只有旧兼容路径与
+    # original/IMRaD 仍做孤儿回收。
+    if not sub_question_bundles:
+        body = _reclaim_orphans(body, allowed)
     if paper_type == "review" and len(allowed_cards) >= 2:
-        body.append(review_synthesis_section(allowed_cards, language=language))
+        body.append(
+            review_synthesis_section(
+                allowed_cards,
+                language=language,
+                sub_question_bundles=sub_question_bundles or [],
+            )
+        )
+        ledger = evidence_ledger_section(
+            allowed_cards,
+            language=language,
+            sub_question_bundles=sub_question_bundles or [],
+        )
+        if ledger is not None:
+            body.append(ledger)
     if paper_type == "review" and review_style == "systematic" and search_method:
         body.insert(0, systematic_method_section(search_method, language=language))
     sections = _with_frame_sections(body, language=language, paper_type=paper_type)
@@ -142,6 +168,7 @@ async def generate_outline(
             "paper_type": paper_type,
             "review_style": review_style if search_method else "narrative",
             "search_method": search_method,
+            "sub_question_bundles": sub_question_bundles or [],
             "sections": sections,
         },
         generator=generator,
@@ -278,48 +305,139 @@ def deterministic_body_sections(
     *,
     language: str = "en",
 ) -> list[dict[str, Any]]:
-    """确定性回退：按发表年代分组（近期进展 / 早期工作），保证每篇都有归属。"""
+    """无问题树的兼容回退：围绕核心证据作单节综合，绝不再按年代分组。"""
     if not cards:
         return []
-    years = [card.year for card in cards if card.year]
-    pivot = max(years) - 2 if years else None
+    return [
+        {
+            "key": "s1",
+            "level": 1,
+            "title": (
+                "围绕研究问题的现有证据"
+                if language == "zh"
+                else "Evidence for the Research Question"
+            ),
+            "summary": (
+                "按论断、证据差异与适用边界综合现有研究。"
+                if language == "zh"
+                else "Synthesize existing studies by claims, evidence differences, and boundaries."
+            ),
+            "argument_points": [],
+            "cite_keys": [card.cite_key for card in cards],
+            "kind": "body",
+        }
+    ]
 
-    recent = [c for c in cards if pivot is not None and (c.year or 0) >= pivot]
-    earlier = [c for c in cards if c not in recent]
-    groups: list[tuple[str, list[CardBrief]]] = []
-    if language == "zh":
-        if earlier:
-            groups.append(("研究背景与早期工作", earlier))
-        if recent:
-            groups.append(("近期研究进展", recent))
-        if not groups:
-            groups.append(("相关工作", cards))
-    else:
-        if earlier:
-            groups.append(("Background and Earlier Work", earlier))
-        if recent:
-            groups.append(("Recent Advances", recent))
-        if not groups:
-            groups.append(("Related Work", cards))
 
+def question_driven_sections(
+    bundles: list[dict[str, Any]],
+    *,
+    language: str,
+    allowed: set[str],
+) -> list[dict[str, Any]]:
+    """一个子问题对应一个正文论证单元，论证点直接来自 SYNTH 判定。"""
+    zh = language == "zh"
     sections: list[dict[str, Any]] = []
-    for index, (title, members) in enumerate(groups):
+    for index, bundle in enumerate(bundles[:MAX_SECTIONS]):
+        evidence = bundle.get("evidence") or []
+        cite_keys = list(
+            dict.fromkeys(
+                str(item.get("cite_key")) for item in evidence if item.get("cite_key") in allowed
+            )
+        )
+        stance = str(bundle.get("stance_summary") or "insufficient")
+        points = _synthesis_argument_points(bundle, language=language)
+        # 分级门禁放行的稿子里会有「只有一个来源」的子问题。综述结论需要两个独立
+        # 来源，所以这种小节必须显式受限地写：说明证据基础有多窄，不得推广。
+        source_count = len({str(item.get("work_id")) for item in evidence if item.get("work_id")})
+        evidence_limited = source_count < 2
         sections.append(
             {
-                "key": f"s{index + 1}",
+                "key": f"q{index + 1}",
                 "level": 1,
-                "title": title,
-                "summary": "",
-                # 确定性回退不编造论证要点，只列出可引用文献。
-                "argument_points": [],
-                "cite_keys": [card.cite_key for card in members],
+                "title": str(bundle.get("question") or ("子问题" if zh else "Sub-question")),
+                "summary": (
+                    f"回答该子问题；当前证据状态：{_stance_label(stance, language)}。"
+                    if zh
+                    else (
+                        "Answer this sub-question; current evidence status: "
+                        f"{_stance_label(stance, language)}."
+                    )
+                ),
+                "evidence_limited": evidence_limited,
+                "distinct_source_count": source_count,
+                "argument_points": points[:MAX_POINTS_PER_SECTION],
+                "cite_keys": cite_keys,
+                "evidence_ids": [
+                    str(item.get("evidence_id")) for item in evidence if item.get("evidence_id")
+                ],
+                "question_id": bundle.get("question_id"),
+                "answer_status": bundle.get("answer_status"),
+                "stance_summary": stance,
+                "comparison_clusters": bundle.get("comparison_clusters") or [],
+                "not_comparable_groups": bundle.get("not_comparable_groups") or [],
+                "evidence_gap": bundle.get("evidence_gap"),
                 "kind": "body",
             }
         )
     return sections
 
 
-def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") -> dict[str, Any]:
+def _synthesis_argument_points(bundle: dict[str, Any], *, language: str) -> list[str]:
+    zh = language == "zh"
+    points: list[str] = []
+    for cluster in bundle.get("comparison_clusters") or []:
+        classification = str(cluster.get("classification") or "mixed")
+        if zh:
+            text = {
+                "consistent": "综合同一可比条件下方向一致的证据",
+                "conditional": "说明同一可比条件下由边界条件造成的差异",
+                "conflicting": "显式呈现同一可比条件下无法消解的冲突",
+            }.get(classification, "说明混合证据及其不确定性")
+        else:
+            text = {
+                "consistent": "Synthesize evidence that agrees under the same comparable setting",
+                "conditional": "Explain differences attributable to boundary conditions",
+                "conflicting": "State unresolved conflict under the same comparable setting",
+            }.get(classification, "Describe mixed evidence and its uncertainty")
+        points.append(text)
+    if bundle.get("not_comparable_groups"):
+        points.append(
+            "分开报告数据集、任务或指标不同的证据，不比较效果量"
+            if zh
+            else "Report evidence with different datasets, tasks, or metrics separately"
+        )
+    if bundle.get("evidence_gap"):
+        points.append(
+            "明确说明现有全文证据不足以回答该子问题"
+            if zh
+            else "State explicitly that current full-text evidence is insufficient"
+        )
+    return points or (
+        ["按证据等级陈述现有发现与适用边界"]
+        if zh
+        else ["State current findings and boundaries according to evidence grade"]
+    )
+
+
+def _stance_label(value: str, language: str) -> str:
+    if language != "zh":
+        return value
+    return {
+        "consistent": "一致",
+        "conditional": "有条件成立",
+        "conflicting": "存在冲突",
+        "partial": "部分回答",
+        "insufficient": "证据不足",
+    }.get(value, value)
+
+
+def review_synthesis_section(
+    cards: list[CardBrief],
+    *,
+    language: str = "en",
+    sub_question_bundles: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Create a deterministic synthesis section and a compact literature matrix.
 
     The table only contains bibliographic metadata, evidence availability, and card-level
@@ -328,30 +446,70 @@ def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") ->
     """
     zh = language == "zh"
     headers = (
-        ["研究", "年份", "方法/对象", "证据基础"]
+        ["研究", "任务/数据集", "方法", "关键指标与数值", "证据等级", "定位"]
         if zh
-        else ["Study", "Year", "Method / setting", "Evidence basis"]
+        else ["Study", "Task / dataset", "Method", "Metric and value", "Grade", "Locator"]
     )
     rows: list[list[str]] = []
-    for card in cards[:20]:
-        method = _clean(card.methods[0]) if card.methods else ("未报告" if zh else "Not reported")
-        evidence = (
-            "已定位全文"
-            if zh and card.fulltext_used
-            else "摘要/元数据"
-            if zh
-            else "Located full text"
-            if card.fulltext_used
-            else "Abstract / metadata"
+    card_by_key = {card.cite_key: card for card in cards}
+    evidence_rows = [
+        item for bundle in sub_question_bundles or [] for item in bundle.get("evidence") or []
+    ]
+    # R8/R9: main comparison rows are canonical papers, never raw evidence
+    # rows.  Its citation/evidence contract is precisely the linked closure.
+    by_cite: dict[str, list[dict[str, Any]]] = {}
+    for evidence in evidence_rows:
+        cite_key = str(evidence.get("cite_key") or "")
+        evidence_id = str(evidence.get("evidence_id") or "")
+        if cite_key in card_by_key and evidence_id:
+            by_cite.setdefault(cite_key, []).append(evidence)
+    for cite_key, work_evidence in by_cite.items():
+        evidence = work_evidence[0]
+        card = card_by_key.get(cite_key)
+        measurements = [
+            measurement for item in work_evidence for measurement in item.get("measurements") or []
+        ]
+        measurement = measurements[0] if measurements else {}
+        task_dataset = " / ".join(
+            value for value in (measurement.get("task"), measurement.get("dataset")) if value
+        ) or ("未报告" if zh else "Not reported")
+        metric = (
+            f"{measurement.get('metric_name')}={measurement.get('value')}"
+            f"{measurement.get('unit') or ''}"
+            if measurement
+            else ("未结构化" if zh else "Not structured")
         )
+        locator = ", ".join(
+            value
+            for value in (
+                f"p.{evidence.get('page')}" if evidence.get("page") else "",
+                str(evidence.get("section_path") or ""),
+                str(evidence.get("object_ref") or ""),
+            )
+            if value
+        ) or ("未定位" if zh else "Unlocated")
         rows.append(
             [
-                _clean(card.title),
-                str(card.year) if card.year else ("未注明" if zh else "n.d."),
-                method,
-                evidence,
+                _short_study_label(str(evidence.get("title") or ""), evidence.get("year")),
+                task_dataset,
+                (
+                    _clean(card.methods[0])
+                    if card and card.methods
+                    else ("未报告" if zh else "Not reported")
+                ),
+                metric,
+                _grade_label(str(evidence.get("grade") or ""), language=language),
+                locator,
             ]
         )
+        if len(rows) >= 40:
+            break
+    cite_keys = list(by_cite)
+    evidence_ids = list(
+        dict.fromkeys(
+            str(item.get("evidence_id")) for item in evidence_rows if item.get("evidence_id")
+        )
+    )
     return {
         "key": "review_synthesis",
         "level": 1,
@@ -379,20 +537,136 @@ def review_synthesis_section(cards: list[CardBrief], *, language: str = "en") ->
                 "Synthesize explicitly reported methodological limitations and evidence gaps",
             ]
         ),
-        "cite_keys": [card.cite_key for card in cards],
+        "cite_keys": cite_keys,
+        "evidence_ids": evidence_ids,
+        "evidence_gap": not bool(rows),
         "kind": "body",
         "synthesis_kind": "comparison_limitations_conflicts",
+        "inline_tables": (
+            [
+                {
+                    "caption": "纳入研究的方法与证据基础比较"
+                    if zh
+                    else "Methods and evidence basis of included studies",
+                    "label": "tab:literature-matrix",
+                    "headers": headers,
+                    "rows": rows,
+                }
+            ]
+            if rows
+            else []
+        ),
+    }
+
+
+def evidence_ledger_section(
+    cards: list[CardBrief],
+    *,
+    language: str,
+    sub_question_bundles: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Build the appendix-only, evidence-level counterpart of the main table.
+
+    The synthesis table is intentionally one row per canonical study.  This
+    ledger is the only place that exposes individual evidence units, and it is
+    built from the question-link closure rather than the whole card library.
+    """
+    zh = language == "zh"
+    cards_by_key = {card.cite_key: card for card in cards}
+    rows: list[list[str]] = []
+    cite_keys: list[str] = []
+    seen: set[str] = set()
+    evidence_ids: list[str] = []
+    for bundle in sub_question_bundles:
+        for evidence in bundle.get("evidence") or []:
+            evidence_id = str(evidence.get("evidence_id") or "")
+            cite_key = str(evidence.get("cite_key") or "")
+            if not evidence_id or evidence_id in seen or cite_key not in cards_by_key:
+                continue
+            seen.add(evidence_id)
+            evidence_ids.append(evidence_id)
+            cite_keys.append(cite_key)
+            locator = ", ".join(
+                value
+                for value in (
+                    str(evidence.get("locator_display") or ""),
+                    f"p.{evidence.get('page')}" if evidence.get("page") else "",
+                    str(evidence.get("object_ref") or ""),
+                )
+                if value
+            ) or ("未定位" if zh else "Unlocated")
+            rows.append(
+                [
+                    _short_study_label(
+                        str(evidence.get("title") or cards_by_key[cite_key].title),
+                        evidence.get("year") or cards_by_key[cite_key].year,
+                    ),
+                    str(evidence.get("text") or "")[:500],
+                    _task_label(str(evidence.get("task_id") or ""), language=language),
+                    _grade_label(str(evidence.get("grade") or ""), language=language),
+                    locator,
+                ]
+            )
+    if not rows:
+        return None
+    return {
+        "key": "evidence_ledger",
+        "level": 1,
+        "title": "附录：证据台账" if zh else "Appendix: Evidence Ledger",
+        "summary": "逐条证据的可追溯定位。"
+        if zh
+        else "Traceable locations for individual evidence units.",
+        "argument_points": [],
+        "cite_keys": list(dict.fromkeys(cite_keys)),
+        "evidence_ids": evidence_ids,
+        "appendix": True,
+        "kind": "appendix",
+        "synthesis_kind": "evidence_ledger",
         "inline_tables": [
             {
-                "caption": "纳入研究的方法与证据基础比较"
-                if zh
-                else "Methods and evidence basis of included studies",
-                "label": "tab:literature-matrix",
-                "headers": headers,
+                "caption": "逐条证据与定位" if zh else "Evidence units and source locations",
+                "label": "tab:evidence-ledger",
+                "headers": (
+                    ["研究", "证据摘录", "任务", "证据强度", "定位"]
+                    if zh
+                    else ["Study", "Evidence excerpt", "Task", "Evidence strength", "Locator"]
+                ),
                 "rows": rows,
             }
         ],
     }
+
+
+def _grade_label(grade: str, *, language: str) -> str:
+    labels = {
+        "A_located_structured": ("表格/公式定位", "Structured location"),
+        "B_located_prose": ("正文定位", "Located prose"),
+        "C_fulltext_unlocated": ("全文未定位", "Full text, unlocated"),
+        "D_abstract_only": ("仅摘要", "Abstract only"),
+    }
+    return labels.get(grade, ("未评定", "Unassessed"))[0 if language == "zh" else 1]
+
+
+def _task_label(task_id: str, *, language: str) -> str:
+    labels = {
+        "bgc.identification": ("BGC 识别", "BGC identification"),
+        "bgc.classification": ("BGC 分类", "BGC classification"),
+        "bgc.product_structure_prediction": ("产物结构预测", "Product structure prediction"),
+        "bgc.product_activity_prediction": ("产物活性预测", "Product activity prediction"),
+        "benchmark.dataset_construction": (
+            "基准与数据集构建",
+            "Benchmark and dataset construction",
+        ),
+        "tool.engineering": ("工具工程与部署", "Tool engineering"),
+        "validation.wetlab": ("湿实验验证", "Wet-lab validation"),
+    }
+    return labels.get(task_id, ("未报告", "Not reported"))[0 if language == "zh" else 1]
+
+
+def _short_study_label(title: str, year: Any) -> str:
+    cleaned = _clean(title)
+    first = re.split(r"[:.。]", cleaned, maxsplit=1)[0][:56]
+    return f"{first} ({year})" if year else first
 
 
 def imrad_body_sections(cite_keys: list[str], *, language: str = "en") -> list[dict[str, Any]]:
@@ -467,7 +741,13 @@ def _with_frame_sections(
             }
         )
     for index, section in enumerate(body):
-        sections.append({**section, "key": f"s{index + 1}", "order": index})
+        # Preserve stable keys for appendix / ledger sections so downstream
+        # writers and templates can address them (N6).
+        if section.get("appendix") or section.get("kind") == "appendix":
+            key = str(section.get("key") or f"appendix{index + 1}")
+        else:
+            key = f"s{index + 1}"
+        sections.append({**section, "key": key, "order": index})
     for key in BACK_SECTION_KEYS:
         sections.append(
             {

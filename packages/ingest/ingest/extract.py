@@ -15,6 +15,8 @@ from ingest.document_extractors import (
     mime_policy_metadata,
     normalize_mime_type,
 )
+from ingest.jats import extract_jats_content
+from ingest.latex_source import extract_latex_source_content
 from ingest.pdf import extract_pdf_content
 from ingest.text_extract import (
     HTML_MIME_TYPES,
@@ -24,8 +26,18 @@ from ingest.text_extract import (
 )
 from ingest.types import ParsedContent, UnsupportedMimeTypeError
 
+JATS_MIME_TYPES = frozenset(
+    {"application/xml", "text/xml", "application/jats+xml", "application/x-jats+xml"}
+)
+LATEX_SOURCE_MIME_TYPES = frozenset(
+    {"application/x-arxiv-source", "application/x-tex", "text/x-tex"}
+)
 SUPPORTED_MIME_TYPES = (
-    frozenset(SUPPORTED_DOCUMENT_MIME_TYPES) | HTML_MIME_TYPES | PLAIN_TEXT_MIME_TYPES
+    frozenset(SUPPORTED_DOCUMENT_MIME_TYPES)
+    | HTML_MIME_TYPES
+    | PLAIN_TEXT_MIME_TYPES
+    | JATS_MIME_TYPES
+    | LATEX_SOURCE_MIME_TYPES
 )
 
 
@@ -36,6 +48,10 @@ def extract_content(*, mime_type: str, content: bytes) -> ParsedContent:
         # PDF 走 pypdf 优先路径（见 ingest/pdf.py：标准库操作符扫描对真实学术
         # PDF 取不全正文，而文献卡片质量直接依赖全文）。
         parsed = extract_pdf_content(content=content, mime_type=normalized)
+    elif normalized in JATS_MIME_TYPES:
+        parsed = extract_jats_content(content=content, mime_type=normalized)
+    elif normalized in LATEX_SOURCE_MIME_TYPES:
+        parsed = extract_latex_source_content(content=content, mime_type=normalized)
     elif normalized in SUPPORTED_DOCUMENT_MIME_TYPES:
         parsed = extract_document_content(mime_type=normalized, content=content)
     elif normalized in HTML_MIME_TYPES:

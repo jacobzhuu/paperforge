@@ -4,6 +4,7 @@ import * as React from 'react';
 import { AlertTriangle, Image as ImageIcon, Info, Loader2, RefreshCw, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
+import { EmptyState as UIEmptyState } from '@/components/ui/empty-state';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
 import { ModuleError } from '@/components/layout/module-error';
@@ -44,6 +45,7 @@ export function VisualsWorkbench() {
   const [filter, setFilter] = React.useState<FilterId>('attention');
   const [editing, setEditing] = React.useState<VisualAsset | null>(null);
   const [confirming, setConfirming] = React.useState<VisualAsset | null>(null);
+  const [preparingVisualId, setPreparingVisualId] = React.useState<string | null>(null);
   const [assetsWanted, setAssetsWanted] = React.useState(false);
   const controller = useVisuals(projectId);
 
@@ -75,9 +77,27 @@ export function VisualsWorkbench() {
     }
   };
 
-  const requestGenerate = (visual: VisualAsset) => {
-    if (visual.kind === 'ai_image') setConfirming(visual);
-    else void controller.generate(visual);
+  const requestGenerate = async (visual: VisualAsset) => {
+    if (visual.kind !== 'ai_image') {
+      await controller.generate(visual);
+      return;
+    }
+    if (preparingVisualId) return;
+    setPreparingVisualId(visual.id);
+    try {
+      const prepared = await controller.prepareGeneration(visual);
+      if (!prepared) throw new Error('DeepSeek 未返回可确认的最终提示词');
+      setConfirming(prepared);
+      controller.reload();
+    } catch (error) {
+      toast({
+        title: 'DeepSeek 全文分析失败',
+        description: describeError(error),
+        variant: 'error',
+      });
+    } finally {
+      setPreparingVisualId(null);
+    }
   };
 
   const approve = async (visual: VisualAsset, sectionKey: string, blockIndex: number) => {
@@ -136,7 +156,13 @@ export function VisualsWorkbench() {
         </div>
       )}
 
-      <ModuleError label="图像服务配置" error={controller.settingsError} onRetry={controller.reloadSettings} />
+      <ModuleError label="AI 生成配置" error={controller.settingsError} onRetry={controller.reloadSettings} />
+      {preparingVisualId && (
+        <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm" role="status">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          DeepSeek 正在读取论文全文、分析意图并生成最终生图提示词…
+        </div>
+      )}
       <ModuleError label="章节列表" error={sectionsModule.error} onRetry={sectionsModule.reload} />
       {assetsWanted && <ModuleError label="素材列表" error={assetsModule.error} onRetry={assetsModule.reload} />}
 
@@ -184,7 +210,7 @@ export function VisualsWorkbench() {
                       if (visual.kind === 'chart') setAssetsWanted(true);
                       setEditing(visual);
                     },
-                    onGenerate: requestGenerate,
+                    onGenerate: (visual) => void requestGenerate(visual),
                     onRevision: (visual, payload, generateNow) => void controller.createRevision(visual, payload, generateNow),
                     onApprove: approve,
                     onReject: (visual) => void controller.reject(visual),
@@ -249,6 +275,16 @@ function IntentComposer({
   const [drafting, setDrafting] = React.useState(false);
   const [result, setResult] = React.useState<VisualDraft | null>(null);
   const [detailsOpen, setDetailsOpen] = React.useState(false);
+  const methodHint =
+    kind === 'diagram'
+      ? '本地直出：适合表达步骤、结构和关系，生成快且便于修改。'
+      : kind === 'chart'
+        ? '本地直出：仅使用已上传的可溯源数值素材，不编造数据。'
+        : kind === 'ai_image'
+          ? 'AI 生成：先创建可编辑草稿，确认提示词后再生成图片。'
+          : aiAvailable
+            ? '自动选择：数据内容本地直出，概念内容优先使用 AI 生成。'
+            : '自动选择：AI 生成当前不可用，将使用本地直出。';
 
   const submit = async () => {
     if (!intent.trim() || drafting) return;
@@ -277,7 +313,7 @@ function IntentComposer({
   };
 
   return (
-    <section className="rounded-2xl border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="visual-intent-title">
+    <section className="rounded-lg border bg-card p-4 shadow-sm sm:p-5" aria-labelledby="visual-intent-title">
       <div className="flex items-start gap-3">
         <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
           <Sparkles className="h-4 w-4" />
@@ -285,8 +321,35 @@ function IntentComposer({
         <div className="min-w-0 flex-1 space-y-3">
           <div>
             <h3 id="visual-intent-title" className="font-medium">描述你想让读者理解什么</h3>
-            <p className="mt-0.5 text-xs text-muted-foreground">默认读取全文并自动选择图表、示意图或概念插图。</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">只需选择 AI 生成或本地直出；自动选择会根据内容判断。</p>
           </div>
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium">生成方式</legend>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {([
+                ['auto', '自动选择'],
+                ['ai_image', 'AI 生成'],
+                ['diagram', '本地直出 · 示意图'],
+                ['chart', '本地直出 · 数据图'],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setKind(value)}
+                  disabled={value === 'ai_image' && !aiAvailable}
+                  aria-label={label}
+                  aria-pressed={kind === value}
+                  className={cn(
+                    'min-h-11 rounded-lg border px-3 text-sm disabled:opacity-45',
+                    kind === value && 'border-primary bg-primary/5',
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-muted-foreground">{methodHint}</p>
+          </fieldset>
           <Textarea
             id="visual-intent"
             value={intent}
@@ -300,7 +363,7 @@ function IntentComposer({
           />
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <button type="button" className="min-h-11 text-left text-xs text-muted-foreground underline-offset-4 hover:underline" onClick={() => setDetailsOpen((value) => !value)} aria-expanded={detailsOpen}>
-              {detailsOpen ? '收起范围与类型' : '限定范围或覆盖类型（可选）'}
+              {detailsOpen ? '收起范围与素材' : '限定正文范围或素材（可选）'}
             </button>
             <Button className="h-11 sm:min-w-36" onClick={() => void submit()} disabled={!intent.trim() || drafting}>
               {drafting ? <Loader2 className="animate-spin" /> : <Sparkles />} {drafting ? '正在理解…' : '开始创作'}
@@ -308,7 +371,7 @@ function IntentComposer({
           </div>
 
           {detailsOpen && (
-            <div className="grid gap-4 border-t pt-4 md:grid-cols-2">
+            <div className="grid gap-4 border-t pt-4">
               <label className="space-y-2 text-sm">
                 <span className="font-medium">正文范围</span>
                 <select value={sectionKey} onChange={(event) => setSectionKey(event.target.value)} className="h-11 w-full rounded-md border bg-background px-3">
@@ -316,27 +379,7 @@ function IntentComposer({
                   {sections.map((section) => <option key={section.section_key} value={section.section_key}>{section.title}</option>)}
                 </select>
               </label>
-              <fieldset className="space-y-2">
-                <legend className="text-sm font-medium">视觉类型</legend>
-                <div className="grid grid-cols-2 gap-2">
-                  {([
-                    ['auto', '自动选择'],
-                    ['chart', '数据图表'],
-                    ['diagram', '示意图'],
-                    ['ai_image', '概念插图'],
-                  ] as const).map(([value, label]) => (
-                    <button
-                      key={value}
-                      type="button"
-                      onClick={() => setKind(value)}
-                      disabled={value === 'ai_image' && !aiAvailable}
-                      aria-pressed={kind === value}
-                      className={cn('min-h-11 rounded-lg border px-3 text-sm disabled:opacity-45', kind === value && 'border-primary bg-primary/5')}
-                    >{label}</button>
-                  ))}
-                </div>
-              </fieldset>
-              <div className="md:col-span-2">
+              <div>
                 {!assetsLoaded ? (
                   <Button variant="ghost" size="sm" onClick={onWantAssets}>选择项目素材（可选）</Button>
                 ) : (
@@ -376,18 +419,18 @@ function AIAvailabilityNotice({ available, settingsLoaded }: { available: boolea
   return (
     <p className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
       <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      AI 概念插图当前不可用；数据图表与示意图仍由本地渲染。启用外部图像服务后，每次调用依然需要单独确认。
+      AI 生成当前不可用；数据图表与示意图仍可本地直出。启用 AI 生成后，每次生成仍需单独确认。
     </p>
   );
 }
 
 function EmptyState({ hasAny }: { hasAny: boolean }) {
   return (
-    <div className="rounded-xl border border-dashed p-8 text-center">
-      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-muted"><ImageIcon className="h-6 w-6 text-muted-foreground" /></div>
-      <p className="mt-3 font-medium">{hasAny ? '这个视图里没有视觉' : '还没有视觉'}</p>
-      <p className="mx-auto mt-1 max-w-lg text-sm text-muted-foreground">在上方描述读者需要理解的内容，系统会根据正文和素材形成第一版预览。</p>
-    </div>
+    <UIEmptyState
+      icon={<ImageIcon className="h-6 w-6" />}
+      title={hasAny ? '这个视图里没有视觉' : '还没有视觉'}
+      description="在上方描述读者需要理解的内容，系统会根据正文和素材形成第一版预览。"
+    />
   );
 }
 

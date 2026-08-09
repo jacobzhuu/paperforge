@@ -25,7 +25,7 @@
 管理命令：
 
 ```bash
-./scripts/dev status   # 查看所有服务状态
+./scripts/dev status   # 查看所有服务状态（含正在生效的部署与 Funnel 指向）
 ./scripts/dev logs     # 查看最近日志
 ./scripts/dev restart   # 改完代码用这个（up 会跳过已在运行的进程，不加载新代码）
 ./scripts/dev down     # 停止服务；保留数据库和对象存储 volume
@@ -34,15 +34,46 @@
 重复执行 `./scripts/dev up` 是安全的。需要阻止脚本自动打开浏览器时，可执行
 `PAPERFORGE_OPEN_BROWSER=0 ./scripts/dev up`。以下章节保留各组件的手动启动和排障说明。
 
+### 0.1 有部署在跑时的 `restart`
+
+`restart` 会先检测有没有正在跑的 `paperforge-deploy-*` compose 项目。有的话它做的是
+**滚动**而不是重启：重建 api/worker/web 镜像 → 在旁边起一套新项目（新端口）→ 健康检查
+通过后把 Tailscale Funnel 指向新端口 → 旧的那套留在原地。
+
+本机 Docker 是 snap 包，曾因 AppArmor 的 `docker-default` 缺少
+`snap.docker.dockerd` signal/ptrace 规则而无法停止容器。修复后仍保留蓝绿更新，
+让新版本健康检查与 Funnel 切换完成后再独立清理旧版本。
+
+因此有两件事必须成立，`infra/docker-compose.bluegreen.yml` 已经处理：
+
+- **每套部署用不同的 Redis 库号**（`PAPERFORGE_DEPLOY_REDIS_DB`）。旧 worker 停不掉且
+  一直在取任务，同库就等于把大约一半的生成任务交给旧镜像跑——表现是「新功能时灵时不灵」，
+  很难看出是部署问题。切换时在途的任务留在旧库，由旧 worker 跑完。
+- **Funnel 每次都要重新指向**。tailscaled 本身不用重启（转发规则而已），但新容器必然换端口。
+  本机 tailscaled 跑在用户态、socket 不在默认路径，直接 `tailscale funnel status` 会报
+  「not running」，脚本从进程命令行里取 `--socket=`。
+- **公网验收是部署成功条件**。切换后脚本会确认 Funnel 状态里的目标端口等于新容器端口，
+  再逐字节比较新容器与公网 `/login` 的响应正文；任一不一致都会让部署命令失败，不能把
+  “本地镜像已启动”误报成“公网新版本已生效”。
+
+`--local` 强制走本地栈，`./scripts/dev deploy` 强制走部署。部署状态记在 `.paperforge/deploy.env`。
+旧部署可在确认不再承载流量后单独清理；清理命令不得带 `-v`。
+
 ## 1. 前置要求
 
 | 工具 | 版本要求 | 说明 |
 |---|---|---|
 | uv | ≥0.9 | Python 包管理与 workspace；若本机无 Python ≥3.12，uv 会自动下载 |
-| Python | ≥3.12（各包 `requires-python`） | 本仓库 `.venv` 实际用 3.14 也可正常工作 |
+| Python | 3.12（各包 `requires-python`） | `.python-version` 固定宿主开发基线；生产镜像同样使用 3.12 |
 | Node.js | ≥20 | 前端 |
-| pnpm | 9.x | 建议经 corepack：`corepack enable && corepack prepare pnpm@9 --activate` |
-| Docker + Compose v2 | 任意近期版本 | 起 pg/redis/minio/texd |
+| pnpm | 9.15.9 | 缺失时开发脚本依次尝试 Corepack 与固定版本 npx |
+| Docker Engine | ≥26 | macOS 使用 Docker Desktop；Linux 使用 systemd |
+| Docker Compose | ≥2.35.1 | Focal 固定为 2.35.1 |
+| Docker Buildx | ≥0.23.0 | Focal 固定为 0.23.0 |
+
+生产环境的完整支持矩阵、Ubuntu 安装脚本、外置配置、备份恢复及迁移流程见
+[`production-deployment.md`](production-deployment.md)。开发模式仍由本页说明，并继续把基础设施
+端口绑定在 loopback、把 API/Worker/Web 作为宿主机热更新进程运行。
 
 ## 2. Python 依赖安装 [已实测]
 
@@ -70,7 +101,7 @@ cd apps/web
 pnpm install            # 实测 pnpm 9.15：约 15s，无 peer 冲突
 ```
 
-`pnpm-lock.yaml` 已提交；CI 使用 pnpm 9 和 `--frozen-lockfile`。
+`pnpm-lock.yaml` 已提交；CI 使用 pnpm 9.15.9 和 `--frozen-lockfile`。
 
 ## 4. 基建：docker compose [已实测]
 
@@ -254,10 +285,12 @@ POST /api/v1/projects/{id}/exports
 | `TEXD_URL` / `TEXD_TIMEOUT_SECONDS` | 编译沙箱地址 | PDF/LaTeX 导出必需，默认 `http://localhost:8081` |
 | `VISUALS_ENABLED` | 视觉资产/API/自动建议总开关 | 默认 `true` |
 | `VISUALD_URL` / `VISUALD_TIMEOUT_SECONDS` | 确定性图表/示意图渲染与位图规范化服务 | 开启 visuals 时需要，默认 `http://localhost:8082` |
-| `AI_IMAGES_ENABLED` | AI 概念插图功能开关 | 默认 `false`，不影响图表/示意图 |
-| `IMAGE_PROVIDER` / `IMAGE_BASE_URL` / `IMAGE_MODEL` | 独立图像 provider 选择/端点/模型 | 默认 `cloudflare` + `https://api.cloudflare.com/client/v4` + `@cf/black-forest-labs/flux-1-schnell` |
+| `AI_IMAGES_ENABLED` | AI 概念插图功能开关 | 默认 `true`；未配置 Yunwu 密钥时自动保持为建议，不阻断全流程 |
+| `IMAGE_PROVIDER` | 图像 provider 选择（`yunwu` / `cloudflare` / `openai`） | 默认 `yunwu`：它的 Images API 真正接受尺寸与质量，Cloudflare FLUX 只接受提示词与步数 |
+| `YUNWU_API_BASE_URL` / `YUNWU_API_KEY` / `YUNWU_IMAGE_MODEL` / `YUNWU_IMAGE_TIMEOUT_SECONDS` | 默认 provider 的独立配置；支持 Images API 的 Base64 与临时 URL 响应 | 默认 `https://yunwu.ai/v1` + `gpt-image-1`，密钥不会返回前端 |
+| `IMAGE_BASE_URL` / `IMAGE_MODEL` | 其他 provider 的端点与模型 | 默认 `https://api.cloudflare.com/client/v4` + `@cf/black-forest-labs/flux-1-schnell` |
 | `IMAGE_ACCOUNT_ID` | Cloudflare Account ID（不是 Token） | Cloudflare 生图时与 Token 一起必填；占位留空时 AI 按钮保持禁用 |
-| `IMAGE_API_KEY` | 图像 provider 密钥；Cloudflare 中填写 Workers AI API Token，不复用文本 LLM 密钥 | 真实 AI 生图时必填；接口不返回密钥、Account ID 或内部端点 |
+| `IMAGE_API_KEY` | 非 Yunwu provider 的密钥；Cloudflare 中填写 Workers AI API Token，不复用文本 LLM 密钥 | 真实 AI 生图时必填；接口不返回密钥、Account ID 或内部端点 |
 | `IMAGE_TIMEOUT_SECONDS` / `IMAGE_MAX_RETRIES` | 图像调用超时与有界重试次数 | 默认 `180` 秒、`2` 次；鉴权/审核/参数错误不会重试 |
 | `CORS_ALLOW_ORIGINS` | API CORS 白名单，逗号分隔 | 默认 `http://localhost:3000` 即可 |
 | `API_HOST` / `API_PORT` | `paperforge-api` 启动命令监听地址与端口 | 可留默认 |
@@ -285,8 +318,13 @@ curl -fsS http://localhost:3000
 ## 10. 当前边界
 
 - 一键全管线、双模式质量门、五种文本产物、M8 图文链路与 M9 个人账号数据隔离已实现；开发环境可以在
-  `IMAGE_API_KEY` 为空时完整验证图表、示意图和无图导出。
-- 真实 Cloudflare 图像冒烟需要手动补齐 `IMAGE_ACCOUNT_ID`、`IMAGE_API_KEY` 并开启
-  `AI_IMAGES_ENABLED`；系统不会在自动建议、启动检查或缺配置时触发外部调用。
-- worker 只依赖统一的 `ImageProvider` 协议。现有 Cloudflare/OpenAI 适配器均通过注册表装配；
-  未来接入 GPT Image、Gemini 或本地 ComfyUI 时，只需新增适配器并注册，无需修改视觉业务管线。
+  图像密钥为空时完整验证图表、示意图和无图导出。
+- 真实图像冒烟需要补齐当前 provider 的凭据（默认 Yunwu：`YUNWU_API_KEY`；Cloudflare 另需
+  `IMAGE_ACCOUNT_ID` + `IMAGE_API_KEY`）并开启 `AI_IMAGES_ENABLED`。普通视觉建议不会自动
+  生图；“跑通全流程”只通过 Yunwu 自动生成一张论文摘要图。启动检查或缺配置时不触发外部调用，
+  摘要图保留为可重试建议且不阻断导出。
+- AI 插图的提示词由文本模型（线上为 DeepSeek）在**规划/起草**阶段写成，落进
+  `AIImageSpec.refined_prompt`；文本模型不可用时退回字段拼接，插图照样能生成。生成确认框展示的
+  与真正发出去的始终是同一句（都走 `AIImageSpec.render_prompt()`）。
+- worker 只依赖统一的 `ImageProvider` 协议。现有 Yunwu/Cloudflare/OpenAI 适配器均通过注册表装配；
+  未来接入 Gemini 或本地 ComfyUI 时，只需新增适配器并注册，无需修改视觉业务管线。

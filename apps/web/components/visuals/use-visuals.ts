@@ -9,6 +9,7 @@ import {
   generateVisual,
   getRuntimeSettings,
   listVisuals,
+  prepareVisualGeneration,
   regenerateVisual,
   rejectVisual,
   updateVisual,
@@ -55,6 +56,7 @@ export interface VisualsController {
   deterministicSlotsFull: boolean;
 
   generate: (visual: VisualAsset) => Promise<void>;
+  prepareGeneration: (visual: VisualAsset) => Promise<VisualAsset | undefined>;
   createRevision: (
     visual: VisualAsset,
     payload?: RegenerateVisualRequest,
@@ -173,6 +175,14 @@ export function useVisuals(projectId: string): VisualsController {
     [projectId, track, listModule, toast],
   );
 
+  const prepareGeneration = React.useCallback(
+    async (visual: VisualAsset) => {
+      const prepared = await prepareVisualGeneration(projectId, visual.id);
+      return prepared.data;
+    },
+    [projectId],
+  );
+
   const createRevision = React.useCallback(
     async (
       visual: VisualAsset,
@@ -284,6 +294,7 @@ export function useVisuals(projectId: string): VisualsController {
     aiJobRunning,
     deterministicSlotsFull,
     generate,
+    prepareGeneration,
     createRevision,
     edit,
     create,

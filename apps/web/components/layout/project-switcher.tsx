@@ -21,7 +21,10 @@ export function ProjectSwitcher() {
   const { projectId, segment } = parseProjectPath(pathname);
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [open, setOpen] = React.useState(false);
+  const [activeIndex, setActiveIndex] = React.useState(0);
   const ref = React.useRef<HTMLDivElement>(null);
+  const triggerRef = React.useRef<HTMLButtonElement>(null);
+  const listRef = React.useRef<HTMLUListElement>(null);
 
   React.useEffect(() => {
     let alive = true;
@@ -51,13 +54,35 @@ export function ProjectSwitcher() {
 
   const current = projects.find((p) => p.id === projectId);
 
+  const openList = React.useCallback((index?: number) => {
+    const selected = projects.findIndex((project) => project.id === projectId);
+    setActiveIndex(index ?? Math.max(0, selected));
+    setOpen(true);
+    requestAnimationFrame(() => listRef.current?.focus());
+  }, [projectId, projects]);
+
+  const choose = React.useCallback((index: number) => {
+    const project = projects[index];
+    if (!project) return;
+    setOpen(false);
+    triggerRef.current?.focus();
+    router.push(`/projects/${project.id}${segment ? `/${segment}` : ''}`);
+  }, [projects, router, segment]);
+
   if (!projectId && projects.length === 0) return null;
 
   return (
     <div ref={ref} className="relative px-3 pb-2">
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => open ? setOpen(false) : openList()}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            openList(event.key === 'ArrowDown' ? 0 : Math.max(0, projects.length - 1));
+          }
+        }}
         aria-expanded={open}
         aria-haspopup="listbox"
         className="flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left text-xs transition-colors hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -71,7 +96,28 @@ export function ProjectSwitcher() {
 
       {open && (
         <ul
+          ref={listRef}
           role="listbox"
+          tabIndex={0}
+          aria-activedescendant={projects[activeIndex] ? `project-option-${projects[activeIndex].id}` : undefined}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault();
+              if (projects.length === 0) return;
+              const delta = event.key === 'ArrowDown' ? 1 : -1;
+              setActiveIndex((index) => (index + delta + projects.length) % projects.length);
+            } else if (event.key === 'Home' || event.key === 'End') {
+              event.preventDefault();
+              setActiveIndex(event.key === 'Home' ? 0 : Math.max(0, projects.length - 1));
+            } else if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              choose(activeIndex);
+            } else if (event.key === 'Escape') {
+              event.preventDefault();
+              setOpen(false);
+              triggerRef.current?.focus();
+            }
+          }}
           className="absolute left-3 right-3 z-50 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover p-1 shadow-lg scrollbar-thin animate-fade-in"
         >
           {projects.length === 0 && (
@@ -80,24 +126,17 @@ export function ProjectSwitcher() {
           {projects.map((p) => (
             <li key={p.id}>
               <button
+                id={`project-option-${p.id}`}
                 type="button"
                 role="option"
                 aria-selected={p.id === projectId}
-                onClick={() => {
-                  setOpen(false);
-                  /*
-                   * 停在同一个工作台，只换项目——比把用户扔回列表页少两次点击。
-                   *
-                   * 这里**不再**为 paper_type 开特例。以前有一条「综述项目 + assets
-                   * ⇒ 退回项目概览」的分支，因为综述论文没有素材中心；现在素材页
-                   * 自己会把综述项目送去视觉工作台，特例是多余的第二套机制——
-                   * 两处各判一次，早晚会判得不一致。
-                   */
-                  router.push(`/projects/${p.id}${segment ? `/${segment}` : ''}`);
-                }}
+                tabIndex={-1}
+                onMouseMove={() => setActiveIndex(projects.indexOf(p))}
+                onClick={() => choose(projects.indexOf(p))}
                 className={cn(
                   'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                   p.id === projectId && 'font-medium',
+                  projects[activeIndex]?.id === p.id && 'bg-accent',
                 )}
               >
                 <Check

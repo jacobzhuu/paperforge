@@ -272,3 +272,35 @@ def test_markdown_renders_marks_and_lists():
     assert "1. 一" in md
     assert "2. 二" in md
     assert "- 要点" in md
+
+
+def test_user_asset_grounding_is_preserved_but_invisible_in_outputs():
+    """Provenance is audit metadata, never manuscript prose or LaTeX syntax."""
+    from latex_render import render_section
+    from paper_ir import GroundingRun, PaperIR, PaperMeta, ParagraphBlock, Section, TextRun
+
+    section = Section(
+        key="s4",
+        title="Results",
+        blocks=[
+            ParagraphBlock(
+                runs=[
+                    TextRun(v="The recorded accuracy was 92.5%."),
+                    GroundingRun(source_refs=["ua_12345678"]),
+                ]
+            )
+        ],
+    )
+    ir = PaperIR(meta=PaperMeta(title="Grounded result"), sections=[section])
+
+    assert ir.collect_asset_refs() == {"ua_12345678"}
+    assert ir.model_dump()["sections"][0]["blocks"][0]["runs"][1] == {
+        "t": "grounding",
+        "source_refs": ["ua_12345678"],
+    }
+    markdown = render_markdown(ir)
+    latex = render_section(section)
+    assert "The recorded accuracy was 92.5%." in markdown
+    assert r"The recorded accuracy was 92.5\%." in latex
+    assert "ua_12345678" not in markdown
+    assert "ua_12345678" not in latex

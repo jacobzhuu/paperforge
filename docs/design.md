@@ -65,7 +65,13 @@ review_protocol -> review_search_strategy -> scholarly_result_occurrence -> scho
 
 ### 1.4 设计原则
 
-1. **Draft-first**:任何阶段失败都降级而不阻断;永远能拿到当前最好的稿子。
+1. **Draft-first(分级门禁)**:任何阶段失败都降级而不阻断;永远能拿到当前最好的稿子。
+   唯一的例外是**语料根本不成立**——没有任何研究子问题,或全项目可用全文证据凑不出
+   两个独立来源——这时出稿没有意义,任务停在 `needs_input`(实现见
+   `pipelines/readiness.py` 的 `BLOCKING_CODES`)。覆盖率没达标属于**降级项**:照常出稿,
+   缺证的子问题写成显式的「现有证据不足以回答」小节。
+   `review_style="systematic"` 与 `quality_profile="submission"` 是用户显式要求的严格产出,
+   覆盖率缺口在那里意味着选择偏差,不参与降级(`STRICT_BLOCKING_CODES`)。
 2. **引用必须真实**:每条参考文献必须对应真实存在、经元数据核验的文献;LLM 永不手写参考文献条目。
 3. **确定性代码管格式,LLM 管内容**:BibTeX、编号、图表渲染、模板、数字一致性由代码保证;论证与行文由 LLM 生成(这一分工原则继承自旧系统,是其最有价值的架构遗产)。
 4. **人机协作节点显式化**:检索圈选、大纲确认、章节改写是产品交互点,不是流程裁决点;全部可跳过(全自动模式)。
@@ -166,7 +172,7 @@ PostgreSQL 16 + Alembic、MinIO/文件系统对象存储、OpenSearch(新系统�
 | 检索 lane 计划与穷尽账目 | `search_lane_plan.py`、`review_search_strategy` 的 lane 家族/版本/穷尽语义 | "必检源终态覆盖 =1.00"是形式化完成的要求;新系统只记录轻量 `search_run` 供复现参考 |
 | 语料冻结 | `review_corpus_snapshot`、corpus 版本不可变语义 | 文献库是活的工作集,支持随时增删 |
 | occurrence 守恒 | `scholarly_result_occurrence` 表 | 每条 provider 命中的守恒账本仅服务 PRISMA |
-| formal/diagnostic/insufficient-evidence 状态机 | `terminal_status.py`、`quality_decision.py`、`quality_metrics.py`、`quality_benchmark.py` | Draft-first 原则下不存在"拒绝产出";质量以评分报告呈现 |
+| formal/diagnostic/insufficient-evidence 状态机 | `terminal_status.py`、`quality_decision.py`、`quality_metrics.py`、`quality_benchmark.py` | 四态裁决机不迁移;质量以评分报告呈现。**注意**:这不等于"永不阻断"——正文写作前保留一个分级门禁(§1.4 原则 1),只有语料根本不成立才停在 `needs_input`,覆盖率缺口一律降级出稿 |
 | 通用 OSINT 管线 | `search/`(SearXNG)、`planning/`、`claims/`、`research_quality/`、`reporting/` grounded 校验、`slides/`、`figures/`、`presentation_ir/`、`artifacts/`、`indexing/`、`entity_resolution/`、crawler/reporter/openclaw 服务 | 属于深度研究平台,与论文生成无关;实测约 9.4 万行不迁移 |
 | 逐段证据绑定渲染门槛 | review writer 的 claim_id 强制 + 段落级校验失败拒绝渲染 | 被引用三硬规则替代(§4.4.3) |
 
@@ -231,7 +237,8 @@ paper-forge/
 -- 项目与任务
 paper_project(id, owner_id, title, paper_type{review|original}, writing_mode{auto|assisted},
               language{zh|en}, venue_template, citation_style, status, scope_json, created_at, updated_at)
-generation_job(id, project_id, kind{search|ingest|cards|outline|write|compile|visual|full},
+generation_job(id, project_id,
+               kind{search|ingest|cards|qdecomp|evidence|qmatrix|synth|outline|write|compile|visual|full},
                status{queued|running|succeeded|failed|cancelled}, progress, stage,
                checkpoint_json, error_json, created_at, finished_at)
 job_event(id, job_id, seq, event_type, payload_json, created_at)          -- SSE 源,借鉴 task_event
@@ -291,11 +298,15 @@ llm_call_log(id, project_id, job_id, role, model, input_tokens, output_tokens,
 ```text
 INIT     题目/方向、语言、模板、篇幅偏好、模式(全自动/协作)
 SCOPE    LLM 生成研究范围+关键词矩阵+时间窗+子主题(可编辑;确定性回退)     [改造自 protocol_generation]
+QDECOMP  核心问题 → 可编辑子问题树 + 比较维度 + 预期证据类型
 SEARCH   五源并行检索 → 规范化 → 去重 → 相关性排序(确定性分 + LLM top-N 重排) [adapters/normalization/dedupe/topic_relevance]
 CURATE   协作模式:用户圈选入库;全自动:top-K 入库。对种子文献做雪球扩展一轮  [snowball]
 INGEST   OA 全文获取 → 解析 → section 感知切块;无全文则摘要级降级          [oa_fulltext/ingest/section_chunks]
 CARDS    每篇入库文献抽取 literature_card(贡献/方法/结果/局限/可引要点)      [llm_extraction 模式]
-OUTLINE  卡片主题聚类 → 章节树(每章分配文献集合+论证要点),用户可调整        [llm_synthesis ThemeBundle 改造]
+EVIDENCE 全文/摘要 → A/B/C/D 级 evidence_unit + 可比较 measurement
+QEMATRIX 子问题 × 候选证据 → stance/condition/confidence；人工覆盖优先
+SYNTH    同 comparability_key 内判定一致/条件差异/冲突；异 key 禁止横比
+OUTLINE  子问题综合包 → 章节树；按问题回退，禁止退化成年代/逐篇结构
 WRITE    逐章节结构化生成(§4.4.3 引用约束)→ 摘要/引言/结论后写;每写完一节立刻落库
 POLISH   全文连贯性 pass(独立阶段,逐节报进度)。默认开启,用户可中途跳过:
          已润色的章节保留,剩余章节按初稿交付
@@ -305,7 +316,17 @@ RENDER   PaperIR → LaTeX 工程 + BibTeX → Tectonic 编译 → PDF(有界自
 REVIEW   编辑器内人工修改/局部重生成/润色 → 再导出
 ```
 
-WRITE 阶段上下文构造(长文一致性关键):全局大纲 + 本章文献卡片全文 + 相邻章节滚动摘要 + 术语表(首次出现时登记,后续章节强制沿用译名/缩写)。
+WRITE 阶段上下文构造(长文一致性关键):全局大纲 + 本章问题对齐证据簇
+(优先 A/B 级并携带 evidence_id/定位/measurement/comparability_key)
++ 相邻章节滚动摘要 + 术语表。写后与质量阶段分别执行 R4 证据等级、R5 可比性、
+R6 数字定位校验。
+
+质量档位与「一键跑通全流程」的关系：一键入口默认 `draft`——同样跑完整质检、
+发现项一条不少，但不把它们升级成阻断项，因此一定产出导出件。要不要为这些发现项
+再花一轮「重写未达标章节 + 全文重新评估」（最坏两轮改写、四次重评），由用户在
+交付之后通过 `quality_repair.available` 决策点显式选择，与可选润色同形。
+`scholarly` / `submission` 是用户主动选择的严格档，那两档保留质量门与管线内
+自动收敛：未达标就不产出导出件。
 
 #### 4.4.2 研究型论文管线
 

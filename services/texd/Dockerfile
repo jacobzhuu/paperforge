@@ -4,7 +4,7 @@ FROM public.ecr.aws/docker/library/python@sha256:57cd7c3a7a273101a6485ba99423ee5
 
 # Tectonic runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates fontconfig \
+    curl ca-certificates fontconfig libgraphite2-3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin the release and verify GitHub's published SHA-256 digest.
@@ -18,7 +18,8 @@ RUN set -eu; \
     esac; \
     archive="tectonic-${TECTONIC_VERSION}-${target}.tar.gz"; \
     url="https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%40${TECTONIC_VERSION}/${archive}"; \
-    curl -fsSL "${url}" -o /tmp/tectonic.tar.gz; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+      "${url}" -o /tmp/tectonic.tar.gz; \
     echo "${sha}  /tmp/tectonic.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/tectonic.tar.gz -C /usr/local/bin tectonic; \
     rm /tmp/tectonic.tar.gz; \

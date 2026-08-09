@@ -4,8 +4,17 @@ export type PaperType = 'review' | 'original';
 export type WritingMode = 'auto' | 'assisted';
 export type Language = 'zh' | 'en';
 export type CitationStyle = 'author_year' | 'gbt7714' | 'ieee' | 'apa';
-export type QualityProfile = 'draft' | 'submission';
+export type QualityProfile = 'draft' | 'scholarly' | 'submission';
 export type ReviewStyle = 'narrative' | 'systematic';
+
+export interface RewriteSectionCandidate {
+  section_key: string;
+  original_body_ir: SectionIR;
+  candidate_body_ir: SectionIR;
+  changed: boolean;
+  checks: Record<string, string>;
+  note?: string | null;
+}
 
 export interface AuthorDetail {
   id: string;
@@ -46,6 +55,38 @@ export interface Project {
   section_count?: number;
   created_at?: string;
   updated_at?: string;
+  /** 非空 = 在回收站里。常规列表拿不到这样的项目。 */
+  deleted_at?: string | null;
+  attention_summary?: ProjectAttentionSummary | null;
+}
+
+export interface ProjectAttentionSummary {
+  manuscript: { sectionCount: number; wordCount: number | null; updatedAt: string | null };
+  active_job: { stage: string; completed: number | null; total: number | null } | null;
+  readiness: {
+    state: 'pass' | 'warn' | 'fail' | 'unknown' | 'stale';
+    attentionCount: number | null;
+    nextAction: string;
+    href: string;
+    checkedAt: string | null;
+  };
+  latest_pdf: { createdAt: string; stale: boolean } | null;
+}
+
+export interface SubmissionReadinessItem {
+  key: string;
+  label: string;
+  state: 'pass' | 'warn' | 'fail' | 'unknown' | 'stale';
+  checked_at: string;
+  reason: string;
+  fix_href: string;
+}
+
+export interface SubmissionReadiness {
+  project_id: string;
+  state: SubmissionReadinessItem['state'];
+  checked_at: string | null;
+  items: SubmissionReadinessItem[];
 }
 
 export interface CreateProjectRequest {
@@ -61,6 +102,18 @@ export interface CreateProjectRequest {
   authors?: string[];
   author_details?: AuthorDetail[];
   keywords?: string[];
+}
+
+export interface AssetCapabilities {
+  max_bytes: number;
+  max_mib: number;
+  preferred_extensions: string[];
+  accepts_unrecognized_as_method_note: boolean;
+}
+
+export interface MaterialPreflight {
+  ready: boolean;
+  issues: { code: string; message: string }[];
 }
 
 /**
@@ -88,13 +141,94 @@ export interface UpdateProjectRequest {
   metadata_confirmed?: boolean;
 }
 
-export type LibraryEntryStatus = 'candidate' | 'selected' | 'excluded';
+export type LibraryEntryStatus =
+  | 'candidate'
+  | 'candidate_uncertain'
+  | 'selected'
+  | 'excluded';
+/** SCREEN 为什么留下/排除/存疑一篇文献——用于诊断筛选偏差。 */
+export interface EligibilityDecision {
+  work_id: string;
+  title: string;
+  decision: 'include' | 'exclude' | 'uncertain';
+  reason?: string | null;
+  anchor_facet_hit: boolean;
+  criterion_hits: Record<string, unknown>;
+  decided_by: string;
+  model?: string | null;
+}
+
+export type LiteratureRole = 'general' | 'core';
 export type AddedVia =
   | 'search'
   | 'snowball'
   | 'doi_import'
   | 'bibtex_import'
+  | 'pdf_upload'
   | 'llm_suggested_verified';
+
+export type PdfUploadStatus =
+  | 'matching'
+  | 'needs_confirmation'
+  | 'parsing'
+  | 'extracting'
+  | 'ready'
+  | 'match_failed'
+  | 'parse_failed'
+  | 'rejected';
+
+export type FulltextStatus =
+  | 'available'
+  | 'parsing'
+  | 'failed'
+  | 'abstract_only'
+  | 'unavailable';
+export type FulltextSource = 'user_pdf' | 'oa' | 'none';
+export type EvidenceStatus = 'extracted' | 'pending' | 'none';
+export type AssignmentStatus = 'assigned' | 'pending' | 'unassigned';
+export type LiteratureCitationStatus = 'cited' | 'not_cited';
+
+export interface LiteratureUtilization {
+  fulltext_status: FulltextStatus;
+  fulltext_source: FulltextSource;
+  evidence_status: EvidenceStatus;
+  assignment_status: AssignmentStatus;
+  citation_status: LiteratureCitationStatus;
+  evidence_count: number;
+  assignment_count: number;
+  /** 正文中的实际引用次数；不要与 ScholarlyWork.citation_count（外部被引量）混淆。 */
+  citation_count: number;
+  usage_evaluated: boolean;
+  /** 后端给出的可读原因；usage_evaluated=false 时必须为空。 */
+  unused_reason?: string | null;
+}
+
+export interface PdfExtractedMetadata {
+  doi?: string | null;
+  title?: string | null;
+  authors: string[];
+  publication_year?: number | null;
+}
+
+export interface LibraryPdfUpload {
+  id: string;
+  project_id?: string;
+  filename: string;
+  status: PdfUploadStatus;
+  extracted_metadata?: PdfExtractedMetadata | null;
+  matched_work?: ScholarlyWork | null;
+  match_method?: string | null;
+  match_confidence?: number | null;
+  document_file_id?: string | null;
+  error?: Record<string, unknown> | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface LibraryPdfUploadResult {
+  upload: LibraryPdfUpload;
+  job?: Job | null;
+}
 
 export interface ScholarlyWork {
   id: string;
@@ -114,6 +248,7 @@ export interface LibraryEntry {
   id: string;
   work: ScholarlyWork;
   status: LibraryEntryStatus;
+  literature_role?: LiteratureRole;
   relevance_score: number;
   rank_reason?: string;
   user_pinned?: boolean;
@@ -121,6 +256,8 @@ export interface LibraryEntry {
   bibtex_key?: string | null;
   verified_at?: string | null;
   card?: LiteratureCard | null;
+  pdf_upload_status?: PdfUploadStatus | null;
+  utilization?: LiteratureUtilization | null;
 }
 
 export interface LiteratureCard {
@@ -175,6 +312,10 @@ export interface ScopePayload {
   research_question?: string;
   scope_summary?: string;
   keyword_groups?: ScopeKeywordGroup[];
+  eligibility_criteria?: {
+    required_anchor_groups?: { name: string; terms: string[] }[];
+    exclusion_domains?: string[];
+  } | null;
   subtopics?: string[];
   time_range?: { start_year?: number; end_year?: number };
   inclusion_notes?: string[];
@@ -189,12 +330,23 @@ export type JobKind =
   | 'search'
   | 'ingest'
   | 'cards'
+  | 'qdecomp'
+  | 'evidence'
+  | 'qmatrix'
+  | 'synth'
   | 'outline'
   | 'write'
   | 'compile'
   | 'visual'
   | 'full';
-export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'needs_input';
 
 export interface Job {
   id: string;
@@ -225,12 +377,21 @@ export interface JobEvent {
  */
 export const JOB_STAGES = [
   'scope',
+  'qdecomp',
   'search',
+  'screen',
   'curate',
   'ingest',
   'snowball',
   'cards',
+  'evidence',
+  'qmatrix',
+  'synth',
   'quality',
+  'repair_search',
+  'repair_ingest',
+  'quality_repair',
+  'quality_recheck',
   'outline',
   'write',
   'polish',
@@ -284,6 +445,8 @@ export interface OutlinePayload {
   version: number;
   status: 'draft' | 'confirmed';
   tree: OutlineTree;
+  stale?: boolean;
+  stale_reason?: string | null;
 }
 
 /**
@@ -295,13 +458,22 @@ export type IRTextMark = 'bold' | 'italic';
 /** PaperIR 行内 run（设计 §4.5：cite 是原子节点，不是正文里的字符串）。 */
 export type IRRun =
   | { t: 'text'; v: string; marks?: IRTextMark[] }
-  | { t: 'cite'; keys: string[] }
+  | { t: 'cite'; keys: string[]; evidence_ids?: string[] }
+  | { t: 'grounding'; source_refs: string[] }
   | { t: 'math_inline'; v: string }
   | { t: 'xref'; target: string; kind: 'figure' };
 
 export interface IRParagraph {
   type: 'paragraph';
   runs: IRRun[];
+  stance_summary?:
+    | 'consistent'
+    | 'conditional'
+    | 'conflicting'
+    | 'insufficient'
+    | 'partial'
+    | 'background'
+    | null;
 }
 
 export interface IRListItem {
@@ -468,6 +640,7 @@ export interface ExportArtifact {
   quality_profile?: QualityProfile;
   readiness_status?: string;
   paper_snapshot_hash?: string | null;
+  export_run_id?: string | null;
 }
 
 // ---- 用户素材与数字 lint（设计 §4.3 user_asset / §4.4.2 NUMLINT） ----
@@ -571,6 +744,8 @@ export interface VisualAsset {
   source_section_keys?: string[];
   /** 建议基于旧版正文。只提示，不自动删除。 */
   stale?: boolean;
+  /** 最近一次成功生成图片/图形的准确时间；不同于建议创建时间。 */
+  generated_at?: string | null;
   created_at?: string | null;
 }
 
@@ -686,6 +861,7 @@ export interface QualityReport {
   core_claim_fulltext_count: number;
   core_claim_fulltext_coverage: number;
   layout_checks: Record<string, unknown>;
+  depth_metrics: Record<string, number | Record<string, number>>;
 }
 
 export interface QualityIssue {
@@ -696,6 +872,120 @@ export interface QualityIssue {
   [key: string]: unknown;
 }
 
+export type AnswerStatus = 'answered' | 'partial' | 'contested' | 'insufficient_evidence';
+export type EvidenceGrade =
+  | 'A_located_structured'
+  | 'B_located_prose'
+  | 'C_fulltext_unlocated'
+  | 'D_abstract_only';
+export type AnchorStrength = 'structured_cell' | 'object_mention' | 'prose_only';
+export type EvidenceStance =
+  | 'supports'
+  | 'contradicts'
+  | 'conditional'
+  | 'not_comparable'
+  | 'gap';
+
+export interface ResearchQuestion {
+  id: string;
+  parent_id?: string | null;
+  text: string;
+  kind: 'core' | 'sub';
+  order_index: number;
+  comparison_dimensions: string[];
+  expected_evidence_kinds: string[];
+  answer_status: AnswerStatus;
+  generator?: string | null;
+  origin?: 'auto' | 'user';
+  locked?: boolean;
+  task_id?: string | null;
+  search_query?: string | null;
+}
+
+export interface EvidenceMeasurement {
+  metric_name: string;
+  value: number;
+  unit?: string | null;
+  ci_low?: number | null;
+  ci_high?: number | null;
+  std?: number | null;
+  dataset?: string | null;
+  task?: string | null;
+  model_family?: string | null;
+  attack_goal?: string | null;
+  threat_model?: string | null;
+  victim_model?: string | null;
+  attack_budget_json?: Record<string, unknown> | null;
+  protocol_json?: Record<string, unknown> | null;
+  sample_size?: number | null;
+  split?: string | null;
+  comparability_key: string;
+}
+
+export interface EvidenceUnit {
+  id: string;
+  work_id: string;
+  cite_key?: string | null;
+  title?: string | null;
+  kind: string;
+  grade: string;
+  anchor_strength?: string | null;
+  text: string;
+  page?: number | null;
+  section_path?: string | null;
+  paragraph_index?: number | null;
+  object_ref?: string | null;
+  measurements: EvidenceMeasurement[];
+}
+
+export interface QuestionEvidenceLink {
+  id: string;
+  research_question_id: string;
+  evidence_unit_id: string;
+  stance: EvidenceStance;
+  condition_note?: string | null;
+  confidence?: number | null;
+  manually_overridden: boolean;
+}
+
+export interface EvidenceMatrixPerQuestionDiagnostics {
+  question_id: string;
+  candidate_count: number;
+  classified_count?: number;
+  eligible_abc_count?: number;
+  best_score?: number | null;
+  routing_mode?: string | null;
+  bridge_source?: string | null;
+  no_link_reason?: string | null;
+  rejected_by_lexical?: number | null;
+  rejected_by_task?: number | null;
+}
+
+export interface EvidenceMatrixDiagnostics {
+  evidence_unit_count: number;
+  link_count: number;
+  question_count: number;
+  unlinked_evidence_count: number;
+  rejected_by_lexical?: number | null;
+  rejected_by_task?: number | null;
+  zero_candidate_questions?: number | null;
+  bridge_sources?: Record<string, number> | null;
+  per_question?: EvidenceMatrixPerQuestionDiagnostics[] | null;
+}
+
+export interface EvidenceMatrix {
+  questions: ResearchQuestion[];
+  evidence: EvidenceUnit[];
+  links: QuestionEvidenceLink[];
+  diagnostics?: EvidenceMatrixDiagnostics | null;
+}
+
+export interface SynthesisPayload {
+  questions: ResearchQuestion[];
+  bundles?: Record<string, unknown>[] | null;
+  comparison_cluster_count: number;
+}
+
 export interface ClaimEvidence {
   id: string;
   report_id: string;
@@ -704,12 +994,17 @@ export interface ClaimEvidence {
   claim_kind: string;
   is_core: boolean;
   cite_key?: string | null;
+  source_key?: string | null;
+  user_asset_id?: string | null;
   source_kind: string;
   source_page?: number | null;
   source_section?: string | null;
   source_paragraph?: number | null;
   evidence_excerpt?: string | null;
   evidence_hash?: string | null;
+  evidence_unit_id?: string | null;
+  comparability_ok?: boolean | null;
+  grade_ok?: boolean | null;
   support_status: string;
   support_score?: number | null;
   manual_status: 'unreviewed' | 'confirmed' | 'rejected';
@@ -738,7 +1033,7 @@ export interface RoleModel {
  * 图像提供商**真正**支持的能力。
  *
  * 界面按它渲染表单：`supported_sizes` 为空时必须显示「尺寸由提供商决定」，
- * 而不是给一个不会生效的比例下拉框（Cloudflare FLUX 只接受 prompt 与 steps）。
+ * 而不是给一个不会生效的比例下拉框（Cloudflare FLUX 接受 prompt、steps 与 seed）。
  */
 export interface ImageProviderCapabilities {
   provider: string;
@@ -761,7 +1056,6 @@ export interface RuntimeSettings {
   llm_enabled: boolean;
   roles: RoleModel[];
   scholar_contact_email_configured: boolean;
-  semantic_scholar_key_configured: boolean;
   storage_backend: string;
   visuals_enabled: boolean;
   ai_images_enabled: boolean;

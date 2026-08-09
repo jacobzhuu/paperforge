@@ -15,6 +15,7 @@ from paper_ir.schema import (
     CiteRun,
     EquationBlock,
     FigureBlock,
+    GroundingRun,
     ListBlock,
     MathInlineRun,
     PaperIR,
@@ -225,6 +226,8 @@ def _render_run(
             index = numbering.get(key)
             marks.append(f"[{index}]" if index else f"[{key}]")
         return " " + "".join(marks)
+    if isinstance(run, GroundingRun):
+        return ""
     if isinstance(run, MathInlineRun):
         return f"${run.v}$"
     if isinstance(run, XRefRun):

@@ -6,6 +6,7 @@ arXiv 返回 Atom XML 而非 JSON，因此覆盖 discover() 走 XML 解析路径
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,6 +50,21 @@ class ArxivDiscoveryAdapter(HttpScholarlyDiscoveryAdapter):
 
     def discover(self, query: ScholarlyDiscoveryQuery) -> ScholarlyDiscoveryResult:
         retrieved_at = datetime.now(UTC)
+        if re.search(r"[\u3400-\u9fff]", query.query_text):
+            return ScholarlyDiscoveryResult(
+                provider_name=self.provider_name,
+                query=query,
+                retrieved_at=retrieved_at,
+                errors=(
+                    ScholarlyDiscoveryError(
+                        provider_name=self.provider_name,
+                        error_code="arxiv_cjk_query_rejected",
+                        message="arXiv discovery requires a non-CJK query.",
+                        retryable=False,
+                    ),
+                ),
+                metadata={"query_rejected": "contains_cjk"},
+            )
         if self._client is None:
             return self._not_configured(query, retrieved_at)
         request_url, params = self._request(query)

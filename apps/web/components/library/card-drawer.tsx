@@ -1,12 +1,28 @@
 'use client';
 
 import * as React from 'react';
-import { ExternalLink, ShieldCheck, ShieldAlert, KeyRound, FileText, Quote } from 'lucide-react';
+import {
+  AlertTriangle,
+  ExternalLink,
+  FileText,
+  KeyRound,
+  Lock,
+  Quote,
+  ShieldAlert,
+  ShieldCheck,
+  Star,
+} from 'lucide-react';
 import { Drawer } from '@/components/ui/drawer';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import type { LibraryEntry } from '@/lib/types';
 import { ADDED_VIA_LABEL, LIBRARY_ACTION } from '@/lib/labels';
+import {
+  entryRole,
+  entryUtilization,
+  isCoreUnused,
+  UtilizationBadges,
+} from './utilization-status';
 
 function Section({ title, items }: { title: string; items?: string[] }) {
   if (!items || items.length === 0) return null;
@@ -64,6 +80,7 @@ export function CardDrawer({
   citedIn = [],
   onClose,
   onToggleSelect,
+  onToggleRole,
 }: {
   entry: LibraryEntry | null;
   open: boolean;
@@ -71,10 +88,14 @@ export function CardDrawer({
   citedIn?: string[];
   onClose: () => void;
   onToggleSelect: (entry: LibraryEntry) => void | Promise<void>;
+  onToggleRole: (entry: LibraryEntry) => void | Promise<void>;
 }) {
   if (!entry) return null;
   const w = entry.work;
-  const verified = !!entry.verified_at && !!entry.bibtex_key;
+  const verified = !!entry.verified_at;
+  const role = entryRole(entry);
+  const utilization = entryUtilization(entry, citedIn);
+  const unusedReason = utilization.unused_reason;
 
   return (
     <Drawer
@@ -83,18 +104,23 @@ export function CardDrawer({
       title={w.canonical_title}
       description={`${w.authors.join(', ')} · ${w.publication_year ?? '—'}${w.venue_name ? ` · ${w.venue_name}` : ''}`}
       footer={
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground">
             来源：{ADDED_VIA_LABEL[entry.added_via]}
           </span>
-          <Button
-            variant={entry.status === 'selected' ? 'secondary' : 'default'}
-            onClick={() => void onToggleSelect(entry)}
-          >
-            {/* 「取消入库」只是把状态退回候选（可逆）；批量栏里的「移出文献库」
-                是真删除。此前两处都叫「移出文献库」，同名不同义。 */}
-            {entry.status === 'selected' ? LIBRARY_ACTION.deselect : LIBRARY_ACTION.select}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => void onToggleRole(entry)}>
+              <Star className={role === 'core' ? 'fill-current' : undefined} />
+              {role === 'core' ? '取消核心' : '标为核心'}
+            </Button>
+            <Button
+              variant={entry.status === 'selected' ? 'secondary' : 'default'}
+              onClick={() => void onToggleSelect(entry)}
+              disabled={w.is_retracted}
+            >
+              {entry.status === 'selected' ? LIBRARY_ACTION.deselect : LIBRARY_ACTION.select}
+            </Button>
+          </div>
         </div>
       }
     >
@@ -102,7 +128,7 @@ export function CardDrawer({
         <div className="flex flex-wrap items-center gap-2">
           {verified ? (
             <Badge variant="success">
-              <ShieldCheck className="mr-1 h-3 w-3" /> 已核验入库
+              <ShieldCheck className="mr-1 h-3 w-3" /> 元数据已核验
             </Badge>
           ) : (
             <Badge variant="warning">
@@ -113,8 +139,30 @@ export function CardDrawer({
           {w.oa_status && w.oa_status !== 'closed' && (
             <Badge variant="secondary">OA · {w.oa_status}</Badge>
           )}
+          {entry.added_via === 'pdf_upload' && (
+            <Badge variant="secondary">
+              <Lock className="mr-1 h-3 w-3" /> 用户私有原文
+            </Badge>
+          )}
+          {role === 'core' && (
+            <Badge variant="outline">
+              <Star className="mr-1 h-3 w-3 fill-current" /> 核心文献
+            </Badge>
+          )}
           <Badge variant="muted">相关性 {(entry.relevance_score * 100).toFixed(0)}%</Badge>
         </div>
+
+        <UtilizationBadges entry={entry} citedIn={citedIn} />
+
+        {isCoreUnused(entry, utilization) && (
+          <div className="flex items-start gap-2 rounded-md border-l-2 border-warning bg-warning/10 px-3 py-2 text-sm">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning-strong" />
+            <span>
+              核心文献尚未进入正文
+              {unusedReason ? `：${unusedReason}` : '。请检查全文、证据和章节分配。'}
+            </span>
+          </div>
+        )}
 
         {entry.bibtex_key && (
           <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
@@ -195,7 +243,7 @@ export function CardDrawer({
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">
-              尚未抽取文献卡片。入库并运行 CARDS 阶段后，将展示贡献 / 方法 / 结果 / 局限 / 可引要点。
+              尚未抽取文献卡片。纳入写作并运行 CARDS 阶段后，将展示贡献 / 方法 / 结果 / 局限 / 可引要点。
             </p>
           )}
         </div>

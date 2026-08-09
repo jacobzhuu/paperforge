@@ -82,17 +82,55 @@ async def test_arq_job_timeout_path_marks_job_failed(session_factory) -> None:
 
     arq 用 `asyncio.wait_for` 掐任务，异常是从外面扔进来的——收尾代码此时跑在一个
     正在被取消的协程里，和 `raise CancelledError` 那条路径并不等价。
+
+    计时从**进入管线之后**才开始：`job_context` 的进入阶段要跑两次数据库往返，
+    此前固定 0.05 秒的窗口经常在那之前就到点，测的就成了另一条路径（见下一个用例），
+    数据库稍慢一点这个用例就红。
+    """
+    project_id, job_id = await _project_and_job(session_factory)
+    entered = asyncio.Event()
+
+    async def _pipeline() -> None:
+        async with job_context(**_kwargs(project_id, job_id, session_factory)):
+            entered.set()
+            await asyncio.sleep(30)
+
+    task = asyncio.ensure_future(_pipeline())
+    await asyncio.wait_for(entered.wait(), timeout=10)
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(task, timeout=0.05)
+
+    # 收尾在后台 task 里，给它几个循环把话说完。
+    for _ in range(50):
+        job = await _job_status(session_factory, job_id)
+        if job.status != "running":
+            break
+        await asyncio.sleep(0.02)
+    assert job.status == "failed"
+    assert job.error_json["reason"] == "interrupted"
+
+
+async def test_cancel_while_entering_the_context_also_marks_job_failed(session_factory) -> None:
+    """取消落在**进入阶段**同样要收尾。
+
+    `job_context` 在 yield 之前还要读项目与 checkpoint，两次数据库往返。worker 停机时
+    的 task.cancel() 可能正好落在这个窗口里；此前那一段完全没有收尾代码，任务就永远
+    停在 running——前端的「进行中」再也不消失，正是本模块要防的那种僵尸。
     """
     project_id, job_id = await _project_and_job(session_factory)
 
     async def _pipeline() -> None:
         async with job_context(**_kwargs(project_id, job_id, session_factory)):
-            await asyncio.sleep(30)
+            pytest.fail("进入阶段就该被取消，管线体不应执行")
 
-    with pytest.raises(TimeoutError):
-        await asyncio.wait_for(_pipeline(), timeout=0.05)
+    task = asyncio.ensure_future(_pipeline())
+    # 让协程跑到第一个 await（进入阶段的数据库查询）上，再掐。
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    # 收尾在后台 task 里，给它几个循环把话说完。
     for _ in range(50):
         job = await _job_status(session_factory, job_id)
         if job.status != "running":

@@ -19,6 +19,8 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Select } from '@/components/ui/select';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
+import { ModuleError } from '@/components/layout/module-error';
+import { EmptyState } from '@/components/ui/empty-state';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { PublicationMetadata } from '@/components/project/publication-metadata';
@@ -28,14 +30,18 @@ import {
   ApiError,
   exportDownloadUrl,
   exportPreviewUrl,
+  exportRunDownloadUrl,
   listExports,
   listJobs,
   getQuality,
+  retryExportRun,
   startExport,
 } from '@/lib/api';
 import type {
   ExportArtifact,
   ExportFormat,
+  Job,
+  JobStatus,
   QualityIssue,
   QualityProfile,
   QualityReport,
@@ -43,8 +49,10 @@ import type {
   VisualSummary,
 } from '@/lib/types';
 import { describeError } from '@/lib/errors';
+import { timestampPredatesVisuals } from '@/lib/artifact-relations';
 import { projectHref } from '@/lib/pipeline';
 import { cn, formatDate } from '@/lib/utils';
+import { useAsyncModule } from '@/lib/useAsyncModule';
 
 const FORMAT_LABEL: Record<ExportFormat, string> = {
   pdf: 'PDF',
@@ -56,13 +64,12 @@ const FORMAT_LABEL: Record<ExportFormat, string> = {
   compile_log: '编译日志',
 };
 
-/** 同一次导出运行内产物的时间间隔上限（毫秒）。 */
-const RUN_WINDOW_MS = 5 * 60 * 1000;
-
 interface ExportRun {
   id: string;
   at: number;
   artifacts: ExportArtifact[];
+  status?: JobStatus;
+  requestedFormats?: RequestableExportFormat[];
 }
 
 /**
@@ -72,71 +79,73 @@ interface ExportRun {
  * 失去区分度，界面上是 10 行长得一模一样的「PDF · v2 · 07/25 02:03」。
  * 用户要找的是「我现在该投出去的那个 PDF」，不是一张 50 行的平表。
  */
-function groupRuns(artifacts: ExportArtifact[]): ExportRun[] {
+function groupRuns(artifacts: ExportArtifact[], jobs: Job[]): ExportRun[] {
   const sorted = [...artifacts].sort(
     (a, b) => Date.parse(b.created_at ?? '') - Date.parse(a.created_at ?? ''),
   );
-  const runs: ExportRun[] = [];
+  const byRun = new Map<string, ExportRun>();
+  for (const job of jobs.filter((candidate) => candidate.kind === 'compile')) {
+    const resume = job.checkpoint?.resume as
+      | { kwargs?: { formats?: RequestableExportFormat[] } }
+      | undefined;
+    byRun.set(job.id, {
+      id: job.id,
+      at: Date.parse(job.created_at ?? '') || 0,
+      artifacts: [],
+      status: job.status,
+      requestedFormats: resume?.kwargs?.formats,
+    });
+  }
   for (const artifact of sorted) {
     const at = Date.parse(artifact.created_at ?? '') || 0;
-    const last = runs[runs.length - 1];
-    if (last && Math.abs(last.at - at) <= RUN_WINDOW_MS) {
-      last.artifacts.push(artifact);
-      continue;
+    // 旧产物没有真实关系，明确放入“批次未知”的历史组；不再用五分钟窗口伪造批次。
+    const id = artifact.export_run_id ?? 'historical-unknown';
+    const existing = byRun.get(id);
+    if (existing) {
+      existing.artifacts.push(artifact);
+      existing.at = Math.max(existing.at, at);
     }
-    runs.push({ id: artifact.id, at, artifacts: [artifact] });
+    else byRun.set(id, { id, at, artifacts: [artifact] });
   }
-  return runs;
+  return [...byRun.values()].sort((a, b) => b.at - a.at);
 }
 
 export function ExportCenter() {
   const { projectId, project, progress, busy, startJob, reload: reloadProject } = useProject();
   const { toast } = useToast();
 
-  const [artifacts, setArtifacts] = React.useState<ExportArtifact[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
   const [result, setResult] = React.useState<Record<string, unknown> | null>(null);
   const [formats, setFormats] = React.useState<RequestableExportFormat[]>(ALL_EXPORT_FORMATS);
-  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
-  const [quality, setQuality] = React.useState<QualityReport | undefined>();
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('scholarly');
   const [gateBlockers, setGateBlockers] = React.useState<QualityIssue[]>([]);
+  const artifactsModule = useAsyncModule<ExportArtifact[]>(
+    (signal) => listExports(projectId, signal).then((response) => response.data), [], [projectId],
+  );
+  const jobsModule = useAsyncModule(
+    (signal) => listJobs(projectId, signal).then((response) => response.data), [], [projectId],
+  );
+  const qualityModule = useAsyncModule<QualityReport | undefined>(
+    (signal) => getQuality(projectId, qualityProfile, signal).then((response) => response.data),
+    undefined,
+    [projectId, qualityProfile],
+  );
+  const artifacts = artifactsModule.data;
+  const quality = qualityModule.data;
 
-  const reload = React.useCallback(async () => {
-    if (!projectId) {
-      setLoading(false);
-      return;
-    }
-    // 诊断此前只来自 SSE，刷新一次页面就没了——而「书目走了兜底排版」这类降级
-    // 恰恰是用户投稿前必须知道的事。编译任务的 checkpoint 里存着同一份 payload。
-    const [rows, jobs, qualityResult] = await Promise.all([
-      listExports(projectId),
-      listJobs(projectId),
-      getQuality(projectId, qualityProfile),
-    ]);
-    setArtifacts(rows.data);
-    setQuality(qualityResult.data);
+  React.useEffect(() => {
     // 一键全管线（kind=full）同样会产出 render 段，按「最近一个带 render 的任务」取。
-    const render = jobs.data.find(
+    const render = jobsModule.data.find(
       (job) => job.status === 'succeeded' && job.checkpoint?.render,
     )?.checkpoint?.render;
     if (render && typeof render === 'object') setResult(render as Record<string, unknown>);
-    setLoadError(null);
-    setLoading(false);
-  }, [projectId, qualityProfile]);
+  }, [jobsModule.data]);
 
-  const runReload = React.useCallback(() => {
-    setLoadError(null);
-    reload().catch((err) => {
-      setLoadError(describeError(err));
-      setLoading(false);
-    });
-  }, [reload]);
-
-  React.useEffect(() => {
-    runReload();
-  }, [runReload]);
-  useJobFinished(runReload);
+  const reloadModules = React.useCallback(() => {
+    artifactsModule.reload();
+    jobsModule.reload();
+    qualityModule.reload();
+  }, [artifactsModule.reload, jobsModule.reload, qualityModule.reload]);
+  useJobFinished(reloadModules);
   useJobEvent((event) => {
     if (event.type === 'render.completed') setResult(event.payload);
   });
@@ -151,8 +160,15 @@ export function ExportCenter() {
     try {
       const started = await startExport(projectId, formats, qualityProfile);
       startJob(started.data, '后端不可用：无法触发导出');
+      toast({
+        title: '已开始生成导出产物',
+        description: `${formats.length} 种格式正在编译，完成后会自动出现在本页。`,
+      });
     } catch (err) {
-      if (err instanceof ApiError && err.code === 'submission_quality_gate_failed') {
+      if (
+        err instanceof ApiError &&
+        ['quality_gate_failed', 'submission_quality_gate_failed'].includes(err.code)
+      ) {
         const detail = err.detail as { blockers?: QualityIssue[] } | undefined;
         setGateBlockers(detail?.blockers ?? []);
       }
@@ -160,20 +176,33 @@ export function ExportCenter() {
     }
   };
 
-  const runs = React.useMemo(() => groupRuns(artifacts), [artifacts]);
+  const runs = React.useMemo(
+    () => groupRuns(artifacts, jobsModule.data),
+    [artifacts, jobsModule.data],
+  );
   const latest = runs[0];
   const latestPdf = latest?.artifacts.find((a) => a.format === 'pdf');
   const compileOk = result?.compile_ok as boolean | undefined;
+
+  const retryRun = React.useCallback(async (runId: string) => {
+    try {
+      const started = await retryExportRun(projectId, runId);
+      startJob(started, '后端不可用：无法重试导出');
+      toast({ title: '已重新开始这批导出' });
+    } catch (error) {
+      toast({ title: '批次重试失败', description: describeError(error), variant: 'error' });
+    }
+  }, [projectId, startJob, toast]);
 
   return (
     <div className="space-y-4">
       <WorkbenchHeader
         title="导出中心"
-        description="LaTeX 工程 / PDF / Markdown 图片包 / BibTeX / docx"
+        description={formats.length > 0 ? `将生成：${formats.map((format) => FORMAT_LABEL[format]).join(' / ')}` : '请选择至少一种投稿文件格式'}
         actions={
           <Button onClick={run} disabled={!projectId || busy}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
-            生成导出产物
+            生成投稿文件
           </Button>
         }
       />
@@ -194,6 +223,9 @@ export function ExportCenter() {
         quality={quality}
         blockers={gateBlockers}
       />
+      <ModuleError label="质量报告" error={qualityModule.error} onRetry={qualityModule.reload} />
+      <ModuleError label="编译诊断" error={jobsModule.error} onRetry={jobsModule.reload} />
+      <DepthMetricsPanel quality={quality} />
 
       <VisualExportSummary
         projectId={projectId}
@@ -210,12 +242,18 @@ export function ExportCenter() {
         />
       )}
 
-      <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-64">
-        {artifacts.length === 0 ? (
-          <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-            {progress.sectionCount === 0 ? (
+      <LoadState
+        loading={artifactsModule.loading && !artifactsModule.ready}
+        error={artifactsModule.error}
+        onRetry={artifactsModule.reload}
+        skeletonClassName="h-64"
+      >
+        {runs.length === 0 ? (
+          <EmptyState
+            title={progress.sectionCount === 0 ? '还没有正文' : '还没有导出产物'}
+            description={progress.sectionCount === 0 ? (
               <>
-                还没有正文。先在
+                先在
                 <Link href={projectHref(projectId, 'write')} className="mx-1 underline">
                   写作工作台
                 </Link>
@@ -224,7 +262,7 @@ export function ExportCenter() {
             ) : (
               <>已有正文，还没有导出过。点右上角「生成导出产物」编译成 PDF。</>
             )}
-          </div>
+          />
         ) : (
           <div className="space-y-6">
             <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr),20rem]">
@@ -233,23 +271,37 @@ export function ExportCenter() {
                 {latestPdf ? (
                   <PdfPreviewPane projectId={projectId} artifact={latestPdf} />
                 ) : (
-                  <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
-                    最近一次运行没有产出 PDF。LaTeX 工程与其余格式仍可在右侧下载。
-                  </div>
+                  <EmptyState
+                    title="最近一次运行没有产出 PDF"
+                    description="LaTeX 工程与其余格式仍可在右侧下载，也可以查看编译日志后重新导出。"
+                    className="py-12"
+                  />
                 )}
               </div>
 
               <aside className="space-y-2 lg:sticky lg:top-4 lg:self-start">
                 <h3 className="text-sm font-medium">
-                  最近一次运行 · {formatDate(latest?.artifacts[0]?.created_at ?? undefined)}
+                  最近一次运行 · {formatDate(latest?.artifacts[0]?.created_at ?? new Date(latest?.at ?? 0).toISOString())}
                 </h3>
-                <Card>
-                  <CardContent className="divide-y p-0">
+                {latest && latest.id !== 'historical-unknown' && latest.artifacts.length > 0 && (
+                  <a
+                    href={exportRunDownloadUrl(projectId, latest.id)}
+                    download
+                    className={buttonVariants({ variant: 'outline', size: 'sm' })}
+                  >
+                    <Download className="h-3.5 w-3.5" /> 下载整批
+                  </a>
+                )}
+                {latest?.status === 'failed' && (
+                  <Button variant="outline" size="sm" onClick={() => retryRun(latest.id)}>
+                    重试本批
+                  </Button>
+                )}
+                <div className="divide-y border-y">
                     {latest?.artifacts.map((artifact) => (
                       <ArtifactRow key={artifact.id} projectId={projectId} artifact={artifact} />
                     ))}
-                  </CardContent>
-                </Card>
+                </div>
                 {!latest?.artifacts.some((a) => a.format === 'compile_log') && (
                   <p className="text-xs text-muted-foreground">
                     这次运行早于「编译日志登记为产物」的改动，因此没有日志条目；
@@ -260,7 +312,7 @@ export function ExportCenter() {
             </div>
 
             {runs.length > 1 && (
-              <HistoryRuns projectId={projectId} runs={runs.slice(1)} />
+              <HistoryRuns projectId={projectId} runs={runs.slice(1)} onRetry={retryRun} />
             )}
           </div>
         )}
@@ -290,10 +342,7 @@ function VisualExportSummary({
   latestRunAt?: number;
 }) {
   const unhandled = summary.pending + summary.ready;
-  const approvedAt = summary.latest_approved_at
-    ? Date.parse(summary.latest_approved_at)
-    : undefined;
-  const outdated = Boolean(latestRunAt && approvedAt && approvedAt > latestRunAt);
+  const outdated = timestampPredatesVisuals(latestRunAt, summary);
 
   if (summary.approved === 0 && unhandled === 0 && summary.failed === 0) return null;
 
@@ -337,6 +386,45 @@ function VisualExportSummary({
   );
 }
 
+function DepthMetricsPanel({ quality }: { quality: QualityReport | undefined }) {
+  const labels: Record<string, string> = {
+    '1_fulltext_acquisition_rate': '全文获取',
+    '2_methods_results_section_coverage': '方法/结果定位',
+    '3_structured_object_coverage': '结构化对象',
+    '4_core_claim_evidence_coverage': '核心证据覆盖',
+    '5_numeric_locator_coverage': '数字定位',
+    '6_numeric_source_consistency': '数值一致',
+    '7_unsupported_strong_claim_rate': '无依据强结论 ↓',
+    '8_invalid_comparison_rate': '错误比较 ↓',
+    '9_cross_study_synthesis_paragraph_rate': '跨研究综合',
+    '10_paper_enumeration_paragraph_rate': '按论文罗列 ↓',
+    '11_question_answer_completeness': '问题回答完整',
+  };
+  const entries = Object.entries(quality?.depth_metrics ?? {}).filter(
+    (entry): entry is [string, number] =>
+      entry[0] in labels && typeof entry[1] === 'number',
+  );
+  if (entries.length === 0) return null;
+  return (
+    <section className="space-y-3">
+      <div>
+        <h3 className="text-sm font-medium">综述深度指标</h3>
+        <p className="text-xs text-muted-foreground">
+          与当前正文快照绑定；改动正文后请重新质检。
+        </p>
+      </div>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
+        {entries.map(([key, value]) => (
+          <div key={key} className="rounded-md border p-2">
+            <div className="font-semibold tabular-nums">{Math.round(value * 100)}%</div>
+            <div className="text-micro text-muted-foreground">{labels[key]}</div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function SubmissionExportMode({
   profile,
   onChange,
@@ -350,8 +438,7 @@ function SubmissionExportMode({
 }) {
   const ready = quality?.readiness_status;
   return (
-    <Card>
-      <CardContent className="space-y-3 py-3">
+    <section className="space-y-3 border-y py-4">
         <div className="grid gap-3 sm:grid-cols-[12rem,1fr] sm:items-end">
           <label className="space-y-1 text-xs font-medium text-muted-foreground">
             产物用途
@@ -360,22 +447,25 @@ function SubmissionExportMode({
               onChange={(event) => onChange(event.target.value as QualityProfile)}
             >
               <option value="draft">内部草稿</option>
+              <option value="scholarly">学术严谨稿（推荐）</option>
               <option value="submission">投稿候选稿</option>
             </Select>
           </label>
           <p className="text-xs text-muted-foreground">
             {profile === 'draft'
-              ? '保留兼容模式：质量问题会提示，但仍可生成产物。'
-              : '严格模式：先通过内容质量门，再由最终 PDF 完成缺字、题注和图片位置验收。'}
+              ? '兼容模式：质量问题会提示，但仍可生成产物。'
+              : profile === 'scholarly'
+                ? '默认模式：证据等级、可比较性与数字定位必须通过，投稿元数据问题先提示。'
+                : '严格模式：内容、审批与投稿元数据全部通过后才能导出。'}
           </p>
         </div>
-        {profile === 'submission' && (
+        {profile !== 'draft' && (
           <div className="flex flex-wrap items-center gap-2 text-xs">
             <Badge
               variant={
                 ready === 'submission_ready' || ready === 'preflight_ready'
                   ? 'success'
-                  : 'destructive'
+                  : 'warning'
               }
             >
               {ready === 'submission_ready'
@@ -392,15 +482,14 @@ function SubmissionExportMode({
           </div>
         )}
         {blockers.length > 0 && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs">
-            <p className="mb-1 font-medium text-destructive-strong">本次导出被质量门阻断：</p>
+          <div className="rounded-md border border-warning/40 bg-warning/5 p-3 text-xs">
+            <p className="mb-1 font-medium text-warning-strong">本次导出被质量门阻断：</p>
             {blockers.map((blocker) => (
               <p key={blocker.code}>· {blocker.message}</p>
             ))}
           </div>
         )}
-      </CardContent>
-    </Card>
+    </section>
   );
 }
 
@@ -417,8 +506,7 @@ function FormatSelector({
     );
 
   return (
-    <Card>
-      <CardContent className="flex flex-wrap items-center gap-x-5 gap-y-2 py-3">
+    <section className="flex flex-wrap items-center gap-x-5 gap-y-2 border-y py-3">
         <span className="text-xs font-medium text-muted-foreground">导出格式</span>
         {ALL_EXPORT_FORMATS.map((format) => (
           <label key={format} className="flex cursor-pointer items-center gap-2 text-sm">
@@ -426,8 +514,7 @@ function FormatSelector({
             {FORMAT_LABEL[format]}
           </label>
         ))}
-      </CardContent>
-    </Card>
+    </section>
   );
 }
 
@@ -444,15 +531,39 @@ function PdfPreviewPane({
   const src = exportPreviewUrl(projectId, artifact.id);
   return (
     <div className="space-y-2">
-      <div className="overflow-hidden rounded-xl border">
+      <div className="hidden overflow-hidden rounded-lg border md:block">
         <iframe
           src={src}
           title="PDF 预览"
           className="h-[calc(100vh-22rem)] min-h-96 w-full bg-muted"
         />
       </div>
+      <EmptyState
+        title="PDF 已生成"
+        description="移动端不内嵌 PDF 阅读器，请下载文件或在新标签中打开。"
+        className="md:hidden"
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <a
+              href={exportDownloadUrl(projectId, artifact.id)}
+              download
+              className={buttonVariants()}
+            >
+              <Download /> 下载 PDF
+            </a>
+            <a
+              href={src}
+              target="_blank"
+              rel="noreferrer"
+              className={buttonVariants({ variant: 'outline' })}
+            >
+              在新标签打开
+            </a>
+          </div>
+        }
+      />
       {/* 不内嵌 PDF 阅读器的浏览器（部分移动端）拿不到上面的预览，给一条出路。 */}
-      <p className="text-xs text-muted-foreground">
+      <p className="hidden text-meta text-muted-foreground md:block">
         预览为空？
         <a href={src} target="_blank" rel="noreferrer" className="mx-1 inline-flex min-h-11 items-center underline">
           在新标签打开 PDF
@@ -481,7 +592,7 @@ function ArtifactRow({
           {FORMAT_LABEL[artifact.format] ?? artifact.format}
         </Badge>
         {artifact.quality_profile === 'submission' && (
-          <Badge variant={ready ? 'success' : needsRevision ? 'destructive' : 'warning'}>
+          <Badge variant={ready ? 'success' : needsRevision ? 'warning' : 'muted'}>
             {ready ? '可提交' : needsRevision ? '需修订' : '未评估'}
           </Badge>
         )}
@@ -502,7 +613,15 @@ function ArtifactRow({
   );
 }
 
-function HistoryRuns({ projectId, runs }: { projectId: string; runs: ExportRun[] }) {
+function HistoryRuns({
+  projectId,
+  runs,
+  onRetry,
+}: {
+  projectId: string;
+  runs: ExportRun[];
+  onRetry: (runId: string) => Promise<void>;
+}) {
   const [open, setOpen] = React.useState<string | null>(null);
 
   return (
@@ -528,7 +647,9 @@ function HistoryRuns({ projectId, runs }: { projectId: string; runs: ExportRun[]
                     )}
                   />
                   <span className="flex-1 text-sm">
-                    {formatDate(run.artifacts[0]?.created_at ?? undefined)}
+                    {run.id === 'historical-unknown'
+                      ? '历史导出（批次未知）'
+                      : formatDate(run.artifacts[0]?.created_at ?? new Date(run.at).toISOString())}
                     <span className="ml-2 text-xs text-muted-foreground">
                       {new Date(run.at).toLocaleTimeString('zh-CN', {
                         hour: '2-digit',
@@ -542,11 +663,39 @@ function HistoryRuns({ projectId, runs }: { projectId: string; runs: ExportRun[]
                     <Badge variant="warning">无 PDF</Badge>
                   )}
                   <span className="text-xs text-muted-foreground">
-                    {run.artifacts.length} 个产物
+                    {run.status === 'failed' ? '批次失败' : `${run.artifacts.length} 个文件`}
                   </span>
                 </button>
                 {expanded && (
                   <div className="divide-y border-t bg-muted/20">
+                    {run.id !== 'historical-unknown' && (
+                      <div className="flex flex-wrap items-center gap-2 px-3 py-2">
+                        {run.artifacts.length > 0 && (
+                          <a
+                            href={exportRunDownloadUrl(projectId, run.id)}
+                            download
+                            className={buttonVariants({ variant: 'outline', size: 'sm' })}
+                          >
+                            <Download className="h-3.5 w-3.5" /> 下载整批
+                          </a>
+                        )}
+                        {run.status === 'failed' && (
+                          <Button variant="outline" size="sm" onClick={() => onRetry(run.id)}>
+                            重试本批
+                          </Button>
+                        )}
+                        {run.requestedFormats && (
+                          <span className="text-xs text-muted-foreground">
+                            请求：{run.requestedFormats.map((format) => FORMAT_LABEL[format]).join(' / ')}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {run.artifacts.length === 0 && (
+                      <p className="px-3 py-3 text-xs text-muted-foreground">
+                        本批次没有留下可下载文件。
+                      </p>
+                    )}
                     {run.artifacts.map((artifact) => (
                       <ArtifactRow key={artifact.id} projectId={projectId} artifact={artifact} />
                     ))}

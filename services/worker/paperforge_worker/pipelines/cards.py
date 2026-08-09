@@ -4,24 +4,29 @@
 去掉 verifier_status 与五级证据指针，仅保留 work_id + 卡片内容（设计 §3.2）。
 卡片按 work + source_hash 跨项目缓存复用（extractor 角色，便宜 + 长上下文）。
 
-M1 为「摘要级卡片」：只用标题/摘要/元数据。M5 接入 OA 全文后升级为全文级。
+M1 为「摘要级卡片」：只用标题/摘要/元数据。接入 OA 或项目私有全文后升级为全文级。
 Draft-first：LLM 不可用时用确定性回退（摘要切句），卡片永远有内容。
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from db import find_cached_card, list_entries, upsert_card
+from db.models.library import LiteratureCard
 from llm_runtime import LLMRunner
+from sqlalchemy import select
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.pipelines.fulltext import load_persisted_fulltext_sources
 
-MAX_LIST_ITEMS = 6
+MAX_LIST_ITEMS = 12
 MAX_SUMMARY_CHARS = 800
+MAX_FULLTEXT_PROMPT_CHARS = 100_000
 
 _SYSTEM_PROMPT_ZH = """你是文献卡片抽取助手。只依据给定的标题/摘要/元数据/全文抽取，
 **不得**补充给定文本以外的任何事实、数字或结论。只输出 JSON：
@@ -37,7 +42,8 @@ _SYSTEM_PROMPT_ZH = """你是文献卡片抽取助手。只依据给定的标题
 }
 全文包含 [[PAGE=... | SECTION=...]] 定位标记时必须原样回填页码/章节；
 没有可靠定位时相应字段填 null。证据片段应尽量保持原文。
-若信息不足，相应数组留空，不要编造。"""
+若信息不足，相应数组留空，不要编造。所有 summary、contributions、methods、results 和 limitations
+必须用中文输出；原文证据片段可保留原始语言。"""
 
 _SYSTEM_PROMPT_EN = """You extract literature cards. Use ONLY the given
 title/abstract/metadata/full text;
@@ -55,7 +61,8 @@ never add facts, numbers, or conclusions that are not present in the given text.
 }
 When full text contains [[PAGE=... | SECTION=...]] markers, copy the page/section
 locator. Use null when no reliable locator exists. Keep evidence excerpts close to
-the source wording. If evidence is thin, return empty arrays — never invent."""
+the source wording. If evidence is thin, return empty arrays — never invent. Write all card
+fields in English; only verbatim evidence excerpts may retain their source language."""
 
 
 @dataclass
@@ -78,9 +85,21 @@ class CardsOutcome:
         }
 
 
-def card_source_hash(*, title: str, abstract: str | None, fulltext: str | None = None) -> str:
+@dataclass(frozen=True)
+class _CardGenerationResult:
+    disposition: str
+    fulltext_generated: bool = False
+
+
+def card_source_hash(
+    *,
+    title: str,
+    abstract: str | None,
+    fulltext: str | None = None,
+    language: str = "en",
+) -> str:
     """卡片输入的内容指纹：输入不变则可跨项目复用卡片（设计 §4.3）。"""
-    payload = "␟".join([title or "", abstract or "", fulltext or ""])
+    payload = "␟".join([language, title or "", abstract or "", fulltext or ""])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
 
 
@@ -91,6 +110,7 @@ async def generate_cards(
     limit: int | None = None,
     language: str = "en",
     fulltexts: dict[str, str] | None = None,
+    work_ids: list[Any] | None = None,
 ) -> CardsOutcome:
     """为项目内指定状态的文献批量生成卡片。"""
     outcome = CardsOutcome()
@@ -98,23 +118,53 @@ async def generate_cards(
 
     async with context.session() as session:
         entries = await list_entries(session, context.project_id, status=status)
+    if work_ids is not None:
+        requested_work_ids = {str(work_id) for work_id in work_ids}
+        entries = [(entry, work) for entry, work in entries if str(work.id) in requested_work_ids]
     if limit is not None:
         entries = entries[:limit]
     outcome.requested = len(entries)
 
-    fulltexts = fulltexts or {}
-    for index, (_entry, work) in enumerate(entries):
+    fulltexts = dict(fulltexts or {})
+    # Card generation can be run independently from ingest; durable chunks are
+    # the source of truth, not a transient worker-process dictionary.
+    persisted_sources = await load_persisted_fulltext_sources(
+        context, [work.id for _entry, work in entries]
+    )
+    for work_id, source in persisted_sources.items():
+        if source.is_private:
+            # The project's explicitly uploaded source wins over a transient OA
+            # fetch from the same run.
+            fulltexts[work_id] = source.text
+        else:
+            fulltexts.setdefault(work_id, source.text)
+
+    async def _generate_one(work: Any) -> _CardGenerationResult:
         fulltext = fulltexts.get(str(work.id))
+        persisted_source = persisted_sources.get(str(work.id))
+        # A caller-provided text that is not the authorized persisted source is
+        # conservatively treated as private.  A content hash is never an ACL.
+        private_source = bool(fulltext) and (
+            persisted_source is None
+            or persisted_source.text != fulltext
+            or persisted_source.is_private
+        )
         source_hash = card_source_hash(
             title=work.canonical_title,
             abstract=work.abstract,
             fulltext=fulltext,
+            language=language,
         )
         async with context.session() as session:
-            cached = await find_cached_card(session, work_id=work.id, source_hash=source_hash)
+            cached = await _find_card_cache(
+                session,
+                project_id=context.project_id,
+                work_id=work.id,
+                source_hash=source_hash,
+                private_source=private_source,
+            )
             if cached is not None and cached.project_id == context.project_id:
-                outcome.cached += 1
-                continue
+                return _CardGenerationResult("cached")
             reused = (
                 {
                     "summary": cached.summary,
@@ -131,7 +181,7 @@ async def generate_cards(
 
         if reused is not None:
             card_data = reused
-            outcome.cached += 1
+            disposition = "cached"
         else:
             card_data, used_fallback = await extract_card(
                 title=work.canonical_title,
@@ -142,12 +192,7 @@ async def generate_cards(
                 language=language,
                 fulltext=fulltext,
             )
-            if used_fallback:
-                outcome.fallback += 1
-            else:
-                outcome.generated += 1
-            if fulltext:
-                outcome.fulltext_cards += 1
+            disposition = "fallback" if used_fallback else "generated"
 
         async with context.session() as session:
             await upsert_card(
@@ -164,14 +209,65 @@ async def generate_cards(
                 extraction_model=card_data.get("extraction_model"),
                 source_hash=source_hash,
             )
-        if index % 5 == 0:
-            await context.emit(
-                "cards.progress",
-                {"done": index + 1, "total": outcome.requested},
-                stage="cards",
-                progress=None,
-            )
+        return _CardGenerationResult(
+            disposition,
+            fulltext_generated=bool(fulltext and reused is None),
+        )
+
+    # Each card has an independent prompt and persistence key.  Process a small
+    # fixed-size batch concurrently, then checkpoint/stop only after every paid
+    # call in that batch has been persisted.  This preserves the existing
+    # interruption guarantee while removing the N × provider-latency wall time.
+    concurrency = max(1, min(int(context.settings.card_concurrency), 12))
+    for batch_start in range(0, len(entries), concurrency):
+        batch = entries[batch_start : batch_start + concurrency]
+        results = await asyncio.gather(*(_generate_one(work) for _entry, work in batch))
+        for result in results:
+            if result.disposition == "cached":
+                outcome.cached += 1
+            elif result.disposition == "fallback":
+                outcome.fallback += 1
+            else:
+                outcome.generated += 1
+            if result.fulltext_generated:
+                outcome.fulltext_cards += 1
+        done = batch_start + len(batch)
+        await context.emit(
+            "cards.progress",
+            {"done": done, "total": outcome.requested},
+            stage="cards",
+            progress=None,
+        )
+        # Cards in the whole batch are upserted before honoring the stop flag;
+        # no completed provider call is discarded.
+        await context.raise_if_stopped()
     return outcome
+
+
+async def _find_card_cache(
+    session: Any,
+    *,
+    project_id: Any,
+    work_id: Any,
+    source_hash: str,
+    private_source: bool,
+) -> LiteratureCard | None:
+    """Never inspect another project's card when the source text is private."""
+    if not private_source:
+        return await find_cached_card(
+            session,
+            work_id=work_id,
+            source_hash=source_hash,
+        )
+    return await session.scalar(
+        select(LiteratureCard)
+        .where(
+            LiteratureCard.project_id == project_id,
+            LiteratureCard.work_id == work_id,
+            LiteratureCard.source_hash == source_hash,
+        )
+        .limit(1)
+    )
 
 
 async def extract_card(
@@ -196,13 +292,15 @@ async def extract_card(
         context_lines.append(f"Venue: {venue}")
     context_lines.append(f"Abstract: {abstract or '(no abstract available)'}")
     if fulltext:
-        # 全文级卡片（M5）：给足上下文，但仍只允许基于给定文本抽取。
-        context_lines.append(f"Full text (OA):\n{fulltext[:60000]}")
+        # 全文级卡片：来源可能是共享 OA，也可能是用户确认的项目私有 PDF。
+        context_lines.append(
+            f"Full text (authorized source):\n{fulltext[:MAX_FULLTEXT_PROMPT_CHARS]}"
+        )
     result = await runner.agenerate_json(
         "extractor",
         system_prompt=system_prompt,
         user_prompt="\n".join(context_lines),
-        max_output_tokens=1600 if fulltext else 1200,
+        max_output_tokens=2600 if fulltext else 1200,
         temperature=0.1,
         metadata={"stage": "cards"},
     )
@@ -268,6 +366,7 @@ def _clean_evidence_points(value: Any) -> list[dict[str, Any]]:
         return []
     points: list[dict[str, Any]] = []
     for item in value:
+        point: dict[str, Any]
         if isinstance(item, str):
             text = _clean_text(item)
             point = {"text": text, "page": None, "section": None, "paragraph": None}

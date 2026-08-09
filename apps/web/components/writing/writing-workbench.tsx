@@ -17,7 +17,9 @@ import {
   X,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { ActionMenu } from '@/components/ui/action-menu';
 import { Button, buttonVariants } from '@/components/ui/button';
+import { Callout } from '@/components/ui/callout';
 import { Dialog } from '@/components/ui/dialog';
 import { Drawer } from '@/components/ui/drawer';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -26,15 +28,17 @@ import { LoadState } from '@/components/layout/load-state';
 import { ModuleError } from '@/components/layout/module-error';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
-import { useJobEvent, useJobFinished, useProject } from '@/components/project/project-context';
-import { SectionEditor, type RefineRequest } from '@/components/writing/section-editor';
-import { DiffPreviewDialog } from '@/components/writing/diff-preview-dialog';
-import { ValidationPanel } from '@/components/writing/validation-panel';
-import { MarkdownPreview } from '@/components/writing/markdown-preview';
+import {
+  useJobEvent,
+  useJobFinished,
+  useProjectActions,
+  useProjectActivity,
+  useProjectData,
+} from '@/components/project/project-context';
+import type { RefineRequest } from '@/components/writing/section-editor';
 // 视觉能力全部来自共用模块：写作台不再维护第二套卡片与编辑器。
-import { AIGenerationDialog } from '@/components/visuals/ai-generation-dialog';
 import { VisualCard } from '@/components/visuals/visual-card';
-import { VisualEditorDrawer } from '@/components/visuals/visual-editor-drawer';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
   groupVisualsByLineage,
   useVisuals,
@@ -44,16 +48,23 @@ import {
   generateQuality,
   generateSections,
   getCitationAudit,
+  getEvidenceUnits,
   getMarkdownPreview,
   getNumLint,
+  getOutline,
   getQuality,
   listSections,
+  repairQuality,
+  rebuildDraft,
   refineText,
   suggestVisuals,
   updateSection,
+  rewriteSectionCandidate,
+  acceptSectionRewrite,
 } from '@/lib/api';
 import type {
   CitationAudit,
+  EvidenceUnit,
   MarkdownPreview as MarkdownPreviewData,
   NumLintReport,
   PaperSection,
@@ -65,11 +76,50 @@ import type {
   VisualAsset,
 } from '@/lib/types';
 import { buildFigureNumbering } from '@/lib/figure-numbering';
-import { countWords, normalizeSectionIR } from '@/lib/ir-serde';
+import { countWords, normalizeSectionIR, sectionPlainText } from '@/lib/ir-serde';
 import { describeError, isSectionChanged } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
 import { useAsyncModule } from '@/lib/useAsyncModule';
 import { cn } from '@/lib/utils';
+
+/*
+ * Tiptap、全文预览、校验和视觉编辑器都很重，但一次只会使用其中一部分。
+ * 拆成独立 chunk，首次进入写作台先交付章节树和操作区。
+ */
+const SectionEditor = React.lazy(() =>
+  import('@/components/writing/section-editor').then((module) => ({
+    default: module.SectionEditor,
+  })),
+);
+const DiffPreviewDialog = React.lazy(() =>
+  import('@/components/writing/diff-preview-dialog').then((module) => ({
+    default: module.DiffPreviewDialog,
+  })),
+);
+const ValidationPanel = React.lazy(() =>
+  import('@/components/writing/validation-panel').then((module) => ({
+    default: module.ValidationPanel,
+  })),
+);
+const MarkdownPreview = React.lazy(() =>
+  import('@/components/writing/markdown-preview').then((module) => ({
+    default: module.MarkdownPreview,
+  })),
+);
+const VisualEditorDrawer = React.lazy(() =>
+  import('@/components/visuals/visual-editor-drawer').then((module) => ({
+    default: module.VisualEditorDrawer,
+  })),
+);
+const AIGenerationDialog = React.lazy(() =>
+  import('@/components/visuals/ai-generation-dialog').then((module) => ({
+    default: module.AIGenerationDialog,
+  })),
+);
+
+function DeferredModuleFallback({ className = 'h-48' }: { className?: string }) {
+  return <Skeleton className={className} aria-label="正在加载模块" />;
+}
 
 type View = 'editor' | 'preview';
 
@@ -85,23 +135,17 @@ function draftKey(projectId: string, sectionKey: string): string {
 }
 
 export function WritingWorkbench() {
-  const {
-    projectId,
-    paperType,
-    whitelist,
-    busy,
-    tracked,
-    startJob,
-    reload: reloadProject,
-  } = useProject();
+  const { projectId, paperType, whitelist, reload: reloadProject } = useProjectData();
+  const { busy, startJob } = useProjectActions();
+  const { runningStage } = useProjectActivity();
   const { toast } = useToast();
   /** 正文正在被逐节写出——章节树底部给一行提示，说明列表还会继续变长。 */
-  const writing = tracked?.job.stage === 'write';
+  const writing = runningStage === 'write';
 
   const [sections, setSections] = React.useState<PaperSection[]>([]);
   const [activeKey, setActiveKey] = React.useState<string | null>(null);
   const [view, setView] = React.useState<View>('editor');
-  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
+  const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('scholarly');
 
   const [draft, setDraft] = React.useState<SectionIR | null>(null);
   const [pristine, setPristine] = React.useState<string>('');
@@ -109,6 +153,9 @@ export function WritingWorkbench() {
   const [savedAt, setSavedAt] = React.useState<Date | null>(null);
   const [pendingSwitch, setPendingSwitch] = React.useState<string | null>(null);
   const [confirmRegenerate, setConfirmRegenerate] = React.useState(false);
+  const [rewriteOpen, setRewriteOpen] = React.useState(false);
+  const [rewriteInstruction, setRewriteInstruction] = React.useState('');
+  const [rewriteLoading, setRewriteLoading] = React.useState(false);
   const [focusMode, setFocusMode] = React.useState(false);
   const [panelOpen, setPanelOpen] = React.useState(false);
   /** 共用的视觉编辑抽屉与生成确认框——点「调整」不再被迫跳去别的页面。 */
@@ -140,23 +187,23 @@ export function WritingWorkbench() {
       setSectionsLoading(false);
       return;
     }
-    let alive = true;
+    const controller = new AbortController();
     setSectionsError(null);
     setSectionsLoading(true);
-    listSections(projectId)
+    listSections(projectId, controller.signal)
       .then(({ data }) => {
-        if (!alive) return;
+        if (controller.signal.aborted) return;
         setSections(data);
         setActiveKey((current) => current ?? data[0]?.section_key ?? null);
         setSectionsLoading(false);
       })
       .catch((err) => {
-        if (!alive) return;
+        if (controller.signal.aborted) return;
         setSectionsError(describeError(err));
         setSectionsLoading(false);
       });
     return () => {
-      alive = false;
+      controller.abort();
     };
   }, [projectId, sectionsToken]);
 
@@ -183,11 +230,22 @@ export function WritingWorkbench() {
     undefined,
     [projectId, paperType],
   );
+  const evidenceModule = useAsyncModule<EvidenceUnit[]>(
+    () => getEvidenceUnits(projectId).then((r) => r.data),
+    [],
+    [projectId],
+  );
+  const outlineModule = useAsyncModule(
+    () => getOutline(projectId).then((r) => r.data),
+    undefined,
+    [projectId],
+  );
 
   const audit = auditModule.data;
   const preview = previewModule.data;
   const quality = qualityModule.data;
   const numlint = numlintModule.data;
+  const evidenceUnits = evidenceModule.data;
 
   const visualsModule = useVisuals(projectId);
   const { visuals } = visualsModule;
@@ -198,8 +256,19 @@ export function WritingWorkbench() {
     previewModule.reload();
     qualityModule.reload();
     numlintModule.reload();
+    evidenceModule.reload();
+    outlineModule.reload();
     visualsModule.reload();
-  }, [reloadSections, auditModule, previewModule, qualityModule, numlintModule, visualsModule]);
+  }, [
+    reloadSections,
+    auditModule,
+    previewModule,
+    qualityModule,
+    numlintModule,
+    evidenceModule,
+    outlineModule,
+    visualsModule,
+  ]);
 
   const runReloadRef = React.useRef(runReload);
   React.useEffect(() => {
@@ -395,6 +464,47 @@ export function WritingWorkbench() {
     setEditorRevision((r) => r + 1);
   };
 
+  const createRewriteCandidate = async () => {
+    if (!active || !draft || rewriteInstruction.trim().length < 3) return;
+    const savedImmediatelyBeforeRewrite = dirty;
+    if (savedImmediatelyBeforeRewrite && !(await save())) return;
+    setRewriteLoading(true);
+    try {
+      const candidate = await rewriteSectionCandidate(
+        projectId,
+        active.section_key,
+        rewriteInstruction.trim(),
+        savedImmediatelyBeforeRewrite ? undefined : active.updated_at,
+      );
+      setRewriteOpen(false);
+      setDiff({
+        original: sectionPlainText(candidate.original_body_ir),
+        refined: sectionPlainText(candidate.candidate_body_ir),
+        note: candidate.note ?? '候选已通过引用、数字、素材引用与结构守恒检查；接受后会创建新的可恢复文档版本。',
+        apply: () => {
+          void acceptSectionRewrite(
+            projectId,
+            active.section_key,
+            candidate.candidate_body_ir,
+            savedImmediatelyBeforeRewrite ? undefined : active.updated_at,
+          ).then((accepted) => {
+            toast({ title: `已创建文稿 v${accepted.document_version}`, description: '单章重写已接受并切换为当前文稿。', variant: 'success' });
+            reloadSections();
+            previewModule.reload();
+            qualityModule.reload();
+            reloadProject();
+          }).catch((error) => {
+            toast({ title: '重写候选未能接受', description: describeError(error), variant: 'error' });
+          });
+        },
+      });
+    } catch (error) {
+      toast({ title: '本章重写失败', description: describeError(error), variant: 'error' });
+    } finally {
+      setRewriteLoading(false);
+    }
+  };
+
   const startWriting = async () => {
     setConfirmRegenerate(false);
     try {
@@ -402,6 +512,19 @@ export function WritingWorkbench() {
       startJob(started.data, '后端不可用：无法开始写作');
     } catch (err) {
       toast({ title: '写作未能启动', description: describeError(err), variant: 'error' });
+    }
+  };
+
+  const rebuildFromLatestEvidence = async () => {
+    try {
+      const started = await rebuildDraft(projectId);
+      startJob(started.data, '后端不可用：无法按最新证据重建草稿');
+    } catch (err) {
+      toast({
+        title: '草稿重建未能启动',
+        description: describeError(err),
+        variant: 'error',
+      });
     }
   };
 
@@ -418,6 +541,22 @@ export function WritingWorkbench() {
       startJob(started.data, '后端不可用：无法生成质量报告');
     } catch (err) {
       toast({ title: '质量报告未能启动', description: describeError(err), variant: 'error' });
+    }
+  };
+
+  const runQualityRepair = async (
+    selectedProfile: QualityProfile,
+    reviewStyle: ReviewStyle,
+  ) => {
+    setQualityProfile(selectedProfile);
+    try {
+      const started = await repairQuality(projectId, {
+        quality_profile: selectedProfile,
+        review_style: reviewStyle,
+      });
+      startJob(started.data, '后端不可用：无法启动质量修复');
+    } catch (err) {
+      toast({ title: '自动修复未能启动', description: describeError(err), variant: 'error' });
     }
   };
 
@@ -527,27 +666,42 @@ export function WritingWorkbench() {
     [visuals, toast],
   );
 
-  // 需要用户处理的信任告警数，用于窄屏「校验」按钮上的角标。
-  const trustAlerts =
-    (audit?.hallucinated_cite_keys.length ?? 0) +
-    (paperType === 'original' && numlint && !numlint.consistent ? numlint.unsourced_count : 0);
+  // 入口只表达“是否有待处理项”。不同作用域的数量不可相加，否则会让用户误以为
+  // 右栏里存在一个统一的问题清单。
+  const hasValidationIssues =
+    (audit?.hallucinated_cite_keys?.length ?? 0) > 0 ||
+    Boolean(paperType === 'original' && numlint && !numlint.consistent) ||
+    (quality?.blockers?.length ?? 0) > 0;
+  const qualityRunning = Boolean(
+    runningStage &&
+      ['quality', 'repair_search', 'repair_ingest', 'quality_repair', 'quality_recheck'].includes(
+        runningStage,
+      ),
+  );
 
   // 抽屉与右栏共用同一个面板实例定义。
   const validationPanel = (
-    <ValidationPanel
-      activeSection={active}
-      activeDraft={draft}
-      audit={audit}
-      quality={quality}
-      numlint={numlint}
-      showNumbers={paperType === 'original'}
-      onGenerateQuality={runQuality}
-      busy={busy}
-      onJumpToSection={(key) => {
-        requestSwitch(key);
-        setPanelOpen(false);
-      }}
-    />
+    <React.Suspense fallback={<DeferredModuleFallback className="h-72" />}>
+      <ValidationPanel
+        activeSection={active}
+        activeDraft={draft}
+        audit={audit}
+        quality={quality}
+        numlint={numlint}
+        auditState={auditModule}
+        qualityState={qualityModule}
+        numlintState={numlintModule}
+        showNumbers={paperType === 'original'}
+        onGenerateQuality={runQuality}
+        onRepairQuality={runQualityRepair}
+        busy={busy}
+        qualityRunning={qualityRunning}
+        onJumpToSection={(key) => {
+          requestSwitch(key);
+          setPanelOpen(false);
+        }}
+      />
+    </React.Suspense>
   );
 
   return (
@@ -558,22 +712,59 @@ export function WritingWorkbench() {
         actions={
           <>
             <SaveStatus dirty={dirty} saving={saving} savedAt={savedAt} />
-            {dirty && (
-              <Button variant="ghost" size="sm" onClick={discardDraft}>
-                放弃草稿
-              </Button>
-            )}
-            <Button variant="outline" onClick={() => void save()} disabled={!draft || saving || !dirty}>
-              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            <Button
+              variant="outline"
+              onClick={() => void save()}
+              disabled={!draft || !dirty}
+              loading={saving}
+              loadingLabel="保存中…"
+            >
+              <Save className="h-4 w-4" />
               保存本节
             </Button>
-            <Button onClick={() => setConfirmRegenerate(true)} disabled={!projectId || busy}>
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PenLine className="h-4 w-4" />}
-              重新生成全文
-            </Button>
+            <ActionMenu
+              label="文稿操作"
+              items={[
+                {
+                  label: '放弃草稿',
+                  icon: X,
+                  description: '恢复本节上次保存的内容',
+                  onSelect: discardDraft,
+                  disabled: !dirty,
+                },
+                {
+                  label: '重写本章',
+                  icon: PenLine,
+                  description: '先生成候选并预览，接受后创建新文档版本',
+                  onSelect: () => setRewriteOpen(true),
+                  disabled: !active || busy,
+                },
+                {
+                  label: '重新生成全文',
+                  icon: PenLine,
+                  description: '生成新文档版本并切换，旧版本与导出文件保留',
+                  onSelect: () => setConfirmRegenerate(true),
+                  disabled: !projectId || busy,
+                },
+              ]}
+            />
           </>
         }
       />
+
+      {outlineModule.data?.stale && (
+        <Callout variant="warning" className="flex flex-wrap items-center justify-between gap-3">
+          <span>证据矩阵与综合判定已更新，当前正文仍基于旧大纲。</span>
+          <Button
+            size="sm"
+            disabled={busy || dirty}
+            onClick={() => void rebuildFromLatestEvidence()}
+          >
+            <RefreshCw className="h-4 w-4" />
+            按最新证据重建草稿
+          </Button>
+        </Callout>
+      )}
 
       {/* 视觉列表失败不能让正文编辑器消失：它只是正文旁边的一条辅助信息。 */}
       {!focusMode && (
@@ -610,7 +801,7 @@ export function WritingWorkbench() {
         ) : (
           <div
             className={cn(
-              'grid gap-6 lg:grid-cols-[12rem,minmax(0,1fr)]',
+              'grid gap-6 xl:grid-cols-[12rem,minmax(0,1fr)]',
               /*
                * 三栏只在 2xl（1536px+）才成立。
                *
@@ -634,7 +825,7 @@ export function WritingWorkbench() {
                 <Tabs value={view} onValueChange={(v) => setView(v as View)}>
                   <TabsList>
                     <TabsTrigger value="editor">编辑</TabsTrigger>
-                    <TabsTrigger value="preview">全文预览</TabsTrigger>
+                    <TabsTrigger value="preview">全文预览{dirty ? '（上次保存）' : ''}</TabsTrigger>
                   </TabsList>
                 </Tabs>
                 <div className="flex items-center gap-2">
@@ -643,19 +834,6 @@ export function WritingWorkbench() {
                       本节 {liveWords.toLocaleString()} 字
                     </span>
                   )}
-                  {/*
-                    单章重写：后端只有整份文稿的 POST /sections/generate，
-                    没有按 section 的端点。这里**显示但禁用**，而不是隐藏——
-                    让用户看得见能力边界，否则「为什么只能全量重跑」无从得知。
-                  */}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled
-                    title="后端目前只支持整份文稿重生成，暂无单章重写端点"
-                  >
-                    <RefreshCw className="h-3.5 w-3.5" /> 重写本章
-                  </Button>
                   {/* 窄屏（<2xl）没有右栏的位置，校验面板收进抽屉。 */}
                   {!focusMode && (
                     <Button
@@ -665,10 +843,11 @@ export function WritingWorkbench() {
                       className="2xl:hidden"
                     >
                       <ShieldCheck className="h-3.5 w-3.5" /> 校验
-                      {trustAlerts > 0 && (
-                        <Badge variant="destructive" className="ml-1 text-xs">
-                          {trustAlerts}
-                        </Badge>
+                      {hasValidationIssues && (
+                        <span
+                          className="ml-1 h-2 w-2 rounded-full bg-warning"
+                          aria-label="有待处理的校验问题"
+                        />
                       )}
                     </Button>
                   )}
@@ -692,24 +871,42 @@ export function WritingWorkbench() {
                 /* 正文按 measure 限宽而不是撑满剩余空间：此前 1280px 屏上
                    正文栏只有 390px（约 24–28 字符/行），远低于 60–80 的舒适区。 */
                 <div className={cn('mx-auto w-full', focusMode ? 'max-w-[78ch]' : 'max-w-[72ch]')}>
-                  <SectionEditor
-                    key={`${active?.section_key}:${editorRevision}`}
-                    section={draft}
-                    whitelist={whitelist}
-                    onChange={setDraft}
-                    softChecks={quality?.soft_check ?? []}
-                    onRefine={onRefine}
-                    refining={refining}
-                    visuals={visuals}
-                    numbering={figureNumbering}
-                    onReplaceFigure={replaceFigure}
-                  />
+                  <React.Suspense fallback={<DeferredModuleFallback className="h-[32rem]" />}>
+                    <SectionEditor
+                      key={`${active?.section_key}:${editorRevision}`}
+                      section={draft}
+                      whitelist={whitelist}
+                      onChange={setDraft}
+                      softChecks={quality?.soft_check ?? []}
+                      onRefine={onRefine}
+                      refining={refining}
+                      visuals={visuals}
+                      numbering={figureNumbering}
+                      onReplaceFigure={replaceFigure}
+                      evidenceUnits={evidenceUnits}
+                    />
+                  </React.Suspense>
                 </div>
               )}
 
               {view === 'preview' && (
-                <div className="mx-auto w-full max-w-[78ch]">
-                  <MarkdownPreview markdown={preview?.markdown ?? ''} />
+                <div className="mx-auto w-full max-w-[78ch] space-y-3">
+                  {dirty && (
+                    <Callout variant="warning" className="flex flex-wrap items-center justify-between gap-3">
+                      <span>预览基于上次保存版本，不包含当前章节的未保存修改。</span>
+                      <Button size="sm" loading={saving} onClick={async () => {
+                        if (await save()) previewModule.reload();
+                      }}>
+                        <Save className="h-3.5 w-3.5" /> 保存并刷新预览
+                      </Button>
+                    </Callout>
+                  )}
+                  <ModuleError label="全文预览" error={previewModule.error} onRetry={previewModule.reload} />
+                  {!previewModule.error && (
+                    <React.Suspense fallback={<DeferredModuleFallback className="h-[32rem]" />}>
+                      <MarkdownPreview markdown={preview?.markdown ?? ''} />
+                    </React.Suspense>
+                  )}
                 </div>
               )}
             </div>
@@ -728,7 +925,7 @@ export function WritingWorkbench() {
         open={panelOpen}
         onClose={() => setPanelOpen(false)}
         title="校验"
-        description="引用真实性、数字一致性与质量提示"
+        description="当前章节检查与整篇投稿质量"
         className="max-w-md"
       >
         {validationPanel}
@@ -737,7 +934,7 @@ export function WritingWorkbench() {
       <Dialog
         open={pendingSwitch !== null}
         onClose={() => setPendingSwitch(null)}
-        title="放弃未保存的编辑？"
+        title="当前章节有未保存修改"
         description="当前章节有尚未保存的修改，切走后这些修改会丢失。"
         footer={
           <>
@@ -771,71 +968,103 @@ export function WritingWorkbench() {
       {/* 后端只有全文重生成端点（POST /sections/generate 重跑整份文稿），
           没有单章重写。既然一次点击会覆盖所有章节的手工修改，就必须先确认。 */}
       <Dialog
+        open={rewriteOpen}
+        onClose={() => setRewriteOpen(false)}
+        title="重写当前章节"
+        description="说明希望如何改写。系统只生成候选，引用、数字、证据与图表必须保持守恒；预览并接受后才会创建新文档版本。"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setRewriteOpen(false)}>取消</Button>
+            <Button loading={rewriteLoading} disabled={rewriteInstruction.trim().length < 3} onClick={createRewriteCandidate}>生成重写候选</Button>
+          </>
+        }
+      >
+        <label className="space-y-1.5 text-sm">
+          <span className="font-medium">重写要求</span>
+          <textarea
+            value={rewriteInstruction}
+            onChange={(event) => setRewriteInstruction(event.target.value)}
+            rows={5}
+            placeholder="例如：强化方法与结果之间的逻辑衔接，压缩背景描述，保留所有数字与引用。"
+            className="w-full rounded-md border bg-background px-3 py-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </label>
+      </Dialog>
+
+      <Dialog
         open={confirmRegenerate}
         onClose={() => setConfirmRegenerate(false)}
-        title="重新生成全文？"
-        description="后端目前只支持整份文稿重生成，不能只重写某一章。"
+        title="生成新的全文版本？"
+        description="系统会按当前大纲生成新的文档版本并切换为当前文稿；旧文档版本和已导出文件仍会保留。"
         footer={
           <>
             <Button variant="outline" onClick={() => setConfirmRegenerate(false)}>
               取消
             </Button>
             <Button variant="destructive" onClick={startWriting}>
-              覆盖并重新生成
+              生成新版本并切换
             </Button>
           </>
         }
       >
-        <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm">
+        <Callout variant="warning" className="flex items-start gap-2">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning-strong" />
           <div className="space-y-1">
             <p>
               <span className="font-medium">全部 {sections.length} 节</span>
-              会按当前大纲重新生成，你在任何一节里的手工修改都会被覆盖。
+              会按当前大纲生成到新的文档版本，完成后切换为当前文稿。
             </p>
             <p className="text-xs text-muted-foreground">
               已导出的产物不受影响，仍可在导出中心下载。
             </p>
           </div>
-        </div>
+        </Callout>
       </Dialog>
 
-      <DiffPreviewDialog
-        open={diff !== null}
-        original={diff?.original ?? ''}
-        refined={diff?.refined ?? ''}
-        note={diff?.note}
-        onCancel={() => setDiff(null)}
-        onAccept={() => {
-          diff?.apply(diff.refined);
-          setDiff(null);
-        }}
-      />
+      <React.Suspense fallback={null}>
+        {diff && (
+          <DiffPreviewDialog
+            open
+            original={diff.original}
+            refined={diff.refined}
+            note={diff.note}
+            onCancel={() => setDiff(null)}
+            onAccept={() => {
+              diff.apply(diff.refined);
+              setDiff(null);
+            }}
+          />
+        )}
 
-      {/* 与视觉工作台同一个编辑器：在写作台点「调整」直接就地改，不用跳页。 */}
-      <VisualEditorDrawer
-        open={editingVisual !== null}
-        onClose={() => setEditingVisual(null)}
-        projectId={projectId}
-        visual={editingVisual}
-        assets={[]}
-        aiGenerationAvailable={visualsModule.aiGenerationAvailable}
-        targetSectionKey={activeKey}
-        capabilities={visualsModule.capabilities}
-        onSubmit={(payload) => {
-          if (editingVisual) void visualsModule.createRevision(editingVisual, payload);
-        }}
-      />
+        {/* 与视觉工作台同一个编辑器：在写作台点「调整」直接就地改，不用跳页。 */}
+        {editingVisual && (
+          <VisualEditorDrawer
+            open
+            onClose={() => setEditingVisual(null)}
+            projectId={projectId}
+            visual={editingVisual}
+            assets={[]}
+            aiGenerationAvailable={visualsModule.aiGenerationAvailable}
+            targetSectionKey={activeKey}
+            capabilities={visualsModule.capabilities}
+            onSubmit={(payload) => {
+              void visualsModule.createRevision(editingVisual, payload);
+            }}
+          />
+        )}
 
-      <AIGenerationDialog
-        visual={confirmingVisual}
-        capabilities={visualsModule.capabilities}
-        onCancel={() => setConfirmingVisual(null)}
-        onConfirm={(visual) => {
-          setConfirmingVisual(null);
-          void visualsModule.generate(visual);
-        }}
-      />
+        {confirmingVisual && (
+          <AIGenerationDialog
+            visual={confirmingVisual}
+            capabilities={visualsModule.capabilities}
+            onCancel={() => setConfirmingVisual(null)}
+            onConfirm={(visual) => {
+              setConfirmingVisual(null);
+              void visualsModule.generate(visual);
+            }}
+          />
+        )}
+      </React.Suspense>
 
       <WorkbenchFooterNav current="write" />
     </div>
@@ -880,19 +1109,26 @@ function VisualSuggestionsPanel({
     .filter((group) => group.latest.target_section_key === activeSectionKey)
     .slice(0, 2);
   const shown = relevant.length > 0 ? relevant : pending.slice(0, 2);
+  const [expanded, setExpanded] = React.useState(false);
 
   return (
-    <section className="rounded-xl border bg-card/60 p-3" aria-label="视觉建议">
+    <section className="rounded-lg border bg-card/60 p-3" aria-label="视觉建议">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
+        <button
+          type="button"
+          onClick={() => pending.length > 0 && setExpanded((value) => !value)}
+          aria-expanded={pending.length > 0 ? expanded : undefined}
+          className="min-w-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
           <p className="flex items-center gap-2 text-sm font-medium">
             <ImageIcon className="h-4 w-4 text-primary" /> 视觉建议
             {pending.length > 0 && <Badge variant="secondary">{pending.length}</Badge>}
+            {pending.length > 0 && <ChevronDown className={cn('h-3.5 w-3.5 transition-transform', expanded && 'rotate-180')} />}
           </p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            建议不会自动插入论文；AI 插图也只在你确认后才调用外部服务。
+            {pending.length > 0 ? `${pending.length} 条待处理；展开后可逐条查看。` : '暂无待处理建议，可随时重新分析全文。'}
           </p>
-        </div>
+        </button>
         <div className="flex items-center gap-2">
           <Link
             href={projectHref(projectId, 'visuals')}
@@ -910,7 +1146,7 @@ function VisualSuggestionsPanel({
           </Button>
         </div>
       </div>
-      {shown.length > 0 && (
+      {expanded && shown.length > 0 && (
         <div className="mt-3 grid gap-3 xl:grid-cols-2">
           {shown.map((group) => (
             <VisualCard
@@ -963,7 +1199,7 @@ function SectionTree({
         type="button"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
-        className="flex w-full items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm transition-colors hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring lg:hidden"
+        className="flex min-h-11 w-full items-center justify-between gap-2 rounded-md border px-3 py-2 text-body transition-colors hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring xl:hidden"
       >
         <span className="min-w-0 truncate font-medium">{activeTitle}</span>
         <span className="shrink-0 text-xs text-muted-foreground">
@@ -977,7 +1213,7 @@ function SectionTree({
       <nav
         aria-label="章节"
         className={cn(
-          'space-y-0.5 lg:sticky lg:top-4 lg:block lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto scrollbar-thin',
+          'space-y-0.5 xl:sticky xl:top-4 xl:block xl:max-h-[calc(100vh-2rem)] xl:self-start xl:overflow-y-auto scrollbar-thin',
           expanded ? 'block' : 'hidden',
         )}
       >

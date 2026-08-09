@@ -54,7 +54,7 @@ export function CiteKeyPicker({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="过滤引用键"
-          className="h-7 pl-7 text-xs"
+          className="pl-8 md:h-9"
         />
       </div>
       <div

@@ -27,6 +27,7 @@ NETWORK_TIMEOUT = "network_timeout"
 INVALID_IMAGE = "invalid_image"
 NORMALIZATION_FAILED = "normalization_failed"
 VISUALD_UNAVAILABLE = "visuald_unavailable"
+VISUAL_PREFLIGHT_FAILED = "visual_preflight_failed"
 SOURCE_UNRESOLVED = "source_unresolved"
 INTERNAL_ERROR = "internal_error"
 
@@ -42,6 +43,7 @@ VISUAL_ERROR_CODES: frozenset[str] = frozenset(
         INVALID_IMAGE,
         NORMALIZATION_FAILED,
         VISUALD_UNAVAILABLE,
+        VISUAL_PREFLIGHT_FAILED,
         SOURCE_UNRESOLVED,
         INTERNAL_ERROR,
     }
@@ -75,6 +77,9 @@ ERROR_MESSAGES: dict[str, str] = {
     INVALID_IMAGE: "图像服务返回的内容不是可用的图片。重试一次；若持续出现请更换模型。",
     NORMALIZATION_FAILED: "图片归一化失败。重试一次；若持续失败请检查 visuald 服务日志。",
     VISUALD_UNAVAILABLE: "图形渲染服务（visuald）不可用。确认该服务已启动后重试。",
+    VISUAL_PREFLIGHT_FAILED: (
+        "图形已生成，但画布尺寸或版式未通过预检。调整布局或输出尺寸后再生成。"
+    ),
     SOURCE_UNRESOLVED: (
         "图表的数据来源无法解析：素材可能已被删除，或尚未完成解析。回素材中心确认后重试。"
     ),
@@ -149,14 +154,20 @@ def classify_visual_error(error: BaseException) -> VisualErrorInfo:
         # visuald 既负责确定性渲染，也负责 AI 图的归一化。两条路径的失败
         # 对用户的含义不同，靠消息里的 `/normalize` 区分。
         code = NORMALIZATION_FAILED if "normalize" in str(error) else VISUALD_UNAVAILABLE
-        return VisualErrorInfo(
-            code=code, message=message_for(code), retryable=True, detail=detail
-        )
+        return VisualErrorInfo(code=code, message=message_for(code), retryable=True, detail=detail)
 
     if isinstance(error, _SOURCE_ERRORS) and _looks_like_source_failure(error):
         return VisualErrorInfo(
             code=SOURCE_UNRESOLVED,
             message=message_for(SOURCE_UNRESOLVED),
+            retryable=False,
+            detail=detail,
+        )
+
+    if isinstance(error, ValueError) and str(error).startswith("visual preflight failed:"):
+        return VisualErrorInfo(
+            code=VISUAL_PREFLIGHT_FAILED,
+            message=message_for(VISUAL_PREFLIGHT_FAILED),
             retryable=False,
             detail=detail,
         )

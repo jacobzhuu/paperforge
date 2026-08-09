@@ -50,12 +50,21 @@ export function ProjectPipelineNav({
 }) {
   const steps = pipelineSteps(paperType);
   const [open, setOpen] = React.useState(false);
+  const listRef = React.useRef<HTMLOListElement>(null);
 
   const index = steps.findIndex((s) => s.id === current);
   const activeStep = index >= 0 ? steps[index] : steps[0];
 
+  React.useEffect(() => {
+    const active = listRef.current?.querySelector<HTMLElement>('[aria-current="page"]');
+    active?.scrollIntoView?.({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+  }, [current, open]);
+
   const list = (
-    <ol className="scrollbar-thin flex items-center gap-0.5 overflow-x-auto pb-2">
+    <ol
+      ref={listRef}
+      className="scrollbar-thin flex items-center gap-0.5 overflow-x-auto pb-2 [mask-image:linear-gradient(to_right,transparent,black_1rem,black_calc(100%-1rem),transparent)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_1rem,black_calc(100%-1rem),transparent)]"
+    >
       {steps.map((step) => (
         <li key={step.id} className="shrink-0">
           <StepLink
@@ -121,7 +130,7 @@ function StepLink({
       aria-current={active ? 'page' : undefined}
       title={badge?.title ?? step.hint}
       className={cn(
-        'flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm transition-colors',
+        'flex min-h-11 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-body transition-colors md:min-h-0',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         active
           ? 'font-medium text-foreground'
@@ -135,7 +144,7 @@ function StepLink({
         「这一步有产物了」，角标说「这里还有事等你做」。
       */}
       {badge?.count ? (
-        <span className="rounded-full bg-muted px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+        <span className="rounded-full bg-muted px-1.5 text-micro font-medium tabular-nums text-muted-foreground">
           {badge.count}
         </span>
       ) : null}

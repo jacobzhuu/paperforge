@@ -1,7 +1,7 @@
 """PaperForge 学术检索网关。
 
 迁移自 DeepSearch literature_review 的确定性资产（设计 §3.1 / §9）：
-标识符规范化、确定性去重、五源检索适配器（含限速/熔断/缓存）、引文雪球扩展、
+标识符规范化、确定性去重、多源检索适配器（含限速/熔断/缓存）、引文雪球扩展、
 OA 全文获取、合规 HTTP 客户端。
 """
 
@@ -25,6 +25,8 @@ from scholar_gateway.fulltext import (
     OaFulltextPlan,
     OaFulltextTarget,
     acquire_oa_fulltext,
+    discover_doaj_links,
+    discover_unpaywall_links,
     plan_oa_fulltext,
 )
 from scholar_gateway.http import HttpFetchResult, SafeHttpClient
@@ -107,6 +109,8 @@ __all__ = [
     "VerificationRequest",
     "VerificationResult",
     "acquire_oa_fulltext",
+    "discover_doaj_links",
+    "discover_unpaywall_links",
     "build_adapter",
     "canonical_request_url",
     "dedupe_scholarly_candidates",

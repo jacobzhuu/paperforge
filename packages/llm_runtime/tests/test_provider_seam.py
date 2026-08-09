@@ -27,6 +27,22 @@ def test_role_routing_prefers_override_then_default():
     assert config.model_for_role("writer") == "custom-writer"
     assert config.model_for_role("planner") == DEFAULT_ROLE_MODELS["planner"]
     assert config.model_for_role("unknown-role") == "fallback"
+    assert config.thinking_for_role("extractor") == "disabled"
+    assert config.thinking_for_role("reranker") == "disabled"
+    assert config.thinking_for_role("writer") is None
+
+
+def test_evidence_classifier_inherits_deployed_deepseek_tiers() -> None:
+    config = LLMConfig(
+        provider="openai",
+        role_models={
+            "extractor": "deepseek-v4-flash",
+            "planner": "deepseek-v4-pro",
+        },
+    )
+    assert config.model_for_role("evidence_classifier") == "deepseek-v4-flash"
+    assert config.model_for_role("evidence_classifier_fallback") == "deepseek-v4-pro"
+    assert config.thinking_for_role("evidence_classifier") is None
 
 
 def _request() -> LLMRequest:
@@ -106,7 +122,7 @@ def test_max_output_tokens_are_clamped_by_model():
     assert clamp_max_output_tokens(999_999, model="unknown") == 8_192
 
 
-def test_empty_content_with_reasoning_is_reported_as_truncation():
+def test_empty_content_with_reasoning_skips_same_budget_provider_retries():
     """推理型模型把思维链计入 max_tokens：预算耗尽时 content 为空。
 
     这与「响应结构非法」是两回事——前者加预算重试就能救，必须区分开。
@@ -115,7 +131,11 @@ def test_empty_content_with_reasoning_is_reported_as_truncation():
     from llm_runtime.providers import OpenAICompatibleLLMProvider
     from llm_runtime.types import LLMError, LLMRequest
 
+    calls = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(
             200,
             json={
@@ -137,7 +157,7 @@ def test_empty_content_with_reasoning_is_reported_as_truncation():
         api_key="k",
         model="deepseek-v4-pro",
         timeout_seconds=5.0,
-        max_retries=0,
+        max_retries=2,
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     try:
@@ -151,9 +171,63 @@ def test_empty_content_with_reasoning_is_reported_as_truncation():
         )
     except LLMError as error:
         assert error.error_code == "output_truncated"
-        assert error.retryable is True
+        assert error.retryable is False
     else:
         raise AssertionError("expected LLMError")
+    assert calls == 1
+
+
+def test_deepseek_structured_request_sets_json_and_disables_thinking():
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "deepseek-v4-flash",
+                "choices": [
+                    {
+                        "message": {"content": '{"ok":true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleLLMProvider(
+            base_url="https://api.deepseek.com",
+            api_key="k",
+            model="deepseek-v4-flash",
+            timeout_seconds=5,
+            max_retries=0,
+            client=client,
+        )
+        response = provider.generate(
+            LLMRequest(
+                system_prompt="return JSON",
+                user_prompt="extract",
+                model="deepseek-v4-flash",
+                max_output_tokens=100,
+                json_output=True,
+                thinking_mode="disabled",
+            )
+        )
+    assert response.text == '{"ok":true}'
+    assert payloads == [
+        {
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": "return JSON"},
+                {"role": "user", "content": "extract"},
+            ],
+            "max_tokens": 100,
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+        }
+    ]
 
 
 def test_runner_retries_once_with_doubled_budget_on_truncation():
@@ -211,12 +285,24 @@ def test_runner_retries_once_with_doubled_budget_on_truncation():
         on_call=calls.append,
     )
     response = runner.generate(
-        "planner", system_prompt="s", user_prompt="u", max_output_tokens=1000
+        "planner",
+        system_prompt="s",
+        user_prompt="u",
+        max_output_tokens=1000,
+        metadata={"stage": "scope"},
     )
     assert response is not None and response.text == "ok"
     assert budgets == [1000, 2000]
     # 两次调用都记账：失败那次带 error_code，成本面板才看得见。
     assert [c.error_code for c in calls] == ["output_truncated", None]
+    assert [c.provider for c in calls] == ["openai", "openai-compatible"]
+    assert calls[0].metadata == {"role": "planner", "stage": "scope"}
+    assert calls[1].metadata == {
+        "role": "planner",
+        "stage": "scope",
+        "retry": "output_truncated",
+    }
+    assert calls[0].occurred_at <= calls[1].occurred_at
 
 
 def test_runner_does_not_retry_forever_on_truncation():

@@ -6,7 +6,6 @@ import { PageContainer } from '@/components/layout/page-container';
 import { PageHeader } from '@/components/layout/page-header';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -79,14 +78,14 @@ export function SettingsPage() {
           }}
         >
           <div className="space-y-6">
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center gap-1.5 text-sm">
+            <section>
+              <header className="pb-2">
+                <h3 className="flex items-center gap-1.5 text-body">
                   <Cpu className="h-4 w-4" /> LLM 运行时
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
+                </h3>
+              </header>
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-meta">
                   <span>
                     provider：<span className="font-mono">{settings?.llm_provider ?? '—'}</span>
                   </span>
@@ -111,20 +110,26 @@ export function SettingsPage() {
                     )}
                   </span>
                 </div>
-                <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                  配置方式：编辑仓库根目录的 <code>.env</code>（<code>LLM_DEFAULT_PROVIDER</code>、
-                  <code>LLM_OPENAI_BASE_URL</code>、<code>LLM_OPENAI_API_KEY</code>、
-                  <code>LLM_ROLE_MODELS</code>），然后重启 <code>./scripts/dev up</code>。
-                  密钥只存在于服务端环境，界面永不回传。
-                </p>
-              </CardContent>
-            </Card>
+                {process.env.NODE_ENV === 'development' ? (
+                  <p className="rounded-md bg-muted/40 px-3 py-2 text-meta text-muted-foreground">
+                    配置方式：编辑仓库根目录的 <code>.env</code>（<code>LLM_DEFAULT_PROVIDER</code>、
+                    <code>LLM_OPENAI_BASE_URL</code>、<code>LLM_OPENAI_API_KEY</code>、
+                    <code>LLM_ROLE_MODELS</code>），然后重启 <code>./scripts/dev up</code>。
+                    密钥只存在于服务端环境，界面永不回传。
+                  </p>
+                ) : (
+                  <p className="rounded-md bg-muted/40 px-3 py-2 text-meta text-muted-foreground">
+                    运行时模型与密钥由管理员统一配置；如需调整，请联系管理员。
+                  </p>
+                )}
+              </div>
+            </section>
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">图片与图表生成</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-xs text-muted-foreground">
+            <section>
+              <header className="pb-2">
+                <h3 className="text-body">图片与图表生成</h3>
+              </header>
+              <div className="space-y-2 text-meta text-muted-foreground">
                 <Row label="确定性视觉" value={settings?.visuals_enabled ? '已启用' : '已关闭'} />
                 <Row
                   label="AI 插图"
@@ -145,14 +150,14 @@ export function SettingsPage() {
                 <p className="border-t pt-2">
                   图像密钥与文本模型密钥相互独立；未配置时，数据图表和学术示意图仍可正常使用。
                 </p>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">模型角色路由</CardTitle>
-              </CardHeader>
-              <CardContent className="px-0 pb-0">
+            <section>
+              <header className="pb-2">
+                <h3 className="text-body">模型角色路由</h3>
+              </header>
+              <div className="px-0 pb-0">
                 <Table>
                   <TableHeader>
                     <TableRow>
@@ -165,27 +170,23 @@ export function SettingsPage() {
                     {(settings?.roles ?? []).map((role) => (
                       <TableRow key={role.role}>
                         <TableCell className="font-medium">{role.role}</TableCell>
-                        <TableCell className="font-mono text-xs">{role.model}</TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
+                        <TableCell className="font-mono text-meta">{role.model}</TableCell>
+                        <TableCell className="text-meta text-muted-foreground">
                           {role.description}
                         </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
                 </Table>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">其他运行时</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-1.5 text-xs text-muted-foreground">
+            <section>
+              <header className="pb-2">
+                <h3 className="text-body">其他运行时</h3>
+              </header>
+              <div className="space-y-1.5 text-meta text-muted-foreground">
                 <Row label="对象存储" value={settings?.storage_backend ?? '—'} />
-                <Row
-                  label="Semantic Scholar Key"
-                  value={settings?.semantic_scholar_key_configured ? '已配置' : '未配置（走匿名限额）'}
-                />
                 <Row
                   label="检索联系邮箱"
                   value={settings?.scholar_contact_email_configured ? '已配置' : '未配置'}
@@ -193,8 +194,8 @@ export function SettingsPage() {
                 <p className="border-t pt-2">
                   项目的成本面板与版本历史已移到各项目的<span className="font-medium text-foreground">概览</span>页。
                 </p>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
           </div>
         </LoadState>
       </div>
@@ -263,14 +264,14 @@ function AcademicProfileCard({
   };
 
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="flex items-center gap-1.5 text-sm">
+    <section>
+      <header className="pb-2">
+        <h3 className="flex items-center gap-1.5 text-body">
           <UserRound className="h-4 w-4" /> 我的学术身份
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <p className="text-xs text-muted-foreground">
+        </h3>
+      </header>
+      <div className="space-y-4">
+        <p className="text-meta text-muted-foreground">
           填写一次即可在每个项目中复用；项目会保存独立快照，之后修改这里不会改写旧论文署名。
         </p>
         <div className="grid gap-4 md:grid-cols-2">
@@ -318,7 +319,7 @@ function AcademicProfileCard({
           </div>
         </div>
         <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
-          <label className="flex min-h-11 items-center gap-3 text-sm">
+          <label className="flex min-h-11 items-center gap-3 text-body">
             <Checkbox
               checked={profile.corresponding}
               onCheckedChange={(corresponding) => setProfile((current) => ({ ...current, corresponding }))}
@@ -331,8 +332,8 @@ function AcademicProfileCard({
             {saving ? '正在保存…' : '保存学术身份'}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 

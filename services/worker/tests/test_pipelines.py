@@ -20,6 +20,11 @@ from paperforge_worker.pipelines.cards import (
     extract_card,
     normalize_card,
 )
+from paperforge_worker.pipelines.evidence import (
+    _evidence_candidates,
+    _measurement_candidates,
+    _parse_locator,
+)
 from paperforge_worker.pipelines.ranking import (
     AUTO_SELECT_MIN_TOPIC_EVIDENCE,
     balanced_selection_indices,
@@ -111,6 +116,8 @@ def test_deterministic_scope_is_valid_without_llm() -> None:
     assert scope["keyword_groups"]
     assert scope["time_range"] == {"start_year": 2021, "end_year": 2026}
     assert scope["research_question"]
+    assert scope["sub_questions"]
+    assert all(item["comparison_dimensions"] for item in scope["sub_questions"])
 
 
 def test_topic_terms_drops_stopwords_and_keeps_order() -> None:
@@ -209,6 +216,32 @@ def test_normalize_scope_repairs_partial_llm_output() -> None:
     ]
     # end_year 缺失时用确定性回退补齐，且顺序被修正。
     assert scope["time_range"]["start_year"] <= scope["time_range"]["end_year"]
+
+
+def test_normalize_scope_preserves_structured_sub_questions() -> None:
+    scope = normalize_scope(
+        {
+            "sub_questions": [
+                {
+                    "text": "Which datasets support the effect?",
+                    "comparison_dimensions": ["dataset", "metric"],
+                    "expected_evidence_kinds": [
+                        "experimental_fact",
+                        "invented_kind",
+                    ],
+                }
+            ]
+        },
+        topic="RAG",
+        now=FIXED_NOW,
+    )
+    assert scope["sub_questions"] == [
+        {
+            "text": "Which datasets support the effect?",
+            "comparison_dimensions": ["dataset", "metric"],
+            "expected_evidence_kinds": ["experimental_fact"],
+        }
+    ]
 
 
 def test_search_queries_and_filters_from_scope() -> None:
@@ -419,7 +452,7 @@ async def test_rerank_without_runner_is_identity() -> None:
 
 
 async def test_card_extraction_uses_llm_output() -> None:
-    runner, _provider, _calls = _runner(
+    runner, provider, _calls = _runner(
         [
             {
                 "summary": "The paper proposes RAG.",
@@ -439,6 +472,8 @@ async def test_card_extraction_uses_llm_output() -> None:
     assert used_fallback is False
     assert card["summary"] == "The paper proposes RAG."
     assert card["extraction_model"] == "stub-model"
+    assert provider.requests[0].json_output is True
+    assert provider.requests[0].thinking_mode == "disabled"
 
 
 async def test_card_extraction_falls_back_without_llm() -> None:
@@ -475,7 +510,7 @@ def test_normalize_card_clips_and_cleans_lists() -> None:
         }
     )
     assert card["summary"] == "spaced out"
-    assert len(card["contributions"]) == 6
+    assert len(card["contributions"]) == 12
     assert card["methods"] == []
     assert card["results"] == ["kept"]
 
@@ -484,6 +519,64 @@ def test_card_source_hash_is_stable_and_input_sensitive() -> None:
     first = card_source_hash(title="T", abstract="A")
     assert first == card_source_hash(title="T", abstract="A")
     assert first != card_source_hash(title="T", abstract="B")
+    assert first != card_source_hash(title="T", abstract="A", language="zh")
+
+
+def test_evidence_candidates_never_promote_abstract_to_fulltext_grade() -> None:
+    candidates = _evidence_candidates(
+        fulltext=None,
+        abstract="The study reports an improvement on a public benchmark.",
+        quotable_points=[],
+        fulltext_used=False,
+    )
+    assert candidates
+    assert {candidate.grade for candidate in candidates} == {"D_abstract_only"}
+    assert all(candidate.section_path == "abstract" for candidate in candidates)
+
+
+def test_fulltext_evidence_retains_page_section_and_object_locator() -> None:
+    candidates = _evidence_candidates(
+        fulltext=(
+            "[[PAGE=7 | SECTION=Results | TABLE=3]]\n"
+            "Results on the benchmark improve by 12 percent in Table 3."
+        ),
+        abstract=None,
+        quotable_points=[],
+        fulltext_used=True,
+    )
+    assert candidates
+    candidate = candidates[0]
+    assert candidate.grade == "A_located_structured"
+    assert candidate.page == 7
+    assert candidate.section_path == "Results"
+    assert candidate.object_ref == "table:3"
+
+
+def test_evidence_locator_parser_is_explicit_and_bounded() -> None:
+    locator = _parse_locator("PAGE=12 | SECTION=Discussion | EQ=4")
+    assert locator == {"page": 12, "section": "Discussion", "object_ref": "eq:4"}
+
+
+def test_measurements_are_extracted_from_prose_and_structured_tables() -> None:
+    prose = _measurement_candidates(
+        "On TestSet, the model reached F1 = 91.3% with a sample size of 1,200."
+    )
+    assert prose[0].metric_name == "F1"
+    assert prose[0].value == 91.3
+    assert prose[0].unit == "%"
+    assert prose[0].dataset == "TestSet"
+    assert prose[0].sample_size == 1200
+
+    table = _measurement_candidates(
+        "Table 2\n| Dataset | nDCG@10 |\n| --- | --- |\n| ML-1M | 0.412 |"
+    )
+    assert any(
+        item.metric_name == "NDCG@10" and item.value == 0.412 and item.dataset == "ML-1M"
+        for item in table
+    )
+
+    bgc = _measurement_candidates("The classifier achieved an AUROC of 0.982 and MCC: 0.71.")
+    assert {(item.metric_name, item.value) for item in bgc} == {("AUROC", 0.982), ("MCC", 0.71)}
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

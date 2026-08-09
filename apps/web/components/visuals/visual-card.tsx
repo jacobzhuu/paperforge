@@ -23,7 +23,7 @@ import { projectHref } from '@/lib/pipeline';
 import { insertPositions } from '@/lib/section-positions';
 import type { PaperSection, RegenerateVisualRequest, SectionIR, VisualAsset } from '@/lib/types';
 import type { TrackedJob } from '@/lib/useJobTracker';
-import { cn } from '@/lib/utils';
+import { cn, formatDate, formatDateTime } from '@/lib/utils';
 import type { VisualGroup } from './use-visuals';
 
 const KIND_LABEL: Record<VisualAsset['kind'], string> = {
@@ -132,23 +132,23 @@ export function VisualCard({
       : []),
     ...downloadItems,
     {
-      label: '来源与技术细节',
+      label: '来源与详情',
       icon: FileClock,
       onSelect: () => setShowDetails((value) => !value),
     },
   ];
 
   return (
-    <article className="rounded-xl border bg-background shadow-sm" data-testid="visual-card">
+    <article className="rounded-lg border bg-background shadow-sm" data-testid="visual-card">
       {preview ? (
         // eslint-disable-next-line @next/next/no-img-element -- authenticated rendition endpoint
         <img
           src={preview}
           alt={visual.alt_text || visual.caption}
-          className={cn('w-full rounded-t-xl bg-white object-contain', compact ? 'h-40' : 'h-56')}
+          className={cn('w-full rounded-t-lg bg-white object-contain', compact ? 'h-40' : 'h-56')}
         />
       ) : (
-        <div className="flex h-36 items-center justify-center rounded-t-xl bg-muted/45 text-sm text-muted-foreground">
+        <div className="flex h-36 items-center justify-center rounded-t-lg bg-muted/45 text-sm text-muted-foreground">
           {generating ? (
             <span className="flex items-center gap-2">
               <Loader2 className="h-4 w-4 animate-spin" /> {job?.label ?? '正在生成预览'}
@@ -166,9 +166,23 @@ export function VisualCard({
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {visual.kind === 'ai_image' && <Badge variant="warning">外部 AI</Badge>}
+            <Badge variant={visual.kind === 'ai_image' ? 'warning' : 'secondary'}>
+              {visual.kind === 'ai_image' ? 'AI 生成' : '本地直出'}
+            </Badge>
             <StatusBadge visual={visual} generating={generating} />
           </div>
+        </div>
+
+        <div
+          className="grid gap-1 rounded-lg bg-muted/40 px-3 py-2 text-xs sm:grid-cols-2"
+          data-testid="visual-generation-metadata"
+        >
+          <p className="min-w-0 text-muted-foreground">
+            生成时间：<span className="font-medium tabular-nums text-foreground">{formatDateTime(visual.generated_at)}</span>
+          </p>
+          <p className="min-w-0 text-muted-foreground">
+            生成方式：<span className="font-medium text-foreground">{generationMethod(visual)}</span>
+          </p>
         </div>
 
         <VisualErrorNotice visual={visual} />
@@ -195,13 +209,19 @@ export function VisualCard({
         {showDetails && (
           <dl className="grid grid-cols-[7rem,minmax(0,1fr)] gap-x-2 gap-y-1 rounded-lg bg-muted/45 p-3 text-xs">
             <dt className="text-muted-foreground">选择依据</dt>
-            <dd>{visual.suggestion_reason || '手动创建'}</dd>
+            <dd>{suggestionBasis(visual)}</dd>
             <dt className="text-muted-foreground">正文来源</dt>
-            <dd>{visual.source_section_keys?.join('、') || '当前意图'}</dd>
+            <dd>
+              {visual.source_section_keys
+                ?.map((key) => sections.find((section) => section.section_key === key)?.title ?? key)
+                .join('、') || '当前意图'}
+            </dd>
             <dt className="text-muted-foreground">目标章节</dt>
-            <dd>{visual.target_section_key || '插入时选择'}</dd>
+            <dd>{selectedSection?.title ?? visual.target_section_key ?? '插入时选择'}</dd>
             <dt className="text-muted-foreground">实际尺寸</dt>
             <dd>{visual.output_width && visual.output_height ? `${visual.output_width} × ${visual.output_height}` : '预览生成后确定'}</dd>
+            <dt className="text-muted-foreground">建议创建时间</dt>
+            <dd>{formatDate(visual.created_at)}</dd>
           </dl>
         )}
       </div>
@@ -252,6 +272,16 @@ export function VisualCard({
       </Dialog>
     </article>
   );
+}
+
+function generationMethod(visual: VisualAsset): string {
+  return visual.kind === 'ai_image' ? 'AI 生成' : '本地直出';
+}
+
+function suggestionBasis(visual: VisualAsset): string {
+  if (visual.kind === 'ai_image') return '概念内容适合使用 AI 生成';
+  if (visual.kind === 'chart') return '可溯源数据适合本地直出';
+  return '结构化内容适合本地直出';
 }
 
 function PrimaryAction({
@@ -318,9 +348,14 @@ function StatusBadge({ visual, generating }: { visual: VisualAsset; generating: 
 }
 
 function VisualErrorNotice({ visual }: { visual: VisualAsset }) {
-  const [open, setOpen] = React.useState(false);
   const error = visual.error;
-  if (!error) return visual.error_message ? <p className="text-xs text-destructive-strong">{visual.error_message}</p> : null;
+  if (!error) {
+    return visual.error_message ? (
+      <p className="text-xs text-destructive-strong">
+        {generationMethod(visual)}失败，请重试或生成新版本。
+      </p>
+    ) : null;
+  }
   return (
     <div className="space-y-1 rounded-lg border border-destructive/35 bg-destructive/10 px-3 py-2 text-xs">
       <p className="flex items-start gap-1.5 text-destructive-strong">
@@ -330,14 +365,6 @@ function VisualErrorNotice({ visual }: { visual: VisualAsset }) {
         {error.retryable ? '这类失败重试通常有效。' : '需要先调整描述，再生成新版本。'}
         {error.request_id && <> 追踪 ID：<code className="font-mono">{error.request_id}</code></>}
       </p>
-      {error.detail && (
-        <>
-          <button type="button" onClick={() => setOpen((value) => !value)} className="underline underline-offset-2">
-            {open ? '收起技术细节' : '展开技术细节'}
-          </button>
-          {open && <pre className="whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[11px]">{error.detail}</pre>}
-        </>
-      )}
     </div>
   );
 }

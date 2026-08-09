@@ -35,13 +35,35 @@ _DEPLOYMENT_ENV_DEFAULTS = {
     "LLM_OPENAI_API_KEY": "",
     "IMAGE_API_KEY": "",
     "IMAGE_ACCOUNT_ID": "",
+    # 本机 .env 可能指向正式 MinIO。测试产物必须始终落到每用例自己的临时目录，
+    # 否则下载/视觉测试会误连 localhost:19000，甚至污染正式对象存储。
+    "STORAGE_BACKEND": "filesystem",
+    # 默认 provider 是 yunwu，它的凭据走独立命名，也必须一起隔离。
+    "YUNWU_API_KEY": "",
 }
+
+_PROXY_ENV_NAMES = (
+    "ALL_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+)
 
 
 @pytest.fixture(autouse=True)
-def isolate_deployment_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_deployment_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
     for name, value in _DEPLOYMENT_ENV_DEFAULTS.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("STORAGE_FS_ROOT", str(tmp_path / "objects"))
+    # 开发机可能通过 SOCKS 代理联网，而最小测试依赖没有安装 httpx[socks]。
+    # 单元/集成测试使用本地替身，不应继承宿主代理；否则连一个请求都没发就初始化失败。
+    for name in _PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_database_url() -> str:

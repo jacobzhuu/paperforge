@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from typing import Any
 
@@ -30,6 +31,13 @@ def extract_pdf_content(*, content: bytes, mime_type: str = "application/pdf") -
         raise DocumentParseError("pdf_signature_mismatch")
 
     parsed = _extract_with_pypdf(content=content, mime_type=mime_type)
+    structured = _extract_with_pdfplumber(content=content, mime_type=mime_type)
+    if structured is not None and (
+        parsed is None
+        or len(structured.text) >= int(len(parsed.text) * 0.8)
+        or bool(structured.metadata.get("structured_objects"))
+    ):
+        parsed = structured
     if parsed is not None and len(parsed.text) >= _MIN_USEFUL_TEXT_CHARS:
         return parsed
 
@@ -76,15 +84,12 @@ def _extract_with_pypdf(*, content: bytes, mime_type: str) -> ParsedContent | No
         if not normalized:
             continue
         parts.append(normalized)
-        segments.append(
-            {
-                "format": "pdf",
-                "page_number": index + 1,
-                "page_range": [index + 1, index + 1],
-                "page_locator_reliable": True,
-                "char_start": offset,
-                "char_end": offset + len(normalized),
-            }
+        segments.extend(
+            _page_structure_segments(
+                normalized,
+                page_number=index + 1,
+                document_offset=offset,
+            )
         )
         offset += len(normalized) + 2
 
@@ -119,3 +124,207 @@ def _derive_title(text: str) -> str | None:
         if len(candidate) >= 8:
             return candidate[:300]
     return None
+
+
+def _extract_with_pdfplumber(*, content: bytes, mime_type: str) -> ParsedContent | None:
+    """MIT 许可的 pdfplumber 增强路径：标题线索、表格、图注与公式引用。"""
+    try:
+        import pdfplumber
+    except ImportError:
+        return None
+    try:
+        pdf = pdfplumber.open(BytesIO(content))
+    except Exception:  # noqa: BLE001 - 损坏/加密 PDF 交给其他路径
+        return None
+    try:
+        parts: list[str] = []
+        segments: list[dict[str, Any]] = []
+        objects: list[dict[str, Any]] = []
+        offset = 0
+        table_number = 0
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_text = _normalize_pdf_text(page.extract_text() or "")
+            if not page_text:
+                continue
+            page_parts = [page_text]
+            page_start = offset
+            segments.extend(
+                _page_structure_segments(
+                    page_text,
+                    page_number=page_number,
+                    document_offset=page_start,
+                )
+            )
+            for match in re.finditer(
+                r"^(?P<label>(?:Figure|Fig\.|Table|图|表)\s*[A-Za-z]?\d+"
+                r"(?:[.-]\d+)?[.:]?[^\n]{0,500})$",
+                page_text,
+                re.IGNORECASE | re.MULTILINE,
+            ):
+                label = match.group("label")
+                kind = "table" if re.match(r"^(?:Table|表)", label, re.IGNORECASE) else "figure"
+                number = re.search(r"[A-Za-z]?\d+(?:[.-]\d+)?", label)
+                prefix = "table" if kind == "table" else "fig"
+                object_ref = f"{prefix}:{number.group() if number else '?'}"
+                object_segment = {
+                    "format": "pdf",
+                    "page_number": page_number,
+                    "page_range": [page_number, page_number],
+                    "page_locator_reliable": True,
+                    "char_start": page_start + match.start(),
+                    "char_end": page_start + match.end(),
+                    "object_ref": object_ref,
+                    "object_kind": kind,
+                }
+                segments.append(object_segment)
+                objects.append({**object_segment, "text": label})
+            try:
+                tables = page.extract_tables()
+            except Exception:  # noqa: BLE001 - 单页表格失败不影响正文
+                tables = []
+            for table in tables:
+                markdown = _pdf_table_to_markdown(table)
+                if not markdown:
+                    continue
+                table_number += 1
+                separator = 2 if page_parts else 0
+                object_start = (
+                    page_start
+                    + sum(len(part) for part in page_parts)
+                    + (2 * (len(page_parts) - 1))
+                    + separator
+                )
+                page_parts.append(markdown)
+                object_ref = f"table:{table_number}"
+                object_segment = {
+                    "format": "pdf",
+                    "page_number": page_number,
+                    "page_range": [page_number, page_number],
+                    "page_locator_reliable": True,
+                    "char_start": object_start,
+                    "char_end": object_start + len(markdown),
+                    "object_ref": object_ref,
+                    "object_kind": "table",
+                }
+                segments.append(object_segment)
+                objects.append({**object_segment, "text": markdown})
+            combined = "\n\n".join(page_parts)
+            parts.append(combined)
+            offset += len(combined) + 2
+        full_text = "\n\n".join(parts)
+        if not full_text:
+            return None
+        return ParsedContent(
+            text=full_text,
+            title=_derive_title(full_text),
+            source_type="pdf_document",
+            metadata={
+                **mime_policy_metadata(mime_type),
+                "extractor": "pdfplumber_v1",
+                "parser_status": "success",
+                "parser_kind": "pdf",
+                "content_type": mime_type,
+                "text_length": len(full_text),
+                "page_count": len(pdf.pages),
+                "page_locator_reliable": True,
+                "parser_warnings": [],
+                "structure_segments": segments,
+                "structured_objects": objects,
+            },
+        )
+    finally:
+        pdf.close()
+
+
+def _pdf_table_to_markdown(table: list[list[str | None]] | None) -> str:
+    if not table:
+        return ""
+    rows = [
+        [" ".join((cell or "").split()).replace("|", r"\|") for cell in row] for row in table if row
+    ]
+    rows = [row for row in rows if any(row)]
+    if len(rows) < 2:
+        return ""
+    width = max(len(row) for row in rows)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    header, *data = normalized
+    if not any(header):
+        header = [f"column_{index + 1}" for index in range(width)]
+    return "\n".join(
+        [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join("---" for _ in header) + " |",
+            *["| " + " | ".join(row) + " |" for row in data],
+        ]
+    )
+
+
+_KNOWN_HEADINGS = re.compile(
+    r"^(?:abstract|introduction|background|related work|literature review|"
+    r"materials? and methods?|methodology|methods?|experimental setup|experiments?|"
+    r"evaluation|results?|findings?|discussion|limitations?|conclusions?|future work|"
+    r"acknowledg(?:e)?ments?|references|摘要|引言|背景|相关工作|文献综述|"
+    r"材料与方法|方法|实验设置|实验|评估|结果|讨论|局限|结论|未来工作|致谢|参考文献)$",
+    re.IGNORECASE,
+)
+_NUMBERED_HEADING = re.compile(
+    r"^(?:(?:\d+(?:\.\d+){0,3})|(?:[IVXLC]+))[\s.、]+(.{2,120})$",
+    re.IGNORECASE,
+)
+
+
+def _heading_title(line: str) -> str | None:
+    """保守识别 PDF 文本行标题；宁可漏掉，也不把正文误标成章节。"""
+    candidate = " ".join(line.split()).strip()
+    if not candidate or len(candidate) > 160:
+        return None
+    numbered = _NUMBERED_HEADING.match(candidate)
+    if numbered:
+        return candidate
+    if _KNOWN_HEADINGS.fullmatch(candidate):
+        return candidate
+    words = candidate.split()
+    if 1 <= len(words) <= 10 and len(candidate) >= 4 and candidate.isupper():
+        return candidate
+    return None
+
+
+def _page_structure_segments(
+    text: str,
+    *,
+    page_number: int,
+    document_offset: int,
+) -> list[dict[str, Any]]:
+    """把页内标题提升为带 section_title 的可靠字符区间。"""
+    headings: list[tuple[int, str]] = []
+    cursor = 0
+    for line in text.splitlines(keepends=True):
+        title = _heading_title(line.rstrip("\r\n"))
+        if title:
+            headings.append((cursor, title))
+        cursor += len(line)
+
+    boundaries: list[tuple[int, str | None]] = [(0, None)]
+    for position, title in headings:
+        if position == 0:
+            boundaries[0] = (0, title)
+        else:
+            boundaries.append((position, title))
+
+    segments: list[dict[str, Any]] = []
+    for index, (start, title) in enumerate(boundaries):
+        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(text)
+        if end <= start:
+            continue
+        segment: dict[str, Any] = {
+            "format": "pdf",
+            "page_number": page_number,
+            "page_range": [page_number, page_number],
+            "page_locator_reliable": True,
+            "char_start": document_offset + start,
+            "char_end": document_offset + end,
+        }
+        if title:
+            segment["section_title"] = title
+        segments.append(segment)
+    return segments

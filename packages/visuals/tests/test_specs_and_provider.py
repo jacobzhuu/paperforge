@@ -7,6 +7,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 from visuals import (
+    AIImageSemantics,
     AIImageSpec,
     ChartSpec,
     CloudflareWorkersAIImageProvider,
@@ -15,6 +16,7 @@ from visuals import (
     ImageProviderError,
     ImageRequest,
     OpenAIImageProvider,
+    YunwuImageProvider,
     available_image_providers,
     create_image_provider,
     image_provider_configured,
@@ -67,10 +69,71 @@ def test_diagram_rejects_duplicate_nodes_and_dangling_edges() -> None:
         )
 
 
-def test_ai_image_is_conceptual_only() -> None:
-    with pytest.raises(ValidationError, match="conceptual"):
-        AIImageSpec(prompt="Draw an accuracy curve with exact experiment results")
-    assert AIImageSpec(prompt="An abstract scientific collaboration concept").kind == "ai_image"
+def test_ai_image_rejects_injection_but_not_subject_matter() -> None:
+    """校验层只挡注入内容。
+
+    题材黑名单（准确率 / 坐标轴 / 柱状图 …）已经去掉：它按关键字工作，
+    连「解释准确率概念」这类正当描述一起挡了。该画什么由规划提示词与人工审核决定。
+    """
+    with pytest.raises(ValidationError, match="URLs or executable content"):
+        AIImageSpec(prompt="Illustrate the pipeline described at https://example.com/paper")
+    assert AIImageSpec(prompt="A conceptual view of how accuracy improves over training").kind == (
+        "ai_image"
+    )
+
+
+def test_render_prompt_uses_the_refined_prompt_verbatim() -> None:
+    """润色后的提示词必须原样下发，不能再被拼接逻辑改写一遍。
+
+    否则确认框展示的 `resolved_prompt` 与实际发送的字符串会分叉——
+    而两者同出于 `render_prompt()` 正是为了防这件事。
+    """
+    refined = (
+        "A wide conceptual illustration of a root system anchoring a soil slope, "
+        "warm neutral palette, soft directional light, publication quality."
+    )
+    spec = AIImageSpec(
+        prompt="root system. composition: cross-section",
+        semantics=AIImageSemantics(subject="root system", text_policy="none"),
+        refined_prompt=refined,
+    )
+    assert spec.render_prompt() == refined
+
+
+def test_manual_prompt_override_has_explicit_highest_precedence() -> None:
+    spec = AIImageSpec(
+        prompt="A sufficiently long fallback image prompt",
+        semantics=AIImageSemantics(
+            subject="structured subject",
+            elements=["first element", "second element"],
+        ),
+        refined_prompt="A sufficiently long model-refined image prompt.",
+        prompt_override="A sufficiently long user-authored final image prompt.",
+        negative_prompt="watermark, signature",
+        seed=42,
+    )
+    assert spec.render_prompt() == "A sufficiently long user-authored final image prompt."
+    assert spec.negative_prompt == "watermark, signature"
+    assert spec.seed == 42
+
+
+def test_render_prompt_falls_back_to_assembly_without_a_refined_prompt() -> None:
+    spec = AIImageSpec(
+        prompt="unused once semantics exist",
+        semantics=AIImageSemantics(subject="root system", composition="cross-section"),
+    )
+    rendered = spec.render_prompt()
+    assert rendered.startswith("root system. composition: cross-section")
+    # text_policy 默认 auto：不再无条件附加禁字指令。
+    assert "no text" not in rendered
+
+
+def test_render_prompt_still_honours_an_explicit_no_text_policy() -> None:
+    spec = AIImageSpec(
+        prompt="unused once semantics exist",
+        semantics=AIImageSemantics(subject="root system", text_policy="none"),
+    )
+    assert "no text, no labels, no numerals" in spec.render_prompt()
 
 
 def test_openai_provider_parses_base64_and_request_id() -> None:
@@ -93,6 +156,149 @@ def test_openai_provider_parses_base64_and_request_id() -> None:
     assert result.data == png
     assert result.request_id == "req_1"
     assert result.model == "gpt-image-2"
+
+
+def test_yunwu_provider_accepts_url_response_without_forwarding_api_key() -> None:
+    jpeg = b"\xff\xd8\xffyunwu-image"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == "/v1/images/generations"
+            assert request.headers["authorization"] == "Bearer yunwu-secret"
+            assert json.loads(request.read()) == {
+                "model": "gpt-image-1",
+                "prompt": "A conceptual scientific illustration",
+                "size": "1536x1024",
+                "quality": "high",
+                "n": 1,
+            }
+            return httpx.Response(
+                200,
+                headers={"x-request-id": "yunwu_req_1"},
+                json={
+                    "data": [{"url": "https://cdn.example.com/generated.jpeg"}],
+                    "usage": {"images": 1},
+                },
+            )
+        assert request.method == "GET"
+        assert request.url == "https://cdn.example.com/generated.jpeg"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=jpeg, headers={"content-type": "image/jpeg"})
+
+    provider = YunwuImageProvider(
+        api_key="yunwu-secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = provider.generate(
+        ImageRequest(
+            prompt="A conceptual scientific illustration",
+            size="1536x1024",
+            quality="high",
+        )
+    )
+    assert result.data == jpeg
+    assert result.media_type == "image/jpeg"
+    assert result.provider == "yunwu"
+    assert result.model == "gpt-image-1"
+    assert result.request_id == "yunwu_req_1"
+    assert result.usage == {"images": 1}
+
+
+def test_yunwu_provider_accepts_base64_and_rejects_unsafe_image_url() -> None:
+    png = b"\x89PNG\r\n\x1a\nyunwu"
+    base64_provider = YunwuImageProvider(
+        api_key="yunwu-secret",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    200,
+                    json={"data": [{"b64_json": base64.b64encode(png).decode()}]},
+                )
+            )
+        ),
+    )
+    assert (
+        base64_provider.generate(ImageRequest(prompt="A conceptual scientific illustration")).data
+        == png
+    )
+
+    unsafe_provider = YunwuImageProvider(
+        api_key="yunwu-secret",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={"data": [{"url": "http://127.0.0.1/internal"}]},
+                    request=request,
+                )
+            )
+        ),
+    )
+    with pytest.raises(ImageProviderError) as captured:
+        unsafe_provider.generate(ImageRequest(prompt="A conceptual scientific illustration"))
+    assert captured.value.code == "invalid_image"
+
+
+@pytest.mark.parametrize(
+    "image_request",
+    [
+        ImageRequest(prompt="A conceptual scientific illustration", seed=42),
+        ImageRequest(
+            prompt="A conceptual scientific illustration",
+            negative_prompt="watermark",
+        ),
+    ],
+)
+def test_yunwu_rejects_unadvertised_optional_parameters_without_network(
+    image_request: ImageRequest,
+) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unsupported options must fail before network I/O")
+
+    provider = YunwuImageProvider(
+        api_key="yunwu-secret",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert not provider.capabilities.supports_negative_prompt
+    assert not provider.capabilities.supports_seed
+    with pytest.raises(ImageProviderError) as captured:
+        provider.generate(image_request)
+    assert captured.value.code == "invalid_request"
+    assert calls == 0
+
+
+def test_capability_enabled_openai_compatible_provider_maps_optional_parameters() -> None:
+    png = b"\x89PNG\r\n\x1a\ncontent"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.read())
+        assert payload["negative_prompt"] == "watermark"
+        assert payload["seed"] == 17
+        return httpx.Response(
+            200,
+            json={"data": [{"b64_json": base64.b64encode(png).decode()}]},
+        )
+
+    provider = OpenAIImageProvider(
+        api_key="secret",
+        provider_name="compatible-test",
+        supports_negative_prompt=True,
+        supports_seed=True,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert provider.capabilities.supports_negative_prompt
+    assert provider.capabilities.supports_seed
+    provider.generate(
+        ImageRequest(
+            prompt="A conceptual scientific illustration",
+            negative_prompt="watermark",
+            seed=17,
+        )
+    )
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 400, 422])
@@ -210,6 +416,7 @@ def test_cloudflare_flux_provider_uses_official_rest_contract() -> None:
         assert json.loads(request.read()) == {
             "prompt": "A conceptual scientific illustration",
             "steps": 8,
+            "seed": 123,
         }
         return httpx.Response(
             200,
@@ -233,6 +440,7 @@ def test_cloudflare_flux_provider_uses_official_rest_contract() -> None:
             prompt="A conceptual scientific illustration",
             size="1536x1024",
             quality="high",
+            seed=123,
         )
     )
     assert result.data == jpeg
@@ -244,8 +452,11 @@ def test_cloudflare_flux_provider_uses_official_rest_contract() -> None:
         "steps": 8,
         "requested_quality": "high",
         "requested_size": "1536x1024",
+        "seed": 123,
         "requests": 1,
     }
+    assert provider.capabilities.supports_seed
+    assert not provider.capabilities.supports_negative_prompt
 
 
 def test_cloudflare_provider_accepts_binary_png_response() -> None:
@@ -413,7 +624,7 @@ def test_cloudflare_rejects_invalid_payload_and_long_prompt() -> None:
 
 
 def test_image_provider_factory_is_extensible_without_worker_changes() -> None:
-    assert {"cloudflare", "openai"} <= set(available_image_providers())
+    assert {"cloudflare", "openai", "yunwu"} <= set(available_image_providers())
     cloudflare = ImageProviderConfig(
         provider="cloudflare",
         api_key="cf-secret",
@@ -426,9 +637,15 @@ def test_image_provider_factory_is_extensible_without_worker_changes() -> None:
         create_image_provider(ImageProviderConfig(provider="openai", api_key="secret")),
         OpenAIImageProvider,
     )
-    assert image_provider_configured(
-        ImageProviderConfig(provider="openai", api_key="secret")
+    assert image_provider_configured(ImageProviderConfig(provider="openai", api_key="secret"))
+    yunwu = ImageProviderConfig(
+        provider="yunwu",
+        api_key="yunwu-secret",
+        base_url="https://yunwu.ai/v1",
+        model="gpt-image-1",
     )
+    assert isinstance(create_image_provider(yunwu), YunwuImageProvider)
+    assert image_provider_configured(yunwu)
 
     class LocalProvider:
         configured = True

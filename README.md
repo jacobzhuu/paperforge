@@ -52,13 +52,14 @@ paper-forge/
 
 ## 一键启动本地开发环境
 
-前置条件：已安装 `uv`、Node.js、pnpm 和 Docker Desktop。仓库根目录只需执行：
+前置条件：已安装 `uv`、Node.js、pnpm，以及 macOS 上的 Docker Desktop 或 Linux 上由
+systemd 管理的 Docker。仓库根目录只需执行：
 
 ```bash
 ./scripts/dev up
 ```
 
-脚本会安装锁定依赖、按需启动 Docker Desktop，并启动 PostgreSQL、Redis、MinIO、
+脚本会安装锁定依赖；macOS 会按需启动 Docker Desktop，Linux 会检查 Docker 服务；随后启动 PostgreSQL、Redis、MinIO、
 Tectonic、visuald、API、worker 和 Web。成功后会自动打开并打印：
 
 - Web：http://localhost:3000
@@ -76,7 +77,31 @@ Tectonic、visuald、API、worker 和 Web。成功后会自动打开并打印：
 ./scripts/dev down
 ```
 
+`restart` 会先看有没有正在跑的部署（`paperforge-deploy-*` compose 项目）：有就重建
+api/worker/web 镜像、在旁边起一套新的、再把 Tailscale Funnel 指过去；没有就照旧重启
+本地栈。之所以是「起一套新的」而不是原地重启，见 `docs/getting-started.md` 的部署一节。
+`--local` 强制走本地栈，`./scripts/dev deploy` 强制走部署。
+
 详细的手动启动和故障排查见 `docs/getting-started.md`。
+
+## 生产部署
+
+生产基线支持 macOS Intel/Apple Silicon、Ubuntu 22.04.5 LTS，以及已启用 Ubuntu Pro/ESM
+的 Ubuntu 20.04.6 LTS。API、Worker 和 Web 使用 Python 3.12 / Node 20 / pnpm 9.15.9
+多阶段非 root 镜像；Worker 镜像内置 Pandoc。生产栈只向宿主机发布
+`127.0.0.1:3000`，PostgreSQL、Redis、MinIO、API、texd 和 visuald 均只在容器网络内可见。
+
+```bash
+sudo ./scripts/install-ubuntu-container-tools   # 仅 Ubuntu；按 Focal/Jammy 自动选择来源
+export PAPERFORGE_ENV_FILE=/absolute/path/to/paperforge.env
+./scripts/ops preflight
+./scripts/ops up
+./scripts/ops status
+```
+
+统一运维入口还提供 `restart/down/logs/backup/restore`。Ubuntu 20.04 如果未同时启用
+`esm-infra` 与 `esm-apps`，生产预检会拒绝启动。完整安装、迁移、Tailscale Funnel 切换与
+七天回滚流程见 [`docs/production-deployment.md`](docs/production-deployment.md)。
 
 ## 实施状态（路线图 M0–M10）
 M0–M10 主链路、个人账号数据隔离与 Cloudflare AI 生图适配已实现；详见 `docs/roadmap.md`、`docs/getting-started.md` 与

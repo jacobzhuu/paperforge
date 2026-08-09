@@ -17,6 +17,7 @@ from ingest import (
     extract_and_chunk,
     extract_content,
     extract_html_content,
+    infer_pdf_bibliographic_metadata,
     normalize_mime_type,
     try_extract_and_chunk,
 )
@@ -241,3 +242,40 @@ def test_encrypted_pdf_is_not_decrypted() -> None:
     parsed = extract_content(mime_type="application/pdf", content=buffer.getvalue())
     # 兜底路径拿不到正文，但不抛出、不解密（draft-first 降级为「无全文」）。
     assert parsed.metadata["extractor"] == "pdf_text_stream_v1"
+
+
+def test_pdf_page_segments_capture_detected_section_titles() -> None:
+    from ingest.pdf import _page_structure_segments
+
+    text = "1 Introduction\nBackground prose.\n\n2 Methods\nWe trained the model."
+    segments = _page_structure_segments(text, page_number=3, document_offset=100)
+    assert [segment.get("section_title") for segment in segments] == [
+        "1 Introduction",
+        "2 Methods",
+    ]
+    assert segments[0]["page_number"] == 3
+    assert segments[0]["char_start"] == 100
+    assert segments[-1]["char_end"] == 100 + len(text)
+
+
+def test_pdf_bibliographic_clues_prefer_embedded_metadata_and_extract_doi() -> None:
+    clues = infer_pdf_bibliographic_metadata(
+        """
+        A noisy publisher running header
+        Evidence-grounded Scientific Writing
+        Ada Lovelace; Grace Hopper
+        Published in 2025
+        https://doi.org/10.1234/Example.42
+        Abstract
+        We study evidence-grounded writing.
+        """,
+        document_metadata={
+            "title": "Evidence-grounded Scientific Writing",
+            "author": "Ada Lovelace; Grace Hopper",
+        },
+    )
+
+    assert clues.title == "Evidence-grounded Scientific Writing"
+    assert clues.authors == ("Ada Lovelace", "Grace Hopper")
+    assert clues.publication_year == 2025
+    assert clues.doi == "10.1234/example.42"

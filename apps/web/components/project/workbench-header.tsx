@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { ActionMenu, type ActionMenuItem } from '@/components/ui/action-menu';
 import { cn } from '@/lib/utils';
 
 /**
@@ -12,11 +13,14 @@ export function WorkbenchHeader({
   title,
   description,
   actions,
+  overflowActions,
   className,
 }: {
   title: React.ReactNode;
   description?: React.ReactNode;
   actions?: React.ReactNode;
+  /** 次要动作在窄屏统一收进菜单，避免页头换成多行按钮堆。 */
+  overflowActions?: ActionMenuItem[];
   className?: string;
 }) {
   return (
@@ -25,7 +29,35 @@ export function WorkbenchHeader({
         <h2 className="font-serif text-lg font-semibold tracking-tight">{title}</h2>
         {description && <p className="text-sm text-muted-foreground">{description}</p>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+      {(actions || overflowActions?.length) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {actions}
+          {overflowActions && overflowActions.length > 0 && (
+            <>
+              <div className="hidden items-center gap-2 md:flex">
+                {overflowActions.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <button
+                      key={item.label}
+                      type="button"
+                      onClick={item.onSelect}
+                      disabled={item.disabled}
+                      className="inline-flex h-9 items-center gap-2 rounded-md px-3 text-body font-medium transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <Icon className="h-4 w-4" />
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="md:hidden">
+                <ActionMenu label="更多操作" items={overflowActions} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

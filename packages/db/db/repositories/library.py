@@ -11,13 +11,27 @@ from typing import Any
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.library import LibraryEntry, LiteratureCard, ScholarlyWork
-from db.repositories.works import get_work_authors
+from db.models.library import (
+    LITERATURE_ROLES,
+    EligibilityDecision,
+    LibraryEntry,
+    LiteratureCard,
+    ScholarlyWork,
+)
+from db.repositories.works import get_work_authors, resolve_canonical_work
 
-ENTRY_STATUSES = frozenset({"candidate", "selected", "excluded"})
+ENTRY_STATUSES = frozenset({"candidate", "selected", "excluded", "candidate_uncertain"})
+
 # R1：只有这些来源可以产生 library_entry（设计 §4.4.3）。
 ADDED_VIA = frozenset(
-    {"search", "snowball", "doi_import", "bibtex_import", "llm_suggested_verified"}
+    {
+        "search",
+        "snowball",
+        "doi_import",
+        "bibtex_import",
+        "pdf_upload",
+        "llm_suggested_verified",
+    }
 )
 
 
@@ -74,6 +88,7 @@ async def upsert_entry(
     relevance_score: float | None = None,
     rank_reason: dict[str, Any] | None = None,
     verified: bool = False,
+    literature_role: str | None = None,
 ) -> tuple[LibraryEntry, bool]:
     """写入或更新一条 library_entry，返回 (entry, created)。
 
@@ -84,6 +99,11 @@ async def upsert_entry(
         raise ValueError(f"unsupported added_via: {added_via}")
     if status not in ENTRY_STATUSES:
         raise ValueError(f"unsupported entry status: {status}")
+    if literature_role is not None and literature_role not in LITERATURE_ROLES:
+        raise ValueError(f"unsupported literature role: {literature_role}")
+    work = await session.get(ScholarlyWork, work_id)
+    if work is not None:
+        work_id = (await resolve_canonical_work(session, work)).id
 
     entry = await get_entry(session, project_id=project_id, work_id=work_id)
     created = False
@@ -94,6 +114,8 @@ async def upsert_entry(
             status=status,
             relevance_score=relevance_score,
             rank_reason_json=rank_reason,
+            literature_role=literature_role or "general",
+            user_pinned=literature_role == "core",
             added_via=added_via,
         )
         session.add(entry)
@@ -103,6 +125,9 @@ async def upsert_entry(
             entry.relevance_score = relevance_score
         if rank_reason is not None:
             entry.rank_reason_json = rank_reason
+        if literature_role is not None:
+            entry.literature_role = literature_role
+            entry.user_pinned = literature_role == "core"
         # 用户已勾选/排除的条目不被后续检索批次改回 candidate。
         if entry.status == "candidate" and status != "candidate":
             entry.status = status
@@ -126,6 +151,83 @@ async def set_entry_status(
         entry.user_pinned = user_pinned
     await session.flush()
     return entry
+
+
+async def set_entry_role(
+    session: AsyncSession,
+    entry: LibraryEntry,
+    literature_role: str,
+) -> LibraryEntry:
+    if literature_role not in LITERATURE_ROLES:
+        raise ValueError(f"unsupported literature role: {literature_role}")
+    entry.literature_role = literature_role
+    # Core papers must survive automatic eligibility screening.  Keep the
+    # existing pin bit as a backward-compatible projection until SCREEN reads
+    # literature_role directly.
+    entry.user_pinned = literature_role == "core"
+    await session.flush()
+    return entry
+
+
+async def upsert_eligibility_decision(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    work_id: uuid.UUID,
+    decision: str,
+    criterion_hits: dict[str, Any],
+    anchor_facet_hit: bool,
+    reason: str,
+    decided_by: str = "deterministic",
+    model: str | None = None,
+) -> EligibilityDecision:
+    if decision not in {"include", "exclude", "uncertain"}:
+        raise ValueError(f"unsupported eligibility decision: {decision}")
+    row = await session.scalar(
+        select(EligibilityDecision).where(
+            EligibilityDecision.project_id == project_id, EligibilityDecision.work_id == work_id
+        )
+    )
+    if row is None:
+        row = EligibilityDecision(
+            project_id=project_id,
+            work_id=work_id,
+            decision=decision,
+            decided_by=decided_by,
+        )
+        session.add(row)
+    row.decision = decision
+    row.criterion_hits_json = criterion_hits
+    row.anchor_facet_hit = anchor_facet_hit
+    row.reason = reason
+    row.decided_by = decided_by
+    row.model = model
+    await session.flush()
+    return row
+
+
+async def list_eligibility_decisions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    decision: str | None = None,
+) -> list[tuple[EligibilityDecision, ScholarlyWork]]:
+    """筛选判定 + 对应文献。
+
+    这些行一直在写，却从来没有被读回过——用户只看得到文献最后的 status，
+    看不到「为什么被排除/为什么存疑」，于是每一次筛选偏差都是不可诊断的。
+    """
+    stmt = (
+        select(EligibilityDecision, ScholarlyWork)
+        .join(ScholarlyWork, ScholarlyWork.id == EligibilityDecision.work_id)
+        .where(EligibilityDecision.project_id == project_id)
+        .order_by(EligibilityDecision.decision, ScholarlyWork.canonical_title)
+    )
+    if decision is not None:
+        if decision not in {"include", "exclude", "uncertain"}:
+            raise ValueError(f"unsupported eligibility decision: {decision}")
+        stmt = stmt.where(EligibilityDecision.decision == decision)
+    return [(row, work) for row, work in (await session.execute(stmt)).all()]
 
 
 async def assign_bibtex_key(

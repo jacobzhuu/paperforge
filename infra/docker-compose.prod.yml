@@ -1,0 +1,275 @@
+name: ${PAPERFORGE_COMPOSE_PROJECT:-paperforge-prod}
+
+x-python-build: &python-build
+  context: ..
+  dockerfile: services/Dockerfile
+  target: api
+
+x-app-security: &app-security
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  postgres:
+    image: ${PAPERFORGE_POSTGRES_IMAGE:-public.ecr.aws/docker/library/postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: ${PAPERFORGE_REDIS_IMAGE:-public.ecr.aws/docker/library/redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2}
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: ${PAPERFORGE_MINIO_IMAGE:-quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  texd:
+    image: paperforge-texd:local
+    build:
+      context: ..
+      dockerfile: services/texd/Dockerfile
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - texdcache:/root/.cache/Tectonic
+      - texdfontcache:/var/cache/fontconfig
+    networks:
+      - texd_isolated
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+  visuald:
+    image: paperforge-visuald:local
+    build:
+      context: ..
+      dockerfile: services/visuald/Dockerfile
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - visuald_isolated
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+  migrate:
+    image: paperforge-api:local
+    build: *python-build
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - core
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
+  api:
+    image: paperforge-api:local
+    build: *python-build
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    environment:
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_APP_URL:?set PAPERFORGE_PUBLIC_APP_URL}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      texd:
+        condition: service_healthy
+      visuald:
+        condition: service_healthy
+    networks:
+      - core
+      - texd_isolated
+      - visuald_isolated
+    <<: *app-security
+    tmpfs:
+      - /tmp
+    volumes:
+      - authoutbox:/data/auth-outbox
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+  worker:
+    image: paperforge-worker:local
+    build:
+      context: ..
+      dockerfile: services/Dockerfile
+      target: worker
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      texd:
+        condition: service_healthy
+      visuald:
+        condition: service_healthy
+    networks:
+      - core
+      - texd_isolated
+      - visuald_isolated
+    <<: *app-security
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('redis', 6379), timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    restart: unless-stopped
+
+  web:
+    image: paperforge-web:local
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        PAPERFORGE_API_INTERNAL_BASE: http://api:8080
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    environment:
+      PAPERFORGE_API_INTERNAL_BASE: http://api:8080
+      PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_APP_URL:?set PAPERFORGE_PUBLIC_APP_URL}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PAPERFORGE_WEB_PORT:-3000}:3000"
+    networks:
+      - core
+    <<: *app-security
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    restart: unless-stopped
+
+  storage-tools:
+    image: paperforge-api:local
+    build: *python-build
+    profiles: ["tools"]
+    env_file:
+      - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
+    command: ["paperforge-admin", "--help"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - core
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  core:
+  texd_isolated:
+    internal: true
+  visuald_isolated:
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  texdcache:
+  texdfontcache:
+  authoutbox:

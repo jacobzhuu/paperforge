@@ -5,6 +5,52 @@ import paperforge_worker.worker as worker
 from arq.connections import RedisSettings
 
 
+def test_worker_settings_resolve_yunwu_specific_image_credentials():
+    settings = worker_config.WorkerSettings(
+        _env_file=None,
+        image_provider="yunwu",
+        image_api_key="cloudflare-key",
+        image_model="@cf/model",
+        image_base_url="https://api.cloudflare.com/client/v4",
+        yunwu_api_key="yunwu-key",
+        yunwu_image_model="gpt-image-1",
+        yunwu_api_base_url="https://yunwu.ai/v1",
+        yunwu_image_timeout_seconds=240,
+    )
+    config = settings.image_provider_config()
+    assert config.provider == "yunwu"
+    assert config.api_key == "yunwu-key"
+    assert config.model == "gpt-image-1"
+    assert config.base_url == "https://yunwu.ai/v1"
+    assert config.timeout_seconds == 240
+
+
+def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
+    settings = worker_config.WorkerSettings(_env_file=None)
+    assert settings.card_concurrency == 6
+    assert settings.qmatrix_concurrency == 4
+    llm = settings.llm_config()
+    assert llm.thinking_for_role("extractor") == "disabled"
+    assert llm.thinking_for_role("reranker") == "disabled"
+    assert llm.thinking_for_role("writer") is None
+
+
+def test_full_pipeline_can_force_yunwu_even_if_manual_provider_is_cloudflare():
+    settings = worker_config.WorkerSettings(
+        _env_file=None,
+        image_provider="cloudflare",
+        image_api_key="cloudflare-key",
+        image_account_id="0123456789abcdef0123456789abcdef",
+        yunwu_api_key="yunwu-key",
+        yunwu_image_model="gpt-image-1",
+    )
+    manual = settings.image_provider_config()
+    summary = settings.image_provider_config("yunwu")
+    assert manual.provider == "cloudflare"
+    assert summary.provider == "yunwu"
+    assert summary.api_key == "yunwu-key"
+
+
 def test_worker_reads_redis_url(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://redis.example:6380/4")
     # 配置是进程级缓存的：重载 config 后再重载 worker，才能拿到新的 RedisSettings。
@@ -31,8 +77,27 @@ def test_worker_registers_m1_pipeline_functions():
         "run_library_pipeline",
         "run_import_pipeline",
         "run_cards_pipeline",
+        "run_polish_pipeline",
         "run_full_pipeline",
     } <= names
+
+
+def test_worker_registers_private_pdf_pipeline_functions():
+    assert {
+        "run_pdf_match_pipeline",
+        "run_uploaded_pdf_pipeline",
+    } <= _registered_names()
+
+
+def test_pdf_workers_wait_for_api_commit_before_emitting_stage_events():
+    import inspect
+
+    match_source = inspect.getsource(worker.run_pdf_match_pipeline)
+    parse_source = inspect.getsource(worker.run_uploaded_pdf_pipeline)
+    assert match_source.index("wait_for_pdf_upload_visibility") < match_source.index(
+        "_mark_running"
+    )
+    assert parse_source.index("prepare_uploaded_pdf") < parse_source.index("_mark_running")
 
 
 def test_full_pipeline_gets_a_longer_timeout_than_single_stage_jobs():
@@ -82,6 +147,138 @@ async def test_library_pipeline_can_defer_finalization():
     assert "finalize=False" in source
 
 
+def test_full_pipeline_enables_fulltext_before_cards():
+    """一键入口必须显式打开文献管线中的 INGEST，不能再生成摘要级卡片。"""
+    import inspect
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    assert "acquire_fulltext=True" in source
+    library_source = inspect.getsource(worker.run_library_pipeline)
+    assert library_source.index('"ingest"') < library_source.index('"cards"')
+    assert "fulltexts=fulltexts" in library_source
+
+
+def _repair_question(**overrides):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    defaults = {
+        "id": uuid4(),
+        "text": "How effective are poisoning attacks?",
+        "search_query": "poisoning attack sequential recommendation",
+        "term_aliases_json": {"poisoning attack": ["data poisoning", "shilling attack"]},
+        "comparison_dimensions_json": ["dataset"],
+        "answer_status": "insufficient_evidence",
+    }
+    return SimpleNamespace(**{**defaults, **overrides})
+
+
+def test_second_source_repair_keeps_the_base_query_and_adds_synonym_variants() -> None:
+    """只缺第二个独立来源时，换一套术语才够得到另一个作者群。"""
+    queries = worker._gap_repair_queries([_repair_question()], "needs_second_source")
+    assert queries[0] == "poisoning attack sequential recommendation"
+    assert "data poisoning sequential recommendation" in queries
+    assert "shilling attack sequential recommendation" in queries
+
+
+def test_zero_candidate_repair_does_not_resend_the_query_that_already_failed() -> None:
+    queries = worker._gap_repair_queries([_repair_question()], "no_candidates")
+    assert "poisoning attack sequential recommendation" not in queries
+    assert "data poisoning sequential recommendation" in queries
+    # 过窄的长查询被截短，好让零召回的问题有机会拿回候选。
+    assert "poisoning attack sequential" in queries
+
+
+def test_repair_queries_drop_cjk_because_providers_only_index_english() -> None:
+    question = _repair_question(search_query="序列推荐投毒攻击", term_aliases_json={})
+    assert worker._gap_repair_queries([question], "needs_second_source") == []
+
+
+def test_evidence_gaps_distinguish_missing_source_from_missing_candidates() -> None:
+    from paperforge_worker.pipelines.readiness import EvidenceReadinessReport
+
+    single_source = _repair_question()
+    barren = _repair_question(search_query="model extraction recommender")
+    report = EvidenceReadinessReport(
+        question_details=[
+            {
+                "question_id": str(single_source.id),
+                "eligible_evidence_count": 3,
+                "distinct_work_count": 1,
+                "ready": False,
+            },
+            {
+                "question_id": str(barren.id),
+                "eligible_evidence_count": 0,
+                "distinct_work_count": 0,
+                "ready": False,
+            },
+        ]
+    )
+    gaps = dict(
+        (question.id, kind)
+        for question, kind in worker._classify_evidence_gaps([single_source, barren], report)
+    )
+    assert gaps[single_source.id] == "needs_second_source"
+    assert gaps[barren.id] == "no_candidates"
+
+
+def test_ready_questions_are_not_re_searched() -> None:
+    from paperforge_worker.pipelines.readiness import EvidenceReadinessReport
+
+    question = _repair_question()
+    report = EvidenceReadinessReport(
+        question_details=[
+            {
+                "question_id": str(question.id),
+                "eligible_evidence_count": 4,
+                "distinct_work_count": 2,
+                "ready": True,
+            }
+        ]
+    )
+    assert worker._classify_evidence_gaps([question], report) == []
+
+
+def test_evidence_repair_recovers_selected_fulltexts_left_half_processed() -> None:
+    from uuid import uuid4
+
+    complete = uuid4()
+    missing_card = uuid4()
+    missing_evidence = uuid4()
+    checkpointed = uuid4()
+    selected = {complete, missing_card, missing_evidence, checkpointed}
+
+    result = worker._repair_processing_ids(
+        selected_work_ids=selected,
+        new_work_ids=set(),
+        fulltext_work_ids={str(item) for item in selected},
+        card_work_ids={complete, missing_evidence, checkpointed},
+        eligible_evidence_work_ids={complete, missing_card, checkpointed},
+        checkpoint_work_ids=[str(checkpointed), "not-a-uuid"],
+    )
+
+    assert set(result) == {missing_card, missing_evidence, checkpointed}
+
+
+def test_library_pipeline_assigns_keys_after_screen_promotions():
+    """Candidates promoted by SCREEN must be citable in later stages."""
+    import inspect
+
+    source = inspect.getsource(worker.run_library_pipeline)
+    assert source.index('"screen"') < source.index('"curate"') < source.index('"ingest"')
+
+
+def test_full_pipeline_delivers_first_draft_before_optional_polish():
+    """一键全流程必须显式关闭自动润色，并留下完成后的用户决策点。"""
+    import inspect
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    assert "coherence=False" in source
+    assert '"polish.available"' in source
+    assert 'POLISH_DECISION_KEY: "pending"' in source
+
+
 def test_submission_full_pipeline_runs_quality_before_visuals_and_export():
     """A technically successful submission job must stop before producing an export."""
     import inspect
@@ -91,5 +288,120 @@ def test_submission_full_pipeline_runs_quality_before_visuals_and_export():
     visual_at = source.index('"visual_plan"')
     render_at = source.index('"render"')
     assert quality_at < visual_at < render_at
-    assert 'quality_outcome.readiness_status in {"preflight_ready", "submission_ready"}' in source
     assert '"quality.blocked"' in source
+    assert "_converge_scholarly_quality" in source
+    assert "_finish_needs_input" in source
+
+
+def test_independent_quality_repair_reuses_monotonic_convergence():
+    """写作页修复入口必须和全流程共用同一套可回滚收敛器。"""
+    import inspect
+
+    source = inspect.getsource(worker.run_quality_repair_pipeline)
+    assert "_converge_scholarly_quality" in source
+    assert '"quality.final"' in source
+    assert "quality_repair_history" in source
+
+
+def test_full_pipeline_only_auto_generates_one_yunwu_graphical_abstract():
+    """普通建议入口不变；只有一键全流程启用单摘要图 + Yunwu 自动生成策略。"""
+    import inspect
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    assert "summary_only=True" in source
+    assert "auto_generate=True" in source
+
+
+def test_only_a_passing_submission_reaches_visuals_and_export():
+    """质量门本身按行为断言。
+
+    上一版在 `run_full_pipeline` 的源码里匹配
+    `quality_outcome.readiness_status in {...}`，于是一次把判定提成局部变量的
+    等价重构就让它永久失败——行为一点没变。判定现在是具名函数，直接断言它。
+    """
+    # 草稿模式成稿优先：评不出来也照样出图出稿。
+    assert worker.can_render_after_quality("draft", "unassessed")
+    assert worker.can_render_after_quality("draft", "blocked")
+    # 投稿模式必须过门，否则用户会拿着一份没过质量门的导出件去投。
+    assert not worker.can_render_after_quality("submission", "unassessed")
+    assert not worker.can_render_after_quality("submission", "blocked")
+    assert worker.can_render_after_quality("submission", "preflight_ready")
+    assert worker.can_render_after_quality("submission", "submission_ready")
+    assert not worker.can_render_after_quality("scholarly", "needs_revision")
+    assert worker.can_render_after_quality("scholarly", "preflight_ready")
+
+
+def test_independent_export_resolves_its_quality_report_from_storage():
+    """The caller's unassessed readiness must not be a bypass mechanism."""
+    import inspect
+
+    source = inspect.getsource(worker.run_export_pipeline)
+    assert "latest_quality_report(session, project_uuid)" in source
+    assert "independent_export_requires_passing_quality_report" in source
+
+
+def test_repairable_finding_count_only_counts_what_the_convergence_loop_can_fix():
+    """概览页那句「另有 N 处可以再加强」必须和收敛器的能力对齐。
+
+    draft 档把学术阻断项降级成 warning，所以计数要读 warnings；但只算
+    SCHOLARLY_BLOCKER_CODES 里的码——收敛器重写的是这些码对应的章节。把
+    「文献过度集中于近五年」这类提示也算进去，用户点完修复会发现什么都没变。
+    """
+    from paperforge_worker.pipelines.quality import QualityReport, repairable_finding_count
+
+    draft = QualityReport(
+        quality_profile="draft",
+        warnings=[
+            {"code": "core_claim_fulltext_missing"},
+            {"code": "citation_resolution_failed"},
+            {"code": "year_imbalance"},
+            {"code": "short_manuscript"},
+        ],
+    )
+    assert repairable_finding_count(draft) == 2
+
+    # 干净的草稿不该弹修复邀请。
+    assert repairable_finding_count(QualityReport(quality_profile="draft")) == 0
+    assert (
+        repairable_finding_count(
+            QualityReport(quality_profile="draft", warnings=[{"code": "year_imbalance"}])
+        )
+        == 0
+    )
+
+    # 严谨档的同一批问题挂在 blockers 上，计数要跟着换一边读。
+    scholarly = QualityReport(
+        quality_profile="scholarly",
+        blockers=[{"code": "placeholders_present"}],
+        warnings=[{"code": "core_claim_fulltext_missing"}],
+    )
+    assert repairable_finding_count(scholarly) == 1
+
+
+def test_full_pipeline_leaves_quality_repair_to_the_user():
+    """质量修复是交付之后的决策点，不是管线的一环。
+
+    draft 档跑完一次评估就交付，发现项写进 checkpoint 供概览页发出邀请；
+    收敛循环只在用户主动选了 scholarly / submission 时才留在管线里。
+    """
+    import inspect
+
+    source = inspect.getsource(worker.run_full_pipeline)
+    assert '"quality_repair.available"' in source
+    assert 'QUALITY_REPAIR_DECISION_KEY: "pending"' in source
+    # 邀请只在 draft 档发出：严谨档的收敛已经在管线内跑过了。
+    assert 'quality_profile == "draft" and quality_outcome is not None' in source
+
+
+def test_quality_repair_refreshes_the_export_it_invalidated():
+    """收敛器接受了改写就意味着正文变了，此前的导出件必须重出。
+
+    全流程现在一定先产出一份 PDF，修复后不重导出的话，用户点完「开始修复」
+    下载到的还是修复前那一份——比不修复更容易误导。
+    """
+    import inspect
+
+    source = inspect.getsource(worker.run_quality_repair_pipeline)
+    assert "export_document" in source
+    assert 'entry["accepted"] for entry in repair_history' in source
+    assert "QUALITY_REPAIR_DECISION_KEY" in source

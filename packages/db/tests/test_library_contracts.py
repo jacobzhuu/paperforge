@@ -18,6 +18,7 @@ from db import (
     get_writing_whitelist,
     list_entries,
     reference_metadata_payload,
+    set_entry_role,
     upsert_entry,
     upsert_work,
 )
@@ -167,6 +168,31 @@ async def test_upsert_entry_rejects_unknown_added_via(session):
             work_id=work.id,
             added_via="llm_guessed",
         )
+
+
+async def test_pdf_upload_entry_can_record_a_core_literature_role(session):
+    project = await _project(session)
+    work, _ = await upsert_work(session, _Candidate())
+    entry, created = await upsert_entry(
+        session,
+        project_id=project.id,
+        work_id=work.id,
+        added_via="pdf_upload",
+        status="selected",
+        verified=True,
+        literature_role="core",
+    )
+
+    assert created is True
+    assert entry.literature_role == "core"
+    # Compatibility with the current eligibility screen while it migrates to role.
+    assert entry.user_pinned is True
+
+    await set_entry_role(session, entry, "background")
+    assert entry.literature_role == "background"
+    assert entry.user_pinned is False
+    with pytest.raises(ValueError, match="unsupported literature role"):
+        await set_entry_role(session, entry, "must_cite")
 
 
 async def test_verified_at_is_not_cleared_by_later_unverified_upsert(session):

@@ -1,0 +1,16 @@
+[
+  {
+    "reviewer_id": "expert-01",
+    "topic_id": "g2-01",
+    "blind_doc_id": "R001-example",
+    "scores": {
+      "depth": 1,
+      "organization": 1,
+      "evidence": 1,
+      "criticality": 1,
+      "credibility": 1,
+      "readability": 1
+    },
+    "notes": ""
+  }
+]

@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
-from PIL import Image, ImageChops, UnidentifiedImageError  # noqa: E402
+from PIL import Image, ImageChops, ImageOps, UnidentifiedImageError  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 from visuals import ChartSpec, DiagramSpec  # noqa: E402
 
@@ -27,6 +27,8 @@ MAX_COLUMNS = 40
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PIXELS = 20_000_000
 COLORBLIND = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9"]
+DIAGRAM_FILLS = ["#DBEAFE", "#FFEDD5", "#DCFCE7", "#FCE7F3", "#FEF3C7", "#EDE9FE"]
+DIAGRAM_PNG_DPI = 300
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
 plt.rcParams.update(
@@ -61,6 +63,13 @@ class DiagramRenderRequest(StrictRequest):
 
 class NormalizeRequest(StrictRequest):
     image_base64: str
+    # AI provider 偶尔会忽略请求尺寸，甚至返回极端长宽图。worker 把原始请求尺寸
+    # 一并传来，visuald 在落库前自动适配到论文画布，避免“已经计费并生成，最后
+    # 却因宽高比预检失败”的死路。
+    target_size: str | None = Field(
+        default=None,
+        pattern=r"^(1024x1024|1536x1024|1024x1536)$",
+    )
 
 
 @app.get("/healthz")
@@ -86,15 +95,23 @@ def render_chart(request: ChartRenderRequest) -> dict[str, Any]:
 
 @app.post("/render/diagram")
 def render_diagram(request: DiagramRenderRequest) -> dict[str, Any]:
+    effective_direction = _diagram_direction(request.spec)
     try:
-        renditions = diagram_renditions(request.spec)
+        renditions = diagram_renditions(request.spec, direction=effective_direction)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return {
         "renditions": renditions,
         "provenance": {
             "layout": "graphviz-dot",
-            "visual_qa": visual_qa(renditions, minimum_font_pt=8, check_outer_margin=True),
+            "requested_direction": request.spec.direction,
+            "effective_direction": effective_direction,
+            "visual_qa": visual_qa(
+                renditions,
+                minimum_font_pt=8,
+                check_outer_margin=True,
+                aspect_ratio_bounds=(0.2, 6.0),
+            ),
         },
     }
 
@@ -116,6 +133,20 @@ def normalize(request: NormalizeRequest) -> dict[str, Any]:
             rgba = source.convert("RGBA")
             clean = Image.new("RGB", rgba.size, "white")
             clean.paste(rgba, mask=rgba.getchannel("A"))
+            source_size = clean.size
+            if request.target_size:
+                target_width, target_height = (
+                    int(value) for value in request.target_size.split("x", maxsplit=1)
+                )
+                if clean.size != (target_width, target_height):
+                    # ImageOps.fit 保持比例后居中裁切，不会把人物/图形横向拉伸；
+                    # 相比白边 padding，它也不会制造 excessive_whitespace 新错误。
+                    clean = ImageOps.fit(
+                        clean,
+                        (target_width, target_height),
+                        method=Image.Resampling.LANCZOS,
+                        centering=(0.5, 0.5),
+                    )
             output = io.BytesIO()
             clean.save(output, format="PNG", optimize=True, dpi=(300, 300))
             renditions = [
@@ -126,10 +157,16 @@ def normalize(request: NormalizeRequest) -> dict[str, Any]:
                 "provenance": {
                     "normalized": True,
                     "metadata_removed": True,
+                    "source_size": list(source_size),
+                    "target_size": request.target_size,
+                    "canvas_adjusted": source_size != clean.size,
                     "visual_qa": visual_qa(
                         renditions,
                         minimum_font_pt=None,
                         check_outer_margin=False,
+                        # AI 插图常用大面积白底和中心构图；图表的 75% 留白硬阈值
+                        # 不适合照片/插画。空白图仍由 visual_content_empty 拒绝。
+                        maximum_outer_whitespace=None,
                     ),
                 },
             }
@@ -347,8 +384,12 @@ def _plot_series(ax, spec: ChartSpec, records: list[dict[str, Any]], colors: lis
         ax.set_xticks(range(len(categories)), categories, rotation=30, ha="right")
 
 
-def diagram_renditions(spec: DiagramSpec) -> list[dict[str, Any]]:
-    dot = _diagram_dot(spec)
+def diagram_renditions(
+    spec: DiagramSpec,
+    *,
+    direction: str | None = None,
+) -> list[dict[str, Any]]:
+    dot = _diagram_dot(spec, direction=direction)
     renditions = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -360,8 +401,15 @@ def diagram_renditions(spec: DiagramSpec) -> list[dict[str, Any]]:
             ("png", "image/png"),
         ):
             target = root / f"diagram.{fmt}"
+            command = ["dot", f"-T{fmt}"]
+            if fmt == "png":
+                # Graphviz otherwise rasterizes at roughly 96 DPI. Short horizontal
+                # diagrams then end up only 70-150 px high and are rejected by the
+                # publication preflight even though the SVG/PDF is perfectly valid.
+                command.append(f"-Gdpi={DIAGRAM_PNG_DPI}")
+            command.extend([str(source), "-o", str(target)])
             proc = subprocess.run(
-                ["dot", f"-T{fmt}", str(source), "-o", str(target)],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -382,6 +430,9 @@ def visual_qa(
     *,
     minimum_font_pt: int | None,
     check_outer_margin: bool,
+    minimum_size: tuple[int, int] = (240, 160),
+    aspect_ratio_bounds: tuple[float, float] = (0.25, 4.0),
+    maximum_outer_whitespace: float | None = 0.75,
 ) -> dict[str, Any]:
     """Preflight dimensions, aspect ratio, content bounds, whitespace and font floor."""
     issues: list[dict[str, Any]] = []
@@ -397,14 +448,12 @@ def visual_qa(
             metrics.update({"width": width, "height": height})
             aspect_ratio = width / max(1, height)
             metrics["aspect_ratio"] = round(aspect_ratio, 4)
-            if width < 240 or height < 160:
-                issues.append(
-                    {"code": "visual_resolution_too_small", "message": "视觉分辨率过低"}
-                )
-            if not 0.25 <= aspect_ratio <= 4.0:
-                issues.append(
-                    {"code": "visual_aspect_ratio_extreme", "message": "视觉宽高比异常"}
-                )
+            minimum_width, minimum_height = minimum_size
+            if width < minimum_width or height < minimum_height:
+                issues.append({"code": "visual_resolution_too_small", "message": "视觉分辨率过低"})
+            minimum_aspect, maximum_aspect = aspect_ratio_bounds
+            if not minimum_aspect <= aspect_ratio <= maximum_aspect:
+                issues.append({"code": "visual_aspect_ratio_extreme", "message": "视觉宽高比异常"})
             white = Image.new("RGB", rgb.size, "white")
             bbox = ImageChops.difference(rgb, white).getbbox()
             if bbox is None:
@@ -421,7 +470,10 @@ def visual_qa(
                         "minimum_outer_margin_px": min(margins),
                     }
                 )
-                if outer_whitespace > 0.75:
+                if (
+                    maximum_outer_whitespace is not None
+                    and outer_whitespace > maximum_outer_whitespace
+                ):
                     issues.append(
                         {"code": "visual_excessive_whitespace", "message": "视觉外围留白过多"}
                     )
@@ -432,13 +484,20 @@ def visual_qa(
     return {"passed": not issues, "issues": issues, "metrics": metrics}
 
 
-def _diagram_dot(spec: DiagramSpec) -> str:
+def _diagram_direction(spec: DiagramSpec) -> str:
+    # A left-to-right chain is readable at full page width, but pathological in a
+    # single column (the real failure was 994×77, aspect ratio 12.9:1). Preserve
+    # the requested direction in provenance while choosing a printable layout.
+    return "TB" if spec.width == "column" and spec.direction == "LR" else spec.direction
+
+
+def _diagram_dot(spec: DiagramSpec, *, direction: str | None = None) -> str:
     lines = [
         "digraph PaperForge {",
-        f"rankdir={spec.direction};",
+        f"rankdir={direction or spec.direction};",
         'graph [bgcolor="white", pad="0.15", nodesep="0.35", ranksep="0.5"];',
         'node [fontname="Noto Sans CJK SC", fontsize=10, color="#4B5563", '
-        'style="filled", fillcolor="#F8FAFC"];',
+        'style="filled", fillcolor="#F8FAFC", penwidth=1.2];',
         'edge [fontname="Noto Sans CJK SC", fontsize=8, color="#64748B", arrowsize=0.7];',
     ]
     grouped = {group.id: [] for group in spec.groups}
@@ -457,9 +516,15 @@ def _diagram_dot(spec: DiagramSpec) -> str:
                 'color="#CBD5E1"; style="rounded";',
             ]
         )
-        lines.extend(_dot_node(node) for node in nodes)
+        lines.extend(
+            _dot_node(node, fillcolor=DIAGRAM_FILLS[index % len(DIAGRAM_FILLS)])
+            for index, node in enumerate(nodes)
+        )
         lines.append("}")
-    lines.extend(_dot_node(node) for node in ungrouped)
+    lines.extend(
+        _dot_node(node, fillcolor=DIAGRAM_FILLS[index % len(DIAGRAM_FILLS)])
+        for index, node in enumerate(ungrouped)
+    )
     for edge in spec.edges:
         label = f' [label="{_dot_text(edge.label)}"]' if edge.label else ""
         lines.append(f"{_dot_id(edge.source)} -> {_dot_id(edge.target)}{label};")
@@ -467,10 +532,13 @@ def _diagram_dot(spec: DiagramSpec) -> str:
     return "\n".join(lines)
 
 
-def _dot_node(node) -> str:
+def _dot_node(node, *, fillcolor: str) -> str:
     shape = {"box": "box", "rounded": "box", "ellipse": "ellipse", "diamond": "diamond"}[node.shape]
     style = 'style="rounded,filled"' if node.shape == "rounded" else 'style="filled"'
-    return f'{_dot_id(node.id)} [label="{_dot_text(node.label)}", shape={shape}, {style}];'
+    return (
+        f'{_dot_id(node.id)} [label="{_dot_text(node.label)}", shape={shape}, '
+        f'{style}, fillcolor="{fillcolor}"];'
+    )
 
 
 def _dot_id(value: str) -> str:

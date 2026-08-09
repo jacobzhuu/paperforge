@@ -12,7 +12,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 class RegisterRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    password: str = Field(min_length=15, max_length=128)
     display_name: str | None = Field(default=None, max_length=120)
 
 
@@ -32,12 +32,12 @@ class ForgotPasswordRequest(BaseModel):
 
 
 class ResetPasswordRequest(TokenRequest):
-    new_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=15, max_length=128)
 
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=128)
-    new_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=15, max_length=128)
 
 
 class AuthMessageResponse(BaseModel):
@@ -166,6 +166,29 @@ class UpdateProjectRequest(BaseModel):
     metadata_confirmed: bool | None = None
 
 
+class ProjectAttentionSummary(BaseModel):
+    manuscript: dict[str, Any]
+    active_job: dict[str, Any] | None = None
+    readiness: dict[str, Any]
+    latest_pdf: dict[str, Any] | None = None
+
+
+class SubmissionReadinessItem(BaseModel):
+    key: str
+    label: str
+    state: Literal["pass", "warn", "fail", "unknown", "stale"]
+    checked_at: datetime | None = None
+    reason: str
+    fix_href: str
+
+
+class SubmissionReadinessResponse(BaseModel):
+    project_id: str
+    state: Literal["pass", "warn", "fail", "unknown", "stale"]
+    checked_at: datetime | None = None
+    items: list[SubmissionReadinessItem] = Field(default_factory=list)
+
+
 class ProjectResponse(BaseModel):
     id: str
     title: str
@@ -186,6 +209,9 @@ class ProjectResponse(BaseModel):
     section_count: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: 非空 = 在回收站里。常规列表永远取不到这样的项目，只有 ?deleted=true 会。
+    deleted_at: datetime | None = None
+    attention_summary: ProjectAttentionSummary | None = None
 
 
 class ScopeResponse(BaseModel):
@@ -251,6 +277,21 @@ class LiteratureCardResponse(BaseModel):
     extraction_model: str | None = None
 
 
+class LibraryUtilizationResponse(BaseModel):
+    """One selected work's progress from full text to an actual body citation."""
+
+    fulltext_status: Literal["available", "parsing", "failed", "abstract_only", "unavailable"]
+    fulltext_source: Literal["user_pdf", "oa", "none"] = "none"
+    evidence_status: Literal["extracted", "pending", "none"] = "none"
+    assignment_status: Literal["assigned", "pending", "unassigned"] = "unassigned"
+    citation_status: Literal["cited", "not_cited"] = "not_cited"
+    evidence_count: int = 0
+    assignment_count: int = 0
+    citation_count: int = 0
+    usage_evaluated: bool = False
+    unused_reason: str | None = None
+
+
 class LibraryEntryResponse(BaseModel):
     id: str
     work: ScholarlyWorkResponse
@@ -262,6 +303,23 @@ class LibraryEntryResponse(BaseModel):
     bibtex_key: str | None = None
     verified_at: datetime | None = None
     card: LiteratureCardResponse | None = None
+    literature_role: Literal[
+        "general", "core", "background", "method", "benchmark", "controversy"
+    ] = "general"
+    utilization: LibraryUtilizationResponse | None = None
+
+
+class EligibilityDecisionResponse(BaseModel):
+    """SCREEN 阶段对一篇文献的判定与理由（可复现的命中项）。"""
+
+    work_id: str
+    title: str
+    decision: Literal["include", "exclude", "uncertain"]
+    reason: str | None = None
+    anchor_facet_hit: bool = False
+    criterion_hits: dict[str, Any] = Field(default_factory=dict)
+    decided_by: str = "deterministic"
+    model: str | None = None
 
 
 class SelectEntriesRequest(BaseModel):
@@ -271,9 +329,54 @@ class SelectEntriesRequest(BaseModel):
     status: EntryStatus = "selected"
 
 
+class UpdateLibraryEntryRequest(BaseModel):
+    literature_role: Literal["general", "core", "background", "method", "benchmark", "controversy"]
+
+
 class ImportReferencesRequest(BaseModel):
     dois: list[str] = Field(default_factory=list)
     bibtex: str | None = None
+
+
+class PdfExtractedMetadataResponse(BaseModel):
+    doi: str | None = None
+    title: str | None = None
+    authors: list[str] = Field(default_factory=list)
+    publication_year: int | None = None
+
+
+class LiteraturePdfUploadResponse(BaseModel):
+    id: str
+    filename: str
+    status: Literal[
+        "matching",
+        "needs_confirmation",
+        "match_failed",
+        "parsing",
+        "extracting",
+        "ready",
+        "parse_failed",
+        "rejected",
+    ]
+    extracted_metadata: PdfExtractedMetadataResponse | None = None
+    matched_work: ScholarlyWorkResponse | None = None
+    match_method: str | None = None
+    match_confidence: float | None = None
+    document_file_id: str | None = None
+    error: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class LiteraturePdfUploadStartedResponse(BaseModel):
+    upload: LiteraturePdfUploadResponse
+    job: JobResponse
+
+
+class ConfirmLiteraturePdfRequest(BaseModel):
+    literature_role: (
+        Literal["general", "core", "background", "method", "benchmark", "controversy"] | None
+    ) = None
 
 
 class SearchRunResponse(BaseModel):
@@ -313,6 +416,8 @@ class OutlineResponse(BaseModel):
     version: int = 0
     status: str = "draft"
     tree: dict[str, Any] = Field(default_factory=dict)
+    stale: bool = False
+    stale_reason: str | None = None
 
 
 class UpdateOutlineRequest(BaseModel):
@@ -375,20 +480,23 @@ class MarkdownResponse(BaseModel):
 # ---- M3：导出 ----
 
 
+ExportFormat = Literal[
+    "pdf",
+    "latex_zip",
+    "markdown",
+    "markdown_bundle",
+    "bibtex",
+    "docx",
+]
+
+
+def _default_export_formats() -> list[ExportFormat]:
+    return ["pdf", "latex_zip", "markdown", "markdown_bundle", "bibtex", "docx"]
+
+
 class ExportRequest(BaseModel):
-    formats: list[Literal["pdf", "latex_zip", "markdown", "markdown_bundle", "bibtex", "docx"]] = (
-        Field(
-            default_factory=lambda: [
-                "pdf",
-                "latex_zip",
-                "markdown",
-                "markdown_bundle",
-                "bibtex",
-                "docx",
-            ]
-        )
-    )
-    quality_profile: Literal["draft", "submission"] = "draft"
+    formats: list[ExportFormat] = Field(default_factory=_default_export_formats)
+    quality_profile: Literal["draft", "scholarly", "submission"] = "scholarly"
 
 
 class ExportArtifactResponse(BaseModel):
@@ -400,9 +508,10 @@ class ExportArtifactResponse(BaseModel):
     created_at: datetime | None = None
     download_url: str | None = None
     quality_report_id: str | None = None
-    quality_profile: Literal["draft", "submission"] = "draft"
+    quality_profile: Literal["draft", "scholarly", "submission"] = "scholarly"
     readiness_status: str = "unassessed"
     paper_snapshot_hash: str | None = None
+    export_run_id: str | None = None
 
 
 # ---- M4：素材与数字 lint ----
@@ -423,6 +532,23 @@ class AssetResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     # asset_ref 供大纲/章节引用素材（渲染期确定性展开）。
     asset_ref: str | None = None
+
+
+class AssetCapabilitiesResponse(BaseModel):
+    max_bytes: int
+    max_mib: int
+    preferred_extensions: list[str] = Field(default_factory=list)
+    accepts_unrecognized_as_method_note: bool = True
+
+
+class MaterialPreflightIssue(BaseModel):
+    code: str
+    message: str
+
+
+class MaterialPreflightResponse(BaseModel):
+    ready: bool
+    issues: list[MaterialPreflightIssue] = Field(default_factory=list)
 
 
 # ---- M8：视觉建议 / 生成 / 审核 ----
@@ -568,6 +694,9 @@ class VisualResponse(BaseModel):
     suggestion_reason: str | None = None
     source_section_keys: list[str] = Field(default_factory=list)
     stale: bool = False
+    #: 最近一次成功生成 rendition 的准确时间，来自 visual_generation_attempt。
+    #: 与建议的 created_at 分开，避免把“提出建议”误写成“图片已生成”。
+    generated_at: datetime | None = None
     created_at: datetime | None = None
 
 
@@ -596,8 +725,21 @@ class IngestRequest(BaseModel):
 
 
 class GenerationOptionsRequest(BaseModel):
-    quality_profile: Literal["draft", "submission"] = "draft"
+    quality_profile: Literal["draft", "scholarly", "submission"] = "scholarly"
     review_style: Literal["narrative", "systematic"] = "narrative"
+
+
+class FullPipelineOptionsRequest(GenerationOptionsRequest):
+    """一键全管线的默认档位，和单跑质量端点不同。
+
+    ``/quality``、``/quality/repair`` 是用户主动要一次严格评估，默认 scholarly 合理。
+    全管线的承诺是「一次跑到 PDF」：scholarly 档会在正文写完后再追加最多两轮
+    「重写未达标章节 + 全文重新评估」，而且没过质量门连导出都不做——把它当默认值，
+    等于让「跑通全流程」默认可能不产出任何稿件。draft 档同样跑完整评估、发现项
+    一条不少，只是不升级成阻断项；要不要为这些发现项花一轮重写，由用户跑完后决定。
+    """
+
+    quality_profile: Literal["draft", "scholarly", "submission"] = "draft"
 
 
 class QualityResponse(BaseModel):
@@ -620,7 +762,7 @@ class QualityResponse(BaseModel):
     report_id: str | None = None
     document_version: int | None = None
     paper_snapshot_hash: str | None = None
-    quality_profile: Literal["draft", "submission"] = "draft"
+    quality_profile: Literal["draft", "scholarly", "submission"] = "scholarly"
     review_style: Literal["narrative", "systematic"] = "narrative"
     readiness_status: str = "unassessed"
     stale: bool = False
@@ -631,6 +773,109 @@ class QualityResponse(BaseModel):
     core_claim_fulltext_count: int = 0
     core_claim_fulltext_coverage: float = 0.0
     layout_checks: dict[str, Any] = Field(default_factory=dict)
+    depth_metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchQuestionResponse(BaseModel):
+    id: str
+    parent_id: str | None = None
+    text: str
+    kind: Literal["core", "sub"]
+    order_index: int
+    comparison_dimensions: list[str] = Field(default_factory=list)
+    expected_evidence_kinds: list[str] = Field(default_factory=list)
+    answer_status: Literal["answered", "partial", "contested", "insufficient_evidence"]
+    generator: str | None = None
+    origin: Literal["auto", "user"] = "auto"
+    locked: bool = False
+    task_id: str | None = None
+    search_query: str | None = None
+
+
+class UpdateResearchQuestionRequest(BaseModel):
+    text: str | None = None
+    comparison_dimensions: list[str] | None = None
+    expected_evidence_kinds: list[str] | None = None
+    answer_status: Literal["answered", "partial", "contested", "insufficient_evidence"] | None = (
+        None
+    )
+    task_id: str | None = None
+    # 检索面：问题改了却不能改检索式的话，编辑对召回毫无作用。
+    search_query: str | None = None
+    # 解锁后这一行重新交给自动重生成管理。
+    locked: bool | None = None
+
+
+class EvidenceUnitResponse(BaseModel):
+    id: str
+    work_id: str
+    cite_key: str | None = None
+    title: str | None = None
+    kind: str
+    grade: str
+    anchor_strength: str | None = None
+    text: str
+    page: int | None = None
+    section_path: str | None = None
+    paragraph_index: int | None = None
+    object_ref: str | None = None
+    measurements: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class QuestionEvidenceLinkResponse(BaseModel):
+    id: str
+    research_question_id: str
+    evidence_unit_id: str
+    stance: Literal["supports", "contradicts", "conditional", "not_comparable", "gap"]
+    condition_note: str | None = None
+    confidence: float | None = None
+    manually_overridden: bool = False
+
+
+class UpdateQuestionEvidenceLinkRequest(BaseModel):
+    stance: Literal["supports", "contradicts", "conditional", "not_comparable", "gap"]
+    condition_note: str | None = None
+
+
+class EvidenceMatrixPerQuestionDiagnostics(BaseModel):
+    question_id: str
+    candidate_count: int = 0
+    classified_count: int = 0
+    eligible_abc_count: int = 0
+    best_score: float | None = None
+    routing_mode: str | None = None
+    bridge_source: str | None = None
+    no_link_reason: str | None = None
+    rejected_by_lexical: int | None = None
+    rejected_by_task: int | None = None
+    fallback_classifier_used: bool = False
+    # 被分类器整批否掉时的候选样本：用来区分「候选真不相关」和「提示过严」。
+    rejected_sample: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EvidenceMatrixDiagnostics(BaseModel):
+    evidence_unit_count: int = 0
+    link_count: int = 0
+    question_count: int = 0
+    unlinked_evidence_count: int = 0
+    rejected_by_lexical: int | None = None
+    rejected_by_task: int | None = None
+    zero_candidate_questions: int | None = None
+    bridge_sources: dict[str, int] | None = None
+    per_question: list[EvidenceMatrixPerQuestionDiagnostics] | None = None
+
+
+class EvidenceMatrixResponse(BaseModel):
+    questions: list[ResearchQuestionResponse] = Field(default_factory=list)
+    evidence: list[EvidenceUnitResponse] = Field(default_factory=list)
+    links: list[QuestionEvidenceLinkResponse] = Field(default_factory=list)
+    diagnostics: EvidenceMatrixDiagnostics | None = None
+
+
+class SynthesisResponse(BaseModel):
+    questions: list[ResearchQuestionResponse] = Field(default_factory=list)
+    bundles: list[dict[str, Any]] | None = None
+    comparison_cluster_count: int = 0
 
 
 class ClaimEvidenceResponse(BaseModel):
@@ -641,12 +886,17 @@ class ClaimEvidenceResponse(BaseModel):
     claim_kind: str
     is_core: bool = False
     cite_key: str | None = None
+    source_key: str | None = None
+    user_asset_id: str | None = None
     source_kind: str
     source_page: int | None = None
     source_section: str | None = None
     source_paragraph: int | None = None
     evidence_excerpt: str | None = None
     evidence_hash: str | None = None
+    evidence_unit_id: str | None = None
+    comparability_ok: bool | None = None
+    grade_ok: bool | None = None
     support_status: str
     support_score: float | None = None
     manual_status: str = "unreviewed"
@@ -670,6 +920,31 @@ class RefineResponse(BaseModel):
     refined: str
     changed: bool = False
     note: str | None = None
+
+
+class RewriteSectionRequest(BaseModel):
+    instruction: str = Field(min_length=3, max_length=2000)
+    expected_updated_at: datetime | None = None
+    allowed_evidence_refs: list[str] = Field(default_factory=list, max_length=100)
+
+
+class RewriteSectionCandidateResponse(BaseModel):
+    section_key: str
+    original_body_ir: dict[str, Any]
+    candidate_body_ir: dict[str, Any]
+    changed: bool
+    checks: dict[str, Any] = Field(default_factory=dict)
+    note: str | None = None
+
+
+class AcceptSectionRewriteRequest(BaseModel):
+    candidate_body_ir: dict[str, Any]
+    expected_updated_at: datetime | None = None
+
+
+class AcceptSectionRewriteResponse(BaseModel):
+    document_version: int
+    section: SectionResponse
 
 
 # ---- M6：设置 / 版本历史 / 成本 ----
@@ -713,7 +988,6 @@ class SettingsResponse(BaseModel):
     llm_enabled: bool = False
     roles: list[RoleModelResponse] = Field(default_factory=list)
     scholar_contact_email_configured: bool = False
-    semantic_scholar_key_configured: bool = False
     storage_backend: str = "filesystem"
     visuals_enabled: bool = True
     ai_images_enabled: bool = False

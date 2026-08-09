@@ -125,7 +125,11 @@ a paper you cannot judge should get a low score, not an invented justification."
 
 # 自动入库的主题证据下限。低于这个值意味着标题、摘要、概念面、LLM 判断
 # 四个信号**全都**没有把候选和主题联系起来——分数只是时效与引用量堆出来的。
-AUTO_SELECT_MIN_TOPIC_EVIDENCE = 0.05
+AUTO_SELECT_MIN_TOPIC_EVIDENCE = 0.15
+# Absolute floor for the final blended score. Prefer selecting fewer papers over
+# padding the library with off-topic noise (N3 / N-RC6).
+AUTO_SELECT_MIN_ABSOLUTE_SCORE = 0.35
+RERANK_BATCH_SIZE = 20
 
 
 def balanced_selection_indices(
@@ -142,6 +146,7 @@ def balanced_selection_indices(
         index
         for index, item in enumerate(ranked)
         if topic_evidence(item) >= AUTO_SELECT_MIN_TOPIC_EVIDENCE
+        and item.score >= AUTO_SELECT_MIN_ABSOLUTE_SCORE
     ]
     foundational = [
         index
@@ -173,6 +178,8 @@ def balanced_selection_indices(
     take(foundational, max(1, round(limit * 0.25)) if foundational else 0)
     take(recent, max(1, round(limit * 0.4)) if recent else 0)
     take(oa, max(1, round(limit * 0.4)) if oa else 0)
+    # Fill remaining slots only from the eligible pool — never drop the absolute
+    # score floor just to hit the numeric limit.
     take(eligible, limit)
     return set(selected[:limit])
 
@@ -262,61 +269,71 @@ async def rerank_with_llm(
 
     Draft-first：LLM 不可用或输出不合法时原样返回确定性排序。
     LLM 只调整顺序与理由，**不能**引入新文献，也不改变任何元数据。
+    Batches of ≤20 avoid output truncation that previously abandoned the whole
+    rerank (N3).
     """
     if runner is None or not runner.enabled or not ranked:
         return ranked
     head = ranked[: max(1, top_n)]
     tail = ranked[len(head) :]
     question = scope.get("research_question") or scope.get("topic") or ""
-    lines = []
-    for index, item in enumerate(head):
-        abstract = (item.candidate.abstract or "").replace("\n", " ")[:400]
-        year = item.candidate.publication_year or "n.d."
-        lines.append(f"[{index}] ({year}) {item.candidate.title}\n{abstract}")
-    result = await runner.agenerate_json(
-        "reranker",
-        system_prompt=_SYSTEM_PROMPT,
-        user_prompt=f"Research question: {question}\n\nCandidates:\n" + "\n\n".join(lines),
-        max_output_tokens=2000,
-        temperature=0.0,
-        metadata={"stage": "rerank", "candidate_count": len(head)},
-    )
-    if not result.ok or not isinstance(result.value, dict):
-        return ranked
-    entries = result.value.get("ranking")
-    if not isinstance(entries, list) or not entries:
-        return ranked
-
-    reranked: list[RankedCandidate] = []
-    seen: set[int] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        index = entry.get("index")
-        if not isinstance(index, int) or not 0 <= index < len(head) or index in seen:
-            continue
-        seen.add(index)
-        base = head[index]
-        score = entry.get("score")
-        llm_score = float(score) if isinstance(score, int | float) else base.score
-        llm_score = min(1.0, max(0.0, llm_score))
-        # 与确定性分取平均：LLM 提供语义判断，确定性分守住可解释的下限。
-        blended = round((llm_score + base.score) / 2, 4)
-        reranked.append(
-            RankedCandidate(
-                candidate=base.candidate,
-                score=blended,
-                reason={
-                    **base.reason,
-                    "method": "deterministic_v1+llm_rerank",
-                    "llm_score": round(llm_score, 4),
-                    "llm_reason": str(entry.get("reason") or "")[:300],
-                    "llm_model": result.model,
-                },
-            )
+    remapped: list[RankedCandidate | None] = [None] * len(head)
+    for batch_start in range(0, len(head), RERANK_BATCH_SIZE):
+        batch = head[batch_start : batch_start + RERANK_BATCH_SIZE]
+        lines = []
+        for local_index, item in enumerate(batch):
+            abstract = (item.candidate.abstract or "").replace("\n", " ")[:400]
+            year = item.candidate.publication_year or "n.d."
+            lines.append(f"[{local_index}] ({year}) {item.candidate.title}\n{abstract}")
+        result = await runner.agenerate_json(
+            "reranker",
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=(f"Research question: {question}\n\nCandidates:\n" + "\n\n".join(lines)),
+            max_output_tokens=min(3200, 400 + 80 * len(batch)),
+            temperature=0.0,
+            metadata={
+                "stage": "rerank",
+                "candidate_count": len(batch),
+                "batch_start": batch_start,
+            },
         )
-    # LLM 漏掉的候选保持确定性顺序附在后面——不因为「没被提及」就丢弃。
-    reranked.extend(head[index] for index in range(len(head)) if index not in seen)
+        seen: set[int] = set()
+        if result.ok and isinstance(result.value, dict):
+            entries = result.value.get("ranking")
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    local_index = entry.get("index")
+                    if (
+                        not isinstance(local_index, int)
+                        or not 0 <= local_index < len(batch)
+                        or local_index in seen
+                    ):
+                        continue
+                    seen.add(local_index)
+                    base = batch[local_index]
+                    score = entry.get("score")
+                    llm_score = float(score) if isinstance(score, int | float) else base.score
+                    llm_score = min(1.0, max(0.0, llm_score))
+                    blended = round((llm_score + base.score) / 2, 4)
+                    remapped[batch_start + local_index] = RankedCandidate(
+                        candidate=base.candidate,
+                        score=blended,
+                        reason={
+                            **base.reason,
+                            "method": "deterministic_v1+llm_rerank",
+                            "llm_score": round(llm_score, 4),
+                            "llm_reason": str(entry.get("reason") or "")[:300],
+                            "llm_model": result.model,
+                        },
+                    )
+        for local_index, item in enumerate(batch):
+            global_index = batch_start + local_index
+            if remapped[global_index] is None:
+                remapped[global_index] = item
+    reranked = [item for item in remapped if item is not None]
+    reranked.sort(key=_sort_key, reverse=True)
     reranked.extend(tail)
     return reranked
 
@@ -356,16 +373,23 @@ def _scope_tokens(scope: dict[str, Any]) -> set[str]:
     return tokens
 
 
-def _scope_facets(scope: dict[str, Any]) -> list[set[str]]:
-    facets: list[set[str]] = []
+def _scope_facets(scope: dict[str, Any]) -> list[list[set[str]]]:
+    """Return keyword phrases grouped by conceptual facet.
+
+    A facet is satisfied only when a whole phrase matches; ``prediction``
+    alone cannot satisfy “biosynthetic gene cluster prediction”.
+    """
+    facets: list[list[set[str]]] = []
     for group in scope.get("keyword_groups") or []:
         if not isinstance(group, dict):
             continue
-        facet: set[str] = set()
+        phrases: list[set[str]] = []
         for keyword in group.get("keywords") or []:
-            facet |= _tokens(str(keyword))
-        if facet:
-            facets.append(facet)
+            phrase = _tokens(str(keyword))
+            if phrase:
+                phrases.append(phrase)
+        if phrases:
+            facets.append(phrases)
     return facets
 
 
@@ -375,11 +399,11 @@ def _overlap(wanted: set[str], have: set[str]) -> float:
     return len(wanted & have) / len(wanted)
 
 
-def _facet_coverage(facets: list[set[str]], have: set[str]) -> float:
+def _facet_coverage(facets: list[list[set[str]]], have: set[str]) -> float:
     """覆盖了几个正交概念面——比单纯词频更能反映主题贴合度。"""
     if not facets:
         return 0.0
-    hit = sum(1 for facet in facets if facet & have)
+    hit = sum(1 for alternatives in facets if any(phrase <= have for phrase in alternatives))
     return hit / len(facets)
 
 

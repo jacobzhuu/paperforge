@@ -1,0 +1,47 @@
+#include <tunables/global>
+
+# Docker's default container policy, rendered for the Snap daemon label.
+#
+# The Snap-packaged daemon runs under snap.docker.dockerd rather than
+# unconfined. Without the explicit peer rules below, AppArmor blocks Docker
+# lifecycle signals and running containers cannot be stopped or removed.
+profile docker-default flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # Host and OCI runtimes may signal container processes.
+  signal (receive) peer=unconfined,
+  signal (receive) peer=runc,
+  signal (receive) peer=crun,
+
+  # The Snap-confined daemon may trace and signal its containers.
+  ptrace (readby, tracedby) peer="snap.docker.dockerd",
+  signal (receive) peer="snap.docker.dockerd",
+
+  # Container processes may signal processes using the same profile.
+  signal (send, receive) peer=docker-default,
+
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  ptrace (trace, read, tracedby, readby) peer=docker-default,
+}

@@ -9,6 +9,7 @@ from paper_ir.schema import (
     CiteRun,
     EquationBlock,
     FigureBlock,
+    GroundingRun,
     ListBlock,
     MathInlineRun,
     PaperIR,
@@ -31,6 +32,7 @@ from latex_render.escape import latex_escape, latex_identifier
 _SECTION_CMD = {1: "section", 2: "subsection", 3: "subsubsection"}
 MAX_TABLE_ROWS_IN_PDF = 40
 MAX_TABLE_COLUMNS_IN_PDF = 8
+_TABLE_SOFT_BREAK_CHARS = frozenset(r"\/._-:;,+|=()[]{}")
 
 # 浮动体位置说明符。
 #
@@ -39,12 +41,12 @@ MAX_TABLE_COLUMNS_IN_PDF = 8
 #
 # `!` 让 LaTeX 忽略「一页最多几个浮动体、正文至少占多少」这类限制，
 # `h` 允许就地放置——作者在第几个 block 插的图，就尽量出现在那里。
-_FLOAT_PLACEMENT = "!htbp"
+FLOAT_PLACEMENT = "!htbp"
 # 双栏浮动体（figure*/table*）只能上页顶或单独成页，`h`/`b` 对它们无效。
 _DOUBLE_FLOAT_PLACEMENT = "!tp"
 
 
-def _render_run(run: TextRun | CiteRun | MathInlineRun | XRefRun) -> str:
+def _render_run(run: TextRun | CiteRun | GroundingRun | MathInlineRun | XRefRun) -> str:
     if isinstance(run, TextRun):
         # 强调是**结构化标记**，正文照常转义后再包命令——LLM 无法借此注入
         # 任意 LaTeX（设计 §4.5：自由 LaTeX 只允许出现在 equation/algorithm）。
@@ -59,6 +61,8 @@ def _render_run(run: TextRun | CiteRun | MathInlineRun | XRefRun) -> str:
         # cite 是原子节点；key 白名单在写作期已保证（R2），此处仅确定性展开。
         keys = [latex_identifier(key, prefix="cite") for key in run.keys]
         return f"\\cite{{{','.join(keys)}}}" if keys else ""
+    if isinstance(run, GroundingRun):
+        return ""
     if isinstance(run, MathInlineRun):
         return f"${run.v}$"
     if isinstance(run, XRefRun):
@@ -108,7 +112,7 @@ def _float_env(base: str, width: str, twocolumn: bool) -> tuple[str, str]:
     """
     if width == "full" and twocolumn:
         return f"{base}*", _DOUBLE_FLOAT_PLACEMENT
-    return base, _FLOAT_PLACEMENT
+    return base, FLOAT_PLACEMENT
 
 
 def _render_figure(
@@ -148,6 +152,28 @@ def _clean_caption(value: str) -> str:
     ).strip()
 
 
+def _escape_table_cell(value: Any) -> str:
+    """转义单元格，并在技术标识符的分隔符后加入零宽断行点。
+
+    普通正文可以依赖词间空格换行；证据台账却常含 URL、文件路径、公式源码和
+    ``fig:...`` locator。它们在窄 ``p{}`` 列里会成为一个不可分词的超长盒子，
+    产生 50--110pt 的 Overfull hbox。先按原字符切段、再逐段转义，避免直接在
+    已转义 LaTeX 上做替换而破坏 ``\\textbackslash{}`` 等命令。
+    """
+    raw = str(value)[:240]
+    parts: list[str] = []
+    start = 0
+    for index, character in enumerate(raw):
+        if character not in _TABLE_SOFT_BREAK_CHARS:
+            continue
+        parts.append(latex_escape(raw[start : index + 1]))
+        parts.append("\\allowbreak{}")
+        start = index + 1
+    parts.append(latex_escape(raw[start:]))
+    # p 列的首个单词默认可能无法断词；零宽盒让 TeX 从单元格开头就能分行。
+    return "\\hspace{0pt}" + "".join(parts)
+
+
 def _render_table(
     block: TableBlock,
     assets: Mapping[str, dict[str, Any]],
@@ -169,37 +195,48 @@ def _render_table(
 
     if not headers or not rows:
         return (
-            f"\\begin{{table}}[{_FLOAT_PLACEMENT}]\n  \\centering\n"
+            f"\\begin{{table}}[{FLOAT_PLACEMENT}]\n  \\centering\n"
             f"  \\caption{{{caption}}}\n  {label}\n"
             f"  \\todo{{缺少表格素材：{latex_escape(ref or 'inline')}}}\n\\end{{table}}"
         )
 
     if len(headers) == 1:
         column_spec = "@{}p{0.94\\linewidth}@{}"
+        use_tabularx = False
     elif len(headers) == 4:
         # 文献矩阵常见的「研究/年份/方法/证据」布局：年份最窄、方法最宽，
         # 避免等宽 p 列把方法描述挤成大量断行。
         column_spec = (
-            "@{}p{0.270\\linewidth}p{0.100\\linewidth}"
-            "p{0.340\\linewidth}p{0.210\\linewidth}@{}"
+            "@{}p{0.270\\linewidth}p{0.100\\linewidth}p{0.340\\linewidth}p{0.210\\linewidth}@{}"
         )
+        use_tabularx = False
     else:
-        first_width = 0.28 if len(headers) <= 4 else 0.2
-        other_width = (0.92 - first_width) / (len(headers) - 1)
+        # ``p{}`` widths do not include the 2\tabcolsep inserted between
+        # columns.  Reserve ~3.5% of \linewidth per gap; the old 0.92 sum
+        # overflowed every six-column row by 20–35pt.
+        content_width = max(0.55, 0.96 - 0.035 * (len(headers) - 1))
+        first_width = min(0.28 if len(headers) <= 4 else 0.2, content_width * 0.30)
+        other_width = (content_width - first_width) / max(1, len(headers) - 1)
         column_spec = (
             f"@{{}}p{{{first_width:.3f}\\linewidth}}"
             + "".join(f"p{{{other_width:.3f}\\linewidth}}" for _ in headers[1:])
             + "@{}"
         )
+        # Wide twocolumn tables prefer tabularx so leftover width is shared (N6).
+        use_tabularx = len(headers) > 4
     header_row = (
         "    "
-        + " & ".join(f"{{\\raggedright\\bfseries {latex_escape(h)}\\par}}" for h in headers)
+        + " & ".join(f"{{\\raggedright\\bfseries {_escape_table_cell(h)}\\par}}" for h in headers)
         + " \\\\"
     )
     row_lines: list[str] = []
-    for row in rows[:MAX_TABLE_ROWS_IN_PDF]:
+    # longtable can page-break and repeat its header, therefore dropping rows
+    # would silently destroy the evidence ledger.  IEEE's tabular fallback is
+    # the only non-pageable path that retains an explicit safety limit.
+    rendered_rows = rows if not twocolumn else rows[:MAX_TABLE_ROWS_IN_PDF]
+    for row in rendered_rows:
         cells = [
-            f"{{\\raggedright {latex_escape(str(cell))}\\par}}" for cell in row[: len(headers)]
+            f"{{\\raggedright {_escape_table_cell(cell)}\\par}}" for cell in row[: len(headers)]
         ]
         cells += [""] * (len(headers) - len(cells))
         row_lines.append("    " + " & ".join(cells) + " \\\\")
@@ -229,27 +266,31 @@ def _render_table(
             "  \\end{longtable}",
             "\\endgroup",
         ]
-        if len(rows) > MAX_TABLE_ROWS_IN_PDF:
-            lines.insert(
-                -2,
-                f"  % [paperforge] table truncated to {MAX_TABLE_ROWS_IN_PDF} rows "
-                f"(source has {len(rows)})",
-            )
         return "\n".join(lines)
 
     # IEEE 双栏模式不支持 longtable；保留单栏内的表格浮动体行为。
+    # Wide tables use tabularx so columns share leftover width.
+    if use_tabularx:
+        x_spec = "@{}" + "X" * len(headers) + "@{}"
+        begin_env = f"  \\begin{{tabularx}}{{\\linewidth}}{{{x_spec}}}"
+        end_env = "  \\end{tabularx}"
+    else:
+        begin_env = f"  \\begin{{tabular}}{{{column_spec}}}"
+        end_env = "  \\end{tabular}"
     lines = [
-        f"\\begin{{table}}[{_FLOAT_PLACEMENT}]",
+        f"\\begin{{table}}[{FLOAT_PLACEMENT}]",
         "  \\centering",
         "  \\small",
         f"  \\caption{{{caption}}}{label}",
-        f"  \\begin{{tabular}}{{{column_spec}}}",
+        begin_env,
         "    \\toprule",
         header_row,
         "    \\midrule",
         *row_lines,
+        "    \\bottomrule",
+        end_env,
+        "\\end{table}",
     ]
-    lines += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}"]
     if len(rows) > MAX_TABLE_ROWS_IN_PDF:
         lines.insert(
             -1,
@@ -273,7 +314,13 @@ def render_section(
     """
     cmd = _SECTION_CMD.get(section.level, "section")
     label = latex_identifier(section.key, prefix="sec")
-    parts = [f"\\{cmd}{{{latex_escape(section.title)}}}\\label{{{label}}}"]
+    # 摘要中的图表会被导出器保留为一个无标题的前置区块。不能为了保住图片
+    # 再输出一次“摘要”章节标题，也不能让空标题产生一个编号章节。
+    parts = (
+        [f"\\{cmd}{{{latex_escape(section.title)}}}\\label{{{label}}}"]
+        if section.title.strip()
+        else []
+    )
     for block in section.blocks:
         parts.append(_render_block(block, assets, twocolumn))
     return "\n\n".join(p for p in parts if p)
@@ -286,4 +333,11 @@ def render_body(
     twocolumn: bool = False,
 ) -> str:
     """渲染 IR 的正文 body（不含导言区/模板骨架）。"""
-    return "\n\n".join(render_section(s, assets, twocolumn=twocolumn) for s in ir.sections)
+    parts: list[str] = []
+    appendix_started = False
+    for section in ir.sections:
+        if section.appendix and not appendix_started:
+            parts.append("\\appendix")
+            appendix_started = True
+        parts.append(render_section(section, assets, twocolumn=twocolumn))
+    return "\n\n".join(parts)

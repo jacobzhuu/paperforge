@@ -13,10 +13,7 @@ BASELINES = Path(__file__).parent / "fixtures" / "paper_quality_baselines.json"
 
 def _pdf_with_text_at(y: int) -> bytes:
     """构造一个最小 PDF，用于验证页面外文字对象而不依赖外部生成器。"""
-    content = (
-        f"BT /F1 12 Tf 10 {y} Td "
-        "(Visible text row) Tj ET"
-    ).encode("ascii")
+    content = (f"BT /F1 12 Tf 10 {y} Td (Visible text row) Tj ET").encode("ascii")
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -44,8 +41,7 @@ def _pdf_with_text_at(y: int) -> bytes:
     for offset in offsets[1:]:
         pdf += f"{offset:010d} 00000 n \n".encode("ascii")
     pdf += (
-        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
-        f"startxref\n{xref}\n%%EOF\n"
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
     ).encode("ascii")
     return bytes(pdf)
 
@@ -92,6 +88,4 @@ def test_three_review_artifacts_are_fixed_quality_baselines() -> None:
                 expected_figure_count=row["expected_figure_count"],
                 source_constraints_ok=True,
             )
-            assert [item["code"] for item in layout["blockers"]] == row[
-                "expected_pdf_blockers"
-            ]
+            assert [item["code"] for item in layout["blockers"]] == row["expected_pdf_blockers"]

@@ -5,9 +5,8 @@ import Link from 'next/link';
 import { AuthPageShell } from '@/components/auth/app-shell';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { resetPassword } from '@/lib/api';
+import { PasswordField } from '@/components/auth/password-field';
 
 export default function ResetPasswordPage() {
   const [token, setToken] = React.useState<string | null>(null);
@@ -43,7 +42,7 @@ export default function ResetPasswordPage() {
   };
   return (
     <AuthPageShell>
-      <Card><CardHeader><CardTitle>{done ? '密码已更新' : '设置新密码'}</CardTitle><CardDescription>更新后所有旧会话都会失效</CardDescription></CardHeader><CardContent>{done ? <p className="text-center text-sm"><Link href="/login" className="text-primary hover:underline">使用新密码登录</Link></p> : <form className="space-y-4" onSubmit={submit}><div className="space-y-1.5"><Label htmlFor="password">新密码</Label><Input id="password" type="password" autoComplete="new-password" minLength={8} maxLength={128} required value={password} onChange={(event) => setPassword(event.target.value)} /></div><div className="space-y-1.5"><Label htmlFor="confirm">确认新密码</Label><Input id="confirm" type="password" autoComplete="new-password" required value={confirm} onChange={(event) => setConfirm(event.target.value)} /></div>{error && <p role="alert" className="text-sm text-destructive">{error}</p>}<Button className="w-full" disabled={submitting}>{submitting ? '正在更新…' : '更新密码'}</Button></form>}</CardContent></Card>
+      <Card className="auth-card"><CardHeader><CardTitle className="font-serif text-2xl leading-tight">{done ? '密码已更新' : '设置新密码'}</CardTitle><CardDescription>更新后所有旧会话都会失效</CardDescription></CardHeader><CardContent>{done ? <p className="text-center text-sm"><Link href="/login" className="text-primary hover:underline">使用新密码登录</Link></p> : <form className="space-y-4" onSubmit={submit}><PasswordField id="password" label="新密码" autoComplete="new-password" minLength={15} value={password} onChange={setPassword} hint="至少 15 个字符。" /><PasswordField id="confirm" label="确认新密码" autoComplete="new-password" minLength={15} value={confirm} onChange={setConfirm} />{error && <p role="alert" className="text-sm text-destructive">{error}</p>}<Button className="w-full" disabled={submitting}>{submitting ? '正在更新…' : '更新密码'}</Button></form>}</CardContent></Card>
     </AuthPageShell>
   );
 }

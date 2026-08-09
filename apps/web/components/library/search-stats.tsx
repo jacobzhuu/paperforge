@@ -2,7 +2,6 @@
 
 import * as React from 'react';
 import { AlertTriangle, CheckCircle2, ChevronDown, Loader2, XCircle } from 'lucide-react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import type { SearchRun } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -26,27 +25,27 @@ export function SearchStats({ runs }: { runs: SearchRun[] }) {
 
   if (runs.length === 0) {
     return (
-      <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm">检索统计</CardTitle>
-        </CardHeader>
-        <CardContent className="text-xs text-muted-foreground">还没有跑过检索。</CardContent>
-      </Card>
+      <section>
+        <header className="pb-2">
+          <h3 className="text-body">检索统计</h3>
+        </header>
+        <div className="text-meta text-muted-foreground">还没有跑过检索。</div>
+      </section>
     );
   }
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm">检索统计</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
+    <section>
+      <header className="pb-3">
+        <h3 className="text-body">检索统计</h3>
+      </header>
+      <div className="space-y-3">
         <div>
           <p className="text-2xl font-semibold tabular-nums">{retrieved.toLocaleString()}</p>
-          <p className="text-xs text-muted-foreground">条候选文献已取回并去重</p>
+          <p className="text-meta text-muted-foreground">条候选文献已取回并去重</p>
         </div>
 
-        <div className="flex flex-wrap gap-x-3 gap-y-1 border-t pt-2 text-xs">
+        <div className="flex flex-wrap gap-x-3 gap-y-1 border-t pt-2 text-meta">
           <span className="inline-flex items-center gap-1 text-success-strong">
             <CheckCircle2 className="h-3.5 w-3.5" /> {succeeded.length} 源成功
           </span>
@@ -68,7 +67,7 @@ export function SearchStats({ runs }: { runs: SearchRun[] }) {
               type="button"
               onClick={() => setShowFailed((v) => !v)}
               aria-expanded={showFailed}
-              className="flex w-full items-start gap-1.5 rounded text-left text-xs text-warning-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex w-full items-start gap-1.5 rounded text-left text-meta text-warning-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning-strong" />
               <span className="flex-1">
@@ -82,7 +81,7 @@ export function SearchStats({ runs }: { runs: SearchRun[] }) {
               />
             </button>
             {showFailed && (
-              <ul className="mt-1.5 space-y-1 text-xs text-muted-foreground">
+              <ul className="mt-1.5 space-y-1 text-meta text-muted-foreground">
                 {failed.map((run) => (
                   <li key={run.id} className="flex items-start gap-1.5">
                     <XCircle className="mt-0.5 h-3 w-3 shrink-0 text-destructive-strong" />
@@ -97,7 +96,7 @@ export function SearchStats({ runs }: { runs: SearchRun[] }) {
           </div>
         )}
 
-        <ul className="space-y-1 border-t pt-2 text-xs">
+        <ul className="space-y-1 border-t pt-2 text-meta">
           {succeeded.concat(partial).map((run) => (
             <li key={run.id} className="flex items-center gap-2">
               {run.status === 'succeeded' ? (
@@ -112,7 +111,7 @@ export function SearchStats({ runs }: { runs: SearchRun[] }) {
             </li>
           ))}
         </ul>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }

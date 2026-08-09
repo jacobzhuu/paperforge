@@ -3,6 +3,7 @@
 import * as React from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Callout } from '@/components/ui/callout';
 import { cn } from '@/lib/utils';
 
 /**
@@ -26,10 +27,11 @@ export function ModuleError({
 }) {
   if (!error) return null;
   return (
-    <div
+    <Callout
+      variant="warning"
       role="alert"
       className={cn(
-        'flex flex-wrap items-center justify-between gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs',
+        'flex flex-wrap items-center justify-between gap-2',
         className,
       )}
     >
@@ -44,6 +46,6 @@ export function ModuleError({
           <RefreshCw className="h-3.5 w-3.5" /> 重试
         </Button>
       )}
-    </div>
+    </Callout>
   );
 }

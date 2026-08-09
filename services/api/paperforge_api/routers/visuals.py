@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -12,12 +13,12 @@ from db import (
     activate_visual,
     active_visual_for_slot,
     add_visual_source,
-    create_job,
     create_visual,
     document_snapshot_hash,
     get_section,
     get_visual,
     latest_document,
+    latest_successful_visual_attempts,
     list_assets,
     list_sections,
     list_visuals,
@@ -31,7 +32,15 @@ from paper_ir import FigureBlock, PaperIR, PaperMeta
 from paper_ir.schema import Section as IRSection
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
-from visuals import ChartSpec, is_retryable, message_for, normalize_code, parse_visual_spec
+from visuals import (
+    AIImageSpec,
+    ChartSpec,
+    image_provider_configured,
+    is_retryable,
+    message_for,
+    normalize_code,
+    parse_visual_spec,
+)
 
 from paperforge_api.concurrency import require_section_unchanged
 from paperforge_api.config import get_settings
@@ -41,6 +50,7 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
+from paperforge_api.jobs import start_job
 from paperforge_api.schemas import (
     ApproveVisualRequest,
     CreateVisualRequest,
@@ -69,9 +79,13 @@ QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 async def suggest(project_id: str, session: SessionDep, queue: QueueDep) -> JobResponse:
     project = await _require_project(session, project_id)
     _require_visuals_enabled()
-    await _require_queue(queue)
-    job = await create_job(session, project_id=project.id, kind="visual")
-    await queue.enqueue_job("run_visual_suggest_pipeline", str(project.id), str(job.id))
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="visual",
+        function="run_visual_suggest_pipeline",
+    )
     return _job_response(job)
 
 
@@ -94,7 +108,16 @@ async def get_visuals(
         review_status=review_status,
     )
     snapshot = await _current_snapshot_hash(session, project.id)
-    return [_visual_response(project.id, row, snapshot) for row in rows]
+    attempts = await latest_successful_visual_attempts(session, [row.id for row in rows])
+    return [
+        _visual_response(
+            project.id,
+            row,
+            snapshot,
+            generation_attempt=attempts.get(row.id),
+        )
+        for row in rows
+    ]
 
 
 @router.get("/projects/{project_id}/visuals/summary", response_model=VisualSummaryResponse)
@@ -111,6 +134,13 @@ async def visuals_summary(project_id: str, session: SessionDep) -> VisualSummary
     project = await _require_project(session, project_id)
     rows = await list_visuals(session, project.id)
     snapshot = await _current_snapshot_hash(session, project.id)
+
+    # 工作台按 supersedes_id 折叠版本，汇总也必须使用同一口径。否则 v1 失败、
+    # v2 已成功时，卡片显示“可批准”，项目导航却永久亮着“失败”红点。
+    # 仍在正文里的旧批准版本通过 is_active 保留：用户可能正在预览一个尚未
+    # 批准的 v2，此时正文中实际使用的 v1 仍应计入 approved。
+    superseded_ids = {row.supersedes_id for row in rows if row.supersedes_id is not None}
+    rows = [row for row in rows if row.id not in superseded_ids or row.is_active]
 
     summary = VisualSummaryResponse(project_id=str(project.id))
     for row in rows:
@@ -153,10 +183,9 @@ Output JSON only:
 Rules:
 - Fill ONLY the object matching the requested kind; omit the other one.
 - caption and alt_text must be written in the same language as the paper title.
-- For "ai_image": describe shapes, layout and relations — never words to render;
-  generated text is always garbled. Avoid security-sensitive word combinations
-  (attack, poison, malicious, damage) that trip image-service content filters;
-  express the mechanism abstractly instead.
+- For "ai_image": write what the figure shows, how it is arranged and what is in it.
+  A separate step turns this brief into the final image prompt, so do not worry about
+  phrasing, style keywords, or the output language here.
 - For "diagram": 3-7 nodes, every edge must reference existing node ids."""
 
 _QUANTITATIVE_INTENT = re.compile(
@@ -171,6 +200,10 @@ _RELATIONAL_INTENT = re.compile(
 )
 _CONCEPTUAL_INTENT = re.compile(
     r"概念|意象|封面|插图|氛围|隐喻|concept|conceptual|illustration|metaphor|cover",
+    re.IGNORECASE,
+)
+_ILLUSTRATED_STYLE_INTENT = re.compile(
+    r"彩色|多彩|图标|icon|图标化|信息图|插画风|colorful|illustrated|infographic",
     re.IGNORECASE,
 )
 
@@ -203,11 +236,14 @@ async def draft_visual(
     context_summary = _context_summary(target, excerpt)
     suggested_block_index = _suggested_block_index(target)
     chart_asset = _chart_asset(assets, request.source_asset_refs)
+    settings = api_settings()
+    image_config = settings.image_provider_config()
+    ai_images_available = settings.ai_images_enabled and image_provider_configured(image_config)
     selected_kind, reason, warnings = _select_draft_kind(
         request.kind,
         intent,
         chart_asset=chart_asset,
-        ai_images_enabled=api_settings().ai_images_enabled,
+        ai_images_available=ai_images_available,
     )
     target_key = target.section_key if target else request.target_section_key
 
@@ -222,6 +258,44 @@ async def draft_visual(
             warnings=warnings,
         )
 
+    # “开始创作”只是创建一张可编辑、可确认的草稿，必须快速返回。此前 AI 插图
+    # 会在这里串行等待“规格生成 + 提示词润色”两次文本模型调用；模型稍慢时，
+    # Next.js 代理会先断开连接，用户只能看到“未知错误”，而 API 仍在后台空等。
+    #
+    # AI 草稿直接用论文标题、匹配章节和用户原话组成 provider-neutral 规格。用户
+    # 在真正调用 Yunwu 前仍能看到并确认 render_prompt()，不会出现“确认 A、发送 B”。
+    if selected_kind == "ai_image":
+        base = _deterministic_draft(
+            selected_kind,
+            intent,
+            target_section_key=target_key,
+            suggested_block_index=suggested_block_index,
+            reason=reason,
+            context_summary=context_summary,
+            warnings=warnings,
+            paper_title=project.title,
+            context_excerpt=excerpt,
+        )
+        analyzed_spec, analysis = await _analyze_ai_spec(
+            project_title=project.title,
+            rows=rows,
+            user_intent=intent,
+            spec=base.spec,
+        )
+        return DraftVisualResponse(
+            kind="ai_image",
+            title=analysis.title,
+            caption=analysis.caption,
+            alt_text=analysis.alt_text,
+            spec=analyzed_spec.model_dump(mode="json"),
+            target_section_key=target_key,
+            suggested_block_index=suggested_block_index,
+            reason=f"DeepSeek 已结合论文全文分析本次意图；{reason}",
+            context_summary=_full_paper_context_summary(rows),
+            warnings=warnings,
+            generator=f"llm:{analysis.model or 'deepseek'}",
+        )
+
     section_list = "\n".join(
         f"- [{row.section_key}] {row.title}: {_section_excerpt(row)[:320]}" for row in rows[:12]
     )
@@ -233,21 +307,27 @@ async def draft_visual(
 
     runner = LLMRunner(api_settings().llm_config())
     if runner.enabled:
-        result = await runner.agenerate_json(
-            "planner",
-            system_prompt=_DRAFT_PROMPT,
-            user_prompt=(
-                f"Paper title: {project.title}\n"
-                f"Requested kind: {selected_kind}\n"
-                f"Target section: {target_key or 'unspecified'}\n"
-                f"Paper context:\n{context}\n\n"
-                f"What the author wants to show: {intent}"
-            ),
-            max_output_tokens=1200,
-            temperature=0.3,
-            metadata={"stage": "visual_draft"},
-        )
-        if result.ok and isinstance(result.value, dict):
+        try:
+            result = await asyncio.wait_for(
+                runner.agenerate_json(
+                    "planner",
+                    system_prompt=_DRAFT_PROMPT,
+                    user_prompt=(
+                        f"Paper title: {project.title}\n"
+                        f"Requested kind: {selected_kind}\n"
+                        f"Target section: {target_key or 'unspecified'}\n"
+                        f"Paper context:\n{context}\n\n"
+                        f"What the author wants to show: {intent}"
+                    ),
+                    max_output_tokens=1200,
+                    temperature=0.3,
+                    metadata={"stage": "visual_draft"},
+                ),
+                timeout=8,
+            )
+        except Exception:
+            result = None
+        if result is not None and result.ok and isinstance(result.value, dict):
             drafted = _draft_from(
                 result.value,
                 selected_kind,
@@ -320,6 +400,8 @@ def _deterministic_draft(
     reason: str,
     context_summary: str,
     warnings: list[str],
+    paper_title: str = "",
+    context_excerpt: str = "",
 ) -> DraftVisualResponse:
     from visuals import AIImageSemantics, AIImageSpec, DiagramSpec
 
@@ -345,18 +427,38 @@ def _deterministic_draft(
             context_summary=context_summary,
             warnings=warnings,
         )
+    title_context = paper_title.strip()[:240]
+    excerpt_context = " ".join(context_excerpt.split())[:500]
+    subject = intent[:200]
+    if intent.strip() in {"摘要图", "图形摘要", "论文摘要图", "graphical abstract"}:
+        subject = (
+            f"论文《{title_context}》的图形摘要" if title_context else "论文核心内容的图形摘要"
+        )
+    prompt_parts = [
+        f"为学术论文《{title_context}》创作一张清晰、可发表的概念插图。" if title_context else "",
+        f"核心表达：{intent}。",
+        f"论文语境：{excerpt_context}。" if excerpt_context else "",
+        "采用横向、层次清楚的图形摘要构图，使用克制配色和简洁背景，不编造数值或研究结论。",
+    ]
+    prompt = " ".join(part for part in prompt_parts if part)[:4000]
     try:
         spec = AIImageSpec(
-            prompt=f"{intent}. abstract academic conceptual illustration"[:4000],
-            semantics=AIImageSemantics(subject=intent[:200], text_policy="none"),
+            prompt=prompt,
+            quality="high",
+            semantics=AIImageSemantics(
+                subject=subject,
+                composition="横向图形摘要，核心主题居中，相关概念按清晰视觉层级展开",
+                text_policy="auto",
+                aspect_ratio="3:2",
+            ),
         ).model_dump(mode="json")
     except ValueError:
-        # 用户的意图可能落在 AI 图禁区（含量化表述）。退回一句安全的通用描述，
+        # 用户的意图里可能带着 URL 或代码片段。退回一句安全的通用描述，
         # 而不是把错误甩回界面。
         spec = AIImageSpec(
             prompt=(
-                "A clean abstract academic illustration of scientific inquiry, "
-                "organic geometric forms, no text"
+                "A clean conceptual illustration of scientific inquiry, "
+                "organic geometric forms, restrained palette"
             )
         ).model_dump(mode="json")
     return DraftVisualResponse(
@@ -378,7 +480,7 @@ def _select_draft_kind(
     intent: str,
     *,
     chart_asset: Any | None,
-    ai_images_enabled: bool,
+    ai_images_available: bool,
 ) -> tuple[str, str, list[str]]:
     warnings: list[str] = []
     if requested == "chart":
@@ -387,8 +489,8 @@ def _select_draft_kind(
         warnings.append("没有找到可作图的数值素材；为避免编造数据，已改为示意图草稿。")
         return "diagram", "数据图表必须来自已解析的项目素材。", warnings
     if requested in {"diagram", "ai_image"}:
-        if requested == "ai_image" and not ai_images_enabled:
-            warnings.append("AI 插图生成当前未启用；草稿仍可保存，外部生成保持不可用。")
+        if requested == "ai_image" and not ai_images_available:
+            warnings.append("AI 插图生成当前未配置；草稿仍可保存，外部生成保持不可用。")
         return (
             requested,
             (
@@ -400,10 +502,27 @@ def _select_draft_kind(
         )
     if chart_asset is not None and _QUANTITATIVE_INTENT.search(intent):
         return "chart", "检测到比较、趋势或分布意图，并找到可溯源的数值素材。", warnings
+    if chart_asset is None and _QUANTITATIVE_INTENT.search(intent):
+        warnings.append("没有找到可溯源的数值素材；为避免 AI 伪造数据，未自动生成数据图。")
+        return "diagram", "量化图表必须来自已解析的项目素材。", warnings
+    if ai_images_available:
+        if _ILLUSTRATED_STYLE_INTENT.search(intent):
+            return "ai_image", "检测到图标化视觉风格，将使用 AI 生成。", warnings
+        if _CONCEPTUAL_INTENT.search(intent):
+            return "ai_image", "检测到概念表达，将使用 AI 生成。", warnings
+        if _RELATIONAL_INTENT.search(intent):
+            return (
+                "ai_image",
+                "自动选择已采用 AI 生成可发表的概念流程插图。",
+                warnings,
+            )
+        return (
+            "ai_image",
+            "自动选择已采用 AI 生成概念插图。",
+            warnings,
+        )
     if _RELATIONAL_INTENT.search(intent):
-        return "diagram", "检测到流程、分类、组件或关系意图，示意图更准确。", warnings
-    if _CONCEPTUAL_INTENT.search(intent) and ai_images_enabled:
-        return "ai_image", "意图是非精确的概念表达，适合概念插图。", warnings
+        return "diagram", "AI 生成当前不可用，已改用本地直出示意图。", warnings
     return "diagram", "未发现需要精确数据的信号，先用可编辑的示意图表达结构。", warnings
 
 
@@ -525,6 +644,96 @@ def _section_excerpt(row: Any | None) -> str:
     return " ".join(parts).strip()
 
 
+def _full_paper_context(project_title: str, rows: list[Any]) -> str:
+    """把当前文稿完整交给 DeepSeek；不按章节数或字符数截断。"""
+    parts = [f"Paper title: {project_title}"]
+    if not rows:
+        parts.append("The paper body is currently empty.")
+        return "\n\n".join(parts)
+    for row in rows:
+        key = str(getattr(row, "section_key", "") or "")
+        title = str(getattr(row, "title", "") or key)
+        body = _section_excerpt(row)
+        parts.append(f"[{key}] {title}\n{body}")
+    return "\n\n".join(parts)
+
+
+def _full_paper_context_summary(rows: list[Any]) -> str:
+    if not rows:
+        return "DeepSeek 已读取当前项目题目；论文正文尚为空。"
+    characters = sum(len(_section_excerpt(row)) for row in rows)
+    return f"DeepSeek 已读取当前论文全部 {len(rows)} 个章节（约 {characters} 字符）。"
+
+
+def _image_intent_from_spec(spec: dict[str, Any], fallback: str = "") -> str:
+    semantics = spec.get("semantics")
+    semantics = semantics if isinstance(semantics, dict) else {}
+    elements = semantics.get("elements") if isinstance(semantics.get("elements"), list) else []
+    parts = [
+        str(spec.get("prompt_override") or "").strip(),
+        str(semantics.get("subject") or "").strip(),
+        str(semantics.get("composition") or "").strip(),
+        "；".join(str(item).strip() for item in elements if str(item).strip()),
+        str(spec.get("style") or "").strip(),
+        str(spec.get("prompt") or "").strip(),
+        fallback.strip(),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+async def _analyze_ai_spec(
+    *,
+    project_title: str,
+    rows: list[Any],
+    user_intent: str,
+    spec: dict[str, Any],
+) -> tuple[AIImageSpec, Any]:
+    """强制通过 DeepSeek 全文分析；失败时阻止未润色提示词进入 Yunwu。"""
+    from llm_runtime import LLMRunner
+    from paperforge_worker.pipelines.image_prompt import analyze_image_prompt
+
+    runner = LLMRunner(get_settings().llm_config())
+    analysis = await analyze_image_prompt(
+        user_intent=user_intent,
+        full_paper=_full_paper_context(project_title, rows),
+        runner=runner,
+        current_spec=spec,
+    )
+    if analysis is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "deepseek_image_prompt_failed",
+                "message": (
+                    "DeepSeek 未能完成论文全文分析，请稍后重试；"
+                    "系统不会把未分析的提示词直接发送给生图服务。"
+                ),
+            },
+        )
+    payload = deepcopy(spec)
+    payload["prompt"] = analysis.prompt
+    payload["refined_prompt"] = analysis.prompt
+    payload.pop("prompt_override", None)
+    payload["quality"] = payload.get("quality") or "high"
+    payload["semantics"] = {
+        "subject": analysis.subject,
+        "composition": analysis.composition,
+        "elements": list(analysis.elements),
+        "text_policy": analysis.text_policy,
+        "aspect_ratio": "3:2",
+    }
+    try:
+        return AIImageSpec.model_validate(payload), analysis
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "deepseek_image_prompt_invalid",
+                "message": "DeepSeek 返回的生图规格未通过安全校验，请重试。",
+            },
+        ) from error
+
+
 def _context_summary(row: Any | None, excerpt: str) -> str:
     if row is None:
         return "尚无正文，草稿仅依据论文题目与当前意图。"
@@ -555,6 +764,8 @@ async def create_visual_endpoint(
     except Exception as error:  # noqa: BLE001 - pydantic contract error -> 422
         raise HTTPException(status_code=422, detail=str(error)) from error
     document = await latest_document(session, project.id)
+    rows = await list_sections(session, document.id) if document else []
+    snapshot = document_snapshot_hash(rows) if rows else None
     visual = await create_visual(
         session,
         project_id=project.id,
@@ -566,6 +777,11 @@ async def create_visual_endpoint(
         target_section_key=request.target_section_key,
         suggested_block_index=request.suggested_block_index,
         document_version=document.version if document else None,
+        # 只有经过 DeepSeek 的提示词才能声明自己绑定了当前全文；未润色的直接
+        # API 草稿会在生成前由 prepare 端点补分析。
+        paper_snapshot_hash=snapshot
+        if isinstance(spec, AIImageSpec) and spec.refined_prompt
+        else None,
     )
     if isinstance(spec, ChartSpec):
         asset, digest = await _resolve_chart_source(session, project.id, spec.source_asset_ref)
@@ -590,10 +806,25 @@ async def update_visual_endpoint(
             raise HTTPException(status_code=409, detail="use regenerate after a preview exists")
         if request.spec is None:
             raise HTTPException(status_code=422, detail="spec cannot be null")
-        try:
-            spec = parse_visual_spec(request.spec)
-        except Exception as error:  # noqa: BLE001
-            raise HTTPException(status_code=422, detail=str(error)) from error
+        if request.spec.get("kind") == "ai_image":
+            document = await latest_document(session, project.id)
+            rows = await list_sections(session, document.id) if document else []
+            spec, analysis = await _analyze_ai_spec(
+                project_title=project.title,
+                rows=rows,
+                user_intent=_image_intent_from_spec(request.spec, visual.caption),
+                spec=request.spec,
+            )
+            if "caption" not in sent:
+                visual.caption = sanitize_figure_caption(analysis.caption)
+            if "alt_text" not in sent:
+                visual.alt_text = analysis.alt_text
+            visual.paper_snapshot_hash = document_snapshot_hash(rows) if rows else None
+        else:
+            try:
+                spec = parse_visual_spec(request.spec)
+            except Exception as error:  # noqa: BLE001
+                raise HTTPException(status_code=422, detail=str(error)) from error
         if spec.kind != visual.kind:
             raise HTTPException(status_code=409, detail="visual kind cannot change")
         if isinstance(spec, ChartSpec):
@@ -625,6 +856,58 @@ async def update_visual_endpoint(
 
 
 @router.post(
+    "/projects/{project_id}/visuals/{visual_id}/prepare-generation",
+    response_model=VisualResponse,
+)
+async def prepare_ai_generation(
+    project_id: str,
+    visual_id: str,
+    session: SessionDep,
+) -> VisualResponse:
+    """为旧草稿或正文已变化的草稿补做 DeepSeek 全文分析。
+
+    前端在打开付费确认框前调用；这样确认框里展示的已经是 DeepSeek 结合当前全文
+    生成的最终提示词，而不是在用户确认以后再偷偷改写。
+    """
+    project = await _require_project(session, project_id)
+    _require_visuals_enabled()
+    visual = await _require_visual(session, project.id, visual_id)
+    if visual.kind != "ai_image":
+        raise HTTPException(status_code=409, detail="only AI images require prompt preparation")
+    if visual.review_status != "pending" or visual.generation_status not in {"proposed", "failed"}:
+        raise HTTPException(
+            status_code=409, detail="visual cannot be prepared in its current state"
+        )
+
+    document = await latest_document(session, project.id)
+    rows = await list_sections(session, document.id) if document else []
+    snapshot = document_snapshot_hash(rows) if rows else None
+    current = AIImageSpec.model_validate(visual.spec_json)
+    already_current = (
+        bool(current.refined_prompt)
+        and not current.prompt_override
+        and visual.paper_snapshot_hash == snapshot
+    )
+    if not already_current:
+        analyzed, analysis = await _analyze_ai_spec(
+            project_title=project.title,
+            rows=rows,
+            user_intent=_image_intent_from_spec(visual.spec_json, visual.caption),
+            spec=visual.spec_json,
+        )
+        visual.spec_json = analyzed.model_dump(mode="json")
+        visual.input_hash = visual_input_hash(visual.spec_json)
+        visual.caption = sanitize_figure_caption(analysis.caption)
+        visual.alt_text = analysis.alt_text
+        visual.paper_snapshot_hash = snapshot
+        visual.generation_status = "proposed"
+        visual.error_code = None
+        visual.error_message = None
+        await session.flush()
+    return _visual_response(project.id, visual, snapshot)
+
+
+@router.post(
     "/projects/{project_id}/visuals/{visual_id}/generate",
     response_model=JobResponse,
     status_code=status.HTTP_202_ACCEPTED,
@@ -644,13 +927,28 @@ async def generate(
         )
     if visual.kind == "ai_image" and not get_settings().ai_images_enabled:
         raise HTTPException(status_code=409, detail="AI image generation is disabled")
-    await _require_queue(queue)
-    job = await create_job(session, project_id=project.id, kind="visual")
+    if visual.kind == "ai_image":
+        spec = AIImageSpec.model_validate(visual.spec_json)
+        snapshot = await _current_snapshot_hash(session, project.id)
+        if (
+            not spec.refined_prompt
+            or spec.prompt_override
+            or visual.paper_snapshot_hash != snapshot
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ai_prompt_requires_deepseek",
+                    "message": "请先让 DeepSeek 结合当前论文全文生成最终提示词。",
+                },
+            )
     visual.generation_status = "queued"
-    await queue.enqueue_job(
-        "run_visual_generate_pipeline",
-        str(project.id),
-        str(job.id),
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="visual",
+        function="run_visual_generate_pipeline",
         visual_id=str(visual.id),
     )
     return _job_response(job)
@@ -786,16 +1084,37 @@ async def regenerate(
     project = await _require_project(session, project_id)
     old = await _require_visual(session, project.id, visual_id)
     payload = deepcopy(request.spec or old.spec_json)
-    if request.revision_instruction and request.revision_instruction.strip():
+    analysis = None
+    document = await latest_document(session, project.id)
+    rows = await list_sections(session, document.id) if document else []
+    snapshot = document_snapshot_hash(rows) if rows else None
+    if old.kind == "ai_image":
+        user_intent = (
+            request.revision_instruction.strip()
+            if request.revision_instruction and request.revision_instruction.strip()
+            else _image_intent_from_spec(payload, old.caption)
+        )
+        spec, analysis = await _analyze_ai_spec(
+            project_title=project.title,
+            rows=rows,
+            user_intent=user_intent,
+            spec=payload,
+        )
+    elif request.revision_instruction and request.revision_instruction.strip():
         payload = _apply_revision_instruction(
             payload,
             old.kind,
             request.revision_instruction.strip(),
         )
-    try:
-        spec = parse_visual_spec(payload)
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            spec = parse_visual_spec(payload)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    else:
+        try:
+            spec = parse_visual_spec(payload)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=422, detail=str(error)) from error
     if spec.kind != old.kind:
         raise HTTPException(status_code=409, detail="visual kind cannot change across revisions")
     new = await create_visual(
@@ -804,14 +1123,27 @@ async def regenerate(
         kind=old.kind,
         spec=spec.model_dump(mode="json"),
         title=old.title,
-        caption=request.caption if request.caption is not None else old.caption,
-        alt_text=request.alt_text if request.alt_text is not None else old.alt_text,
+        caption=(
+            request.caption
+            if request.caption is not None
+            else analysis.caption
+            if analysis is not None
+            else old.caption
+        ),
+        alt_text=(
+            request.alt_text
+            if request.alt_text is not None
+            else analysis.alt_text
+            if analysis is not None
+            else old.alt_text
+        ),
         target_section_key=old.target_section_key,
         suggested_block_index=old.suggested_block_index,
-        document_version=old.document_version,
+        document_version=document.version if document else old.document_version,
         version=old.version + 1,
         supersedes_id=old.id,
         figure_label=old.figure_label,
+        paper_snapshot_hash=snapshot if isinstance(spec, AIImageSpec) else old.paper_snapshot_hash,
     )
     if isinstance(spec, ChartSpec):
         asset, digest = await _resolve_chart_source(session, project.id, spec.source_asset_ref)
@@ -862,10 +1194,6 @@ def _apply_revision_instruction(
         if re.search(r"通栏|更宽|full.width|wide", lowered):
             payload["width"] = "full"
         # Deliberately never change source_asset_ref/x/y or any data value from prose.
-    elif kind == "ai_image":
-        style = str(payload.get("style") or "clean academic conceptual illustration")
-        candidate = f"{style}; {instruction}"[:160]
-        payload["style"] = candidate
     return payload
 
 
@@ -1022,7 +1350,11 @@ def _resolved_prompt(spec: dict[str, Any]) -> str | None:
 
 
 def _visual_response(
-    project_id: uuid.UUID, visual: Any, snapshot: str | None = None
+    project_id: uuid.UUID,
+    visual: Any,
+    snapshot: str | None = None,
+    *,
+    generation_attempt: Any | None = None,
 ) -> VisualResponse:
     renditions = {}
     for fmt, item in (visual.renditions_json or {}).items():
@@ -1047,8 +1379,8 @@ def _visual_response(
         suggested_block_index=visual.suggested_block_index,
         figure_label=visual.figure_label,
         spec=visual.spec_json,
-        provider=visual.provider,
-        model=visual.model,
+        provider=visual.provider or getattr(generation_attempt, "provider", None),
+        model=visual.model or getattr(generation_attempt, "model", None),
         error_code=visual.error_code,
         error_message=visual.error_message,
         error=_visual_error(visual),
@@ -1064,6 +1396,7 @@ def _visual_response(
         suggestion_reason=getattr(visual, "suggestion_reason", None),
         source_section_keys=list(getattr(visual, "source_section_keys", None) or []),
         stale=_is_stale(visual, snapshot),
+        generated_at=getattr(generation_attempt, "created_at", None),
         created_at=visual.created_at,
     )
 
@@ -1100,11 +1433,6 @@ async def _require_visual(session: AsyncSession, project_id: uuid.UUID, visual_i
 def _require_visuals_enabled() -> None:
     if not get_settings().visuals_enabled:
         raise HTTPException(status_code=404, detail="visual generation is disabled")
-
-
-async def _require_queue(queue: ArqRedis | None) -> None:
-    if queue is None:
-        raise HTTPException(status_code=503, detail="task queue is unavailable")
 
 
 def _job_response(job: Any) -> JobResponse:

@@ -83,6 +83,7 @@ def expand_citation_snowball(
     direction: SnowballDirection = "both",
     cache: HttpCacheBackend | None = None,
     cache_ttl_hours: float = 72.0,
+    enable_semantic_scholar: bool = False,
     semantic_scholar_api_key: str | None = None,
     openalex_api_key: str | None = None,
     semantic_scholar_min_interval_seconds: float | None = None,
@@ -91,6 +92,7 @@ def expand_citation_snowball(
 
     ``direction="both"`` 时每个方向取 ``max_neighbors_per_seed`` 的一半，
     使邻居总量与仅前向时相当。任何 provider 失败都只记诊断，不抛出（draft-first）。
+    Semantic Scholar 仅保留兼容实现，默认关闭；生产流程只使用 OpenAlex 扩展。
     """
     if direction not in {"both", "forward", "backward"}:
         raise ValueError(f"unsupported snowball direction: {direction}")
@@ -133,7 +135,7 @@ def expand_citation_snowball(
 
     for seed in selected:
         openalex_id = (seed.openalex_id or "").strip()
-        s2_id = (seed.semantic_scholar_id or "").strip()
+        s2_id = (seed.semantic_scholar_id or "").strip() if enable_semantic_scholar else ""
 
         if run_forward and openalex_id:
             neighbors, call_diag = _openalex_neighbors(

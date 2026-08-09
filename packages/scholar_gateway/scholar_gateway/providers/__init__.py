@@ -1,4 +1,4 @@
-"""五源学术检索适配器（设计 §3.1 / §9）。
+"""学术检索适配器（设计 §3.1 / §9）。
 
 DeepSearch 的 `literature_review/adapters.py`（1961 行，五源合一）在此按 provider 拆分迁移：
 - `crossref.py` / `openalex.py` / `semantic_scholar.py` / `arxiv.py` / `europepmc.py`
@@ -29,7 +29,6 @@ from scholar_gateway.providers.semantic_scholar import SemanticScholarDiscoveryA
 ADAPTER_REGISTRY: dict[str, type[HttpScholarlyDiscoveryAdapter]] = {
     "openalex": OpenAlexDiscoveryAdapter,
     "crossref": CrossrefDiscoveryAdapter,
-    "semantic_scholar": SemanticScholarDiscoveryAdapter,
     "arxiv": ArxivDiscoveryAdapter,
     "europe_pmc": EuropePmcDiscoveryAdapter,
 }
@@ -40,7 +39,6 @@ DEFAULT_PROVIDER_ORDER: tuple[str, ...] = (
     "europe_pmc",
     "crossref",
     "arxiv",
-    "semantic_scholar",
 )
 
 ALL_PROVIDERS: tuple[str, ...] = tuple(ADAPTER_REGISTRY)

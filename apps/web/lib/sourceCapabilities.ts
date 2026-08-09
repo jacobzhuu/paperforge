@@ -1,5 +1,5 @@
 // 移植自 DeepSearch apps/web/src/components/literatureReview/sourceCapabilities.ts
-// 各学术源（OpenAlex/Crossref/Semantic Scholar/arXiv/EuropePMC）能力与筛选项元数据。
+// 各学术源（OpenAlex/Crossref/arXiv/EuropePMC）能力与筛选项元数据。
 
 export type SourceCapabilityId =
   | 'scholarly_indexes'
@@ -20,7 +20,7 @@ export const SOURCE_CAPABILITIES: SourceCapability[] = [
     id: 'scholarly_indexes',
     label: '综合学术索引',
     description: '跨学科论文元数据与开放学术图谱',
-    providers: ['openalex', 'semantic_scholar'],
+    providers: ['openalex'],
   },
   {
     id: 'citation_doi',
@@ -51,7 +51,6 @@ export const SOURCE_CAPABILITIES: SourceCapability[] = [
 export const ALL_PROVIDER_OPTIONS = [
   { id: 'openalex', label: 'OpenAlex' },
   { id: 'crossref', label: 'Crossref' },
-  { id: 'semantic_scholar', label: 'Semantic Scholar' },
   { id: 'arxiv', label: 'arXiv' },
   { id: 'europe_pmc', label: 'Europe PMC' },
 ] as const;

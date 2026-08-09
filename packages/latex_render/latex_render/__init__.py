@@ -7,8 +7,11 @@ from latex_render.compile import (
     TexdClient,
     bibliography_broken,
     compile_with_repair,
+    degrade_includegraphics,
+    degrade_longtable,
     deterministic_repairs,
     error_context,
+    layout_checks,
     with_inline_bibliography,
 )
 from latex_render.escape import latex_escape, latex_identifier
@@ -35,8 +38,11 @@ __all__ = [
     "bibliography_broken",
     "build_latex_project",
     "compile_with_repair",
+    "degrade_includegraphics",
+    "degrade_longtable",
     "deterministic_repairs",
     "error_context",
+    "layout_checks",
     "latex_escape",
     "latex_identifier",
     "render_body",

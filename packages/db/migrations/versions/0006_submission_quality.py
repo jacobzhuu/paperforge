@@ -30,7 +30,8 @@ def upgrade() -> None:
         sa.Column("keywords_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     )
     op.add_column(
-        "paper_project", sa.Column("metadata_confirmed_at", sa.DateTime(timezone=True), nullable=True)
+        "paper_project",
+        sa.Column("metadata_confirmed_at", sa.DateTime(timezone=True), nullable=True),
     )
 
     op.add_column("visual_asset", sa.Column("logical_slot_key", sa.String(160), nullable=True))
@@ -82,7 +83,9 @@ def upgrade() -> None:
         sa.Column("scores_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("metrics_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("layout_checks_json", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.ForeignKeyConstraint(["document_id"], ["paper_document.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["project_id"], ["paper_project.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
@@ -118,7 +121,9 @@ def upgrade() -> None:
         sa.Column("support_status", sa.String(24), nullable=False),
         sa.Column("support_score", sa.Float(), nullable=True),
         sa.Column("manual_status", sa.String(24), server_default="unreviewed", nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.ForeignKeyConstraint(["document_id"], ["paper_document.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["project_id"], ["paper_project.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["quality_report_id"], ["quality_report.id"], ondelete="CASCADE"),
@@ -126,7 +131,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["work_id"], ["scholarly_work.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
-            "quality_report_id", "claim_hash", "cite_key", name="uq_claim_evidence_report_claim_cite"
+            "quality_report_id",
+            "claim_hash",
+            "cite_key",
+            name="uq_claim_evidence_report_claim_cite",
         ),
     )
     for column in ("quality_report_id", "project_id", "document_id", "section_id", "work_id"):
@@ -153,13 +161,20 @@ def upgrade() -> None:
         ["id"],
         ondelete="SET NULL",
     )
-    op.create_index("ix_export_artifact_quality_report_id", "export_artifact", ["quality_report_id"])
+    op.create_index(
+        "ix_export_artifact_quality_report_id", "export_artifact", ["quality_report_id"]
+    )
 
 
 def downgrade() -> None:
     op.drop_index("ix_export_artifact_quality_report_id", table_name="export_artifact")
     op.drop_constraint("fk_export_artifact_quality_report", "export_artifact", type_="foreignkey")
-    for column in ("paper_snapshot_hash", "readiness_status", "quality_profile", "quality_report_id"):
+    for column in (
+        "paper_snapshot_hash",
+        "readiness_status",
+        "quality_profile",
+        "quality_report_id",
+    ):
         op.drop_column("export_artifact", column)
     op.drop_table("claim_evidence_anchor")
     op.drop_table("quality_report")

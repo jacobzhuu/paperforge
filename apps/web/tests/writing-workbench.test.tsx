@@ -14,6 +14,18 @@ vi.mock('next/navigation', () => ({
 
 vi.mock('@/components/project/project-context', () => ({
   useProject: () => projectCtx.current,
+  useProjectData: () => projectCtx.current,
+  useProjectActions: () => projectCtx.current,
+  useProjectActivity: () => {
+    const tracked = projectCtx.current.tracked as unknown as {
+      job?: { stage?: string; kind?: string };
+    } | null;
+    return {
+      busy: projectCtx.current.busy,
+      runningStage: tracked?.job?.stage,
+      runningKind: tracked?.job?.kind,
+    };
+  },
   useJobFinished: () => {},
   useJobEvent: () => {},
 }));
@@ -36,6 +48,10 @@ const getMarkdownPreview = vi.fn();
 const getQuality = vi.fn();
 const getNumLint = vi.fn();
 const getRuntimeSettings = vi.fn();
+const getEvidenceUnits = vi.fn();
+const getOutline = vi.fn();
+const rebuildDraft = vi.fn();
+const repairQuality = vi.fn();
 const approveVisual = vi.fn();
 const updateSection = vi.fn();
 
@@ -47,6 +63,10 @@ vi.mock('@/lib/api', () => ({
   getQuality: (...a: unknown[]) => getQuality(...a),
   getNumLint: (...a: unknown[]) => getNumLint(...a),
   getRuntimeSettings: (...a: unknown[]) => getRuntimeSettings(...a),
+  getEvidenceUnits: (...a: unknown[]) => getEvidenceUnits(...a),
+  getOutline: (...a: unknown[]) => getOutline(...a),
+  rebuildDraft: (...a: unknown[]) => rebuildDraft(...a),
+  repairQuality: (...a: unknown[]) => repairQuality(...a),
   approveVisual: (...a: unknown[]) => approveVisual(...a),
   updateSection: (...a: unknown[]) => updateSection(...a),
   generateQuality: vi.fn(),
@@ -77,6 +97,7 @@ function dirtyDraft(key: string, title: string) {
 }
 
 async function insertCurrentVisual() {
+  await userEvent.click(await screen.findByRole('button', { name: /视觉建议/ }));
   await userEvent.click(await screen.findByRole('button', { name: /^插入论文$/ }));
   const dialog = await screen.findByRole('dialog');
   await userEvent.click(within(dialog).getByRole('button', { name: /^插入论文$/ }));
@@ -94,6 +115,11 @@ describe('写作工作台', () => {
     getRuntimeSettings.mockReturnValue(
       ok({ ai_images_enabled: true, image_provider_configured: true, image_capabilities: null }),
     );
+    getEvidenceUnits.mockReturnValue(ok([]));
+    getOutline.mockReturnValue(
+      ok({ project_id: 'p1', version: 1, status: 'draft', tree: { sections: [] }, stale: false }),
+    );
+    rebuildDraft.mockReturnValue(ok({ id: 'job-rebuild', kind: 'write' }));
     approveVisual.mockReturnValue(ok(makeVisual({ id: 'v1', review_status: 'approved' })));
     updateSection.mockReturnValue(ok(makeSection()));
   });
@@ -113,6 +139,17 @@ describe('写作工作台', () => {
     render(<WritingWorkbench />);
 
     expect(await screen.findByTestId('section-editor')).toBeInTheDocument();
+  });
+
+  it('证据综合较新时提示确认式重建，不自动替换正文', async () => {
+    getOutline.mockReturnValue(
+      ok({ project_id: 'p1', version: 1, status: 'draft', tree: { sections: [] }, stale: true }),
+    );
+    render(<WritingWorkbench />);
+
+    expect(await screen.findByText(/当前正文仍基于旧大纲/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /按最新证据重建草稿/ })).toBeInTheDocument();
+    expect(rebuildDraft).not.toHaveBeenCalled();
   });
 
   it('章节接口失败才是硬失败：这时才显示整页加载失败', async () => {
@@ -199,6 +236,7 @@ describe('写作工作台', () => {
 
   it('写作台里能从次级菜单直接调整——不再被迫跳去素材中心', async () => {
     render(<WritingWorkbench />);
+    await userEvent.click(await screen.findByRole('button', { name: /视觉建议/ }));
     await userEvent.click(await screen.findByRole('button', { name: '更多' }));
     await userEvent.click(await screen.findByRole('menuitem', { name: /调整视觉/ }));
     expect(await screen.findByText('调整视觉')).toBeInTheDocument();

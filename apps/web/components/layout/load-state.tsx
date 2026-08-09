@@ -31,7 +31,7 @@ export function LoadState({
     return (
       <div
         role="alert"
-        className="flex flex-col items-center justify-center gap-3 rounded-xl border border-destructive/40 bg-destructive/5 px-6 py-12 text-center"
+        className="flex flex-col items-center justify-center gap-3 rounded-lg border border-destructive/40 bg-destructive/5 px-6 py-12 text-center"
       >
         <AlertTriangle className="h-6 w-6 text-destructive-strong" />
         <div>

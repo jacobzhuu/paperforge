@@ -3,52 +3,84 @@
 import * as React from 'react';
 import {
   ArrowUpDown,
-  Download,
+  FileCode2,
   FileText,
+  Link,
   Loader2,
   Network,
   Rocket,
   Search,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ActionMenu } from '@/components/ui/action-menu';
 import { Dialog } from '@/components/ui/dialog';
+import { Drawer } from '@/components/ui/drawer';
 import { useToast } from '@/components/ui/toast';
 import { LoadState } from '@/components/layout/load-state';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
-import { useJobFinished, useProject } from '@/components/project/project-context';
-import { CardDrawer } from './card-drawer';
-import { ImportDialog } from './import-dialog';
+import {
+  useJobFinished,
+  useProjectActions,
+  useProjectData,
+} from '@/components/project/project-context';
+import { PdfMatchDialog, PdfUploadQueue } from './pdf-upload-queue';
 import { SearchStats } from './search-stats';
 import { ProviderFilter } from './provider-filter';
 import { EntryList } from './entry-list';
+import { UtilizationSummary, entryRole } from './utilization-status';
 import {
+  confirmPdfUpload,
   deleteLibraryEntry,
   generateAll,
   generateCards,
   importReferences,
   listLibrary,
+  listPdfUploads,
   listSearchRuns,
   listSections,
+  rejectPdfUpload,
+  retryPdfUpload,
   selectEntries,
   startIngest,
   startSearch,
   startSnowball,
+  updateLibraryEntry,
+  uploadLibraryPdf,
 } from '@/lib/api';
-import type { Job, LibraryEntry, LibraryEntryStatus, SearchRun } from '@/lib/types';
+import type {
+  Job,
+  LibraryEntry,
+  LibraryEntryStatus,
+  LibraryPdfUpload,
+  LibraryPdfUploadResult,
+  LiteratureRole,
+  SearchRun,
+} from '@/lib/types';
 import { buildCiteKeyUsage, sectionsCiting, type CiteKeyUsage } from '@/lib/citation-usage';
 import type { SourceCapabilityId } from '@/lib/sourceCapabilities';
 import { providersFromCapabilities } from '@/lib/sourceCapabilities';
 import { LIBRARY_ACTION } from '@/lib/labels';
 import { describeError } from '@/lib/errors';
+
+/** 详情与导入流程只在用户主动打开后下载，主列表首屏不携带这些表单代码。 */
+const CardDrawer = React.lazy(() =>
+  import('./card-drawer').then((module) => ({ default: module.CardDrawer })),
+);
+const ImportDialog = React.lazy(() =>
+  import('./import-dialog').then((module) => ({ default: module.ImportDialog })),
+);
+const PdfUploadDialog = React.lazy(() =>
+  import('./pdf-upload-dialog').then((module) => ({ default: module.PdfUploadDialog })),
+);
 
 type StatusFilter = 'all' | 'cited' | LibraryEntryStatus;
 
@@ -56,16 +88,19 @@ const STATUS_TABS: { value: StatusFilter; label: string }[] = [
   { value: 'all', label: '全部' },
   { value: 'cited', label: '正文引用' },
   { value: 'candidate', label: LIBRARY_ACTION.candidate },
+  { value: 'candidate_uncertain', label: LIBRARY_ACTION.uncertain },
   { value: 'selected', label: LIBRARY_ACTION.selected },
   { value: 'excluded', label: LIBRARY_ACTION.excluded },
 ];
 
 export function LibraryWorkbench() {
-  const { projectId, project, busy, startJob, reload: reloadProject } = useProject();
+  const { projectId, project, reload: reloadProject } = useProjectData();
+  const { busy, startJob } = useProjectActions();
   const { toast } = useToast();
 
   const [entries, setEntries] = React.useState<LibraryEntry[]>([]);
   const [runs, setRuns] = React.useState<SearchRun[]>([]);
+  const [pdfUploads, setPdfUploads] = React.useState<LibraryPdfUpload[]>([]);
   /** cite-key → 引用它的章节，用于每行的「被引用于 …」（ui-design.md §3.6）。 */
   const [usage, setUsage] = React.useState<CiteKeyUsage>(() => new Map());
   const [loading, setLoading] = React.useState(true);
@@ -73,7 +108,9 @@ export function LibraryWorkbench() {
 
   const [statusFilter, setStatusFilter] = React.useState<StatusFilter>('all');
   const [query, setQuery] = React.useState('');
+  const deferredQuery = React.useDeferredValue(query);
   const [sortDesc, setSortDesc] = React.useState(true);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = React.useState(false);
   const [capabilities, setCapabilities] = React.useState<SourceCapabilityId[]>([
     'scholarly_indexes',
     'cs_preprints',
@@ -82,6 +119,10 @@ export function LibraryWorkbench() {
 
   const [active, setActive] = React.useState<LibraryEntry | null>(null);
   const [importOpen, setImportOpen] = React.useState(false);
+  const [importTab, setImportTab] = React.useState<'doi' | 'bibtex'>('doi');
+  const [pdfUploadOpen, setPdfUploadOpen] = React.useState(false);
+  const [activePdfUpload, setActivePdfUpload] = React.useState<LibraryPdfUpload | null>(null);
+  const [pdfBusyId, setPdfBusyId] = React.useState<string | null>(null);
   const [checked, setChecked] = React.useState<Set<string>>(new Set());
   const [lastIndex, setLastIndex] = React.useState<number | null>(null);
   const [bulkBusy, setBulkBusy] = React.useState(false);
@@ -92,7 +133,7 @@ export function LibraryWorkbench() {
       setLoading(false);
       return;
     }
-    const [lib, sr, sections] = await Promise.all([
+    const [lib, sr, sections, uploads] = await Promise.all([
       listLibrary(projectId),
       // 检索统计属于右侧 Inspector；它失败时主列表仍应可用。
       listSearchRuns(projectId).catch(() => null),
@@ -100,10 +141,16 @@ export function LibraryWorkbench() {
       // 所以不需要为「还没写正文」单独分支。章节反查只是增强信息：即使它
       // 暂时 500，也不能把检索与分诊主界面一起打进错误态。
       listSections(projectId).catch(() => null),
+      // PDF 队列是增强模块：暂时拉不到不能拖垮文献列表。
+      listPdfUploads(projectId).catch(() => null),
     ]);
     setEntries(lib.data);
+    setActive((current) =>
+      current ? lib.data.find((entry) => entry.id === current.id) ?? null : null,
+    );
     setRuns(sr?.data ?? []);
     setUsage(sections ? buildCiteKeyUsage(sections.data) : new Map());
+    if (uploads) setPdfUploads(uploads.data);
     setLoadError(null);
     setLoading(false);
   }, [projectId]);
@@ -121,6 +168,48 @@ export function LibraryWorkbench() {
   }, [runReload]);
   useJobFinished(runReload);
 
+  const hasProcessingPdf = pdfUploads.some((upload) =>
+    ['matching', 'parsing', 'extracting'].includes(upload.status),
+  );
+  React.useEffect(() => {
+    if (!projectId || !hasProcessingPdf) return;
+    let timer: number | null = null;
+    let inFlight = false;
+
+    const poll = () => {
+      if (document.hidden || inFlight) return;
+      inFlight = true;
+      void listPdfUploads(projectId)
+        .then(({ data }) => {
+          setPdfUploads(data);
+          setActivePdfUpload((current) =>
+            current ? data.find((upload) => upload.id === current.id) ?? current : null,
+          );
+        })
+        .catch(() => {
+          /* 下一轮继续；队列轮询失败不影响主列表。 */
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
+    const schedule = () => {
+      if (timer !== null) window.clearInterval(timer);
+      timer = document.hidden ? null : window.setInterval(poll, 3000);
+    };
+    const onVisibilityChange = () => {
+      if (!document.hidden) poll();
+      schedule();
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    schedule();
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [projectId, hasProcessingPdf]);
+
   const filtered = React.useMemo(() => {
     let list = entries;
     if (statusFilter === 'cited') {
@@ -128,8 +217,8 @@ export function LibraryWorkbench() {
     } else if (statusFilter !== 'all') {
       list = list.filter((entry) => entry.status === statusFilter);
     }
-    if (query.trim()) {
-      const q = query.toLowerCase();
+    if (deferredQuery.trim()) {
+      const q = deferredQuery.toLowerCase();
       list = list.filter(
         (e) =>
           e.work.canonical_title.toLowerCase().includes(q) ||
@@ -141,13 +230,19 @@ export function LibraryWorkbench() {
     return [...list].sort((a, b) =>
       sortDesc ? b.relevance_score - a.relevance_score : a.relevance_score - b.relevance_score,
     );
-  }, [entries, statusFilter, query, sortDesc, usage]);
+  }, [entries, statusFilter, deferredQuery, sortDesc, usage]);
 
-  const selectedCount = entries.filter((e) => e.status === 'selected').length;
+  const selectedCount = React.useMemo(
+    () => entries.filter((e) => e.status === 'selected').length,
+    [entries],
+  );
   const citedCount = React.useMemo(
     () => entries.filter((entry) => sectionsCiting(usage, entry.bibtex_key).length > 0).length,
     [entries, usage],
   );
+  const activePdfMatchedEntry = activePdfUpload?.matched_work
+    ? entries.find((entry) => entry.work.id === activePdfUpload.matched_work?.id)
+    : undefined;
 
   /** 局部更新，不再整表重拉。 */
   const applyStatus = (ids: Set<string>, status: LibraryEntryStatus) => {
@@ -155,39 +250,80 @@ export function LibraryWorkbench() {
     setActive((a) => (a && ids.has(a.id) ? { ...a, status } : a));
   };
 
-  /**
-   * 单条勾选。
-   *
-   * 此前每点一次都要 `runReload()` 重拉 4 个端点（含 330 条列表）并整表重渲染。
-   * 现在只做乐观更新 + 单次 POST，失败才回滚；白名单交给 provider 在任务/批量
-   * 提交后统一刷新。
-   */
-  const toggleOne = async (entry: LibraryEntry, index: number, shiftKey: boolean) => {
-    if (shiftKey && lastIndex !== null) {
-      const [from, to] = lastIndex < index ? [lastIndex, index] : [index, lastIndex];
-      const range = filtered.slice(from, to + 1).map((e) => e.id);
-      setChecked((prev) => {
-        const next = new Set(prev);
-        range.forEach((id) => next.add(id));
-        return next;
-      });
-      setLastIndex(index);
-      return;
-    }
+  /** 行首复选框只服务批量操作；Shift 连选也只修改这份临时状态。 */
+  const toggleBulk = (entry: LibraryEntry, index: number, shiftKey: boolean) => {
+    setChecked((previous) => {
+      const next = new Set(previous);
+      const shouldAdd = !previous.has(entry.id);
+      if (shiftKey && lastIndex !== null) {
+        const [from, to] = lastIndex < index ? [lastIndex, index] : [index, lastIndex];
+        for (const item of filtered.slice(from, to + 1)) {
+          if (shouldAdd) next.add(item.id);
+          else next.delete(item.id);
+        }
+      } else if (shouldAdd) {
+        next.add(entry.id);
+      } else {
+        next.delete(entry.id);
+      }
+      return next;
+    });
     setLastIndex(index);
+  };
 
+  /** “纳入写作”是持久状态，不再借用批量复选框的视觉或键盘语义。 */
+  const toggleIncluded = async (entry: LibraryEntry) => {
     const previousStatus = entry.status;
     const nextStatus: LibraryEntryStatus = previousStatus === 'selected' ? 'candidate' : 'selected';
     const ids = new Set([entry.id]);
     applyStatus(ids, nextStatus);
     try {
-      await selectEntries(projectId, [entry.work.id], nextStatus);
+      const result = await selectEntries(projectId, [entry.work.id], nextStatus);
+      const updated = result.data.find((item) => item.id === entry.id);
+      if (updated) {
+        setEntries((previous) =>
+          previous.map((item) => (item.id === updated.id ? updated : item)),
+        );
+        setActive((current) => (current?.id === updated.id ? updated : current));
+      }
       // 白名单变了（R1），项目层需要知道。
       reloadProject();
     } catch (err) {
       // 这个勾选决定 R1 引用白名单，失败却不回滚等于让界面对文献库状态撒谎。
       applyStatus(ids, previousStatus);
-      toast({ title: '入库状态未能保存', description: describeError(err), variant: 'error' });
+      toast({ title: '纳入状态未能保存', description: describeError(err), variant: 'error' });
+    }
+  };
+
+  const toggleRole = async (entry: LibraryEntry) => {
+    const previousRole = entryRole(entry);
+    const nextRole: LiteratureRole = previousRole === 'core' ? 'general' : 'core';
+    const applyRole = (role: LiteratureRole) => {
+      setEntries((previous) =>
+        previous.map((item) =>
+          item.id === entry.id ? { ...item, literature_role: role } : item,
+        ),
+      );
+      setActive((current) =>
+        current?.id === entry.id ? { ...current, literature_role: role } : current,
+      );
+    };
+    applyRole(nextRole);
+    try {
+      const updated = await updateLibraryEntry(projectId, entry.id, {
+        literature_role: nextRole,
+      });
+      setEntries((previous) =>
+        previous.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setActive((current) => (current?.id === updated.id ? updated : current));
+    } catch (error) {
+      applyRole(previousRole);
+      toast({
+        title: '核心文献标记未能保存',
+        description: describeError(error),
+        variant: 'error',
+      });
     }
   };
 
@@ -205,7 +341,7 @@ export function LibraryWorkbench() {
         status,
       );
       toast({
-        title: `${targets.length} 条已${status === 'selected' ? '入库' : status === 'excluded' ? '排除' : '设为候选'}`,
+        title: `${targets.length} 条已${status === 'selected' ? '纳入写作' : status === 'excluded' ? '排除' : '设为候选'}`,
         variant: 'success',
       });
       setChecked(new Set());
@@ -251,12 +387,14 @@ export function LibraryWorkbench() {
     action: () => Promise<{ data: Job | undefined }>,
     fallbackMessage: string,
     failTitle: string,
-  ) => {
+  ): Promise<boolean> => {
     try {
       const started = await action();
       startJob(started.data, fallbackMessage);
+      return Boolean(started.data);
     } catch (err) {
       toast({ title: failTitle, description: describeError(err), variant: 'error' });
+      return false;
     }
   };
 
@@ -265,7 +403,7 @@ export function LibraryWorkbench() {
       kind === 'doi'
         ? { dois: payload.split('\n').map((line) => line.trim()).filter(Boolean) }
         : { bibtex: payload };
-    await runAction(
+    return runAction(
       () => importReferences(projectId, body),
       '后端不可用：导入需要 R1 反查核验，未写入任何文献',
       '导入未能启动',
@@ -282,6 +420,99 @@ export function LibraryWorkbench() {
       '后端不可用：无法触发检索',
       '检索未能启动',
     );
+
+  const upsertPdfUpload = (upload: LibraryPdfUpload) => {
+    setPdfUploads((previous) => {
+      const exists = previous.some((item) => item.id === upload.id);
+      return exists
+        ? previous.map((item) => (item.id === upload.id ? upload : item))
+        : [upload, ...previous];
+    });
+  };
+
+  const handlePdfUploaded = (result: LibraryPdfUploadResult) => {
+    upsertPdfUpload(result.upload);
+    if (result.job) {
+      startJob(result.job, '后端不可用：PDF 元数据匹配未能启动');
+    }
+    if (result.upload.status === 'needs_confirmation') {
+      setActivePdfUpload(result.upload);
+    }
+  };
+
+  const handlePdfConfirm = async (upload: LibraryPdfUpload, role: LiteratureRole) => {
+    setPdfBusyId(upload.id);
+    try {
+      const result = await confirmPdfUpload(projectId, upload.id, role);
+      upsertPdfUpload(result.upload);
+      if (result.job) {
+        startJob(result.job, '后端不可用：PDF 全文解析未能启动');
+      }
+      setActivePdfUpload(null);
+      toast({
+        title: '匹配已确认',
+        description: '私有原文已绑定，正在解析全文并提取卡片与证据。',
+        variant: 'success',
+      });
+      runReload();
+      reloadProject();
+    } catch (error) {
+      toast({
+        title: '匹配确认失败',
+        description: describeError(error),
+        variant: 'error',
+      });
+    } finally {
+      setPdfBusyId(null);
+    }
+  };
+
+  const handlePdfReject = async (upload: LibraryPdfUpload) => {
+    setPdfBusyId(upload.id);
+    try {
+      await rejectPdfUpload(projectId, upload.id);
+      setPdfUploads((previous) => previous.filter((item) => item.id !== upload.id));
+      setActivePdfUpload((current) => (current?.id === upload.id ? null : current));
+      toast({ title: '已拒绝并移除该 PDF', variant: 'success' });
+    } catch (error) {
+      toast({
+        title: 'PDF 未能移除',
+        description: describeError(error),
+        variant: 'error',
+      });
+    } finally {
+      setPdfBusyId(null);
+    }
+  };
+
+  const handlePdfRetry = async (upload: LibraryPdfUpload) => {
+    const rematching = upload.status === 'match_failed';
+    setPdfBusyId(upload.id);
+    try {
+      const result = await retryPdfUpload(projectId, upload.id);
+      upsertPdfUpload(result.upload);
+      if (result.job) {
+        startJob(
+          result.job,
+          rematching
+            ? '后端不可用：PDF 重新匹配未能启动'
+            : '后端不可用：PDF 重新解析未能启动',
+        );
+      }
+      toast({
+        title: rematching ? '已重新开始匹配' : '已重新开始解析',
+        variant: 'success',
+      });
+    } catch (error) {
+      toast({
+        title: rematching ? 'PDF 重新匹配失败' : 'PDF 重新解析失败',
+        description: describeError(error),
+        variant: 'error',
+      });
+    } finally {
+      setPdfBusyId(null);
+    }
+  };
 
   const checkedInView = filtered.filter((e) => checked.has(e.id)).length;
   const allChecked = filtered.length > 0 && checkedInView === filtered.length;
@@ -305,6 +536,46 @@ export function LibraryWorkbench() {
         actions={
           <>
             <ActionMenu
+              label={LIBRARY_ACTION.add}
+              disabled={!projectId}
+              items={[
+                {
+                  label: LIBRARY_ACTION.uploadPdf,
+                  icon: Upload,
+                  description: '识别元数据、确认匹配后私有保存原文',
+                  onSelect: () => setPdfUploadOpen(true),
+                },
+                {
+                  label: LIBRARY_ACTION.importDoi,
+                  icon: Link,
+                  description: '每行一个 DOI，经 Crossref/OpenAlex 核验',
+                  disabled: busy,
+                  onSelect: () => {
+                    setImportTab('doi');
+                    setImportOpen(true);
+                  },
+                },
+                {
+                  label: LIBRARY_ACTION.importBibtex,
+                  icon: FileCode2,
+                  description: '粘贴 BibTeX，反查真实 scholarly_work',
+                  disabled: busy,
+                  onSelect: () => {
+                    setImportTab('bibtex');
+                    setImportOpen(true);
+                  },
+                },
+                {
+                  label: LIBRARY_ACTION.search,
+                  icon: Search,
+                  description: '按右侧选定的检索源添加候选文献',
+                  disabled: busy,
+                  onSelect: () => void triggerSearch(),
+                },
+              ]}
+            />
+            <ActionMenu
+              label="处理文献"
               disabled={!projectId || busy}
               items={[
                 {
@@ -341,12 +612,6 @@ export function LibraryWorkbench() {
                     ),
                 },
                 {
-                  label: LIBRARY_ACTION.import,
-                  icon: Download,
-                  description: '经 R1 反查核验后入库',
-                  onSelect: () => setImportOpen(true),
-                },
-                {
                   label: LIBRARY_ACTION.runAll,
                   icon: Rocket,
                   description: '检索 → 大纲 → 写作 → 编译，失败降级不阻断',
@@ -359,18 +624,91 @@ export function LibraryWorkbench() {
                 },
               ]}
             />
-            <Button onClick={triggerSearch} disabled={!projectId || busy}>
-              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
-              {LIBRARY_ACTION.search}
-            </Button>
           </>
         }
+      />
+
+      <PdfUploadQueue
+        uploads={pdfUploads}
+        busyId={pdfBusyId}
+        onConfirm={setActivePdfUpload}
+        onRetry={(upload) => void handlePdfRetry(upload)}
+        onReject={(upload) => void handlePdfReject(upload)}
       />
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr),20rem]">
         <div className="min-w-0 space-y-3">
           {/* 筛选与批量操作常驻：此前它们随页面滚走，滚到第 200 行就再也够不到。 */}
-          <div className="space-y-3 border-b pb-3">
+          <Button
+            variant="outline"
+            className="w-full justify-between md:hidden"
+            onClick={() => setMobileFiltersOpen((open) => !open)}
+            aria-expanded={mobileFiltersOpen}
+          >
+            <span className="inline-flex items-center gap-2">
+              <SlidersHorizontal /> 筛选与批量操作
+            </span>
+            <Badge variant="secondary">{filtered.length}</Badge>
+          </Button>
+          <Drawer
+            open={mobileFiltersOpen}
+            onClose={() => setMobileFiltersOpen(false)}
+            title="筛选文献"
+            description={`当前显示 ${filtered.length} / ${entries.length} 条`}
+            className="md:hidden"
+            footer={
+              <Button className="w-full" onClick={() => setMobileFiltersOpen(false)}>
+                查看结果
+              </Button>
+            }
+          >
+            <div className="space-y-6">
+              <Tabs
+                value={statusFilter}
+                onValueChange={(value) => {
+                  setStatusFilter(value as StatusFilter);
+                  setLastIndex(null);
+                }}
+              >
+                <TabsList className="w-full flex-wrap">
+                  {STATUS_TABS.map((tab) => (
+                    <TabsTrigger key={tab.value} value={tab.value}>
+                      {tab.label}
+                    </TabsTrigger>
+                  ))}
+                </TabsList>
+              </Tabs>
+              <Input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="过滤标题 / 作者 / 章节"
+                aria-label="过滤文献"
+              />
+              <Button
+                variant="outline"
+                className="w-full justify-start"
+                onClick={() => setSortDesc((value) => !value)}
+              >
+                <ArrowUpDown /> 相关性{sortDesc ? '降序' : '升序'}
+              </Button>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 text-body">
+                <input
+                  type="checkbox"
+                  checked={allChecked}
+                  onChange={(event) =>
+                    setChecked(
+                      event.target.checked ? new Set(filtered.map((entry) => entry.id)) : new Set(),
+                    )
+                  }
+                  className="h-5 w-5 rounded border-input accent-primary"
+                />
+                全选当前筛选结果（{filtered.length}）
+              </label>
+            </div>
+          </Drawer>
+          <div
+            className="hidden space-y-3 border-b pb-3 md:block"
+          >
             <div className="flex flex-wrap items-center justify-between gap-3">
               <Tabs
                 value={statusFilter}
@@ -400,7 +738,7 @@ export function LibraryWorkbench() {
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="过滤标题 / 作者 / 章节"
                   aria-label="过滤文献"
-                  className="h-8 w-48"
+                  className="w-48 md:h-9"
                 />
               </div>
             </div>
@@ -461,46 +799,101 @@ export function LibraryWorkbench() {
           <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-96">
             <EntryList
               entries={filtered}
-              selectedIds={checked}
+              bulkSelectedIds={checked}
               activeId={active?.id}
               usage={usage}
-              onToggleOne={toggleOne}
+              onToggleBulk={toggleBulk}
+              onToggleIncluded={(entry) => void toggleIncluded(entry)}
               onOpen={setActive}
               emptyHint={
                 entries.length === 0
-                  ? '文献库为空。点右上角「触发检索」从五个学术源检索并入库。'
+                  ? '文献库为空。用右上角「添加文献」上传 PDF、输入 DOI/BibTeX 或搜索添加。'
                   : statusFilter === 'cited'
                     ? '正文尚未引用文献；生成或编辑章节后，这里会按引用位置自动汇总。'
                   : '当前筛选条件下无匹配文献'
               }
             />
           </LoadState>
+          {checkedInView > 0 && (
+            <div className="fixed inset-x-4 bottom-4 z-30 flex items-center gap-2 overflow-x-auto rounded-lg border bg-background/95 p-2 shadow-xl backdrop-blur md:hidden">
+              <Badge variant="secondary" className="shrink-0">
+                已选 {checkedInView}
+              </Badge>
+              <Button size="sm" className="shrink-0" onClick={() => bulkStatus('selected')} disabled={bulkBusy}>
+                {bulkBusy && <Loader2 className="animate-spin" />}
+                {LIBRARY_ACTION.bulkSelect}
+              </Button>
+              <Button size="sm" variant="outline" className="shrink-0" onClick={() => bulkStatus('excluded')} disabled={bulkBusy}>
+                {LIBRARY_ACTION.bulkExclude}
+              </Button>
+              <Button size="sm" variant="ghost" className="shrink-0" onClick={() => setConfirmDelete(true)} disabled={bulkBusy}>
+                <Trash2 /> {LIBRARY_ACTION.remove}
+              </Button>
+              <Button size="icon" variant="ghost" className="shrink-0" onClick={() => setChecked(new Set())} aria-label="取消选择">
+                <X />
+              </Button>
+            </div>
+          )}
         </div>
 
         <aside className="space-y-4 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:self-start lg:overflow-y-auto scrollbar-thin">
+          <UtilizationSummary
+            entries={entries}
+            citedIn={(entry) => sectionsCiting(usage, entry.bibtex_key)}
+          />
           <SearchStats runs={runs} />
           <ProviderFilter selected={capabilities} onChange={setCapabilities} />
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">引用真实性</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-1.5 text-xs text-muted-foreground">
-              <p>R1 入库核验：仅 selected + 已核验 + 有 key + 未撤稿进入写作白名单。</p>
-              <p>R2 写作约束：cite-key 越权自动重写/移除。</p>
-              <p>R3 参考文献确定性生成：key 入库时持久化，导出只消费。</p>
-            </CardContent>
-          </Card>
+          <details className="text-meta text-muted-foreground">
+            <summary className="min-h-11 cursor-pointer py-3 underline-offset-4 hover:text-foreground hover:underline">
+              了解引用真实性规则 →
+            </summary>
+            <div className="space-y-2 border-t pt-3">
+              <p>入库核验：仅已选中、已核验、有引用键且未撤稿的文献进入写作白名单。</p>
+              <p>写作约束：越权引用会被自动重写或移除。</p>
+              <p>导出约束：引用键在入库时持久化，参考文献由程序确定性生成。</p>
+            </div>
+          </details>
         </aside>
       </div>
 
-      <CardDrawer
-        entry={active}
-        open={!!active}
-        citedIn={sectionsCiting(usage, active?.bibtex_key)}
-        onClose={() => setActive(null)}
-        onToggleSelect={(entry) => toggleOne(entry, -1, false)}
-      />
-      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImport={handleImport} />
+      <React.Suspense fallback={null}>
+        {active && (
+          <CardDrawer
+            entry={active}
+            open
+            citedIn={sectionsCiting(usage, active.bibtex_key)}
+            onClose={() => setActive(null)}
+            onToggleSelect={(entry) => toggleIncluded(entry)}
+            onToggleRole={(entry) => toggleRole(entry)}
+          />
+        )}
+        {importOpen && (
+          <ImportDialog
+            open
+            initialTab={importTab}
+            onClose={() => setImportOpen(false)}
+            onImport={handleImport}
+          />
+        )}
+        {pdfUploadOpen && (
+          <PdfUploadDialog
+            open
+            onClose={() => setPdfUploadOpen(false)}
+            onUpload={(file) => uploadLibraryPdf(projectId, file)}
+            onUploaded={handlePdfUploaded}
+          />
+        )}
+        {activePdfUpload && (
+          <PdfMatchDialog
+            upload={activePdfUpload}
+            initialRole={activePdfMatchedEntry ? entryRole(activePdfMatchedEntry) : 'general'}
+            busy={pdfBusyId === activePdfUpload.id}
+            onClose={() => setActivePdfUpload(null)}
+            onConfirm={handlePdfConfirm}
+            onReject={handlePdfReject}
+          />
+        )}
+      </React.Suspense>
 
       <Dialog
         open={confirmDelete}

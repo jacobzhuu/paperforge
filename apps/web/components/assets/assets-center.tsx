@@ -24,8 +24,8 @@ import { ModuleError } from '@/components/layout/module-error';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobFinished, useProject } from '@/components/project/project-context';
-import { assetDownloadUrl, deleteAsset, getNumLint, listAssets, uploadAsset } from '@/lib/api';
-import type { AssetKind, NumLintReport, UserAsset } from '@/lib/types';
+import { assetDownloadUrl, deleteAsset, getMaterialPreflight, getNumLint, listAssets, uploadAsset } from '@/lib/api';
+import type { AssetKind, MaterialPreflight, NumLintReport, UserAsset } from '@/lib/types';
 import { describeError } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
 import { useAsyncModule } from '@/lib/useAsyncModule';
@@ -79,13 +79,19 @@ export function AssetsCenter() {
     undefined,
     [projectId],
   );
+  const preflightModule = useAsyncModule<MaterialPreflight | undefined>(
+    () => getMaterialPreflight(projectId),
+    undefined,
+    [projectId],
+  );
 
   const assets = assetsModule.data;
 
   const reloadAll = React.useCallback(() => {
     assetsModule.reload();
     lintModule.reload();
-  }, [assetsModule, lintModule]);
+    preflightModule.reload();
+  }, [assetsModule.reload, lintModule.reload, preflightModule.reload]);
 
   const reloadRef = React.useRef(reloadAll);
   React.useEffect(() => {
@@ -180,6 +186,16 @@ export function AssetsCenter() {
       <ModuleError label="数字一致性报告" error={lintModule.error} onRetry={lintModule.reload} />
       {!lintModule.error && <NumLintSummary report={lintModule.data} projectId={projectId} />}
 
+      <ModuleError label="材料预检" error={preflightModule.error} onRetry={preflightModule.reload} />
+      {!preflightModule.error && preflightModule.data && !preflightModule.data.ready && (
+        <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning-foreground">
+          <p className="font-medium">项目已保存，全自动生成前还需补充：</p>
+          <ul className="mt-1 list-disc pl-5">
+            {preflightModule.data.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}
+          </ul>
+        </div>
+      )}
+
       <VisualsEntry projectId={projectId} />
 
       <LoadState
@@ -200,7 +216,7 @@ export function AssetsCenter() {
             void onUpload(e.dataTransfer.files);
           }}
           className={cn(
-            'space-y-4 rounded-xl transition-colors',
+            'space-y-4 rounded-lg transition-colors',
             dragOver && 'outline-dashed outline-2 outline-offset-4 outline-primary/60',
           )}
         >
@@ -266,7 +282,7 @@ function VisualsEntry({ projectId }: { projectId: string }) {
 /** 无素材不是错误状态——这是产品明确支持的「纯生成模式」。 */
 function PureGenerationNotice() {
   return (
-    <div className="rounded-xl border border-dashed p-8 text-center">
+    <div className="rounded-lg border border-dashed p-8 text-center">
       <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-muted">
         <Upload className="h-6 w-6 text-muted-foreground" />
       </div>

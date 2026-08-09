@@ -10,10 +10,12 @@ import uuid
 from typing import Annotated, Any
 
 from db import (
+    asset_document_dependency_count,
     create_asset,
     delete_asset,
     get_asset,
     list_assets,
+    list_jobs,
     parsed_asset_payloads,
     visual_source_dependency_count,
 )
@@ -26,7 +28,12 @@ from storage import make_object_store
 from paperforge_api.config import get_settings
 from paperforge_api.deps import authorize_project_request, get_session
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.schemas import AssetResponse, NumLintResponse
+from paperforge_api.schemas import (
+    AssetCapabilitiesResponse,
+    AssetResponse,
+    MaterialPreflightResponse,
+    NumLintResponse,
+)
 
 router = APIRouter(
     prefix="/api/v1", tags=["assets"], dependencies=[Depends(authorize_project_request)]
@@ -35,6 +42,74 @@ router = APIRouter(
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 MAX_ASSET_BYTES = 32 * 1024 * 1024
+PREFERRED_ASSET_EXTENSIONS = [
+    ".csv",
+    ".tsv",
+    ".xlsx",
+    ".pdf",
+    ".docx",
+    ".txt",
+    ".md",
+    ".py",
+    ".r",
+    ".ipynb",
+    ".bib",
+    ".png",
+    ".jpg",
+    ".svg",
+]
+
+
+@router.get("/assets/capabilities", response_model=AssetCapabilitiesResponse)
+async def asset_capabilities() -> AssetCapabilitiesResponse:
+    """素材限制的单一事实源，供上传前校验与帮助文案使用。"""
+    return AssetCapabilitiesResponse(
+        max_bytes=MAX_ASSET_BYTES,
+        max_mib=MAX_ASSET_BYTES // (1024 * 1024),
+        preferred_extensions=PREFERRED_ASSET_EXTENSIONS,
+        accepts_unrecognized_as_method_note=True,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/assets/preflight",
+    response_model=MaterialPreflightResponse,
+)
+async def material_preflight(project_id: str, session: SessionDep) -> MaterialPreflightResponse:
+    project = await _require_project(session, project_id)
+    if project.paper_type != "original":
+        return MaterialPreflightResponse(ready=True)
+    issues = _original_material_issues(await list_assets(session, project.id))
+    return MaterialPreflightResponse(ready=not issues, issues=issues)
+
+
+def _original_material_issues(assets: list[Any]) -> list[dict[str, str]]:
+    has_results = False
+    has_method = False
+    for asset in assets:
+        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
+        if asset.kind in {"dataset", "result_table"}:
+            has_results = (
+                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
+                or has_results
+            )
+        if asset.kind in {"method_note", "code"}:
+            has_method = (
+                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
+            )
+    issues: list[dict[str, str]] = []
+    if not has_results:
+        issues.append(
+            {
+                "code": "result_material_missing",
+                "message": "请上传包含数据行和可解析数值的结果表或数据集",
+            }
+        )
+    if not has_method:
+        issues.append(
+            {"code": "method_material_missing", "message": "请上传可解析的方法笔记或代码"}
+        )
+    return issues
 
 
 @router.post(
@@ -112,6 +187,16 @@ async def remove_asset(project_id: str, asset_id: str, session: SessionDep) -> N
     asset = await get_asset(session, asset_uuid)
     if asset is None or asset.project_id != project.id:
         raise HTTPException(status_code=404, detail="asset not found")
+    if any(job.status in {"queued", "running"} for job in await list_jobs(session, project.id)):
+        raise HTTPException(
+            status_code=409,
+            detail="asset cannot be deleted while a generation job is active",
+        )
+    if await asset_document_dependency_count(session, asset):
+        raise HTTPException(
+            status_code=409,
+            detail="asset is used by the manuscript provenance and cannot be deleted",
+        )
     if await visual_source_dependency_count(session, asset.id):
         raise HTTPException(
             status_code=409,

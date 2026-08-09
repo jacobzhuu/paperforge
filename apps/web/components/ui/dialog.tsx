@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFocusTrap, useId } from '@/lib/useFocusTrap';
@@ -41,7 +42,7 @@ export function Dialog({
 
   if (!open) return null;
 
-  return (
+  const content = (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
         className="absolute inset-0 bg-black/50 animate-fade-in dark:bg-black/70"
@@ -56,7 +57,7 @@ export function Dialog({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cn(
-          'relative z-10 flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col rounded-xl border bg-card shadow-xl animate-fade-in',
+          'relative z-10 flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col rounded-lg border bg-card shadow-xl animate-fade-in motion-reduce:animate-none',
           className,
         )}
       >
@@ -84,4 +85,5 @@ export function Dialog({
       </div>
     </div>
   );
+  return typeof document === 'undefined' ? null : createPortal(content, document.body);
 }

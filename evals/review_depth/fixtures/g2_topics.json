@@ -1,0 +1,32 @@
+[
+  {
+    "topic_id": "g2-01",
+    "topic": "Retrieval-augmented generation factuality",
+    "comparison_dimensions": ["task", "dataset", "retriever", "metric", "split"],
+    "annotation_status": "needs_expert_review"
+  },
+  {
+    "topic_id": "g2-02",
+    "topic": "Poisoning attacks on recommender systems",
+    "comparison_dimensions": ["attack budget", "dataset", "model family", "metric", "split"],
+    "annotation_status": "needs_expert_review"
+  },
+  {
+    "topic_id": "g2-03",
+    "topic": "Clinical effectiveness of digital cognitive behavioral therapy",
+    "comparison_dimensions": ["population", "intervention", "comparator", "outcome", "follow-up"],
+    "annotation_status": "needs_expert_review"
+  },
+  {
+    "topic_id": "g2-04",
+    "topic": "Perovskite solar-cell stability",
+    "comparison_dimensions": ["composition", "encapsulation", "stress protocol", "metric", "duration"],
+    "annotation_status": "needs_expert_review"
+  },
+  {
+    "topic_id": "g2-05",
+    "topic": "Urban heat mitigation by green roofs",
+    "comparison_dimensions": ["climate", "roof design", "baseline", "temperature metric", "season"],
+    "annotation_status": "needs_expert_review"
+  }
+]

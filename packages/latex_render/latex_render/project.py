@@ -149,9 +149,15 @@ def build_latex_project(
     twocolumn = is_two_column(template_name)
 
     section_files: list[str] = []
+    appendix_started = False
     for index, section in enumerate(ir.sections):
         rel = f"sections/{index:02d}-{_safe_stem(section.key)}.tex"
-        project.with_file(rel, render_section(section, assets, twocolumn=twocolumn) + "\n")
+        prefix = "\\appendix\n" if section.appendix and not appendix_started else ""
+        appendix_started = appendix_started or section.appendix
+        project.with_file(
+            rel,
+            prefix + render_section(section, assets, twocolumn=twocolumn) + "\n",
+        )
         section_files.append(rel)
 
     body = "\n".join(f"\\input{{{path[:-4]}}}" for path in section_files)

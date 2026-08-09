@@ -6,6 +6,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
+\usepackage{longtable}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage[margin=2.5cm]{geometry}
@@ -18,6 +19,28 @@
 Text with a citation~\cite{warmup2020sample} and \todo{placeholder}.
 \begin{equation}E = mc^2\end{equation}
 \begin{table}[t]\centering\begin{tabular}{ll}\toprule a & b \\ \midrule 1 & 2 \\ \bottomrule\end{tabular}\caption{t}\end{table}
+
+%% longtable 预热：渲染器对**所有单栏模板**的表格都用 longtable（可分页、
+%% 续页重复表头）。它一度不在任何预热文档里，于是 longtable.sty 从没进过
+%% Tectonic 缓存——凡是带表格的论文，运行时都会 `File longtable.sty not found`，
+%% 接着被降级逻辑注释掉宏包、再报 `Environment longtable undefined` 而彻底失败。
+%% 预热文档的导言区必须与模板导言区逐条对齐，见 test_warmup_covers_templates。
+\begin{longtable}{@{}p{0.5\linewidth}p{0.4\linewidth}@{}}
+  \caption{longtable warmup}\label{tab:warm} \\
+  \toprule
+  {\raggedright\bfseries head a\par} & {\raggedright\bfseries head b\par} \\
+  \midrule
+  \endfirsthead
+  \toprule
+  {\raggedright\bfseries head a\par} & {\raggedright\bfseries head b\par} \\
+  \midrule
+  \endhead
+  \midrule
+  \endfoot
+  \bottomrule
+  \endlastfoot
+  {\raggedright cell 1\par} & {\raggedright cell 2\par} \\
+\end{longtable}
 
 %% 字体族预热：数学下标/上标会拉取 cmr5/cmr7/cmmi7 等小号字，
 %% 只有在构建期真正排版过一次，networkless 运行时才拿得到。

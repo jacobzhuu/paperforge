@@ -18,6 +18,11 @@ dependencies = [
     "paperforge-visuals",
     "psycopg[binary]>=3.2",
     "pypdfium2>=4.30,<5",
+    # DOCX 导出把上传的 PDF 插图首页转成 PNG，走的是 pypdfium2 的 `bitmap.to_pil()`——
+    # 它需要 Pillow，而 Pillow 此前只被 visuald 声明。运行镜像里因此没有 PIL，
+    # `to_pil()` 抛的 AttributeError 又不在 `_pdf_first_page_png` 捕获的异常里，
+    # 于是整份导出直接失败。
+    "pillow==12.3.0",
 ]
 
 [tool.uv.sources]

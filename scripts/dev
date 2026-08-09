@@ -3,10 +3,14 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/infra/docker-compose.yml"
+BLUEGREEN_FILE="${ROOT_DIR}/infra/docker-compose.bluegreen.yml"
 STATE_DIR="${ROOT_DIR}/.paperforge"
 RUN_DIR="${STATE_DIR}/run"
 LOG_DIR="${STATE_DIR}/logs"
-WEB_URL="${PAPERFORGE_WEB_URL:-http://localhost:3000}"
+DEPLOY_STATE="${STATE_DIR}/deploy.env"
+PUBLIC_URL="${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}"
+WEB_HOST_PORT="${PAPERFORGE_WEB_PORT:-3000}"
+WEB_URL="${PAPERFORGE_WEB_URL:-http://localhost:${WEB_HOST_PORT}}"
 API_URL="${PAPERFORGE_API_URL:-http://localhost:8080}"
 WEB_MODE="${PAPERFORGE_WEB_MODE:-development}"
 TEXD_URL="${PAPERFORGE_TEXD_URL:-http://localhost:8081}"
@@ -29,12 +33,20 @@ Usage: ./scripts/dev <command>
 
 Commands:
   up       Install locked dependencies and start every local service
-  restart  Stop everything and start again (use this after changing code:
-           `up` skips processes that are already running, so it will NOT
+  restart  Apply your code changes. Rolls the deployed stack when one is
+           running (see below); otherwise stops and starts the local stack
+           (`up` skips processes that are already running, so it will NOT
            pick up your edits)
+  deploy   Force the deployed-stack roll, even with no deployment running
   down     Stop PaperForge services (persistent database volumes are kept)
   status   Show service status and local URLs
   logs     Show recent application and Docker service logs
+
+Deployed-stack roll (`restart` when a paperforge-deploy-* project is up):
+  rebuilds the api/worker/web images, starts a NEW deployment beside the old
+  one, points Tailscale Funnel at it, and leaves the old one running. It has
+  to work this way because Snap Docker on this host refuses to stop or
+  recreate a running container. Add --local to force the local stack instead.
 EOF
 }
 
@@ -152,20 +164,57 @@ ensure_docker() {
     done
   fi
 
-  echo "Docker daemon is unavailable. Start Docker Desktop and retry." >&2
+  if [ "$(uname -s)" = "Linux" ]; then
+    echo "Docker daemon is unavailable. Start it with 'sudo systemctl start docker' and retry." >&2
+  else
+    echo "Docker daemon is unavailable. Start Docker Desktop and retry." >&2
+  fi
   return 1
 }
 
 select_pnpm() {
   local installed_version=""
-  installed_version="$(pnpm --version 2>/dev/null || true)"
-  if [[ "${installed_version}" == 9.* ]]; then
+  if command -v pnpm >/dev/null 2>&1; then
+    # Corepack 在仓库根（没有 packageManager 字段）会尝试下载“最新版”；
+    # 必须从含有 packageManager=pnpm@9.15.9 的 Web 包目录探测。
+    installed_version="$(cd "${ROOT_DIR}/apps/web" && pnpm --version 2>/dev/null || true)"
+  fi
+  if [ "${installed_version}" = "9.15.9" ]; then
     PNPM_COMMAND=(pnpm)
+    return
+  fi
+  if command -v corepack >/dev/null 2>&1; then
+    PNPM_COMMAND=(corepack pnpm)
+    echo "Using Corepack with project-pinned pnpm 9.15.9 (installed: ${installed_version:-none})"
     return
   fi
   require_command npx
   PNPM_COMMAND=(npx -y pnpm@9.15.9)
   echo "Using project-pinned pnpm 9.15.9 (installed: ${installed_version:-none})"
+}
+
+select_local_web_port() {
+  # 正式容器通常占用 3000。本地开发栈不能停它，也不能因为端口冲突启动失败；
+  # 未显式指定端口时自动落到部署滚动端口段之外的 3100-3199。
+  if [ -n "${PAPERFORGE_WEB_PORT:-}" ] || managed_process_is_running web; then
+    return
+  fi
+  if port_is_free "${WEB_HOST_PORT}"; then
+    return
+  fi
+  local candidate=""
+  for candidate in $(seq 3100 3199); do
+    if port_is_free "${candidate}"; then
+      WEB_HOST_PORT="${candidate}"
+      if [ -z "${PAPERFORGE_WEB_URL:-}" ]; then
+        WEB_URL="http://localhost:${candidate}"
+      fi
+      echo "Port 3000 is already in use; local Web will use ${WEB_HOST_PORT}."
+      return
+    fi
+  done
+  echo "No free local Web port in 3100-3199" >&2
+  return 1
 }
 
 wait_http() {
@@ -184,6 +233,76 @@ wait_http() {
   done
   echo "${name} did not become healthy: ${url}" >&2
   return 1
+}
+
+verify_public_deployment() {
+  local local_url="$1" public_url="$2" expected_port="$3"
+  local actual_port="" temp_dir="" local_body="" public_body="" local_hash="" public_hash=""
+
+  actual_port="$(funnel_target_port || true)"
+  if [ "${actual_port}" != "${expected_port}" ]; then
+    echo "Funnel target mismatch: expected 127.0.0.1:${expected_port}, found 127.0.0.1:${actual_port:-unknown}" >&2
+    return 1
+  fi
+
+  # 200 只能证明公网入口可访问，不能证明它已经是刚构建的版本。登录页不含用户数据，
+  # 可以安全地与新容器直连响应逐字节比较；哈希一致才算公网切换完成。
+  temp_dir="$(mktemp -d)"
+  local_body="${temp_dir}/local.html"
+  public_body="${temp_dir}/public.html"
+  if ! curl -fsS --max-time 15 "${local_url}/login" -o "${local_body}" \
+    || ! curl -fsS --max-time 30 "${public_url}/login" -o "${public_body}"; then
+    rm -r "${temp_dir}"
+    echo "Unable to download local/public login pages for deployment verification" >&2
+    return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    local_hash="$(sha256sum "${local_body}" | awk '{print $1}')"
+    public_hash="$(sha256sum "${public_body}" | awk '{print $1}')"
+  else
+    # macOS 默认提供 shasum，开发脚本的部署流程也必须可用。
+    local_hash="$(shasum -a 256 "${local_body}" | awk '{print $1}')"
+    public_hash="$(shasum -a 256 "${public_body}" | awk '{print $1}')"
+  fi
+  rm -r "${temp_dir}"
+  if [ "${local_hash}" != "${public_hash}" ]; then
+    echo "Public deployment content mismatch: local ${local_hash}, public ${public_hash}" >&2
+    return 1
+  fi
+  echo "✓ Funnel target and public content match the new deployment (${public_hash})"
+}
+
+verify_texd_runtime() {
+  local project="$1"
+  # 健康端点只证明 uvicorn 活着，不能证明离线 Tectonic 缓存含有模板依赖。
+  # 2026-08-01 的真实事故就是 longtable 优化已进 worker，但部署复用了旧 texd，
+  # 公网切换后所有长证据台账都在运行时尝试联网取包并失败。
+  docker exec "${project}-worker-1" python -c '
+import httpx
+
+source = r"""\documentclass{article}
+\usepackage{booktabs}
+\usepackage{longtable}
+\begin{document}
+\begin{longtable}{ll}
+\toprule A & B \\
+\midrule 1 & 2 \\
+\bottomrule
+\end{longtable}
+\end{document}
+"""
+response = httpx.post(
+    "http://texd:8081/compile",
+    json={"text_files": {"main.tex": source}, "binary_files": {}, "entrypoint": "main.tex"},
+    timeout=90,
+)
+response.raise_for_status()
+payload = response.json()
+if not payload.get("ok") or not payload.get("pdf_base64"):
+    print(str(payload.get("log") or "")[-2000:])
+    raise SystemExit("texd runtime preflight failed")
+print("✓ texd offline longtable preflight passed")
+'
 }
 
 wait_postgres() {
@@ -243,10 +362,10 @@ up() {
   require_command docker
   require_command curl
   require_command uv
-  require_command pnpm
   prepare_state
   ensure_docker
   select_pnpm
+  select_local_web_port
 
   if [ ! -f "${ROOT_DIR}/.env" ]; then
     cp "${ROOT_DIR}/.env.example" "${ROOT_DIR}/.env"
@@ -277,7 +396,10 @@ up() {
   fi
 
   echo "Starting Docker services..."
-  "${COMPOSE[@]}" up -d --build
+  # `up` is idempotent and intentionally does not reload code. Compose will build a
+  # missing local image on first use; forcing a rebuild here makes every ordinary
+  # startup redownload fonts/TeX packages. Use `restart --local` after code changes.
+  "${COMPOSE[@]}" up -d
 
   # Host services must never start against an older schema: the API can otherwise boot and
   # fail only when a newly added endpoint first touches its table (for example account signup).
@@ -293,6 +415,8 @@ up() {
     env \
       API_HOST=127.0.0.1 \
       API_PORT=8080 \
+      CORS_ALLOW_ORIGINS="${WEB_URL}" \
+      PUBLIC_APP_URL="${WEB_URL}" \
       DATABASE_URL="postgresql+asyncpg://paperforge:paperforge@localhost:${POSTGRES_HOST_PORT}/paperforge" \
       REDIS_URL="redis://localhost:${REDIS_HOST_PORT}/0" \
       MINIO_ENDPOINT="localhost:${MINIO_API_HOST_PORT}" \
@@ -307,10 +431,10 @@ up() {
         NODE_ENV=production \
         PAPERFORGE_API_INTERNAL_BASE="http://127.0.0.1:8080" \
         NEXT_PUBLIC_DEMO_MODE=false \
-        "${PNPM_COMMAND[@]}" start --hostname 127.0.0.1 --port 3000
+        "${PNPM_COMMAND[@]}" start --hostname 127.0.0.1 --port "${WEB_HOST_PORT}"
   else
     start_process web "${ROOT_DIR}/apps/web" \
-      "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port 3000
+      "${PNPM_COMMAND[@]}" dev --hostname 127.0.0.1 --port "${WEB_HOST_PORT}"
   fi
 
   echo "Waiting for health checks..."
@@ -339,11 +463,303 @@ up() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# 部署态滚动。
+#
+# 这台机器使用 Snap Docker；历史上 docker-default 缺少 snap.docker.dockerd 的
+# signal/ptrace 规则。即使主机已加载 scripts/docker-default-snap.apparmor，生产
+# 更新仍保持蓝绿滚动：先起新版本并切换 Funnel，确认健康后再单独清理旧版本。
+# ---------------------------------------------------------------------------
+
+deploy_env_file() {
+  # 生产 env 文件不在仓库里（scripts/ops 也强制这一点）。优先用显式变量，
+  # 其次从在跑的部署上把它读回来——这样重启一次之后就不用再手工传了。
+  local project="" value=""
+  if [ -n "${PAPERFORGE_ENV_FILE:-}" ]; then
+    echo "${PAPERFORGE_ENV_FILE}"
+    return
+  fi
+  project="$(detect_deploy_project || true)"
+  if [ -n "${project}" ]; then
+    value="$(docker inspect -f \
+      '{{index .Config.Labels "com.docker.compose.project.environment_file"}}' \
+      "${project}-api-1" 2>/dev/null || true)"
+    # compose 记的是逗号分隔的列表；只取第一个。
+    value="${value%%,*}"
+    if [ -n "${value}" ] && [ -f "${value}" ]; then
+      echo "${value}"
+      return
+    fi
+  fi
+  if [ -f "${DEPLOY_STATE}" ]; then
+    # shellcheck disable=SC1090
+    value="$(. "${DEPLOY_STATE}" && echo "${PAPERFORGE_ENV_FILE:-}")"
+    if [ -n "${value}" ] && [ -f "${value}" ]; then
+      echo "${value}"
+      return
+    fi
+  fi
+  return 1
+}
+
+detect_deploy_project() {
+  # 当前在跑的蓝绿项目；同名前缀可能有多个（旧的停不掉），取最新创建的那个。
+  docker ps \
+    --filter 'label=com.docker.compose.project' \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep '^paperforge-deploy-' \
+    | head -n 1
+}
+
+tailscale_socket() {
+  # tailscaled 以 userspace 模式跑在用户态，socket 不在默认路径上。
+  local socket=""
+  socket="$(ps -eo args= 2>/dev/null \
+    | sed -n 's/.*tailscaled .*--socket=\([^ ]*\).*/\1/p' | head -n 1)"
+  echo "${socket:-/var/run/tailscale/tailscaled.sock}"
+}
+
+tailscale_cli() {
+  command -v tailscale >/dev/null 2>&1 || return 1
+  tailscale --socket="$(tailscale_socket)" "$@"
+}
+
+funnel_target_port() {
+  tailscale_cli funnel status 2>/dev/null \
+    | sed -n 's|.*proxy http://127.0.0.1:\([0-9]\{1,\}\).*|\1|p' | head -n 1
+}
+
+port_is_free() {
+  ! ss -ltn 2>/dev/null | grep -q ":$1[[:space:]]"
+}
+
+free_web_port() {
+  local port
+  for port in $(seq 3004 3099); do
+    if port_is_free "${port}"; then
+      echo "${port}"
+      return
+    fi
+  done
+  echo "No free port in 3004-3099 for the new deployment" >&2
+  return 1
+}
+
+current_image_of() {
+  # 在跑的那套用的是哪个镜像。texd / visuald 不随应用代码变化，沿用它们即可；
+  # 写死 :local 会把别人单独修过的渲染服务悄悄退回旧版本。
+  local project="$1" service="$2" fallback="$3" image=""
+  if [ -n "${project}" ]; then
+    image="$(docker inspect -f '{{.Config.Image}}' "${project}-${service}-1" 2>/dev/null || true)"
+  fi
+  echo "${image:-${fallback}}"
+}
+
+previous_deploy_redis_url() {
+  local value=""
+  if [ -n "${PAPERFORGE_DEPLOY_REDIS_URL:-}" ]; then
+    echo "${PAPERFORGE_DEPLOY_REDIS_URL}"
+    return
+  fi
+  if [ -f "${DEPLOY_STATE}" ]; then
+    # shellcheck disable=SC1090
+    value="$(. "${DEPLOY_STATE}" && echo "${PAPERFORGE_DEPLOY_REDIS_URL:-}")"
+  fi
+  [ -n "${value}" ] && echo "${value}"
+}
+
+next_redis_url() {
+  # 旧 worker 停不掉，会一直从原来的库号取任务；同库就等于把一半的生成任务
+  # 交给旧镜像。换一个还没有 worker 在盯着的库号，新 API 入队的任务就只有
+  # 新 worker 会消费。
+  #
+  # 「+1」不够：滚动多次之后库号会绕回来。按 Redis 主机分别统计实际占用，
+  # 并自动沿用 deploy.env 里上一次切换到的专用 Redis；否则共享库 0-15 用满后，
+  # 后续每次发布都必须手工重新 export PAPERFORGE_DEPLOY_REDIS_URL。
+  local taken="" container db index worker_url worker_base seed_url redis_base
+  seed_url="$(previous_deploy_redis_url || true)"
+  if [ -n "${seed_url}" ]; then
+    redis_base="$(sed -E 's|/[0-9]+$||' <<<"${seed_url}")"
+  else
+    redis_base="redis://redis:6379"
+  fi
+  for container in $(docker ps --format '{{.Names}}' 2>/dev/null | grep -- '-worker-1$'); do
+    worker_url="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${container}" 2>/dev/null \
+      | sed -n 's|^REDIS_URL=||p' | head -n 1)"
+    worker_base="$(sed -E 's|/[0-9]+$||' <<<"${worker_url}")"
+    if [ "${worker_base}" = "${redis_base}" ]; then
+      db="$(sed -n 's|.*/\([0-9]\{1,\}\)$|\1|p' <<<"${worker_url}" | head -n 1)"
+      taken="${taken} ${db:-0}"
+    fi
+  done
+  for index in $(seq 0 15); do
+    case " ${taken} " in
+      *" ${index} "*) ;;
+      *) echo "${redis_base}/${index}"; return ;;
+    esac
+  done
+  echo "All 16 Redis databases on ${redis_base} are taken by running workers; clean up old deployments or provide a new dedicated Redis" >&2
+  return 1
+}
+
+next_deploy_subnets() {
+  # Do not depend on Docker's implicit pools: blue/green history may retain
+  # every one of them when the constrained daemon cannot remove old stacks.
+  # Pick adjacent /24 networks from a dedicated range after checking all
+  # existing Docker IPAM allocations and host routes.
+  local used="" third runtime ingress
+  used="$(docker network ls -q 2>/dev/null | xargs -r docker network inspect \
+    --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' 2>/dev/null || true)"
+  for third in $(seq 0 253); do
+    runtime="10.254.${third}.0/24"
+    ingress="10.254.$((third + 1)).0/24"
+    if ! grep -Fqx "${runtime}" <<<"${used}" \
+      && ! grep -Fqx "${ingress}" <<<"${used}" \
+      && ! ip route | grep -Eq "^10\\.254\\.${third}\\.0/24 |^10\\.254\\.$((third + 1))\\.0/24 "; then
+      printf '%s %s\n' "${runtime}" "${ingress}"
+      return
+    fi
+  done
+  echo "No free explicit deployment subnets in 10.254.0.0/16" >&2
+  return 1
+}
+
+build_deploy_images() {
+  local tag="$1"
+  echo "Building images (${tag})..."
+  # texd 不是静态基础设施：模板新增宏包时，离线 Tectonic 缓存必须随部署更新。
+  # Docker 的分层缓存会让未变化的 texd 构建快速命中；显式镜像覆盖仍可跳过构建。
+  if [ -z "${PAPERFORGE_DEPLOY_TEXD_IMAGE:-}" ]; then
+    docker build --network host --progress plain -f "${ROOT_DIR}/services/texd/Dockerfile" \
+      -t "paperforge-texd:${tag}" "${ROOT_DIR}"
+  fi
+  docker build --network host --progress plain -f "${ROOT_DIR}/services/Dockerfile" --target api \
+    -t "paperforge-api:${tag}" "${ROOT_DIR}"
+  docker build --network host --progress plain -f "${ROOT_DIR}/services/Dockerfile" --target worker \
+    -t "paperforge-worker:${tag}" "${ROOT_DIR}"
+  docker build --network host --progress plain -f "${ROOT_DIR}/apps/web/Dockerfile" \
+    -t "paperforge-web:${tag}" "${ROOT_DIR}"
+}
+
+deploy() {
+  require_command docker
+  require_command curl
+  ensure_docker
+  prepare_state
+
+  local env_file previous tag port redis_db redis_url compose_project texd_image visuald_image subnets runtime_subnet runtime_network runtime_gateway ingress_subnet
+  if ! env_file="$(deploy_env_file)"; then
+    echo "No production env file. Set PAPERFORGE_ENV_FILE=/absolute/path/to/paperforge.env" >&2
+    return 1
+  fi
+  previous="$(detect_deploy_project || true)"
+  tag="deploy-$(date '+%Y%m%d-%H%M%S')"
+  port="$(free_web_port)"
+  redis_url="$(next_redis_url)"
+  redis_db="$(sed -n 's|.*/\([0-9]\{1,\}\)$|\1|p' <<<"${redis_url}" | head -n 1)"
+  subnets="$(next_deploy_subnets)"
+  runtime_subnet="${subnets%% *}"
+  runtime_network="${runtime_subnet%/*}"
+  runtime_gateway="${runtime_network%.*}.1"
+  ingress_subnet="${subnets##* }"
+  compose_project="paperforge-${tag}"
+  texd_image="${PAPERFORGE_DEPLOY_TEXD_IMAGE:-paperforge-texd:${tag}}"
+  visuald_image="${PAPERFORGE_DEPLOY_VISUALD_IMAGE:-$(current_image_of "${previous}" visuald paperforge-visuald:local)}"
+
+  echo "Rolling deployment"
+  echo "  previous:  ${previous:-none}"
+  echo "  project:   ${compose_project}"
+  echo "  web port:  ${port}"
+  echo "  redis db:  ${redis_db}"
+  echo "  networks:  ${runtime_subnet}, ${ingress_subnet}"
+  echo "  proxy:     ${runtime_gateway}:38888 → 127.0.0.1:${PAPERFORGE_HOST_PROXY_PORT:-38888}"
+  echo "  texd:      ${texd_image}"
+  echo "  visuald:   ${visuald_image}"
+
+  build_deploy_images "${tag}"
+
+  echo "Starting ${compose_project}..."
+  PAPERFORGE_ENV_FILE="${env_file}" \
+  PAPERFORGE_DEPLOY_PROJECT="${compose_project}" \
+  PAPERFORGE_DEPLOY_API_IMAGE="paperforge-api:${tag}" \
+  PAPERFORGE_DEPLOY_WORKER_IMAGE="paperforge-worker:${tag}" \
+  PAPERFORGE_DEPLOY_WEB_IMAGE="paperforge-web:${tag}" \
+  PAPERFORGE_DEPLOY_TEXD_IMAGE="${texd_image}" \
+  PAPERFORGE_DEPLOY_VISUALD_IMAGE="${visuald_image}" \
+  PAPERFORGE_DEPLOY_WEB_PORT="${port}" \
+  PAPERFORGE_DEPLOY_REDIS_DB="${redis_db}" \
+  PAPERFORGE_DEPLOY_REDIS_URL="${redis_url}" \
+  PAPERFORGE_DEPLOY_RUNTIME_SUBNET="${runtime_subnet}" \
+  PAPERFORGE_DEPLOY_RUNTIME_GATEWAY="${runtime_gateway}" \
+  PAPERFORGE_DEPLOY_INGRESS_SUBNET="${ingress_subnet}" \
+  PAPERFORGE_PUBLIC_URL="${PUBLIC_URL}" \
+    docker compose --progress plain --env-file "${env_file}" \
+      -f "${BLUEGREEN_FILE}" --profile worker up -d --wait --remove-orphans
+
+  wait_http "new deployment" "http://127.0.0.1:${port}/login"
+  verify_texd_runtime "${compose_project}"
+
+  # The public UI must not be switched to a worker that still cannot reach the
+  # image provider.  Any HTTP response proves DNS/TLS/proxy connectivity; only
+  # transport failures should abort the rollout.
+  if ! docker exec "${compose_project}-worker-1" python -c \
+    "import httpx; response=httpx.get('https://yunwu.ai', timeout=20); print(f'✓ image provider route reachable (HTTP {response.status_code})')"; then
+    echo "Image provider route is unavailable from the new worker; refusing to switch Funnel." >&2
+    return 1
+  fi
+
+  # Funnel 只是一条转发规则，改指向不需要重启 tailscaled。新容器必须换端口
+  # （旧的占着且停不掉），所以这一步不能省，否则公网地址还连着旧代码。
+  if tailscale_cli status >/dev/null 2>&1; then
+    echo "Pointing Tailscale Funnel at 127.0.0.1:${port}..."
+    tailscale_cli funnel --bg "${port}" >/dev/null
+    wait_http "public URL" "${PUBLIC_URL}/login" 30
+    verify_public_deployment "http://127.0.0.1:${port}" "${PUBLIC_URL}" "${port}"
+  else
+    echo "Tailscale is unavailable; refusing to mark this deployment live. Funnel still points at $(funnel_target_port || echo unknown)." >&2
+    return 1
+  fi
+
+  {
+    printf 'PAPERFORGE_ENV_FILE=%s\n' "${env_file}"
+    printf 'PAPERFORGE_DEPLOY_PROJECT=%s\n' "${compose_project}"
+    printf 'PAPERFORGE_DEPLOY_WEB_PORT=%s\n' "${port}"
+    printf 'PAPERFORGE_DEPLOY_REDIS_DB=%s\n' "${redis_db}"
+    printf 'PAPERFORGE_DEPLOY_REDIS_URL=%s\n' "${redis_url}"
+    printf 'PAPERFORGE_DEPLOY_RUNTIME_SUBNET=%s\n' "${runtime_subnet}"
+    printf 'PAPERFORGE_DEPLOY_RUNTIME_GATEWAY=%s\n' "${runtime_gateway}"
+    printf 'PAPERFORGE_DEPLOY_INGRESS_SUBNET=%s\n' "${ingress_subnet}"
+    printf 'PAPERFORGE_DEPLOY_TAG=%s\n' "${tag}"
+  } >"${DEPLOY_STATE}"
+
+  echo
+  echo "Deployment is live: ${PUBLIC_URL} (local ${port})"
+  if [ -n "${previous}" ]; then
+    echo
+    echo "The previous deployment (${previous}) is still running: this host's Snap"
+    echo "Docker refuses to stop containers. It no longer receives traffic and its"
+    echo "worker polls a different Redis database, so it is idle. Remove it with"
+    echo "'docker rm -f' once the AppArmor profile is fixed."
+  fi
+}
+
 restart() {
-  # 改完代码必须走这里：up() 对已在运行的进程直接跳过，不会加载新代码。
-  echo "Restarting PaperForge..."
-  down
-  up
+  local mode="${1:-auto}"
+  if [ "${mode}" = "--local" ]; then
+    echo "Restarting the local stack..."
+    down
+    up
+    return
+  fi
+  if [ "${mode}" = "auto" ] && [ -z "$(detect_deploy_project || true)" ] && [ ! -f "${DEPLOY_STATE}" ]; then
+    # 没有部署在跑，restart 就还是本地栈的含义：up() 对已在运行的进程直接跳过，
+    # 不会加载新代码，所以必须先 down。
+    echo "No deployment detected; restarting the local stack..."
+    down
+    up
+    return
+  fi
+  deploy
 }
 
 down() {
@@ -358,11 +774,20 @@ down() {
 
 status() {
   prepare_state
+  local project funnel_port
+  project="$(detect_deploy_project || true)"
+  if [ -n "${project}" ]; then
+    echo "Deployment: ${project}"
+    funnel_port="$(funnel_target_port || true)"
+    echo "Funnel:     ${PUBLIC_URL} → 127.0.0.1:${funnel_port:-unknown}"
+    docker compose -p "${project}" ps 2>/dev/null || true
+    echo
+  fi
   for name in api worker web; do
     if managed_process_is_running "${name}"; then
-      echo "✓ ${name}: running"
+      echo "✓ local ${name}: running"
     else
-      echo "✗ ${name}: stopped"
+      echo "✗ local ${name}: stopped"
     fi
   done
   if docker info >/dev/null 2>&1; then
@@ -382,7 +807,8 @@ logs() {
 
 case "${1:-}" in
   up) up ;;
-  restart) restart ;;
+  restart) restart "${2:-auto}" ;;
+  deploy) deploy ;;
   down) down ;;
   status) status ;;
   logs) logs ;;

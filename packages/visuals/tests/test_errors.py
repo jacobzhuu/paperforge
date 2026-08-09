@@ -16,6 +16,7 @@ from visuals.errors import (
     NORMALIZATION_FAILED,
     SOURCE_UNRESOLVED,
     VISUAL_ERROR_CODES,
+    VISUAL_PREFLIGHT_FAILED,
     VISUALD_UNAVAILABLE,
     is_retryable,
     normalize_code,
@@ -73,6 +74,13 @@ def test_chart_source_failures_are_actionable() -> None:
     info = classify_visual_error(error)
     assert info.code == SOURCE_UNRESOLVED
     assert "素材" in info.message
+
+
+def test_visual_preflight_failure_is_actionable_and_not_blindly_retryable() -> None:
+    info = classify_visual_error(ValueError("visual preflight failed: visual_resolution_too_small"))
+    assert info.code == VISUAL_PREFLIGHT_FAILED
+    assert "画布尺寸或版式" in info.message
+    assert not info.retryable
 
 
 def test_arbitrary_exceptions_never_leak_their_class_name_as_the_code() -> None:

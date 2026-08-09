@@ -2,6 +2,7 @@
 
 import { Dialog } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Callout } from '@/components/ui/callout';
 
 /**
  * AI 改写的接受 / 放弃确认。
@@ -46,9 +47,9 @@ export function DiffPreviewDialog({
     >
       <div className="space-y-3">
         {note && (
-          <p className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+          <Callout variant="warning">
             {note}
-          </p>
+          </Callout>
         )}
         <div className="grid gap-3 md:grid-cols-2">
           <Panel label="原文" tone="muted" text={original} />

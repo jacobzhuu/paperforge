@@ -15,6 +15,26 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
     "writer": "gpt-4o",
     "polisher": "gpt-4o",
     "verifier": "gpt-4o-mini",
+    "evidence_classifier": "gpt-4o-mini",
+    "evidence_classifier_fallback": "gpt-4o",
+}
+
+# New semantic roles inherit the deployment's existing model tiers unless an
+# operator explicitly routes them.  This keeps old production env files valid
+# while allowing qmatrix classification to use a different thinking policy
+# from mechanical card extraction.
+ROLE_MODEL_FALLBACKS: dict[str, str] = {
+    "evidence_classifier": "extractor",
+    "evidence_classifier_fallback": "planner",
+}
+
+# DeepSeek V4 defaults to high-effort thinking.  That is useful for planning and
+# long-form writing, but it wastes latency/output budget on bounded extraction and
+# reranking tasks whose prompts already define a closed JSON schema.  Keep the
+# quality-critical roles on the provider default unless a deployment opts in.
+DEFAULT_ROLE_THINKING: dict[str, str] = {
+    "extractor": "disabled",
+    "reranker": "disabled",
 }
 
 
@@ -34,10 +54,19 @@ class LLMConfig:
     retry_backoff_seconds: float = 1.0
     # 角色 → 模型 覆盖映射；缺省回退到 DEFAULT_ROLE_MODELS，再回退到 self.model。
     role_models: dict[str, str] = field(default_factory=dict)
+    # 角色 → enabled/disabled。未配置的角色保留 provider 默认思考档位。
+    role_thinking: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_THINKING))
 
     def model_for_role(self, role: Role) -> str:
         if role in self.role_models and self.role_models[role].strip():
             return self.role_models[role].strip()
+        fallback_role = ROLE_MODEL_FALLBACKS.get(role)
+        if fallback_role and self.role_models.get(fallback_role, "").strip():
+            return self.role_models[fallback_role].strip()
         if role in DEFAULT_ROLE_MODELS:
             return DEFAULT_ROLE_MODELS[role]
         return self.model
+
+    def thinking_for_role(self, role: Role) -> str | None:
+        value = str(self.role_thinking.get(role) or "").strip().lower()
+        return value if value in {"enabled", "disabled"} else None

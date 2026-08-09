@@ -67,6 +67,7 @@ def test_forward_and_backward_expansion_collects_unique_candidates() -> None:
         seeds=[SnowballSeed(work_id="w-1", openalex_id="W1", semantic_scholar_id="c" * 40)],
         client=client,
         cache=InMemoryHttpCache(),
+        enable_semantic_scholar=True,
         semantic_scholar_min_interval_seconds=0.0,
         max_neighbors_per_seed=10,
         direction="both",
@@ -95,11 +96,30 @@ def test_direction_forward_skips_backward_calls() -> None:
         seeds=[SnowballSeed(work_id="w-1", openalex_id="W1", semantic_scholar_id="c" * 40)],
         client=client,
         cache=InMemoryHttpCache(),
+        enable_semantic_scholar=True,
         semantic_scholar_min_interval_seconds=0.0,
         direction="forward",
     )
 
     assert not any("/references" in call for call in calls)
+
+
+def test_semantic_scholar_is_disabled_by_default() -> None:
+    calls: list[str] = []
+    routes = {
+        "/citations": {"data": [{"citingPaper": _s2_paper("a" * 40, "S2 Citing")}]},
+    }
+    client = httpx.Client(transport=httpx.MockTransport(_handler(routes, calls)))
+
+    result = expand_citation_snowball(
+        seeds=[SnowballSeed(work_id="w-1", semantic_scholar_id="c" * 40)],
+        client=client,
+        cache=InMemoryHttpCache(),
+        direction="forward",
+    )
+
+    assert result.discovered_candidates == ()
+    assert not calls
 
 
 def test_provider_failure_is_degraded_not_raised() -> None:

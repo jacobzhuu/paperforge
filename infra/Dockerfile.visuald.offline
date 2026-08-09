@@ -1,0 +1,10 @@
+# Offline deployment fallback: retain the verified Graphviz/font/dependency
+# runtime, then install the visual packages from the current checkout.
+ARG PAPERFORGE_VISUALD_BASE=paperforge-visuald:local
+FROM ${PAPERFORGE_VISUALD_BASE}
+
+USER 0:0
+COPY packages/visuals /app/packages/visuals
+COPY services/visuald /app/services/visuald
+RUN pip install --no-deps /app/packages/visuals /app/services/visuald
+USER 65534:65534

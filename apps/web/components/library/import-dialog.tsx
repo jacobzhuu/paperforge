@@ -9,22 +9,33 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 
 export function ImportDialog({
   open,
+  initialTab = 'doi',
   onClose,
   onImport,
 }: {
   open: boolean;
+  initialTab?: 'doi' | 'bibtex';
   onClose: () => void;
-  onImport: (kind: 'doi' | 'bibtex', payload: string) => void | Promise<void>;
+  onImport: (kind: 'doi' | 'bibtex', payload: string) => Promise<boolean>;
 }) {
   const [doi, setDoi] = React.useState('');
   const [bibtex, setBibtex] = React.useState('');
-  const [tab, setTab] = React.useState('doi');
+  const [tab, setTab] = React.useState<'doi' | 'bibtex'>(initialTab);
+  const [submitting, setSubmitting] = React.useState(false);
 
-  const submit = () => {
-    if (tab === 'doi' && doi.trim()) void onImport('doi', doi.trim());
-    if (tab === 'bibtex' && bibtex.trim()) void onImport('bibtex', bibtex.trim());
-    setDoi('');
-    setBibtex('');
+  React.useEffect(() => {
+    if (open) setTab(initialTab);
+  }, [initialTab, open]);
+
+  const value = tab === 'doi' ? doi.trim() : bibtex.trim();
+  const submit = async () => {
+    if (!value || submitting) return;
+    setSubmitting(true);
+    const started = await onImport(tab, value);
+    setSubmitting(false);
+    if (!started) return;
+    if (tab === 'doi') setDoi('');
+    else setBibtex('');
     onClose();
   };
 
@@ -36,14 +47,21 @@ export function ImportDialog({
       description="DOI / BibTeX 导入将触发 Crossref/OpenAlex 反查核验（R1）"
       footer={
         <>
-          <Button variant="ghost" onClick={onClose}>
+          <Button variant="ghost" onClick={onClose} disabled={submitting}>
             取消
           </Button>
-          <Button onClick={submit}>核验并导入</Button>
+          <Button
+            onClick={() => void submit()}
+            disabled={!value}
+            loading={submitting}
+            loadingLabel="正在核验…"
+          >
+            核验并导入
+          </Button>
         </>
       }
     >
-      <Tabs value={tab} onValueChange={setTab}>
+      <Tabs value={tab} onValueChange={(value) => setTab(value as 'doi' | 'bibtex')}>
         <TabsList>
           <TabsTrigger value="doi">DOI</TabsTrigger>
           <TabsTrigger value="bibtex">BibTeX</TabsTrigger>

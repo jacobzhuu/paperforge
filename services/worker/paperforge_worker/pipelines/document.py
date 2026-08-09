@@ -14,19 +14,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from db import (
+    WRITE_DOCUMENT_KEY,
     apply_generated_publication_metadata,
     create_document,
     get_cards,
+    get_outline,
     get_project,
     get_writing_whitelist,
+    grounded_asset_payloads,
+    latest_document,
     latest_outline,
+    list_citation_usage,
     list_entries,
-    parsed_asset_payloads,
+    list_sections,
     polish_skip_requested,
     reference_metadata_payload,
     replace_citation_usage,
     upsert_section,
 )
+from db.models.paper import PaperDocument, PaperSection
 from ingest.numlint import lint_sections
 from observability import get_logger
 from paper_ir import (
@@ -109,20 +115,39 @@ async def write_document(
     title: str = "",
     coherence: bool = True,
     paper_type: str = "review",
+    outline_id: uuid.UUID | str | None = None,
 ) -> WriteOutcome:
     """按大纲逐章写作并落库，返回统计。"""
     outcome = WriteOutcome()
     runner = context.llm_runner()
 
     async with context.session() as session:
-        outline_row = await latest_outline(session, context.project_id)
+        if outline_id is not None:
+            try:
+                requested_outline_id = uuid.UUID(str(outline_id))
+            except ValueError:
+                requested_outline_id = None
+            outline_row = (
+                await get_outline(session, requested_outline_id)
+                if requested_outline_id is not None
+                else None
+            )
+            if outline_row is not None and outline_row.project_id != context.project_id:
+                outline_row = None
+        else:
+            outline_row = await latest_outline(session, context.project_id)
         if outline_row is None:
-            outcome.warnings.append({"stage": "write", "reason": "no_outline"})
+            outcome.warnings.append(
+                {
+                    "stage": "write",
+                    "reason": "outline_not_found" if outline_id is not None else "no_outline",
+                }
+            )
             return outcome
         outline = dict(outline_row.tree_json or {})
         whitelist = await get_writing_whitelist(session, context.project_id)
         cards = await _card_context(session, context.project_id)
-        assets = await parsed_asset_payloads(session, context.project_id)
+        assets = await grounded_asset_payloads(session, context.project_id)
         outline_id = outline_row.id
 
     sections = [s for s in (outline.get("sections") or []) if isinstance(s, dict)]
@@ -140,18 +165,31 @@ async def write_document(
     # 已经写完的章节连同那十几分钟的 LLM 调用一起蒸发，重跑只能从头再写一遍。
     # 现在写完一节存一节，末尾那次全量 upsert 仍然保留（它带全篇白名单终检），
     # 只是不再是唯一的落库时机。
-    async with context.session() as session:
-        document = await create_document(
-            session,
-            project_id=context.project_id,
-            outline_id=outline_id,
+    #
+    # 续跑先认上一轮的 document：用户在第 6 节按了暂停，「继续」必须从第 7 节接着写，
+    # 否则新建 document 从头重写，暂停就等于没暂停。
+    document_id, resumed = await _resume_document(context)
+    if document_id is None:
+        async with context.session() as session:
+            document = await create_document(
+                session,
+                project_id=context.project_id,
+                outline_id=outline_id,
+            )
+            document_id = document.id
+        # 单独落一次 checkpoint：write 阶段跑完才有阶段 checkpoint，
+        # 而暂停恰恰发生在「没跑完」的时候。update_job 是合并语义，安全。
+        await context.emit(
+            "write.document",
+            {"document_id": str(document_id)},
+            stage=WRITE_STAGE,
+            checkpoint={WRITE_DOCUMENT_KEY: str(document_id)},
         )
-        document_id = document.id
     outcome.document_id = str(document_id)
 
     # 分节写作占 0.65→0.82，润色占 0.82→0.90：两段各自线性摊，
     # 用户看到的百分比因此和「写到第几节 / 润到第几节」对得上。
-    written = 0
+    written = len(resumed)
     total_sections = len(sections)
 
     def _write_progress() -> float:
@@ -174,8 +212,18 @@ async def write_document(
             progress=_write_progress(),
         )
 
+    # 续跑：已落库的章节直接进 drafts，并注册进滚动摘要——不注册的话后续章节
+    # 拿不到前文上下文，接着写出来的部分会和前面脱节。
     drafts: dict[str, SectionDraft] = {}
+    for section in sections:
+        key = str(section.get("key") or "")
+        if key in resumed:
+            drafts[key] = resumed[key]
+            writing_context.register(key, resumed[key])
+
     for section in body_sections:
+        if str(section.get("key") or "") in resumed:
+            continue
         draft = await _write_one(
             section=section,
             cards=cards,
@@ -198,9 +246,15 @@ async def write_document(
         )
         written += 1
         await _emit_section(draft)
+        # 落库 + 发完事件才查停止开关：这一节的 LLM 花费已经变成库里的正文，
+        # 停在这里不浪费任何东西。write 阶段本身实测 18 分钟，只在阶段边界查
+        # 等于用户点了取消要干等十几分钟。
+        await context.raise_if_stopped()
 
     # 框架章节后写：此时滚动摘要已覆盖全部正文。
     for section in frame_sections:
+        if str(section.get("key") or "") in resumed:
+            continue
         draft = await _write_one(
             section={**section, "summary": _frame_goal(section, outline, language)},
             cards=cards,
@@ -223,6 +277,7 @@ async def write_document(
         written += 1
         # 框架章节此前不发事件：摘要/引言/结论那几分钟前端完全没有进度可看。
         await _emit_section(draft)
+        await context.raise_if_stopped()
 
     if coherence:
         await _polish_all(
@@ -389,7 +444,16 @@ async def _polish_all(
     完成的正文配一个不动的「分节写作」，只能理解为卡死。所以它有自己的阶段名，
     每节报一次进度，并且允许中途叫停：已润色的保留，剩下的直接用初稿。
     """
-    polishable = [key for key, draft in drafts.items() if draft.generator.startswith("llm")]
+    # 续跑的章节（generator="resumed"）也要润色：暂停发生在写作途中时，先写好的
+    # 那几节还没轮到润色，排除它们等于让「继续」出来的稿子前半段永远没被打磨。
+    # 上一轮已经润过的靠 checkpoint 记名单排除，不重复付钱。
+    polished_before = {str(key) for key in (context.checkpoint.get(WRITE_POLISHED_KEY) or [])}
+    polishable = [
+        key
+        for key, draft in drafts.items()
+        if (draft.generator.startswith("llm") or draft.generator == "resumed")
+        and key not in polished_before
+    ]
     total = len(polishable)
     outcome.polish_pending_count = total
     if not total:
@@ -405,6 +469,9 @@ async def _polish_all(
 
     done = 0
     for key in polishable:
+        # 取消/暂停优先于「跳过润色」：跳过是「别润了，直接交稿」，
+        # 停止是「整个任务先别跑了」，两者的收尾完全不同。
+        await context.raise_if_stopped()
         # 每节之间查一次开关：正在跑的那一节跑完再停，不打断已经付过钱的调用。
         if await _polish_skip_requested(context):
             outcome.polish_skipped = True
@@ -437,6 +504,7 @@ async def _polish_all(
         )
         done += 1
         outcome.polished_count = done
+        polished_before.add(key)
         await context.emit(
             "polish.section",
             {
@@ -447,6 +515,8 @@ async def _polish_all(
             },
             stage=POLISH_STAGE,
             progress=_POLISH_PROGRESS_START + span * (done / total),
+            # 逐节记名单：在润色途中暂停后「继续」，已润过的这些不再重跑。
+            checkpoint={WRITE_POLISHED_KEY: sorted(polished_before)},
         )
 
     outcome.polish_pending_count = total - done
@@ -470,6 +540,92 @@ async def _polish_skip_requested(context: JobContext) -> bool:
     except Exception:  # noqa: BLE001 - 读不到开关就当没按过，继续润色
         logger.warning("failed to read polish skip flag", exc_info=True)
         return False
+
+
+#: 已润色完成的章节，续跑时不再重复润色（每节一次 LLM 调用）。
+WRITE_POLISHED_KEY = "write_polished_keys"
+
+
+def _draft_from_section(section: PaperSection) -> SectionDraft:
+    """把已落库的章节还原成 SectionDraft，供续跑时跳过重写。
+
+    只还原 text + cite_keys 两样，但这两样必须准：收尾的全量 upsert 会拿
+    `draft.to_ir_section()` 重建 body_ir，而它只在 paragraph 带 `sentences` 时才发
+    CiteRun——还原成纯文本段落会把续跑章节的引用**全部抹掉**。
+    术语表（`terms`）无法从 IR 还原，续跑后的章节因此不再贡献 glossary，
+    这是可接受的降级：正文与引用不受影响。
+    """
+    paragraphs: list[dict[str, Any]] = []
+    for block in (section.body_ir_json or {}).get("blocks") or []:
+        if not isinstance(block, dict) or block.get("type") != "paragraph":
+            continue
+        sentences: list[dict[str, Any]] = []
+        pending = ""
+        for run in block.get("runs") or []:
+            if not isinstance(run, dict):
+                continue
+            if run.get("t") == "text":
+                pending += str(run.get("v") or "")
+            elif run.get("t") == "cite":
+                keys = [str(key) for key in (run.get("keys") or []) if key]
+                evidence_ids = [str(value) for value in (run.get("evidence_ids") or []) if value]
+                sentences.append(
+                    {
+                        "text": pending.strip(),
+                        "cite_keys": keys,
+                        "evidence_ids": evidence_ids,
+                    }
+                )
+                pending = ""
+            elif run.get("t") == "grounding":
+                if pending.strip():
+                    sentences.append({"text": pending.strip(), "cite_keys": [], "evidence_ids": []})
+                    pending = ""
+                if sentences:
+                    sentences[-1]["source_refs"] = [
+                        str(value) for value in (run.get("source_refs") or []) if value
+                    ]
+        if pending.strip():
+            sentences.append({"text": pending.strip(), "cite_keys": []})
+        if not sentences:
+            continue
+        paragraphs.append(
+            {
+                "text": " ".join(item["text"] for item in sentences).strip(),
+                "sentences": sentences,
+                "cite_keys": [key for item in sentences for key in item["cite_keys"]],
+                "stance_summary": block.get("stance_summary"),
+            }
+        )
+    return SectionDraft(
+        section_key=section.section_key,
+        title=section.title,
+        paragraphs=paragraphs,
+        model=section.model,
+        generator="resumed",
+    )
+
+
+async def _resume_document(
+    context: JobContext,
+) -> tuple[uuid.UUID | None, dict[str, SectionDraft]]:
+    """上一轮留下的 document 及其已落库章节；没有可续的就返回 (None, {})。"""
+    raw = context.checkpoint.get(WRITE_DOCUMENT_KEY)
+    if not raw:
+        return None, {}
+    try:
+        document_id = uuid.UUID(str(raw))
+    except ValueError:
+        return None, {}
+    try:
+        async with context.session() as session:
+            if await session.get(PaperDocument, document_id) is None:
+                return None, {}
+            rows = await list_sections(session, document_id)
+    except Exception:  # noqa: BLE001 - 读不出上一轮的稿子就当没有，从头写
+        logger.warning("failed to load resumable document", exc_info=True)
+        return None, {}
+    return document_id, {row.section_key: _draft_from_section(row) for row in rows}
 
 
 async def _persist_draft(
@@ -553,6 +709,145 @@ async def _upsert_draft(
     )
 
 
+async def repair_document_sections(
+    context: JobContext,
+    *,
+    section_keys: set[str],
+    language: str,
+    paper_type: str,
+) -> WriteOutcome:
+    """Rewrite only quality-failing sections against the latest evidence/outline."""
+    outcome = WriteOutcome()
+    async with context.session() as session:
+        outline_row = await latest_outline(session, context.project_id)
+        document = await latest_document(session, context.project_id)
+        if outline_row is None or document is None:
+            return outcome
+        outline = dict(outline_row.tree_json or {})
+        rows = await list_sections(session, document.id)
+        whitelist = await get_writing_whitelist(session, context.project_id)
+        cards = await _card_context(session, context.project_id)
+        assets = await grounded_asset_payloads(session, context.project_id)
+    sections = [item for item in outline.get("sections") or [] if isinstance(item, dict)]
+    existing = {row.section_key: _draft_from_section(row) for row in rows}
+    writing_context = WritingContext(outline=outline, language=language, paper_type=paper_type)
+    for section in sections:
+        key = str(section.get("key") or "")
+        if key in existing:
+            writing_context.register(key, existing[key])
+
+    # Frame sections summarize the repaired body and must never remain attached
+    # to claims that were removed in a prior round.
+    targets = set(section_keys) | {"abstract", "introduction", "conclusion"}
+    order_by_key = {str(item.get("key") or ""): index for index, item in enumerate(sections)}
+    for section in sections:
+        key = str(section.get("key") or "")
+        if key not in targets:
+            continue
+        repair_section = {
+            **section,
+            "summary": (
+                str(section.get("summary") or "")
+                + "\nQUALITY REPAIR: omit every claim that is not directly supported by the "
+                "provided evidence/source refs; split non-comparable results and copy no "
+                "number without an exact locator."
+            ),
+        }
+        draft = await _write_one(
+            section=repair_section,
+            cards=cards,
+            whitelist=set(whitelist),
+            writing_context=writing_context,
+            runner=context.llm_runner(),
+            context=context,
+            outcome=outcome,
+            assets=assets,
+        )
+        await _persist_draft(
+            context,
+            document_id=document.id,
+            draft=draft,
+            order_no=order_by_key.get(key, 0),
+            whitelist=whitelist,
+            language=language,
+        )
+        existing[key] = draft
+        writing_context.register(key, draft)
+        outcome.section_count += 1
+        outcome.word_count += draft.word_count
+        await context.emit(
+            "quality_repair.section",
+            {"section": key, "words": draft.word_count},
+            stage="quality_repair",
+        )
+        await context.raise_if_stopped()
+    outcome.document_id = str(document.id)
+    return outcome
+
+
+async def snapshot_document_sections(context: JobContext) -> dict[str, dict[str, Any]]:
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        rows = await list_sections(session, document.id) if document else []
+        usage_rows = await list_citation_usage(session, context.project_id)
+    usages_by_section: dict[uuid.UUID, list[dict[str, Any]]] = {}
+    for usage in usage_rows:
+        usages_by_section.setdefault(usage.section_id, []).append(
+            {
+                "work_id": usage.work_id,
+                "cite_key": usage.cite_key,
+                "context_snippet": usage.context_snippet,
+            }
+        )
+    return {
+        row.section_key: {
+            "document_id": row.document_id,
+            "title": row.title,
+            "order_no": row.order_no,
+            "body_ir": row.body_ir_json,
+            "cite_keys": row.cite_keys_json or [],
+            "asset_refs": row.asset_refs_json or [],
+            "status": row.status,
+            "model": row.model,
+            "usages": usages_by_section.get(row.id, []),
+        }
+        for row in rows
+    }
+
+
+async def restore_document_sections(
+    context: JobContext,
+    snapshot: dict[str, dict[str, Any]],
+) -> None:
+    """Restore a non-improving repair candidate and its citation-usage rows."""
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        current_rows = await list_sections(session, document.id) if document else []
+        for current in current_rows:
+            if current.section_key not in snapshot:
+                await session.delete(current)
+        await session.flush()
+        for key, item in snapshot.items():
+            row = await upsert_section(
+                session,
+                document_id=item["document_id"],
+                section_key=key,
+                title=item["title"],
+                order_no=item["order_no"],
+                body_ir=item["body_ir"],
+                cite_keys=item["cite_keys"],
+                asset_refs=item["asset_refs"],
+                status=item["status"],
+                model=item["model"],
+            )
+            await replace_citation_usage(
+                session,
+                project_id=context.project_id,
+                section_id=row.id,
+                usages=item["usages"],
+            )
+
+
 async def build_markdown(
     context: JobContext,
     *,
@@ -599,7 +894,7 @@ async def build_markdown(
             citation_style = "author_year"
 
     ir = PaperIR(
-        meta=PaperMeta(title=project_title, language=language),
+        meta=PaperMeta(title=project_title, language=language),  # type: ignore[arg-type]
         sections=sections,
         bibliography=Bibliography(style=citation_style),  # type: ignore[arg-type]
     )

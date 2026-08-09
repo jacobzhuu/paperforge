@@ -13,10 +13,10 @@ import {
   Wand2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Callout } from '@/components/ui/callout';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Dialog } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/components/ui/toast';
@@ -225,7 +225,7 @@ export function OutlineEditor() {
         description={tree.topic ? `主题：${tree.topic}` : '章节结构、文献分配与论证要点'}
         actions={
           <>
-            <span className="text-xs text-muted-foreground">
+            <span className="text-meta text-muted-foreground">
               v{version}
               {saving ? ' · 保存中…' : ''}
             </span>
@@ -261,7 +261,7 @@ export function OutlineEditor() {
 
       <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-80">
         {tree.sections.length === 0 ? (
-          <div className="rounded-xl border border-dashed py-16 text-center text-sm text-muted-foreground">
+          <div className="rounded-lg border border-dashed py-16 text-center text-body text-muted-foreground">
             还没有大纲。点「生成大纲」，系统会按文献卡片聚类出章节树。
           </div>
         ) : (
@@ -278,8 +278,8 @@ export function OutlineEditor() {
                 <Plus className="h-4 w-4" /> 新增章节
               </Button>
 
-              <Card>
-                <CardContent className="space-y-1 py-3 text-xs text-muted-foreground">
+              <section>
+                <div className="space-y-1 py-3 text-meta text-muted-foreground">
                   <p>
                     已分配文献 {assignedKeys.size} / {whitelist.length}
                   </p>
@@ -291,8 +291,8 @@ export function OutlineEditor() {
                   <p className="border-t pt-1.5">
                     章节只能分配写作白名单内的文献；手工编辑同样会被服务端收敛到白名单内。
                   </p>
-                </CardContent>
-              </Card>
+                </div>
+              </section>
             </div>
 
             {active && (
@@ -429,28 +429,28 @@ function OutlineTreeNav({
             >
               <span className="flex items-center gap-1.5">
                 <span
-                  className={cn('line-clamp-1 text-sm', active && 'font-medium', isFrame && 'text-muted-foreground')}
+                  className={cn('line-clamp-1 text-body', active && 'font-medium', isFrame && 'text-muted-foreground')}
                 >
                   {section.title}
                 </span>
               </span>
               <span className="mt-0.5 flex items-center gap-1">
                 {isFrame ? (
-                  <Badge variant="muted" className="text-xs">
+                  <Badge variant="muted" className="text-meta">
                     框架
                   </Badge>
                 ) : (
                   <>
-                    <Badge variant="outline" className="font-mono text-xs">
+                    <Badge variant="outline" className="font-mono text-meta">
                       {section.key}
                     </Badge>
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-meta text-muted-foreground">
                       {section.cite_keys?.length ?? 0} 篇
                     </span>
                   </>
                 )}
                 {section.grounding === 'user_asset' && (
-                  <Badge variant="secondary" className="text-xs">
+                  <Badge variant="secondary" className="text-meta">
                     素材支撑
                   </Badge>
                 )}
@@ -505,8 +505,8 @@ function SectionDetail({
 
   return (
     <div className="min-w-0 space-y-4">
-      <Card>
-        <CardHeader className="flex-row items-start justify-between gap-3 space-y-0 pb-3">
+      <section>
+        <header className="flex-row items-start justify-between gap-3 space-y-0 pb-3">
           <div className="min-w-0 flex-1 space-y-1.5">
             <Label htmlFor="section-title">章节标题</Label>
             <Input
@@ -526,8 +526,8 @@ function SectionDetail({
               <Trash2 className="h-4 w-4" />
             </button>
           )}
-        </CardHeader>
-        <CardContent className="space-y-3">
+        </header>
+        <div className="space-y-3">
           <div className="space-y-1.5">
             <Label htmlFor="section-summary">本章要论证什么</Label>
             <Textarea
@@ -543,20 +543,20 @@ function SectionDetail({
             />
           </div>
           {isFrame && (
-            <p className="rounded-md bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+            <p className="rounded-md bg-muted/40 px-3 py-2 text-meta leading-relaxed text-muted-foreground">
               {FRAME_HINT[section.key] ?? '内容在正文写完后自动生成。'}
             </p>
           )}
-        </CardContent>
-      </Card>
+        </div>
+      </section>
 
       {!isFrame && (
         <>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">论证要点（每行一条）</CardTitle>
-            </CardHeader>
-            <CardContent>
+          <section>
+            <header className="pb-2">
+              <h3 className="text-body">论证要点（每行一条）</h3>
+            </header>
+            <div>
               <Textarea
                 value={points}
                 onChange={(e) => setPoints(e.target.value)}
@@ -571,33 +571,33 @@ function SectionDetail({
                 className="min-h-32"
                 aria-label="论证要点"
               />
-            </CardContent>
-          </Card>
+            </div>
+          </section>
 
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm">
+          <section>
+            <header className="pb-2">
+              <h3 className="text-body">
                 分配文献（{section.cite_keys?.length ?? 0}）
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
+              </h3>
+            </header>
+            <div className="space-y-2">
               {section.grounding === 'user_asset' && (
-                <p className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+                <Callout variant="warning">
                   这一章由<span className="font-medium">用户素材</span>接地，通常不需要分配文献。
                   正文里的数字会从
                   <Link href={projectHref(projectId, 'assets')} className="mx-1 underline">
                     素材中心
                   </Link>
                   确定性注入。
-                </p>
+                </Callout>
               )}
               <CiteKeyPicker
                 whitelist={whitelist}
                 selected={section.cite_keys ?? []}
                 onChange={(keys) => onChange({ cite_keys: keys })}
               />
-            </CardContent>
-          </Card>
+            </div>
+          </section>
         </>
       )}
     </div>

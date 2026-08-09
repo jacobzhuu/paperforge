@@ -1,0 +1,36 @@
+# Local-only runtime overlay for Ubuntu hosts where the Snap Docker daemon
+# cannot execute image entrypoints with no-new-privileges enabled.
+#
+# This file deliberately contains no credentials. It reuses the external
+# PAPERFORGE_ENV_FILE for database, object-storage, and provider settings, but
+# overrides authentication and public URLs so the restored application is only
+# served on localhost with the built-in development account.
+
+services:
+  visuald:
+    security_opt: !reset []
+
+  migrate:
+    security_opt: !reset []
+
+  api:
+    security_opt: !reset []
+    environment:
+      AUTH_COOKIE_SECURE: "false"
+      AUTH_DEV_LOGIN_ENABLED: "false"
+      AUTH_EMAIL_MODE: file
+      CORS_ALLOW_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      PUBLIC_APP_URL: http://localhost:3000
+      PAPERFORGE_PUBLIC_APP_URL: http://localhost:3000
+
+  worker:
+    security_opt: !reset []
+
+  web:
+    security_opt: !reset []
+    environment:
+      PUBLIC_APP_URL: http://localhost:3000
+      PAPERFORGE_PUBLIC_APP_URL: http://localhost:3000
+
+  storage-tools:
+    security_opt: !reset []

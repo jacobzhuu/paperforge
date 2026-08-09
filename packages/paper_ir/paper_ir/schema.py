@@ -29,6 +29,15 @@ class TextRun(BaseModel):
 class CiteRun(BaseModel):
     t: Literal["cite"] = "cite"
     keys: list[str] = Field(default_factory=list)  # 必须 ⊆ 项目白名单（R2）
+    # R6：句级引用可进一步绑定到 EvidenceUnit；渲染器仍只消费 keys。
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class GroundingRun(BaseModel):
+    """Invisible sentence-level provenance for user supplied assets."""
+
+    t: Literal["grounding"] = "grounding"
+    source_refs: list[str] = Field(default_factory=list)
 
 
 class MathInlineRun(BaseModel):
@@ -44,13 +53,24 @@ class XRefRun(BaseModel):
     kind: Literal["figure"] = "figure"
 
 
-Run = TextRun | CiteRun | MathInlineRun | XRefRun
+Run = TextRun | CiteRun | GroundingRun | MathInlineRun | XRefRun
 
 
 # ---- 块级元素 ----
 class ParagraphBlock(BaseModel):
     type: Literal["paragraph"] = "paragraph"
     runs: list[Run] = Field(default_factory=list)
+    stance_summary: (
+        Literal[
+            "consistent",
+            "conditional",
+            "conflicting",
+            "insufficient",
+            "partial",
+            "background",
+        ]
+        | None
+    ) = None
 
 
 class EquationBlock(BaseModel):
@@ -137,6 +157,7 @@ class Section(BaseModel):
     key: str
     level: int = 1
     title: str
+    appendix: bool = False
     blocks: list[Block] = Field(default_factory=list)
     citation_warnings: list[CitationWarning] = Field(default_factory=list)
 
@@ -225,7 +246,7 @@ class PaperIR(BaseModel):
         return keys
 
     def collect_asset_refs(self) -> set[str]:
-        """收集图与表使用的素材引用，供持久化、导出与删除保护使用。"""
+        """收集图、表与句级接地使用的素材引用。"""
         refs: set[str] = set()
         for section in self.sections:
             for block in section.blocks:
@@ -233,6 +254,10 @@ class PaperIR(BaseModel):
                     refs.add(block.asset_ref)
                 elif isinstance(block, TableBlock) and block.source.ref:
                     refs.add(block.source.ref)
+                for _suffix, runs in _run_containers(block):
+                    for run in runs:
+                        if isinstance(run, GroundingRun):
+                            refs.update(ref for ref in run.source_refs if ref)
         return refs
 
     def enforce_cite_key_whitelist(

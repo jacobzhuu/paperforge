@@ -118,6 +118,38 @@ async def verify_email(body: TokenRequest, session: SessionDep) -> AuthMessageRe
     return AuthMessageResponse(message="Email verified.")
 
 
+@router.post(
+    "/resend-verification",
+    response_model=AuthMessageResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def resend_verification(
+    body: ForgotPasswordRequest,
+    request: Request,
+    session: SessionDep,
+    queue: QueueDep,
+    settings: SettingsDep,
+) -> AuthMessageResponse:
+    """统一响应并服务端限流，避免借此探测邮箱是否已注册。"""
+    await _rate_limit(
+        queue, settings, request, "verify-resend", str(body.email), limit=3, window=3600
+    )
+    user = await get_user_by_email(session, str(body.email))
+    if user is not None and user.status == "active" and user.email_verified_at is None:
+        raw_token = new_token()
+        await create_action_token(
+            session,
+            user_id=user.id,
+            purpose="verify_email",
+            token_hash=token_hash(raw_token),
+            expires_at=action_expiry(hours=24),
+        )
+        await send_auth_email(
+            settings, recipient=user.email, purpose="verify_email", token=raw_token
+        )
+    return AuthMessageResponse(message="If verification is available, an email was sent.")
+
+
 @router.post("/login", response_model=LoginResponse)
 async def login(
     body: LoginRequest,

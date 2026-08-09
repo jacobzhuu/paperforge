@@ -1,0 +1,6 @@
+# Offline deployment fallback: reuse the already verified Tectonic runtime and
+# warmed package cache, while replacing the application code from this checkout.
+ARG PAPERFORGE_TEXD_BASE=paperforge-texd:local
+FROM ${PAPERFORGE_TEXD_BASE}
+
+COPY services/texd/paperforge_texd /app/paperforge_texd

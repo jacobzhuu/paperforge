@@ -4,9 +4,16 @@ import base64
 import io
 import shutil
 import zipfile
+from types import SimpleNamespace
 
 import pytest
-from paperforge_worker.pipelines.export import _markdown_bundle, _markdown_to_docx
+from paperforge_worker.pipelines.export import (
+    MAX_FIGURE_FILES,
+    _build_ir,
+    _enforce_binary_channel_limits,
+    _markdown_bundle,
+    _markdown_to_docx,
+)
 from pypdf import PdfWriter
 
 
@@ -23,6 +30,100 @@ def _pdf() -> bytes:
     writer.add_blank_page(width=144, height=72)
     writer.write(output)
     return output.getvalue()
+
+
+def test_abstract_figure_is_preserved_as_front_matter_for_export() -> None:
+    rows = [
+        SimpleNamespace(
+            body_ir_json={
+                "key": "abstract",
+                "level": 1,
+                "title": "摘要",
+                "blocks": [
+                    {"type": "paragraph", "runs": [{"t": "text", "v": "摘要正文"}]},
+                    {
+                        "type": "figure",
+                        "asset_ref": "va_summary",
+                        "caption": "摘要图",
+                        "alt_text": "论文摘要图",
+                        "label": "fig:summary",
+                        "width": "full",
+                    },
+                ],
+            }
+        ),
+        SimpleNamespace(
+            body_ir_json={
+                "key": "introduction",
+                "level": 1,
+                "title": "引言",
+                "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": "正文"}]}],
+            }
+        ),
+    ]
+
+    ir = _build_ir(
+        rows,
+        title="论文",
+        language="zh",
+        citation_style="gbt7714",
+    )
+
+    assert ir.meta.abstract == "摘要正文"
+    assert [section.key for section in ir.sections] == ["abstract-visuals", "introduction"]
+    assert ir.sections[0].title == ""
+    assert ir.collect_asset_refs() == {"va_summary"}
+
+
+def test_too_many_figures_are_dropped_instead_of_killing_the_whole_compile() -> None:
+    """texd 超限时拒收**整个请求**，日志里没有 TeX 输出，修复轮次救不回来。
+
+    所以超出的图必须在这一侧就摘掉，让渲染器排占位——少几张图可以，
+    整篇论文没有 PDF 不行。
+    """
+    count = MAX_FIGURE_FILES + 5
+    render_assets = {
+        f"va_{index}": {"figure_path": f"figures/va_{index:03d}.png"} for index in range(count)
+    }
+    latex_files = {str(asset["figure_path"]): _png() for asset in render_assets.values()}
+
+    warnings = _enforce_binary_channel_limits(render_assets, latex_files)
+
+    assert len(latex_files) == MAX_FIGURE_FILES
+    assert warnings[0]["reason"] == "figures_dropped_for_compile_limits"
+    assert warnings[0]["count"] == 5
+    # 被摘掉的图不能再留着 figure_path，否则 \includegraphics 会指向
+    # 工程里并不存在的文件——编译照样挂。
+    kept = set(latex_files)
+    for asset in render_assets.values():
+        path = asset.get("figure_path")
+        assert path is None or path in kept
+
+
+def test_oversized_figure_is_dropped_but_the_others_survive() -> None:
+    render_assets = {
+        "va_ok": {"figure_path": "figures/ok.png"},
+        "va_huge": {"figure_path": "figures/huge.png"},
+    }
+    latex_files = {
+        "figures/ok.png": _png(),
+        "figures/huge.png": b"\x89PNG\r\n\x1a\n" + b"\0" * (17 * 1024 * 1024),
+    }
+
+    warnings = _enforce_binary_channel_limits(render_assets, latex_files)
+
+    assert set(latex_files) == {"figures/ok.png"}
+    assert warnings[0]["count"] == 1
+    assert render_assets["va_ok"]["figure_path"] == "figures/ok.png"
+    assert "figure_path" not in render_assets["va_huge"]
+
+
+def test_figures_within_limits_are_left_completely_alone() -> None:
+    render_assets = {"va_1": {"figure_path": "figures/a.png"}}
+    latex_files = {"figures/a.png": _png()}
+    assert _enforce_binary_channel_limits(render_assets, latex_files) == []
+    assert set(latex_files) == {"figures/a.png"}
+    assert render_assets["va_1"]["figure_path"] == "figures/a.png"
 
 
 def test_markdown_bundle_contains_figures_and_provenance() -> None:

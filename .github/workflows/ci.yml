@@ -7,7 +7,7 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     services:
       # R1 白名单、bibtex_key 唯一性等不变量活在 SQL 里，契约测试跑真实 Postgres。
       postgres:
@@ -50,7 +50,7 @@ jobs:
         run: uv run pytest -q
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: apps/web
@@ -58,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: 9.15.9
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -66,4 +66,51 @@ jobs:
           cache-dependency-path: apps/web/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
+      - run: pnpm test
       - run: pnpm build
+
+  macos-host:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.12"
+      - name: Verify macOS/Bash 3.2 host paths
+        run: |
+          uv sync --all-packages --frozen
+          uv run pytest -q services/api/tests/test_ops_scripts.py services/api/tests/test_storage_migration.py
+          /bin/bash -n scripts/dev scripts/ops scripts/install-ubuntu-container-tools scripts/compat/compose-smoke scripts/compat/lxd-smoke
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: Verify macOS Node workflow
+        working-directory: apps/web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm test
+          pnpm build
+
+  multiarch-images:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Validate production Compose compatibility
+        env:
+          PAPERFORGE_ENV_FILE: ${{ github.workspace }}/.env.production.example
+        run: docker compose --env-file .env.production.example -f infra/docker-compose.prod.yml config --quiet
+      - name: Build API for amd64 and arm64
+        run: docker buildx build --platform linux/amd64,linux/arm64 --target api --output type=cacheonly -f services/Dockerfile .
+      - name: Build Worker with Pandoc for amd64 and arm64
+        run: docker buildx build --platform linux/amd64,linux/arm64 --target worker --output type=cacheonly -f services/Dockerfile .
+      - name: Build Web for amd64 and arm64
+        run: docker buildx build --platform linux/amd64,linux/arm64 --output type=cacheonly -f apps/web/Dockerfile .

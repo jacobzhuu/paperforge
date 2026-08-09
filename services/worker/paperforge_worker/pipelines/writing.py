@@ -23,12 +23,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from llm_runtime import LLMRunner
-from paper_ir import CiteRun, ParagraphBlock, Section, TableBlock, TableSource, TextRun
+from paper_ir import (
+    CiteRun,
+    GroundingRun,
+    ParagraphBlock,
+    Section,
+    TableBlock,
+    TableSource,
+    TextRun,
+)
 
 MAX_PARAGRAPHS_PER_SECTION = 8
 MAX_ROLLING_SUMMARY_CHARS = 600
 TARGET_WORDS_PER_SECTION_ZH = 1200
 TARGET_WORDS_PER_SECTION_EN = 800
+WRITING_CARD_CONTEXT_CHAR_BUDGET = 36_000
+MAX_CARD_FIELD_ITEMS = 8
+MAX_CARD_EVIDENCE_POINTS = 12
 
 _NO_FABRICATION_ZH = (
     "绝对禁止：编造实验数值、样本量、准确率等任何数字；"
@@ -43,8 +54,10 @@ _SYSTEM_PROMPT_ZH = f"""你是学术综述写作助手。根据大纲与文献�
 只输出 JSON：
 {{
   "paragraphs": [
-    {{"sentences": [
-      {{"text": "一个完整论断句（不要写引用标记）", "cite_keys": ["只支撑本句的引用键"]}}
+    {{"stance_summary": "consistent|conditional|conflicting|insufficient|partial|background",
+      "sentences": [
+      {{"text": "一个完整论断句", "cite_keys": ["引用键"],
+        "evidence_ids": ["直接支撑本句的 EVIDENCE_ID"]}}
     ]}}
   ],
   "terms": [{{"term": "术语", "translation": "译名/缩写"}}]
@@ -52,17 +65,23 @@ _SYSTEM_PROMPT_ZH = f"""你是学术综述写作助手。根据大纲与文献�
 要求：
 - 按主题论证展开，不要逐篇复述文献；每段 3-6 句，观点先行、证据跟随；
 - 每个句子的 cite_keys 只能列真正支撑该句的可用引用键；禁止发明或在段末堆整段引用；
+- 非背景句必须填写 evidence_ids；只能使用给定 EVIDENCE_ID，数字句必须绑定页码/表格/公式证据；
+- 段落按「论断→一致证据→条件差异→冲突/缺口→适用边界」展开；
+- 连续“文献A提出…文献B提出…”式归因不得超过 2 句；
 - 正文里不要写 [1]、(Smith 2020) 之类的标记——引用由系统按 cite_keys 渲染；
 - 沿用给定术语表中的译名与缩写；新术语登记到 terms。
+- 正文必须全部使用中文；英文只可作为必要的术语、缩写、数据集、模型名或引用键。
 - {_NO_FABRICATION_ZH}"""
 
 _SYSTEM_PROMPT_EN = f"""You write sections of an academic review. Follow the outline and cards.
 Output JSON only:
 {{
   "paragraphs": [
-    {{"sentences": [
+    {{"stance_summary": "consistent|conditional|conflicting|insufficient|partial|background",
+      "sentences": [
       {{"text": "one complete claim sentence (no inline markers)",
-       "cite_keys": ["keys supporting only this sentence"]}}
+       "cite_keys": ["keys supporting only this sentence"],
+       "evidence_ids": ["EVIDENCE_ID values directly supporting this sentence"]}}
     ]}}
   ],
   "terms": [{{"term": "term", "translation": "abbreviation or gloss"}}]
@@ -71,26 +90,52 @@ Rules:
 - argue by theme, never paper-by-paper; 3-6 sentences per paragraph, claim first, evidence after;
 - each sentence's cite_keys MUST support that exact sentence and come from the provided list;
   never invent or pile paragraph-wide citations at the end; use [] when unsupported;
+- every non-background sentence must declare supplied evidence_ids; numeric claims require a
+  page-, table-, or equation-located evidence unit;
+- structure paragraphs as claim → agreement → conditional difference → conflict/gap → boundary;
+- never write more than two consecutive paper-by-paper attribution sentences;
 - do not write inline markers like [1] or (Smith 2020) — the system renders citations;
 - reuse the given glossary terms consistently; register new terms in `terms`.
+- write all prose in English; retain another language only for essential proper names or quotations.
 - {_NO_FABRICATION_EN}"""
+
+_ORIGINAL_SYSTEM_PROMPT_ZH = f"""你是原创研究论文写作助手。只依据提供的方法与结果素材撰写指定章节。
+只输出 JSON：{{"paragraphs":[{{"stance_summary":"background|partial|conditional",
+"sentences":[{{"text":"完整句子","cite_keys":[],"evidence_ids":[],
+"source_refs":["直接支撑本句的 SOURCE_REF"]}}]}}],"terms":[]}}。
+要求：方法、实验设置、结果、讨论和结论中的事实句必须填写给定 SOURCE_REF；相关工作使用给定
+cite_keys/evidence_ids；不得发明来源标识、实验步骤、数据或数字；数字只能逐字取自绑定素材。
+无法由素材支撑的内容不要写。正文必须使用中文。{_NO_FABRICATION_ZH}"""
+
+_ORIGINAL_SYSTEM_PROMPT_EN = f"""You write an original research paper using only the supplied
+method and result assets. Return JSON only with paragraphs/sentences; every sentence has text,
+cite_keys, evidence_ids, and source_refs. Method, setup, result, discussion, and conclusion facts
+must bind supplied SOURCE_REF values. Related work uses supplied cite_keys/evidence_ids. Never
+invent a source, procedure, result, or number; numbers must be copied exactly from a bound asset.
+Omit claims that the sources cannot support. Write all prose in English. {_NO_FABRICATION_EN}"""
 
 _COHERENCE_PROMPT_ZH = """你是学术论文的连贯性编辑。给定相邻章节的正文，改写目标章节，使其：
 过渡自然、术语一致、不与其他章节重复论述。只输出 JSON，结构与输入相同：
-{"paragraphs": [{"sentences": [{"text": "...", "cite_keys": [...]}]}]}
-不得新增引用键，不得改动或新增任何数字。"""
+{"paragraphs": [{"stance_summary": "...", "sentences":
+[{"text": "...", "cite_keys": [...], "evidence_ids": [...],
+"source_refs": [...]}]}]}
+不得新增、删除或调换引用键、evidence_ids 与 source_refs，不得改动或新增任何数字。"""
 
 _COHERENCE_PROMPT_EN = """You are a coherence editor. Rewrite the target section so that it
 transitions smoothly, uses consistent terminology, and does not repeat neighbouring sections.
 Output JSON with the same sentence-level shape:
-{"paragraphs": [{"sentences": [{"text": "...", "cite_keys": [...]}]}]}
-Never add cite keys and never add or change any number."""
+{"paragraphs": [{"stance_summary": "...", "sentences":
+[{"text": "...", "cite_keys": [...], "evidence_ids": [...],
+"source_refs": [...]}]}]}
+Never add, remove, or swap cite keys, evidence_ids, or source_refs. Never add or change any
+number."""
 
 
 @dataclass
 class SectionDraft:
     section_key: str
     title: str
+    appendix: bool = False
     paragraphs: list[dict[str, Any]] = field(default_factory=list)
     inline_tables: list[dict[str, Any]] = field(default_factory=list)
     citation_warnings: list[dict[str, Any]] = field(default_factory=list)
@@ -107,22 +152,52 @@ class SectionDraft:
         """转成 PaperIR Section：cite 是原子节点，不是正文里的字符串。"""
         blocks: list[Any] = []
         for paragraph in self.paragraphs:
-            sentence_rows = paragraph.get("sentences") or []
+            sentence_rows = [
+                sentence
+                for sentence in (paragraph.get("sentences") or [])
+                if str(sentence.get("text") or "").strip()
+            ]
             runs: list[Any] = []
             if sentence_rows:
                 for index, sentence in enumerate(sentence_rows):
-                    runs.append(TextRun(v=str(sentence.get("text") or "")))
+                    text = str(sentence.get("text") or "").strip()
+                    if not text:
+                        continue
+                    runs.append(TextRun(v=text))
                     keys = [key for key in sentence.get("cite_keys", []) if key]
                     if keys:
-                        runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
+                        runs.append(
+                            CiteRun(
+                                keys=list(dict.fromkeys(keys)),
+                                evidence_ids=list(
+                                    dict.fromkeys(
+                                        str(value)
+                                        for value in sentence.get("evidence_ids", [])
+                                        if value
+                                    )
+                                ),
+                            )
+                        )
+                    source_refs = [str(value) for value in sentence.get("source_refs", []) if value]
+                    if source_refs:
+                        runs.append(GroundingRun(source_refs=list(dict.fromkeys(source_refs))))
                     if index < len(sentence_rows) - 1:
                         runs.append(TextRun(v=" "))
             else:
-                runs.append(TextRun(v=paragraph.get("text", "")))
-                keys = [key for key in paragraph.get("cite_keys", []) if key]
-                if keys:
-                    runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
-            blocks.append(ParagraphBlock(runs=runs))
+                text = str(paragraph.get("text") or "").strip()
+                if text:
+                    runs.append(TextRun(v=text))
+                    keys = [key for key in paragraph.get("cite_keys", []) if key]
+                    if keys:
+                        runs.append(CiteRun(keys=list(dict.fromkeys(keys))))
+            if not runs:
+                continue
+            blocks.append(
+                ParagraphBlock(
+                    runs=runs,
+                    stance_summary=paragraph.get("stance_summary"),
+                )
+            )
         for table in self.inline_tables:
             headers = table.get("headers") or []
             rows = table.get("rows") or []
@@ -137,7 +212,13 @@ class SectionDraft:
                         label=str(table.get("label") or "") or None,
                     )
                 )
-        section = Section(key=self.section_key, level=level, title=self.title, blocks=blocks)
+        section = Section(
+            key=self.section_key,
+            level=level,
+            title=self.title,
+            appendix=self.appendix,
+            blocks=blocks,
+        )
         for warning in self.citation_warnings:
             section.citation_warnings.append(
                 {  # type: ignore[arg-type]
@@ -191,10 +272,25 @@ async def write_section(
     section_key = str(section.get("key") or "section")
     title = str(section.get("title") or section_key)
     allowed = {key for key in section.get("cite_keys", []) if key in whitelist}
+    section_evidence = _section_evidence(section, context.outline)
+    evidence_by_id = {
+        str(item.get("evidence_id")): item for item in section_evidence if item.get("evidence_id")
+    }
+    allowed_evidence_ids = set(evidence_by_id)
+    source_assets = _source_assets_for_section(
+        assets or [],
+        section=section,
+        paper_type=context.paper_type,
+    )
+    assets_by_ref = {
+        str(item.get("_asset_ref")): item for item in source_assets if item.get("_asset_ref")
+    }
+    allowed_source_refs = set(assets_by_ref)
 
     draft = SectionDraft(
         section_key=section_key,
         title=title,
+        appendix=bool(section.get("appendix")),
         inline_tables=[
             dict(table) for table in section.get("inline_tables") or [] if isinstance(table, dict)
         ],
@@ -203,9 +299,35 @@ async def write_section(
         draft.paragraphs = [{"text": str(section["deterministic_text"]), "cite_keys": []}]
         draft.generator = "deterministic_search_log"
         return draft
-    if runner is None or not runner.enabled:
-        draft.paragraphs = deterministic_paragraphs(section, cards, allowed)
-        draft.generator = "deterministic"
+    # R15 / N0-5: never call the LLM to freely write a body section with an empty
+    # cite-key whitelist. That path produced fluent, unsourced prose.
+    body_without_cites = (
+        section.get("kind", "body") == "body"
+        and not allowed
+        and not section_evidence
+        and not allowed_source_refs
+    )
+    if body_without_cites or runner is None or not runner.enabled:
+        if context.paper_type == "original" and allowed_source_refs:
+            draft.paragraphs = deterministic_asset_paragraphs(
+                section,
+                source_assets,
+                language=context.language,
+            )
+        else:
+            draft.paragraphs = deterministic_paragraphs(
+                section,
+                cards,
+                allowed,
+                evidence=section_evidence,
+                language=context.language,
+            )
+            draft.paragraphs = enforce_sentence_evidence_rules(
+                draft.paragraphs,
+                evidence_by_id=evidence_by_id,
+                language=context.language,
+            )
+        draft.generator = "evidence_gap_skeleton" if body_without_cites else "deterministic"
         return draft
 
     user_prompt = _build_prompt(
@@ -215,7 +337,15 @@ async def write_section(
         context=context,
         assets=assets or [],
     )
-    system_prompt = _SYSTEM_PROMPT_ZH if context.language == "zh" else _SYSTEM_PROMPT_EN
+    system_prompt = (
+        _ORIGINAL_SYSTEM_PROMPT_ZH
+        if context.paper_type == "original" and context.language == "zh"
+        else _ORIGINAL_SYSTEM_PROMPT_EN
+        if context.paper_type == "original"
+        else _SYSTEM_PROMPT_ZH
+        if context.language == "zh"
+        else _SYSTEM_PROMPT_EN
+    )
 
     # 第一轮：report 模式——不改动内容，只报告越权 key。
     result = await runner.agenerate_json(
@@ -266,16 +396,70 @@ async def write_section(
             )
 
     if not result.ok or not isinstance(result.value, dict):
-        draft.paragraphs = deterministic_paragraphs(section, cards, allowed)
+        if context.paper_type == "original" and allowed_source_refs:
+            draft.paragraphs = deterministic_asset_paragraphs(
+                section,
+                source_assets,
+                language=context.language,
+            )
+        else:
+            draft.paragraphs = deterministic_paragraphs(
+                section,
+                cards,
+                allowed,
+                evidence=section_evidence,
+                language=context.language,
+            )
+            draft.paragraphs = enforce_sentence_evidence_rules(
+                draft.paragraphs,
+                evidence_by_id=evidence_by_id,
+                language=context.language,
+            )
         draft.generator = "deterministic_fallback"
         return draft
 
-    draft.paragraphs = normalize_paragraphs(result.value.get("paragraphs"), allowed=allowed)
+    draft.paragraphs = normalize_paragraphs(
+        result.value.get("paragraphs"),
+        allowed=allowed,
+        allowed_evidence_ids=allowed_evidence_ids,
+        allowed_source_refs=allowed_source_refs,
+    )
+    if context.paper_type == "original" and allowed_source_refs:
+        draft.paragraphs = enforce_sentence_grounding_rules(
+            draft.paragraphs,
+            assets_by_ref=assets_by_ref,
+            require_grounding=section.get("grounding") != "library",
+            require_numeric=section_key == "s4",
+        )
+    elif context.paper_type != "original":
+        draft.paragraphs = enforce_sentence_evidence_rules(
+            draft.paragraphs,
+            evidence_by_id=evidence_by_id,
+            language=context.language,
+        )
     draft.terms = normalize_terms(result.value.get("terms"))
     draft.model = result.model
     draft.generator = f"llm:{result.model}"
     if not draft.paragraphs:
-        draft.paragraphs = deterministic_paragraphs(section, cards, allowed)
+        if context.paper_type == "original" and allowed_source_refs:
+            draft.paragraphs = deterministic_asset_paragraphs(
+                section,
+                source_assets,
+                language=context.language,
+            )
+        else:
+            draft.paragraphs = deterministic_paragraphs(
+                section,
+                cards,
+                allowed,
+                evidence=section_evidence,
+                language=context.language,
+            )
+            draft.paragraphs = enforce_sentence_evidence_rules(
+                draft.paragraphs,
+                evidence_by_id=evidence_by_id,
+                language=context.language,
+            )
         draft.generator = "deterministic_fallback"
     return draft
 
@@ -312,8 +496,42 @@ async def coherence_pass(
     )
     if not result.ok or not isinstance(result.value, dict):
         return draft
-    rewritten = normalize_paragraphs(result.value.get("paragraphs"), allowed=allowed)
+    allowed_evidence_ids = {
+        str(evidence_id)
+        for paragraph in draft.paragraphs
+        for sentence in paragraph.get("sentences") or []
+        for evidence_id in sentence.get("evidence_ids") or []
+    }
+    allowed_source_refs = {
+        str(source_ref)
+        for paragraph in draft.paragraphs
+        for sentence in paragraph.get("sentences") or []
+        for source_ref in sentence.get("source_refs") or []
+    }
+    rewritten = normalize_paragraphs(
+        result.value.get("paragraphs"),
+        allowed=allowed,
+        allowed_evidence_ids=allowed_evidence_ids,
+        allowed_source_refs=allowed_source_refs,
+    )
     if not rewritten:
+        return draft
+    evidence_ids_after = {
+        str(evidence_id)
+        for paragraph in rewritten
+        for sentence in paragraph.get("sentences") or []
+        for evidence_id in sentence.get("evidence_ids") or []
+    }
+    # 连贯性编辑只能改措辞，不能悄悄增删句子的证据绑定。
+    if evidence_ids_after != allowed_evidence_ids:
+        return draft
+    source_refs_after = {
+        str(source_ref)
+        for paragraph in rewritten
+        for sentence in paragraph.get("sentences") or []
+        for source_ref in sentence.get("source_refs") or []
+    }
+    if source_refs_after != allowed_source_refs:
         return draft
     # 连贯性 pass 不得引入新数字：一旦发现新数值，放弃改写保留原稿（红线优先于文采）。
     numbers_after = extract_numbers("\n\n".join(p.get("text", "") for p in rewritten))
@@ -336,20 +554,30 @@ def _build_prompt(
     outline_titles = [
         str(s.get("title")) for s in (context.outline.get("sections") or []) if s.get("title")
     ]
-    card_lines = []
+    card_lines: list[str] = []
+    remaining_context = WRITING_CARD_CONTEXT_CHAR_BUDGET
+    per_card_budget = max(1_200, remaining_context // max(1, len(allowed)))
     for key in sorted(allowed):
         card = cards.get(key) or {}
         parts = [f"[{key}] {card.get('title', '')} ({card.get('year') or 'n.d.'})"]
         if card.get("summary"):
-            parts.append(f"  summary: {str(card['summary'])[:300]}")
+            parts.append(f"  summary: {str(card['summary'])[:600]}")
         for field_name in ("contributions", "methods", "results", "limitations"):
             values = card.get(field_name) or []
             if values:
-                parts.append(f"  {field_name}: {'; '.join(str(v) for v in values[:3])}")
+                parts.append(
+                    f"  {field_name}: {'; '.join(str(v) for v in values[:MAX_CARD_FIELD_ITEMS])}"
+                )
         if card.get("fulltext_used"):
             points = card.get("quotable_points") or []
             located = [point for point in points if isinstance(point, dict) and point.get("text")]
-            for point in located[:3]:
+            located.sort(
+                key=lambda point: bool(
+                    point.get("page") or point.get("section") or point.get("paragraph")
+                ),
+                reverse=True,
+            )
+            for point in located[:MAX_CARD_EVIDENCE_POINTS]:
                 locator = ", ".join(
                     item
                     for item in (
@@ -360,9 +588,19 @@ def _build_prompt(
                     if item
                 )
                 parts.append(f"  fulltext evidence ({locator or 'unlocated'}): {point['text']}")
-        card_lines.append("\n".join(parts))
+        # 不再对所有文献机械 [:3]；按章节总 token 预算和文献数动态分配，
+        # 同时保证每篇至少保留题名行。
+        rendered = _truncate_card_context(parts, min(per_card_budget, remaining_context))
+        card_lines.append(rendered)
+        remaining_context = max(0, remaining_context - len(rendered))
 
     points = section.get("argument_points") or []
+    section_evidence = _section_evidence(section, context.outline)
+    evidence_block = _evidence_context_block(
+        section=section,
+        evidence=section_evidence,
+        language=context.language,
+    )
     return "\n".join(
         [
             f"Paper topic: {context.outline.get('topic', '')}",
@@ -376,9 +614,12 @@ def _build_prompt(
             f"Argument points: {'; '.join(str(p) for p in points) or '(derive from cards)'}",
             f"Target length: about {target} {'字' if zh else 'words'}",
             f"Available cite keys: {', '.join(sorted(allowed)) or '(none)'}",
+            _evidence_limitation_line(section, language=context.language),
             "",
-            "Literature cards:",
-            "\n\n".join(card_lines) or "(no cards assigned to this section)",
+            ("Question-aligned evidence clusters:" if section_evidence else "Literature cards:"),
+            evidence_block
+            if section_evidence
+            else ("\n\n".join(card_lines) or "(no cards assigned to this section)"),
             "",
             _asset_block(
                 assets or [],
@@ -386,9 +627,145 @@ def _build_prompt(
                 section=section,
                 paper_type=context.paper_type,
                 cards=[cards.get(key) or {} for key in sorted(allowed)],
+                evidence=section_evidence,
             ),
         ]
     )
+
+
+def _evidence_limitation_line(section: dict[str, Any], *, language: str) -> str:
+    """证据基础不足两个独立来源时，正文必须显式声明限度。
+
+    分级门禁允许覆盖率不达标的稿子继续产出，代价必须是「说清楚证据有多窄」，
+    而不是让 LLM 用一篇文献写出一段听起来像综述结论的话。
+    """
+    if not section.get("evidence_limited"):
+        return ""
+    count = int(section.get("distinct_source_count") or 0)
+    if language == "zh":
+        return (
+            f"证据限度（必须遵守）：本节可用证据仅来自 {count} 篇独立文献。"
+            "只能陈述该证据直接支持的内容，明确指出这是单一来源的初步发现，"
+            "不得推广为一般结论，并在结尾用一句话点明缺口。"
+        )
+    return (
+        f"Evidence limitation (mandatory): only {count} independent source(s) support this "
+        "section. State only what that evidence directly supports, mark it explicitly as a "
+        "single-source preliminary finding, do not generalise, and close with one sentence "
+        "naming the gap."
+    )
+
+
+def _truncate_card_context(parts: list[str], char_budget: int) -> str:
+    if not parts:
+        return ""
+    if char_budget <= 0:
+        return parts[0]
+    kept = [parts[0]]
+    used = len(parts[0])
+    for part in parts[1:]:
+        remaining = char_budget - used - 1
+        if remaining <= 0:
+            break
+        kept.append(part if len(part) <= remaining else part[:remaining])
+        used += len(kept[-1]) + 1
+        if len(part) > remaining:
+            break
+    return "\n".join(kept)
+
+
+def _section_evidence(
+    section: dict[str, Any],
+    outline: dict[str, Any],
+) -> list[dict[str, Any]]:
+    question_id = str(section.get("question_id") or "")
+    if not question_id:
+        return []
+    bundle: dict[str, Any] = next(
+        (
+            item
+            for item in outline.get("sub_question_bundles") or []
+            if str(item.get("question_id") or "") == question_id
+        ),
+        {},
+    )
+    return [item for item in bundle.get("evidence") or [] if isinstance(item, dict)]
+
+
+def _evidence_context_block(
+    *,
+    section: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    language: str,
+) -> str:
+    if not evidence:
+        return "(no question-aligned evidence)"
+    lines = [
+        f"Sub-question: {section.get('title')}",
+        f"SYNTH stance: {section.get('stance_summary') or 'insufficient'}",
+    ]
+    for cluster in section.get("comparison_clusters") or []:
+        lines.append(
+            f"[COMPARISON CLUSTER {cluster.get('comparability_key')}] "
+            f"classification={cluster.get('classification')} "
+            f"evidence_ids={','.join(cluster.get('evidence_ids') or [])}"
+        )
+    if section.get("not_comparable_groups"):
+        lines.append(
+            "[NOT COMPARABLE] The following comparability keys must be reported separately: "
+            + ", ".join(
+                str(item.get("comparability_key")) for item in section["not_comparable_groups"]
+            )
+        )
+    grade_order = {
+        "A_located_structured": 0,
+        "B_located_prose": 1,
+        "C_fulltext_unlocated": 2,
+        "D_abstract_only": 3,
+    }
+    used = len("\n".join(lines))
+    for item in sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9)):
+        grade = str(item.get("grade") or "")
+        locator = (
+            ", ".join(
+                value
+                for value in (
+                    f"p.{item.get('page')}" if item.get("page") else "",
+                    str(item.get("section_path") or ""),
+                    str(item.get("object_ref") or ""),
+                )
+                if value
+            )
+            or "unlocated"
+        )
+        measurements = "; ".join(
+            f"{row.get('metric_name')}={row.get('value')}{row.get('unit') or ''} "
+            f"dataset={row.get('dataset') or 'unknown'} "
+            f"comparability_key={row.get('comparability_key')}"
+            for row in item.get("measurements") or []
+        )
+        restriction = (
+            " [ABSTRACT-ONLY — 只可用于背景或“该文献报告”式转述]"
+            if language == "zh" and grade == "D_abstract_only"
+            else " [ABSTRACT-ONLY — background or attribution only]"
+            if grade == "D_abstract_only"
+            else ""
+        )
+        rendered = (
+            f"EVIDENCE_ID={item.get('evidence_id')} cite_key={item.get('cite_key')} "
+            f"grade={grade} kind={item.get('kind')} stance={item.get('stance')}"
+            f"{restriction}\n"
+            f"  locator={locator}\n"
+            f"  text={str(item.get('text') or '')[:1600]}\n"
+            f"  measurements={measurements or '(none)'}"
+        )
+        if used + len(rendered) > WRITING_CARD_CONTEXT_CHAR_BUDGET:
+            break
+        lines.append(rendered)
+        used += len(rendered)
+    if section.get("evidence_gap"):
+        lines.append(f"[EVIDENCE GAP] {section['evidence_gap']}")
+    return "\n".join(lines)
 
 
 def _asset_block(
@@ -398,6 +775,7 @@ def _asset_block(
     section: dict[str, Any],
     paper_type: str,
     cards: list[dict[str, Any]],
+    evidence: list[dict[str, Any]] | None = None,
 ) -> str:
     """素材接地块。
 
@@ -406,6 +784,11 @@ def _asset_block(
     明确要求写占位符而不是编数字——表格与图另由渲染器确定性展开，模型只写 caption。
     """
     zh = language == "zh"
+    assets = _source_assets_for_section(
+        assets,
+        section=section,
+        paper_type=paper_type,
+    )
     grounding = section.get("grounding")
     located_fulltext = any(
         card.get("fulltext_used")
@@ -418,6 +801,24 @@ def _asset_block(
         for card in cards
     )
     if paper_type == "review":
+        if evidence:
+            grades = sorted(
+                {str(item.get("grade") or "") for item in evidence if item.get("grade")}
+            )
+            return (
+                "综述证据规则：严格按每条 EVIDENCE_ID 的 grade 与定位写作；A/B 可支撑"
+                "核心论断，C 只能在明确不确定性时支撑效果/结论，D 只能支撑背景或归因。"
+                f"本节证据等级：{', '.join(grades)}。跨研究效果比较只能发生在相同 "
+                "comparability_key 内。"
+                if zh
+                else (
+                    "Review evidence rule: obey each EVIDENCE_ID's grade and locator. "
+                    "A/B may support core claims; C supports effect/conclusion only with "
+                    "explicit uncertainty; D supports background or attribution only. "
+                    f"Available grades: {', '.join(grades)}. Cross-study effect comparison "
+                    "is allowed only within one comparability_key."
+                )
+            )
         if located_fulltext:
             return (
                 "综述证据规则：数字、因果、比较、效果和结论性论断只能使用上方标注为 "
@@ -460,32 +861,206 @@ def _asset_block(
     lines = [header]
     for asset in assets[:6]:
         name = asset.get("filename") or asset.get("type") or "asset"
+        source_ref = str(asset.get("_asset_ref") or "")
+        prefix = f"SOURCE_REF={source_ref} " if source_ref else ""
         if asset.get("type") == "table":
             cells = asset.get("numeric_cells") or {}
             preview = "; ".join(f"{k}={v}" for k, v in list(cells.items())[:12])
-            lines.append(f"- 表 {name}: {preview}")
+            lines.append(f"- {prefix}表 {name}: {preview}")
             lines.append(
                 "  （表格本身由系统按 booktabs 渲染，你只写分析文字与 caption，不要复述整张表）"
                 if zh
                 else "  (the table itself is rendered by the system; write analysis, not the cells)"
             )
         elif asset.get("type") == "note":
-            lines.append(f"- 笔记 {name}: {str(asset.get('text') or '')[:400]}")
+            lines.append(f"- {prefix}笔记 {name}: {str(asset.get('text') or '')[:1200]}")
+        elif asset.get("type") == "code":
+            lines.append(f"- {prefix}代码 {name}: {str(asset.get('text') or '')[:1200]}")
         elif asset.get("type") == "figure":
-            lines.append(f"- 图 {name}（由系统 \\includegraphics 插入，你只写 caption 与分析）")
+            lines.append(
+                f"- {prefix}图 {name}（由系统 \\includegraphics 插入，你只写 caption 与分析）"
+            )
     return "\n".join(lines)
 
 
-def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]:
+def _source_assets_for_section(
+    assets: list[dict[str, Any]],
+    *,
+    section: dict[str, Any],
+    paper_type: str,
+) -> list[dict[str, Any]]:
+    if paper_type != "original" or section.get("grounding") == "library":
+        return []
+    key = str(section.get("key") or "")
+    kinds = {
+        "s2": {"method_note", "code"},
+        "s3": {"method_note", "code", "dataset", "result_table"},
+        "s4": {"dataset", "result_table"},
+        "s5": {"method_note", "code", "dataset", "result_table"},
+    }.get(key)
+    return [
+        item
+        for item in assets
+        if item.get("_asset_ref") and (kinds is None or item.get("_asset_kind") in kinds)
+    ]
+
+
+def deterministic_asset_paragraphs(
+    section: dict[str, Any],
+    assets: list[dict[str, Any]],
+    *,
+    language: str,
+) -> list[dict[str, Any]]:
+    """Conservative fallback that only restates exact, bound asset content."""
+    sentences: list[dict[str, Any]] = []
+    for asset in assets:
+        source_ref = str(asset.get("_asset_ref") or "")
+        if not source_ref:
+            continue
+        if asset.get("type") in {"note", "code"}:
+            raw = " ".join(str(asset.get("text") or "").split())
+            text = next(
+                (
+                    part.strip()
+                    for part in re.split(r"(?<=[.!?。！？])\s*", raw)
+                    if len(part.strip()) >= 12
+                ),
+                "",
+            )
+            if text:
+                sentences.append(
+                    {"text": text, "cite_keys": [], "evidence_ids": [], "source_refs": [source_ref]}
+                )
+        elif asset.get("type") == "table":
+            cells = list((asset.get("numeric_cells") or {}).items())
+            if cells:
+                cell, value = cells[0]
+                text = (
+                    f"结果素材“{asset.get('filename') or source_ref}”记录了 {cell}={value}。"
+                    if language == "zh"
+                    else (
+                        f"The result asset {asset.get('filename') or source_ref} "
+                        f"records {cell}={value}."
+                    )
+                )
+                sentences.append(
+                    {"text": text, "cite_keys": [], "evidence_ids": [], "source_refs": [source_ref]}
+                )
+        if len(sentences) >= MAX_PARAGRAPHS_PER_SECTION:
+            break
+    return [
+        {
+            "text": sentence["text"],
+            "cite_keys": [],
+            "sentences": [sentence],
+            "stance_summary": "partial",
+        }
+        for sentence in sentences
+    ]
+
+
+def enforce_sentence_grounding_rules(
+    paragraphs: list[dict[str, Any]],
+    *,
+    assets_by_ref: dict[str, dict[str, Any]],
+    require_grounding: bool,
+    require_numeric: bool = False,
+) -> list[dict[str, Any]]:
+    """Strip original-paper claims whose bound asset cannot support their numbers."""
+    from ingest.assets import normalize_number
+
+    from paperforge_worker.pipelines.quality import (
+        asset_numeric_support_score,
+        asset_text_support_score,
+        classify_claim,
+    )
+
+    for paragraph in paragraphs:
+        kept: list[dict[str, Any]] = []
+        for sentence in paragraph.get("sentences") or []:
+            refs = [ref for ref in sentence.get("source_refs") or [] if ref in assets_by_ref]
+            claim_kind = classify_claim(str(sentence.get("text") or ""))
+            must_bind = require_grounding or claim_kind not in {"background", "attribution"}
+            values = {
+                normalize_number(str(value))
+                for ref in refs
+                for value in (assets_by_ref[ref].get("numbers") or [])
+            }
+            numbers = {
+                normalize_number(value)
+                for value in extract_numbers(str(sentence.get("text") or ""))
+            }
+            prose_sources = [
+                str(
+                    assets_by_ref[ref].get("text")
+                    or assets_by_ref[ref].get("_asset_description")
+                    or ""
+                )
+                for ref in refs
+                if assets_by_ref[ref].get("type") in {"note", "code"}
+            ]
+            lexical_support = max(
+                (
+                    asset_text_support_score(str(sentence.get("text") or ""), source)
+                    for source in prose_sources
+                ),
+                default=0.0,
+            )
+            numeric_support = asset_numeric_support_score(
+                str(sentence.get("text") or ""),
+                numbers,
+                [assets_by_ref[ref] for ref in refs],
+            )
+            content_missing = not numbers and (not prose_sources or lexical_support < 0.15)
+            if (
+                (must_bind and not refs)
+                or (require_numeric and not numbers)
+                or (must_bind and content_missing)
+                or not numbers.issubset(values)
+                or (bool(numbers) and numeric_support < 0.1)
+            ):
+                sentence["downgraded_reason"] = (
+                    "asset_grounding_missing"
+                    if not refs
+                    else "asset_result_value_missing"
+                    if require_numeric and not numbers
+                    else "asset_content_mismatch"
+                    if content_missing
+                    else "asset_numeric_context_mismatch"
+                    if numbers.issubset(values) and numeric_support < 0.1
+                    else "asset_number_mismatch"
+                )
+                continue
+            sentence["source_refs"] = refs
+            kept.append(sentence)
+        if paragraph.get("sentences") is not None:
+            paragraph["sentences"] = kept
+            paragraph["text"] = " ".join(str(item.get("text") or "") for item in kept).strip()
+    return [paragraph for paragraph in paragraphs if str(paragraph.get("text") or "").strip()]
+
+
+def normalize_paragraphs(
+    raw: Any,
+    *,
+    allowed: set[str],
+    allowed_evidence_ids: set[str] | None = None,
+    allowed_source_refs: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """净化段落结构；cite_keys 再次按白名单过滤（纵深防御）。"""
     if not isinstance(raw, list):
         return []
     paragraphs: list[dict[str, Any]] = []
     for item in raw[:MAX_PARAGRAPHS_PER_SECTION]:
+        keys: list[Any]
         if isinstance(item, str):
             text, keys = item, []
         elif isinstance(item, dict):
-            sentence_rows = _normalize_sentences(item.get("sentences"), allowed=allowed)
+            sentence_rows = _normalize_sentences(
+                item.get("sentences"),
+                allowed=allowed,
+                allowed_evidence_ids=allowed_evidence_ids or set(),
+                allowed_source_refs=allowed_source_refs or set(),
+            )
             if sentence_rows:
                 paragraphs.append(
                     {
@@ -496,6 +1071,7 @@ def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
                             )
                         ),
                         "sentences": sentence_rows,
+                        "stance_summary": _normalize_stance(item.get("stance_summary")),
                     }
                 )
                 continue
@@ -506,7 +1082,7 @@ def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
         text = _clean_paragraph(text)
         if not text:
             continue
-        cite_keys = [
+        cite_keys: list[str] = [
             key
             for key in dict.fromkeys(str(k).strip() for k in keys if str(k).strip())
             if key in allowed
@@ -515,7 +1091,13 @@ def normalize_paragraphs(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
     return paragraphs
 
 
-def _normalize_sentences(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]:
+def _normalize_sentences(
+    raw: Any,
+    *,
+    allowed: set[str],
+    allowed_evidence_ids: set[str],
+    allowed_source_refs: set[str],
+) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
     sentences: list[dict[str, Any]] = []
@@ -531,8 +1113,160 @@ def _normalize_sentences(raw: Any, *, allowed: set[str]) -> list[dict[str, Any]]
             for key in dict.fromkeys(str(value).strip() for value in keys if str(value).strip())
             if key in allowed
         ]
-        sentences.append({"text": text, "cite_keys": cite_keys})
+        evidence_ids = [
+            evidence_id
+            for evidence_id in dict.fromkeys(
+                str(value).strip() for value in item.get("evidence_ids") or [] if str(value).strip()
+            )
+            if evidence_id in allowed_evidence_ids
+        ]
+        source_refs = [
+            source_ref
+            for source_ref in dict.fromkeys(
+                str(value).strip() for value in item.get("source_refs") or [] if str(value).strip()
+            )
+            if source_ref in allowed_source_refs
+        ]
+        sentences.append(
+            {
+                "text": text,
+                "cite_keys": cite_keys,
+                "evidence_ids": evidence_ids,
+                "source_refs": source_refs,
+            }
+        )
     return sentences
+
+
+def _normalize_stance(value: Any) -> str | None:
+    normalized = str(value or "").strip().casefold()
+    allowed = {
+        "consistent",
+        "conditional",
+        "conflicting",
+        "insufficient",
+        "partial",
+        "background",
+    }
+    return normalized if normalized in allowed else None
+
+
+def enforce_sentence_evidence_rules(
+    paragraphs: list[dict[str, Any]],
+    *,
+    evidence_by_id: dict[str, dict[str, Any]],
+    language: str,
+) -> list[dict[str, Any]]:
+    """写作后处理的 R4/R5/R6：违规句降级改写，不让摘要冒充全文。"""
+    from paperforge_worker.pipelines.quality import classify_claim
+
+    for paragraph in paragraphs:
+        for sentence in paragraph.get("sentences") or []:
+            claim_kind = classify_claim(str(sentence.get("text") or ""))
+            if claim_kind in {"background", "attribution"}:
+                continue
+            units = [
+                evidence_by_id[evidence_id]
+                for evidence_id in sentence.get("evidence_ids") or []
+                if evidence_id in evidence_by_id
+            ]
+            grade_ok = _sentence_grade_ok(
+                claim_kind,
+                str(sentence.get("text") or ""),
+                units,
+            )
+            comparable = claim_kind != "comparison" or _units_comparable(units)
+            located = claim_kind != "numeric" or any(
+                unit.get("page") or unit.get("object_ref") for unit in units
+            )
+            if units and grade_ok and comparable and located:
+                continue
+            if claim_kind == "comparison" and units and not comparable:
+                sentence["text"] = (
+                    "这些证据采用不同的任务、数据集、指标或划分，结果应分别陈述。"
+                    if language == "zh"
+                    else (
+                        "These evidence units use different tasks, datasets, metrics, "
+                        "or splits; their results must be reported separately."
+                    )
+                )
+                sentence["downgraded_reason"] = "R5_not_comparable"
+            elif units and all(unit.get("grade") == "D_abstract_only" for unit in units):
+                original = str(sentence.get("text") or "")
+                sentence["text"] = (
+                    f"摘要层面的作者表述是：{original}"
+                    if language == "zh"
+                    else (f"The cited work reports in its abstract that {original.rstrip('.')}.")
+                )
+                sentence["downgraded_reason"] = "R4_abstract_attribution"
+            else:
+                # Do not spray an internal quality warning into the prose. The
+                # discarded sentence and reason remain in claim/evidence audit
+                # records and the evidence appendix.
+                sentence["text"] = ""
+                sentence["cite_keys"] = []
+                sentence["evidence_ids"] = []
+                sentence["downgraded_reason"] = (
+                    "R6_locator_missing" if not located else "R4_grade_missing"
+                )
+        # R18 / N0-6: physically drop blanked sentences so IR never keeps empty
+        # runs or dangling connective adverbs without antecedents.  Keep the
+        # audit trail on the paragraph for quality/claim review.
+        if paragraph.get("sentences"):
+            kept: list[dict[str, Any]] = []
+            downgraded: list[dict[str, Any]] = []
+            for sentence in paragraph["sentences"]:
+                if str(sentence.get("text") or "").strip():
+                    kept.append(sentence)
+                else:
+                    downgraded.append(sentence)
+            paragraph["sentences"] = kept
+            if downgraded:
+                paragraph["downgraded_sentences"] = (
+                    list(paragraph.get("downgraded_sentences") or []) + downgraded
+                )
+            paragraph["text"] = " ".join(
+                str(sentence.get("text") or "").strip() for sentence in kept
+            )
+    return [
+        paragraph
+        for paragraph in paragraphs
+        if str(paragraph.get("text") or "").strip()
+        or any(str(s.get("text") or "").strip() for s in paragraph.get("sentences") or [])
+        or paragraph.get("downgraded_sentences")
+    ]
+
+
+def _sentence_grade_ok(
+    claim_kind: str,
+    text: str,
+    units: list[dict[str, Any]],
+) -> bool:
+    grades = {str(unit.get("grade") or "") for unit in units}
+    if grades & {"A_located_structured", "B_located_prose"}:
+        return True
+    uncertain = bool(
+        re.search(
+            r"(?:可能|或许|尚不确定|may|might|could|suggests?|uncertain)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return claim_kind in {"effect", "conclusion"} and "C_fulltext_unlocated" in grades and uncertain
+
+
+def _units_comparable(units: list[dict[str, Any]]) -> bool:
+    if len({str(unit.get("work_id")) for unit in units if unit.get("work_id")}) < 2:
+        return False
+    key_sets = [
+        {
+            str(measurement.get("comparability_key"))
+            for measurement in unit.get("measurements") or []
+            if measurement.get("comparability_key")
+        }
+        for unit in units
+    ]
+    return bool(key_sets) and all(key_sets) and bool(set.intersection(*key_sets))
 
 
 def normalize_terms(raw: Any) -> dict[str, str]:
@@ -552,24 +1286,55 @@ def deterministic_paragraphs(
     section: dict[str, Any],
     cards: dict[str, dict[str, Any]],
     allowed: set[str],
+    *,
+    evidence: list[dict[str, Any]] | None = None,
+    language: str = "en",
 ) -> list[dict[str, Any]]:
     """确定性回退：用卡片摘要拼出可读的占位正文，绝不产生卡片之外的断言。"""
     paragraphs: list[dict[str, Any]] = []
     summary = str(section.get("summary") or "").strip()
     if summary:
         paragraphs.append({"text": summary, "cite_keys": []})
-    for key in sorted(allowed):
-        card = cards.get(key) or {}
-        text = str(card.get("summary") or card.get("title") or "").strip()
-        if text:
-            paragraphs.append({"text": text, "cite_keys": [key]})
-    if not paragraphs:
-        paragraphs.append(
-            {
-                "text": str(section.get("title") or ""),
-                "cite_keys": [],
+    if evidence:
+        for item in evidence[: MAX_PARAGRAPHS_PER_SECTION - len(paragraphs)]:
+            text = str(item.get("text") or "").strip()
+            cite_key = str(item.get("cite_key") or "")
+            evidence_id = str(item.get("evidence_id") or "")
+            if not text or cite_key not in allowed or not evidence_id:
+                continue
+            if item.get("grade") == "D_abstract_only":
+                text = (
+                    f"相关文献仅在摘要中报告：{text.rstrip('。')}。"
+                    if language == "zh"
+                    else f"The cited work reports in its abstract that {text.rstrip('.')}."
+                )
+            sentence = {
+                "text": text,
+                "cite_keys": [cite_key],
+                "evidence_ids": [evidence_id],
             }
+            paragraphs.append(
+                {
+                    "text": text,
+                    "cite_keys": [cite_key],
+                    "sentences": [sentence],
+                    "stance_summary": section.get("stance_summary") or "partial",
+                }
+            )
+        return paragraphs[:MAX_PARAGRAPHS_PER_SECTION]
+    # Never turn an empty evidence contract into an alphabetical dump of every
+    # library card.  That looks like a review while silently admitting papers
+    # outside the section's scope.  Keep the gap visible for the author instead.
+    title = str(section.get("title") or "").strip()
+    gap = (
+        f"本节“{title}”尚无满足定位与可比性要求的证据；待补充可核验来源后再展开论述。"
+        if language == "zh"
+        else (
+            f"This section ({title}) has no evidence meeting the required provenance "
+            "and comparability criteria; add verifiable sources before drafting the discussion."
         )
+    )
+    paragraphs.append({"text": gap, "cite_keys": [], "evidence_gap": True})
     return paragraphs[:MAX_PARAGRAPHS_PER_SECTION]
 
 

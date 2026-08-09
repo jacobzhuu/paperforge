@@ -84,6 +84,7 @@ def preflight_llm_provider(config: LLMConfig) -> str | None:
         model=config.model or config.model_for_role("writer"),
         max_output_tokens=16,
         temperature=0.0,
+        thinking_mode="disabled",
         metadata={"purpose": "preflight"},
     )
     try:

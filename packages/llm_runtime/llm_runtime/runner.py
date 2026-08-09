@@ -14,6 +14,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from llm_runtime.client import create_llm_provider
@@ -40,6 +41,7 @@ class LLMCallRecord:
     latency_ms: int | None = None
     error_code: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,7 @@ class LLMRunner:
         user_prompt: str,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
+        json_output: bool = False,
         metadata: dict[str, Any] | None = None,
         _retry_on_truncation: bool = True,
     ) -> LLMResponse | None:
@@ -113,6 +116,8 @@ class LLMRunner:
             model=model,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            json_output=json_output,
+            thinking_mode=self._config.thinking_for_role(role),
             metadata={"role": role, **(metadata or {})},
         )
         started = time.monotonic()
@@ -125,6 +130,7 @@ class LLMRunner:
                 provider=self._config.provider,
                 latency_ms=_elapsed_ms(started),
                 error_code=error.error_code,
+                metadata=request.metadata,
             )
             if (
                 error.error_code == "output_truncated"
@@ -137,6 +143,7 @@ class LLMRunner:
                     user_prompt=user_prompt,
                     max_output_tokens=min(max_output_tokens * 2, MAX_OUTPUT_TOKENS_CEILING),
                     temperature=temperature,
+                    json_output=json_output,
                     metadata={**(metadata or {}), "retry": "output_truncated"},
                     _retry_on_truncation=False,
                 )
@@ -148,6 +155,7 @@ class LLMRunner:
                 provider=self._config.provider,
                 latency_ms=_elapsed_ms(started),
                 error_code=type(error).__name__,
+                metadata=request.metadata,
             )
             return None
         usage = response.usage or {}
@@ -160,6 +168,7 @@ class LLMRunner:
             output_tokens=_int_or_none(
                 usage.get("completion_tokens") or usage.get("output_tokens")
             ),
+            metadata=request.metadata,
         )
         return response
 
@@ -171,6 +180,7 @@ class LLMRunner:
         user_prompt: str,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
+        json_output: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> LLMResponse | None:
         """异步包装：provider 是同步 httpx 实现，放线程池执行以免阻塞事件循环。"""
@@ -181,6 +191,7 @@ class LLMRunner:
             user_prompt=user_prompt,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            json_output=json_output,
             metadata=metadata,
         )
 
@@ -210,6 +221,7 @@ class LLMRunner:
             user_prompt=user_prompt,
             max_output_tokens=max_output_tokens,
             temperature=temperature,
+            json_output=True,
             metadata=metadata,
         )
         if response is None:
@@ -264,6 +276,7 @@ class LLMRunner:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         error_code: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if self._on_call is None:
             return
@@ -276,6 +289,7 @@ class LLMRunner:
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
                 error_code=error_code,
+                metadata=dict(metadata or {}),
             )
         )
 

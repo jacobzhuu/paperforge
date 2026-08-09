@@ -3,15 +3,18 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { ArrowRight, ChevronDown, FileText, Loader2, Paperclip, Settings2, X } from 'lucide-react';
+import { AlertCircle, ArrowRight, BookOpen, CheckCircle2, ChevronDown, FileText, FlaskConical, Loader2, Paperclip, RefreshCw, Settings2, X } from 'lucide-react';
+import { ContributionEditor } from '@/components/projects/contribution-editor';
 import { Button } from '@/components/ui/button';
+import { Callout } from '@/components/ui/callout';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
-import { createProject, listProjects, uploadAsset } from '@/lib/api';
-import { describeError } from '@/lib/errors';
+import { createProject, generateAll, getAssetCapabilities, getMaterialPreflight, listProjects, uploadAsset } from '@/lib/api';
+import { describeError, networkHelp } from '@/lib/errors';
 import { CITATION_STYLE_LABEL, LANGUAGE_LABEL, VENUE_TEMPLATES } from '@/lib/labels';
-import type { CitationStyle, Language, PaperType, Project, WritingMode } from '@/lib/types';
+import type { AssetCapabilities, CitationStyle, Language, MaterialPreflight, PaperType, Project, UserAsset, WritingMode } from '@/lib/types';
 import { cn, formatDate } from '@/lib/utils';
 
 /** 从一段自由描述里取出一个像样的题目。 */
@@ -33,6 +36,24 @@ function greeting(): string {
   if (h < 14) return '中午好';
   if (h < 18) return '下午好';
   return '晚上好';
+}
+
+type UploadStatus = 'queued' | 'uploading' | 'received' | 'warning' | 'failed' | 'invalid';
+type UploadItemState = { status: UploadStatus; error?: string; asset?: UserAsset };
+const fileKey = (file: File) => `${file.name}:${file.size}:${file.lastModified}`;
+const formatBytes = (bytes: number) => bytes < 1024 * 1024
+  ? `${Math.max(1, Math.round(bytes / 1024))} KiB`
+  : `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+const titleFromFile = (file: File) => file.name.replace(/\.[^.]+$/, '').trim() || '未命名论文';
+function uploadStatusLabel(status: UploadStatus): string {
+  return {
+    queued: '排队中',
+    uploading: '上传中',
+    received: '已接收',
+    warning: '已接收，有解析警告',
+    failed: '上传失败',
+    invalid: '本地校验未通过',
+  }[status];
 }
 
 /**
@@ -59,6 +80,10 @@ export function PromptCanvas() {
    */
   const typePinned = React.useRef(false);
   const [files, setFiles] = React.useState<File[]>([]);
+  const [uploadStates, setUploadStates] = React.useState<Record<string, UploadItemState>>({});
+  const [capabilities, setCapabilities] = React.useState<AssetCapabilities | null>(null);
+  const [createdProject, setCreatedProject] = React.useState<Project | null>(null);
+  const [materialPreflight, setMaterialPreflight] = React.useState<MaterialPreflight | null>(null);
   const [dragging, setDragging] = React.useState(false);
   const [showSettings, setShowSettings] = React.useState(false);
   const [submitting, setSubmitting] = React.useState(false);
@@ -68,6 +93,8 @@ export function PromptCanvas() {
   const [citationStyle, setCitationStyle] = React.useState<CitationStyle>('gbt7714');
   const [venueTemplate, setVenueTemplate] = React.useState('article');
   const [writingMode, setWritingMode] = React.useState<WritingMode>('assisted');
+  const [customTitle, setCustomTitle] = React.useState('');
+  const [contributionPoints, setContributionPoints] = React.useState<string[]>(['']);
 
   const [recent, setRecent] = React.useState<Project[] | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -82,6 +109,32 @@ export function PromptCanvas() {
     };
   }, []);
 
+  React.useEffect(() => {
+    const controller = new AbortController();
+    getAssetCapabilities(controller.signal)
+      .then(setCapabilities)
+      .catch(() => setCapabilities(null));
+    return () => controller.abort();
+  }, []);
+
+  React.useEffect(() => {
+    if (!submitting) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [submitting]);
+
+  React.useEffect(() => {
+    const preset = new URLSearchParams(window.location.search).get('type');
+    if (preset === 'review' || preset === 'original') {
+      pickType(preset);
+      setShowSettings(true);
+    }
+  }, []);
+
   /**
    * 带上文件就切到研究型论文。
    *
@@ -92,7 +145,20 @@ export function PromptCanvas() {
    */
   const addFiles = (incoming: File[]) => {
     if (incoming.length === 0) return;
-    setFiles((prev) => [...prev, ...incoming]);
+    const unique = incoming.filter((file) => !files.some((existing) => fileKey(existing) === fileKey(file)));
+    setFiles((prev) => [...prev, ...unique]);
+    setUploadStates((current) => {
+      const next = { ...current };
+      for (const file of unique) {
+        const invalid = file.size === 0
+          ? '空文件无法上传'
+          : capabilities && file.size > capabilities.max_bytes
+            ? `超过 ${capabilities.max_mib} MiB 上限`
+            : undefined;
+        next[fileKey(file)] = { status: invalid ? 'invalid' : 'queued', error: invalid };
+      }
+      return next;
+    });
     if (!typePinned.current) {
       setPaperType('original');
       setCitationStyle('ieee');
@@ -105,7 +171,31 @@ export function PromptCanvas() {
     setCitationStyle(next === 'original' ? 'ieee' : 'gbt7714');
   };
 
-  const canSubmit = text.trim().length > 0 && !submitting;
+  const hasUsableFile = files.some((file) => uploadStates[fileKey(file)]?.status !== 'invalid');
+  const canSubmit = !submitting && (
+    paperType === 'review' ? text.trim().length > 0 : text.trim().length > 0 || hasUsableFile
+  );
+
+  const uploadOne = async (projectId: string, file: File): Promise<boolean> => {
+    const key = fileKey(file);
+    setUploadStates((current) => ({ ...current, [key]: { status: 'uploading' } }));
+    try {
+      const uploaded = await uploadAsset(projectId, file);
+      if (!uploaded.data) throw new Error(uploaded.note ?? '服务未接收文件');
+      const warning = (uploaded.data.warnings?.length ?? 0) > 0;
+      setUploadStates((current) => ({
+        ...current,
+        [key]: { status: warning ? 'warning' : 'received', asset: uploaded.data },
+      }));
+      return true;
+    } catch (uploadError) {
+      setUploadStates((current) => ({
+        ...current,
+        [key]: { status: 'failed', error: describeError(uploadError) },
+      }));
+      return false;
+    }
+  };
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -113,39 +203,78 @@ export function PromptCanvas() {
     setError(null);
     const topic = text.trim();
     try {
-      const res = await createProject({
-        title: deriveTitle(topic),
+      const res = createdProject ? { data: createdProject, source: 'live' as const } : await createProject({
+        title: customTitle.trim() || (topic ? deriveTitle(topic) : titleFromFile(files[0])),
         paper_type: paperType,
         writing_mode: writingMode,
         language,
-        topic,
+        topic: topic || undefined,
         venue_template: venueTemplate,
         citation_style: citationStyle,
+        contribution_points:
+          paperType === 'original'
+            ? contributionPoints.map((point) => point.trim()).filter(Boolean)
+            : undefined,
       });
       if (res.source === 'mock') {
         // createProject 降级时返回的是本地乐观桩（id: local-…）。导航过去会让用户
         // 进入一个并不存在的项目，还会看到示例文献——宁可停在这里说清楚。
         setError(
-          `项目未创建：${res.note ?? '后端不可用'}。请确认 ./scripts/dev up 已启动后重试。`,
+          `项目未创建：${res.note ?? '后端不可用'}。${networkHelp()}`,
         );
         setSubmitting(false);
         return;
       }
-      // 文件必须等项目建好才能传（uploadAsset 需要 projectId）。传失败不阻断——
-      // 项目已经存在了，把人送进去、在素材中心重传，比回滚掉整个项目好。
-      // 注意 uploadAsset 降级时**不抛异常**，而是返回 data===undefined，
-      // 所以这里靠返回值判断成败，不能只包一个 try/catch。
-      const failed: string[] = [];
-      for (const file of files) {
-        try {
-          const uploaded = await uploadAsset(res.data.id, file);
-          if (!uploaded.data) failed.push(file.name);
-        } catch {
-          failed.push(file.name);
+      setCreatedProject(res.data);
+      // 最多三个并发 worker；已成功文件不重复上传，单个失败也不取消其它文件。
+      const pending = files.filter((file) => {
+        const status = uploadStates[fileKey(file)]?.status;
+        return status !== 'received' && status !== 'warning' && status !== 'invalid';
+      });
+      let cursor = 0;
+      const results: boolean[] = [];
+      await Promise.all(Array.from({ length: Math.min(3, pending.length) }, async () => {
+        while (cursor < pending.length) {
+          const file = pending[cursor++];
+          results.push(await uploadOne(res.data.id, file));
+        }
+      }));
+      const failed = results.some((ok) => !ok);
+      const target = `/projects/${res.data.id}`;
+      if (failed) {
+        setError('项目已创建，部分文件上传失败。成功文件已保留，请单独重试失败项或进入素材中心继续。');
+        setSubmitting(false);
+        return;
+      }
+      if (paperType === 'original') {
+        const preflight = await getMaterialPreflight(res.data.id);
+        setMaterialPreflight(preflight);
+        if (!preflight.ready) {
+          try {
+            sessionStorage.setItem(`paperforge:material-preflight:${res.data.id}`, JSON.stringify(preflight));
+          } catch { /* 存储不可用不阻断导航，素材页会重新请求 */ }
+          router.push(`${target}/assets?preflight=1`);
+          return;
         }
       }
-      const target = `/projects/${res.data.id}`;
-      router.push(failed.length > 0 ? `${target}/assets` : target);
+      if (writingMode === 'auto') {
+        // 「全自动（一次跑到 PDF）」是执行承诺，不只是一个项目标签。必须等素材
+        // 上传完再启动：原创论文的 generate 预检会读取这些素材来确认方法与结果
+        // 可核验。拿到真实 job 后再导航，项目页首次加载即可订阅这条全管线。
+        // 档位固定为 draft：一键全流程的承诺是「一次跑到 PDF」，而 scholarly
+        // 会在写完之后再跑最多两轮「重写失败章节 + 全文重新评估」，并且没过质量门
+        // 就连导出都不做——用户等了更久，最后拿到的是一个 needs_input 而不是稿子。
+        // draft 档同样跑完整评估、warnings 一条不少，只是不把发现项升级成阻断项，
+        // 修复改由用户在概览页显式发起（quality_repair.available）。
+        const started = await generateAll(res.data.id, {
+          quality_profile: 'draft',
+          review_style: 'narrative',
+        });
+        if (!started.data) {
+          throw new Error(started.note ?? '后端未返回全管线任务');
+        }
+      }
+      router.push(!topic && files.length > 0 ? `${target}/assets` : target);
     } catch (err) {
       setError(describeError(err));
       setSubmitting(false);
@@ -153,11 +282,11 @@ export function PromptCanvas() {
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-16 pt-[12vh]">
-      <h1 className="text-center font-serif text-3xl font-semibold tracking-tight">
+    <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-16 pt-8 md:pt-[12vh]">
+      <h1 className="text-center font-serif text-display font-semibold tracking-tight">
         {greeting()}
       </h1>
-      <p className="mt-2 text-center font-serif text-xl text-muted-foreground">
+      <p className="mt-2 text-center font-serif text-heading text-muted-foreground">
         今天想研究什么？
       </p>
 
@@ -173,7 +302,7 @@ export function PromptCanvas() {
           addFiles(Array.from(e.dataTransfer.files));
         }}
         className={cn(
-          'mt-8 rounded-xl border bg-card shadow-sm transition-colors',
+          'mt-8 rounded-lg border bg-card shadow-sm transition-colors',
           dragging && 'border-primary bg-accent/40',
         )}
       >
@@ -190,23 +319,54 @@ export function PromptCanvas() {
           }}
           rows={4}
           placeholder="描述你的研究主题、问题或论文目标…"
-          className="w-full resize-none bg-transparent px-4 pt-4 text-base leading-relaxed placeholder:text-muted-foreground focus-visible:outline-none"
+          aria-invalid={Boolean(error)}
+          aria-describedby={error ? 'create-project-error' : undefined}
+          className="w-full resize-none bg-transparent px-4 pt-4 text-body placeholder:text-muted-foreground focus-visible:outline-none"
         />
 
         {files.length > 0 && (
-          <ul className="flex flex-wrap gap-1.5 px-4 pb-1">
+          <ul className="space-y-1.5 px-4 pb-2">
             {files.map((file, i) => (
               <li
-                key={`${file.name}-${i}`}
-                className="flex items-center gap-1.5 rounded-md border bg-muted/40 px-2 py-1 text-xs"
+                key={fileKey(file)}
+                className="flex items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5 text-meta"
               >
                 <FileText className="h-3 w-3 shrink-0 text-muted-foreground" />
-                <span className="max-w-48 truncate">{file.name}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{file.name}</span>
+                  <span className="text-muted-foreground">
+                    {file.type || '未知类型'} · {formatBytes(file.size)} ·{' '}
+                    {uploadStatusLabel(uploadStates[fileKey(file)]?.status ?? 'queued')}
+                  </span>
+                  {uploadStates[fileKey(file)]?.error && (
+                    <span className="block text-destructive">{uploadStates[fileKey(file)]?.error}</span>
+                  )}
+                </span>
+                {uploadStates[fileKey(file)]?.status === 'uploading' && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                {['received', 'warning'].includes(uploadStates[fileKey(file)]?.status ?? '') && <CheckCircle2 className="h-3.5 w-3.5 text-success-strong" />}
+                {uploadStates[fileKey(file)]?.status === 'failed' && createdProject && (
+                  <button
+                    type="button"
+                    onClick={() => void uploadOne(createdProject.id, file)}
+                    aria-label={`重试 ${file.name}`}
+                    className="relative z-10 flex h-8 items-center gap-1 rounded px-2 text-primary hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <RefreshCw className="h-3 w-3" /> 重试
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => setFiles((prev) => prev.filter((_, j) => j !== i))}
+                  onClick={() => {
+                    setFiles((prev) => prev.filter((_, j) => j !== i));
+                    setUploadStates((current) => {
+                      const next = { ...current };
+                      delete next[fileKey(file)];
+                      return next;
+                    });
+                  }}
+                  disabled={uploadStates[fileKey(file)]?.status === 'uploading'}
                   aria-label={`移除 ${file.name}`}
-                  className="rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="flex h-11 w-11 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:w-8"
                 >
                   <X className="h-3 w-3" />
                 </button>
@@ -239,18 +399,33 @@ export function PromptCanvas() {
               />
             </Button>
           </div>
-          <Button onClick={() => void submit()} disabled={!canSubmit}>
-            {submitting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <ArrowRight className="h-4 w-4" />
-            )}
-            开始
+          <Button
+            onClick={() => void submit()}
+            disabled={!canSubmit}
+            loading={submitting}
+            loadingLabel={writingMode === 'auto' ? '正在启动全流程…' : '正在创建…'}
+          >
+            <ArrowRight className="h-4 w-4" />
+            {createdProject
+              ? '继续处理文件'
+              : writingMode === 'auto'
+                ? '创建并启动全流程'
+                : paperType === 'original' && !text.trim()
+                  ? '从材料创建研究项目'
+                  : '创建项目'}
           </Button>
         </div>
 
         {showSettings && (
           <div className="grid gap-3 border-t px-4 py-3 sm:grid-cols-2">
+            <Field label="自定义题目（可选）" id="custom-title" className="sm:col-span-2">
+              <Input
+                id="custom-title"
+                value={customTitle}
+                onChange={(event) => setCustomTitle(event.target.value)}
+                placeholder={text.trim() ? deriveTitle(text) : '留空则从研究描述自动生成'}
+              />
+            </Field>
             <Field label="语言" id="lang">
               <Select
                 id="lang"
@@ -300,14 +475,55 @@ export function PromptCanvas() {
                 <option value="auto">全自动（一次跑到 PDF）</option>
               </Select>
             </Field>
+            {paperType === 'original' && (
+              <ContributionEditor points={contributionPoints} onChange={setContributionPoints} />
+            )}
           </div>
         )}
       </div>
 
-      {error && (
-        <p className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive-strong">
-          {error}
+      {recent?.length === 0 && (
+        <div className="mt-3 space-y-2 text-center text-meta text-muted-foreground">
+          <p>描述研究主题，或为研究型论文直接上传材料。</p>
+          <div className="flex flex-wrap justify-center gap-2" aria-label="研究意图示例">
+            {[
+              '比较近五年大语言模型事实一致性评估方法',
+              '系统综述可解释医学影像中的证据与局限',
+              '根据上传的实验结果撰写研究型论文',
+            ].map((example) => (
+              <button
+                key={example}
+                type="button"
+                onClick={() => setText(example)}
+                className="rounded-full border px-3 py-1 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {example}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {capabilities && (
+        <p className="mt-2 text-center text-meta text-muted-foreground">
+          单文件上限 {capabilities.max_mib} MiB；推荐 {capabilities.preferred_extensions.join('、')}。
+          其它类型会保留并作为方法备注尝试解析。
         </p>
+      )}
+
+      {materialPreflight && !materialPreflight.ready && (
+        <Callout variant="warning" className="mt-3">
+          <span className="flex items-center gap-2 font-medium"><AlertCircle className="h-4 w-4" />项目已保存，还需补充材料</span>
+          <ul className="mt-1 list-disc pl-5">
+            {materialPreflight.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}
+          </ul>
+        </Callout>
+      )}
+
+      {error && (
+        <Callout id="create-project-error" role="alert" variant="error" className="mt-3">
+          {error}
+        </Callout>
       )}
 
       <RecentPapers projects={recent} />
@@ -319,14 +535,16 @@ function Field({
   label,
   id,
   children,
+  className,
 }: {
   label: string;
   id: string;
   children: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="space-y-1">
-      <Label htmlFor={id} className="text-xs text-muted-foreground">
+    <div className={cn('space-y-1.5', className)}>
+      <Label htmlFor={id} className="text-meta text-muted-foreground">
         {label}
       </Label>
       {children}
@@ -342,64 +560,20 @@ function PaperTypeSelect({
   value: PaperType;
   onChange: (next: PaperType) => void;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef<HTMLDivElement>(null);
-
-  React.useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (!ref.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
-  const OPTIONS: { id: PaperType; label: string; hint: string }[] = [
-    { id: 'review', label: '综述论文', hint: '从题目出发，检索并综合文献' },
-    { id: 'original', label: '研究型论文', hint: '从你的素材与结果出发' },
-  ];
-  const current = OPTIONS.find((o) => o.id === value) ?? OPTIONS[0];
-
   return (
-    <div ref={ref} className="relative">
-      <Button variant="ghost" size="sm" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        {current.label}
-        <ChevronDown className={cn('h-3 w-3 transition-transform', open && 'rotate-180')} />
-      </Button>
-      {open && (
-        <ul
-          role="listbox"
-          className="absolute bottom-full z-20 mb-1 w-64 rounded-lg border bg-popover p-1 shadow-md"
-        >
-          {OPTIONS.map((option) => (
-            <li key={option.id}>
-              <button
-                type="button"
-                role="option"
-                aria-selected={option.id === value}
-                onClick={() => {
-                  onChange(option.id);
-                  setOpen(false);
-                }}
-                className={cn(
-                  'w-full rounded-md px-2.5 py-2 text-left transition-colors hover:bg-accent',
-                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                  option.id === value && 'bg-accent/60',
-                )}
-              >
-                <span className="block text-sm font-medium">{option.label}</span>
-                <span className="block text-xs text-muted-foreground">{option.hint}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+    <>
+      <label className="sr-only" htmlFor="paper-type">论文类型</label>
+      <select
+        id="paper-type"
+        aria-label="论文类型"
+        value={value}
+        onChange={(event) => onChange(event.target.value as PaperType)}
+        className="h-9 rounded-md border-0 bg-transparent px-2 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <option value="review">综述论文</option>
+        <option value="original">研究型论文</option>
+      </select>
+    </>
   );
 }
 
@@ -414,17 +588,46 @@ function RecentPapers({ projects }: { projects: Project[] | null }) {
       </div>
     );
   }
-  if (projects.length === 0) return null;
+  if (projects.length === 0) {
+    return (
+      <section className="mt-12 space-y-6 border-t pt-8" aria-labelledby="first-paper-title">
+        <div>
+          <h2 id="first-paper-title" className="font-serif text-subheading font-semibold">
+            从一种工作方式开始
+          </h2>
+          <p className="mt-1 text-meta text-muted-foreground">
+            两条管线共用同一个入口，类型、素材和贡献点都可以在上方一次说明。
+          </p>
+        </div>
+        <div className="grid gap-6 sm:grid-cols-2">
+          <div className="space-y-2">
+            <BookOpen className="h-5 w-5 text-muted-foreground" />
+            <h3 className="font-medium">综述论文</h3>
+            <p className="text-meta text-muted-foreground">
+              从研究主题出发，检索并核验真实文献，再生成大纲、正文与 LaTeX/PDF。
+            </p>
+          </div>
+          <div className="space-y-2">
+            <FlaskConical className="h-5 w-5 text-muted-foreground" />
+            <h3 className="font-medium">研究型论文</h3>
+            <p className="text-meta text-muted-foreground">
+              上传实验素材并说明贡献点，完成相关工作、IMRaD 写作与数字一致性检查。
+            </p>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="mt-12 space-y-1">
       <div className="flex items-baseline justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        <h2 className="text-meta font-semibold uppercase tracking-wider text-muted-foreground">
           最近的论文
         </h2>
         <Link
           href="/projects"
-          className="rounded text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="rounded text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           全部项目
         </Link>
@@ -436,8 +639,8 @@ function RecentPapers({ projects }: { projects: Project[] | null }) {
               href={`/projects/${project.id}`}
               className="flex items-baseline justify-between gap-4 py-2.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <span className="min-w-0 flex-1 truncate font-serif text-lg">{project.title}</span>
-              <span className="shrink-0 text-xs text-muted-foreground">
+              <span className="min-w-0 flex-1 truncate font-serif text-subheading">{project.title}</span>
+              <span className="shrink-0 text-meta text-muted-foreground">
                 {formatDate(project.updated_at)}
               </span>
             </Link>

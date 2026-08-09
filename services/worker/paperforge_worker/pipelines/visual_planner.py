@@ -1,17 +1,17 @@
 """结构化视觉规划。
 
 此前 `visual_plan` 是纯确定性的：AI 插图的提示词就是「A clean academic conceptual
-illustration representing {论文标题}」。它不理解章节内容、构图目标和论文语境，于是
-「投毒攻击」被画成毒药袋，学术信息被装饰图顶掉，英文安全敏感词组合还会触发
-Cloudflare 的内容检查。
+illustration representing {论文标题}」。它不理解章节内容、构图目标和论文语境，
+于是「投毒攻击」被画成毒药袋，学术信息被装饰图顶掉。
 
 这里让规划器读正文结构后输出**结构化建议**：为什么要这张图、依据哪些章节、
-插到哪里、画什么。三条硬约束：
+插到哪里、画什么。随后 `image_prompt` 再把插图建议润色成成品提示词——本模块
+只负责「画什么」，不负责「怎么说」。三条硬约束：
 
 1. 建议阶段绝不调用 ImageProvider——本模块只产出 proposal，没有任何生图调用；
 2. 文本模型不可用 / 超时 / JSON 不合法时，回退到原有的确定性规划器，
    `visual_plan` 永远有产物（draft-first）；
-3. 送进模型的是章节标题与摘要级文本，不整篇灌入。
+3. 送进模型的是当前论文全部章节正文，使规划器能做真正的跨章节综合。
 
 注意数据流向：这一层**会**把正文摘要发给文本模型。生成确认框因此只能承诺
 「不会发送给**图像**服务商」，不能笼统写「不会发送论文原文」。
@@ -19,17 +19,17 @@ Cloudflare 的内容检查。
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
 from llm_runtime import LLMRunner
 
+from paperforge_worker.pipelines.image_prompt import refine_image_prompt
+
 #: 一次规划最多提这么多条，AI 插图另有更严的上限——插图是唯一会花钱的一类。
 MAX_PROPOSALS = 6
 MAX_AI_IMAGES = 2
-#: 每节送进模型的正文字符上限。规划只需要知道「这节在讲什么」。
-SECTION_EXCERPT_CHARS = 600
-
 _SYSTEM_PROMPT = """You plan figures for an academic paper. Given the section structure and
 excerpts, decide which figures genuinely help the reader. Output JSON only:
 {
@@ -56,13 +56,12 @@ excerpts, decide which figures genuinely help the reader. Output JSON only:
   ]
 }
 Rules:
-- Prefer a DIAGRAM whenever the content has steps, components or relations that can be
-  expressed as nodes and edges. A diagram carries information; an illustration does not.
-- Only propose "ai_image" when the idea genuinely cannot be drawn as nodes and edges.
-  Never use an illustration as a substitute for academic information.
-- For "ai_image", describe shapes and relations, not words: generated text is always
-  garbled. Avoid security-sensitive word combinations (attack, poison, malicious) which
-  trip image-service content filters; describe the mechanism abstractly instead.
+- Prefer a DIAGRAM when the content is a set of steps, components or relations that reads
+  better as nodes and edges. Use "ai_image" for anything that needs depiction rather than
+  topology: a physical setting, a mechanism in the real world, a conceptual overview.
+- For "ai_image", write the brief as content, not as constraints: what is shown, how it is
+  arranged, what is in it. A separate step turns this brief into the final image prompt,
+  so do not worry about phrasing, style keywords, or the output language here.
 - Do not propose charts here; the system derives those deterministically from uploaded data.
 - target_section_key and source_section_keys MUST come from the given key list.
 - At most 4 proposals, at most 2 of kind "ai_image"."""
@@ -96,6 +95,7 @@ async def plan_visuals(
     sections: list[SectionBrief],
     runner: LLMRunner | None,
     allow_ai_images: bool,
+    paper_context: str = "",
 ) -> tuple[list[PlannedProposal], str]:
     """返回 (建议列表, generator 标记)。
 
@@ -107,8 +107,7 @@ async def plan_visuals(
 
     allowed = {section.key for section in sections}
     outline = "\n\n".join(
-        f"[{section.key}] {section.title}\n{section.excerpt[:SECTION_EXCERPT_CHARS]}"
-        for section in sections
+        f"[{section.key}] {section.title}\n{section.excerpt}" for section in sections
     )
     result = await runner.agenerate_json(
         "planner",
@@ -129,7 +128,55 @@ async def plan_visuals(
     )
     if not proposals:
         return [], "deterministic_fallback"
+    await _refine_ai_image_prompts(
+        proposals,
+        runner=runner,
+        sections=sections,
+        paper_context=paper_context or outline,
+    )
     return proposals, f"llm:{result.model}"
+
+
+async def _refine_ai_image_prompts(
+    proposals: list[PlannedProposal],
+    *,
+    runner: LLMRunner,
+    sections: list[SectionBrief],
+    paper_context: str,
+) -> None:
+    """就地把插图建议的提示词换成润色版。
+
+    在这里做（而不是生图时）是为了让确认框展示的提示词就是最终发出去的那一句：
+    结果落进 spec，`render_prompt()` 原样返回。至多 2 条，并发发出。
+    失败的那条保持原样——拼接式提示词依然可用。
+    """
+    targets = [item for item in proposals if item.kind == "ai_image"]
+    if not targets:
+        return
+    titles = {section.key: section.title for section in sections}
+    refined = await asyncio.gather(
+        *(
+            refine_image_prompt(
+                item.spec,
+                runner=runner,
+                context=(
+                    f"{paper_context}\n\nTarget figure context: "
+                    + "; ".join(
+                        part
+                        for part in (
+                            titles.get(item.target_section_key or "", ""),
+                            item.caption,
+                        )
+                        if part
+                    )
+                ),
+            )
+            for item in targets
+        )
+    )
+    for item, prompt in zip(targets, refined, strict=True):
+        if prompt:
+            item.spec["refined_prompt"] = prompt
 
 
 def _normalize(
@@ -241,22 +288,22 @@ def _ai_image_spec(raw: Any) -> dict[str, Any] | None:
     elements = [item for item in elements if item]
     # prompt 仍然写满：语义层是新的表达方式，但下游（含历史数据、导出）都还
     # 依赖 prompt 字段，两者必须一致。
-    prompt = ". ".join(
-        part for part in (subject, composition, ", ".join(elements)) if part
-    )
+    prompt = ". ".join(part for part in (subject, composition, ", ".join(elements)) if part)
     try:
         return AIImageSpec(
             prompt=prompt if len(prompt) >= 10 else f"{subject} conceptual academic illustration",
+            quality="high",
             semantics=AIImageSemantics(
                 subject=subject,
                 composition=composition or None,
                 elements=elements,
-                text_policy="none",
+                # 画面里要不要文字，交给润色阶段按题材判断。
+                text_policy="auto",
                 aspect_ratio="3:2",
             ),
         ).model_dump(mode="json")
     except ValueError:
-        # 模型给的描述可能落在 AI 图禁区（量化表述、URL）。这是一条可选建议，
+        # 模型给的描述可能带上 URL 或代码片段。这是一条可选建议，
         # 不能因此让整个 visual_plan 失败。
         return None
 

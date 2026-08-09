@@ -1,4 +1,4 @@
-"""五源适配器契约测试（M0 验收：五源检索测试全绿）。
+"""学术检索适配器契约测试。
 
 覆盖：请求构造（查询净化 + 时间窗过滤）、响应映射、错误降级（draft-first）、
 限流/熔断、缓存优先、凭据不进缓存键与诊断。
@@ -19,6 +19,7 @@ from scholar_gateway import (
     reset_provider_rate_limit_state,
 )
 from scholar_gateway.providers import ProviderConfig
+from scholar_gateway.providers.semantic_scholar import SemanticScholarDiscoveryAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -251,8 +252,7 @@ def test_semantic_scholar_sends_api_key_header_and_year_filter() -> None:
         seen["params"] = dict(request.url.params)
         return httpx.Response(200, json=S2_PAYLOAD)
 
-    adapter = build_adapter(
-        "semantic_scholar",
+    adapter = SemanticScholarDiscoveryAdapter(
         client=_client(handler),
         config=_config(api_key="secret-key", min_request_interval_seconds=0.0),
     )
@@ -331,11 +331,10 @@ def test_europe_pmc_maps_results_and_cursor() -> None:
     assert result.metadata["next_cursor"] == "next-cursor"
 
 
-def test_all_five_providers_are_registered_and_constructible() -> None:
+def test_all_active_providers_are_registered_and_constructible() -> None:
     assert set(ALL_PROVIDERS) == {
         "openalex",
         "crossref",
-        "semantic_scholar",
         "arxiv",
         "europe_pmc",
     }

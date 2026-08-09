@@ -12,7 +12,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from db import get_job, list_job_events
+from db import FINISHED_JOB_STATUSES, get_job, list_job_events
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -26,7 +26,9 @@ router = APIRouter(
 POLL_INTERVAL_SECONDS = 0.5
 # 空闲心跳：穿透代理的空闲超时，同时让前端知道连接仍然活着。
 HEARTBEAT_SECONDS = 15.0
-TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+# 这一轮运行已结束、事件流可以收口的状态。paused 也在内：任务本身还没做完，
+# 但这一轮确实停了，流不关的话前端的进度条会一直转下去；「继续」另起一个 job。
+TERMINAL_STATUSES = FINISHED_JOB_STATUSES
 
 
 @router.get("/projects/{project_id}/jobs/{job_id}/events")

@@ -14,12 +14,6 @@ _REMOTE_OR_CODE = re.compile(
     r"(?:https?://|javascript:|<\s*script|```|\b(?:import|exec|eval|subprocess)\b)",
     re.IGNORECASE,
 )
-_AI_FORBIDDEN = re.compile(
-    r"(?:坐标轴|结果曲线|准确率|精确数据|实验数据|混淆矩阵|散点图|柱状图|折线图|"
-    r"accuracy\s*(?:plot|curve)|result\s*curve|axis|scatter\s*plot|bar\s*chart|"
-    r"line\s*chart|confusion\s*matrix|precise\s*(?:data|device))",
-    re.IGNORECASE,
-)
 
 
 class StrictModel(BaseModel):
@@ -170,21 +164,22 @@ class AIImageSemantics(StrictModel):
     subject: str | None = Field(default=None, max_length=200)
     composition: str | None = Field(default=None, max_length=200)
     elements: list[str] = Field(default_factory=list, max_length=8)
-    #: 学术插图里的文字几乎必然是伪中文/伪英文，默认一个字都不要。
-    text_policy: Literal["none", "minimal"] = "none"
+    #: 画面里的文字策略。`auto` 交给提示词自己决定——现代生图模型已经能写对短标签，
+    #: 一律禁字会把「带标注的机制示意」这类合理需求也挡掉。需要绝对无字时显式设 `none`。
+    text_policy: Literal["auto", "none", "minimal"] = "auto"
     aspect_ratio: str | None = Field(default=None, max_length=16)
 
     @field_validator("subject", "composition")
     @classmethod
-    def conceptual_only_text(cls, value: str | None) -> str | None:
-        return _reject_non_conceptual(value)
+    def reject_unsafe_text(cls, value: str | None) -> str | None:
+        return _reject_unsafe(value)
 
     @field_validator("elements")
     @classmethod
-    def conceptual_only_elements(cls, value: list[str]) -> list[str]:
-        # 校验必须覆盖新字段：否则 elements 就是一条绕过 AI 图禁区的旁路。
+    def reject_unsafe_elements(cls, value: list[str]) -> list[str]:
+        # 校验必须覆盖新字段：否则 elements 就是一条绕过注入校验的旁路。
         for item in value:
-            _reject_non_conceptual(item)
+            _reject_unsafe(item)
         return value
 
 
@@ -196,13 +191,28 @@ class AIImageSpec(StrictModel):
     style: str = Field(default="clean academic conceptual illustration", max_length=160)
     width: FigureWidth = "full"
     semantics: AIImageSemantics | None = None
+    #: 文本模型润色后的成品提示词，设定时**原样**发给图像服务商。
+    #:
+    #: 字段拼接（`subject. composition: …. elements: …`）读起来像表单，不像给生图
+    #: 模型的描述；真正决定画面质量的是连贯的自然语言。因此提示词由
+    #: `paperforge_worker.pipelines.image_prompt` 交给文本模型写，写完落在这里，
+    #: 拼接逻辑退化为模型不可用时的兜底。
+    #:
+    #: 它不进 `input_hash`（见 `db.repositories.visuals.visual_input_hash`）：
+    #: 换一次措辞不等于换了一条建议。
+    refined_prompt: str | None = Field(default=None, min_length=10, max_length=4000)
+    #: 用户手动编辑“最终厂商提示词”时写入。它优先于 refined_prompt 和结构化
+    #: 字段拼接；只有显式清除后，subject/composition/elements 才重新接管。
+    prompt_override: str | None = Field(default=None, min_length=10, max_length=4000)
+    #: 只有当前 provider 的能力声明为 True 时才会下发。保存在 spec 中是为了
+    #: provider 切换后仍能在服务端做能力校验，而不是静默忽略。
+    negative_prompt: str | None = Field(default=None, max_length=1000)
+    seed: int | None = Field(default=None, ge=0, le=4_294_967_295)
 
-    @field_validator("prompt", "style")
+    @field_validator("prompt", "style", "refined_prompt", "prompt_override", "negative_prompt")
     @classmethod
-    def conceptual_only(cls, value: str) -> str:
-        result = _reject_non_conceptual(value)
-        assert result is not None  # noqa: S101 - 非空输入必得非空输出
-        return result
+    def reject_unsafe(cls, value: str | None) -> str | None:
+        return _reject_unsafe(value)
 
     def render_prompt(self) -> str:
         """**实际会发送给图像服务商的那一句**。
@@ -210,6 +220,10 @@ class AIImageSpec(StrictModel):
         生成确认框展示的就是这个返回值——不能让界面自己再拼一遍，否则用户
         确认的文本和真正发出去的文本会悄悄分叉。
         """
+        if self.prompt_override:
+            return self.prompt_override
+        if self.refined_prompt:
+            return self.refined_prompt
         parts: list[str] = []
         semantics = self.semantics
         if semantics is not None and semantics.subject:
@@ -221,18 +235,25 @@ class AIImageSpec(StrictModel):
         else:
             parts.append(self.prompt)
         parts.append(f"Style: {self.style}")
-        if semantics is None or semantics.text_policy == "none":
+        if semantics is not None and semantics.text_policy == "none":
             parts.append("no text, no labels, no numerals")
+        elif semantics is not None and semantics.text_policy == "minimal":
+            parts.append("keep any lettering to a few short, correctly spelled labels")
         return ". ".join(part.strip().rstrip(".") for part in parts if part.strip()) + "."
 
 
-def _reject_non_conceptual(value: str | None) -> str | None:
+def _reject_unsafe(value: str | None) -> str | None:
+    """只挡注入类内容。
+
+    这里曾经还有一份题材黑名单（坐标轴 / 准确率 / 柱状图 …），初衷是逼用户用真实
+    图表而不是让模型画数据图。但它按关键字工作，误伤了「解释准确率概念」这类正当
+    描述，也无法阻止真正想造假的人换个说法。题材该由规划提示词与人工审核决定，
+    不该由正则决定；校验层只负责不让 URL 与代码片段混进提示词。
+    """
     if value is None:
         return None
     if _REMOTE_OR_CODE.search(value):
         raise ValueError("AI image prompts cannot contain URLs or executable content")
-    if _AI_FORBIDDEN.search(value):
-        raise ValueError("AI images are limited to conceptual illustrations")
     return value
 
 

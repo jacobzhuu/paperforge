@@ -76,6 +76,12 @@
        1.75 的行高对 CJK 是必要的，14px/1.5 读一节综述会很累。 */
     --reading-font-size: 1.0625rem; /* 17px */
     --reading-line-height: 1.75;
+
+    /* 全站只使用一套短动效节奏；属性限定为 opacity/transform，避免触发布局动画。 */
+    --motion-enter: 180ms;
+    --motion-panel: 220ms;
+    --motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --motion-ease-emphasized: cubic-bezier(0.32, 0.72, 0, 1);
   }
 
   /* 暗色同样走暖调（中性偏棕的深灰），不是把冷蓝直接调暗。 */
@@ -128,9 +134,27 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }
+
+  button,
+  a,
+  input,
+  textarea,
+  select {
+    -webkit-tap-highlight-color: transparent;
+  }
 }
 
 @layer components {
+  /* 认证页是一张安静的学术工作台入口：纸面质感来自层次与排印，而不是额外图片。 */
+  .auth-card {
+    border-color: hsl(var(--border) / 0.85);
+    background-color: hsl(var(--card) / 0.92);
+    box-shadow:
+      0 24px 65px -42px hsl(var(--foreground) / 0.38),
+      0 1px 0 hsl(var(--card) / 0.9) inset;
+    backdrop-filter: blur(12px);
+  }
+
   /*
    * 长文正文排版。
    *
@@ -218,6 +242,136 @@
   }
 }
 
+/* 认证页的背景网格和光晕沿用全站暖色变量，亮暗主题无需维护两套色值。 */
+.auth-grid {
+  background-image:
+    linear-gradient(hsl(var(--border) / 0.32) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(var(--border) / 0.32) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, black, transparent 88%);
+}
+
+.auth-glow {
+  position: absolute;
+  width: 34rem;
+  height: 34rem;
+  border-radius: 9999px;
+  filter: blur(4px);
+  opacity: 0.65;
+  animation: auth-glow-drift 14s ease-in-out infinite;
+}
+
+.auth-glow-one {
+  left: -12rem;
+  top: -14rem;
+  background: radial-gradient(circle, hsl(var(--accent) / 0.9), transparent 68%);
+}
+
+.auth-glow-two {
+  bottom: -18rem;
+  right: -10rem;
+  background: radial-gradient(circle, hsl(var(--secondary) / 0.8), transparent 68%);
+  animation-delay: -7s;
+}
+
+.auth-enter {
+  animation: auth-rise 520ms var(--motion-ease-out) both;
+}
+
+.auth-enter-delay {
+  animation-delay: 90ms;
+}
+
+.auth-manuscript {
+  transform-origin: 50% 70%;
+  animation: auth-paper-float 7s ease-in-out infinite;
+}
+
+.auth-citation {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.25rem;
+  height: 1.75rem;
+  border: 1px solid hsl(var(--border));
+  border-radius: 9999px;
+  background: hsl(var(--background) / 0.92);
+  color: hsl(var(--muted-foreground));
+  box-shadow: 0 8px 24px -14px hsl(var(--foreground) / 0.45);
+  font-family: var(--font-serif);
+  font-size: 0.6875rem;
+  backdrop-filter: blur(8px);
+  animation: auth-citation-in 600ms var(--motion-ease-out) both;
+}
+
+.auth-citation-one {
+  right: -1rem;
+  top: 4.25rem;
+  animation-delay: 360ms;
+}
+
+.auth-citation-two {
+  bottom: 3.25rem;
+  left: -1.1rem;
+  animation-delay: 480ms;
+}
+
+.auth-stage {
+  animation: auth-rise 520ms var(--motion-ease-out) both;
+  animation-delay: 220ms;
+}
+
+.auth-stage:nth-child(2) {
+  animation-delay: 300ms;
+}
+
+.auth-stage:nth-child(3) {
+  animation-delay: 380ms;
+}
+
+@keyframes auth-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes auth-citation-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes auth-paper-float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-0.35deg);
+  }
+  50% {
+    transform: translateY(-6px) rotate(0.15deg);
+  }
+}
+
+@keyframes auth-glow-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(1.5rem, 1rem, 0) scale(1.05);
+  }
+}
+
 @layer utilities {
   .scrollbar-thin::-webkit-scrollbar {
     width: 8px;
@@ -241,5 +395,13 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  .auth-glow,
+  .auth-enter,
+  .auth-manuscript,
+  .auth-citation,
+  .auth-stage {
+    animation: none !important;
   }
 }

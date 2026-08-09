@@ -28,7 +28,7 @@ export interface AsyncModule<T> {
 }
 
 export function useAsyncModule<T>(
-  load: () => Promise<T>,
+  load: (signal: AbortSignal) => Promise<T>,
   fallback: T,
   deps: React.DependencyList,
 ): AsyncModule<T> {
@@ -46,25 +46,25 @@ export function useAsyncModule<T>(
   });
 
   React.useEffect(() => {
-    let alive = true;
+    const controller = new AbortController();
     setLoading(true);
     setError(null);
     loadRef
-      .current()
+      .current(controller.signal)
       .then((value) => {
-        if (!alive) return;
+        if (controller.signal.aborted) return;
         setData(value);
         setReady(true);
         setLoading(false);
       })
       .catch((err) => {
-        if (!alive) return;
+        if (controller.signal.aborted) return;
         setError(describeError(err));
         setLoading(false);
       });
     return () => {
-      // 切项目 / 主动重载时丢弃在途结果：迟到的响应不能覆盖新一轮的数据。
-      alive = false;
+      // 切项目 / 主动重载时真正终止 fetch，避免迟到响应和无效网络占用。
+      controller.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, token]);

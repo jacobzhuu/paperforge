@@ -4,7 +4,7 @@ import { buttonVariants } from '@/components/ui/button';
 
 export default function NotFound() {
   return (
-    <div className="flex flex-col items-center justify-center gap-4 rounded-xl border border-dashed px-6 py-20 text-center">
+    <div className="flex flex-col items-center justify-center gap-4 rounded-lg border border-dashed px-6 py-20 text-center">
       <Compass className="h-8 w-8 text-muted-foreground" />
       <div>
         <h1 className="text-lg font-semibold">页面不存在</h1>

@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -20,10 +22,30 @@ from llm_runtime import LLMRunner
 SOFT_CHECK_THRESHOLD = 0.5
 MAX_SOFT_CHECKS = 40
 RECENT_YEARS_WINDOW = 5
+CROSS_LANGUAGE_SUPPORT_CONFIDENCE = 0.9
+MAX_CROSS_LANGUAGE_CHECKS = 60
+CROSS_LANGUAGE_BATCH_SIZE = 12
 
-_SOFT_CHECK_PROMPT = """判断每条「引用位置的上下文」与「被引文献摘要」是否语义相关。
+_SOFT_CHECK_PROMPT = """判断每条「引用位置的上下文」与「被引证据摘录」是否语义相关。
 只输出 JSON：{"judgements": [{"index": 0, "score": 0.0-1.0, "reason": "简短理由"}]}
-score 表示该文献能否支撑该处论述；无法判断时给 0.5 并说明。不要臆测摘要之外的内容。"""
+score 表示该证据能否支撑该处论述；无法判断时给 0.5 并说明。不要臆测摘录之外的内容。"""
+
+_CROSS_LANGUAGE_EVIDENCE_PROMPT = """You are a strict academic evidence auditor.
+Each pair contains one manuscript claim and one exact, located source excerpt.  The two may be
+written in different languages.  Judge only whether the excerpt directly supports the complete
+claim; never use outside knowledge.
+
+Use verdict="supported" only when every material proposition in the claim is explicitly entailed
+or reported by the excerpt.  Topic overlap, sharing a method name, or merely not contradicting the
+claim is insufficient.  Preserve polarity, scope, conditions, system/population, metrics, numbers,
+and comparison direction.  A single study does not support a broad cross-study synthesis or a
+claim that evidence is absent unless the excerpt explicitly establishes that fact.  When evidence
+supports only part of a claim, use "partial".  When uncertain, use "uncertain".
+
+Return JSON only:
+{"judgements": [{"index": 0, "verdict": "supported|partial|unsupported|contradicted|uncertain",
+"confidence": 0.0, "reason": "brief evidence-bound explanation"}]}
+confidence is confidence in the verdict, not topical similarity."""
 
 
 @dataclass
@@ -78,6 +100,7 @@ class QualityReport:
     core_claim_fulltext_count: int = 0
     core_claim_fulltext_coverage: float = 0.0
     layout_checks: dict[str, Any] = field(default_factory=dict)
+    depth_metrics: dict[str, Any] = field(default_factory=dict)
     claim_evidence: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     def to_payload(self) -> dict[str, Any]:
@@ -109,11 +132,13 @@ class QualityReport:
             "core_claim_fulltext_count": self.core_claim_fulltext_count,
             "core_claim_fulltext_coverage": round(self.core_claim_fulltext_coverage, 4),
             "layout_checks": self.layout_checks,
+            "depth_metrics": self.depth_metrics,
         }
 
 
 _PLACEHOLDER_RE = re.compile(
-    r"(?:待实验补充|待补充实验数据|待补充|TODO|TBD|PLACEHOLDER|\[待[^\]]*\])",
+    r"(?:待实验补充|待补充实验数据|待补充|尚无满足定位与可比性要求的证据|"
+    r"no evidence meeting the required provenance|TODO|TBD|PLACEHOLDER|\[待[^\]]*\])",
     re.IGNORECASE,
 )
 _NUMBER_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
@@ -138,10 +163,26 @@ _CONCLUSION_RE = re.compile(
     r"(?:表明|说明|证实|结论|因此|综上|demonstrat|indicat|suggest|conclude|therefore)",
     re.IGNORECASE,
 )
+_ATTRIBUTION_RE = re.compile(
+    r"(?:文献|研究|作者|论文|摘要).{0,18}(?:报告|指出|声称|描述)|"
+    r"(?:the (?:cited )?(?:study|work|paper|authors?)|according to).{0,24}"
+    r"(?:reports?|states?|claims?|describes?|suggests?)",
+    re.IGNORECASE,
+)
+_LATIN_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'-]*\b")
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u9fff]")
+_UNCERTAINTY_RE = re.compile(
+    r"(?:可能|或许|提示但未证实|尚不确定|may|might|could|suggests?|uncertain)",
+    re.IGNORECASE,
+)
 
 
 def classify_claim(text: str) -> str:
     """将需要全文支持的论断分成可解释类别，并排除化学命名中的数字。"""
+    # 摘要证据经 R4 自动降级后是“某文献报告……”式归因；即使句内含数字，
+    # 它也不是系统替作者背书的核心结论。
+    if _ATTRIBUTION_RE.search(text):
+        return "attribution"
     number_text = _IDENTIFIER_NAME_RE.sub("", _CHEMICAL_NAME_RE.sub("", text))
     if _NUMBER_RE.search(number_text):
         return "numeric"
@@ -160,8 +201,10 @@ def build_claim_evidence(
     *,
     rows: list[Any],
     evidence_sources: dict[str, dict[str, Any]],
+    evidence_units: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """从 Paragraph/List IR 构造论断—证据矩阵，引用绑定到句级论断。"""
+    """从句级 PaperIR 构造论断—EvidenceUnit 矩阵并执行 R4/R5/R6。"""
+    units_by_id = evidence_units or {}
     anchors: list[dict[str, Any]] = []
     for row in rows:
         body = getattr(row, "body_ir_json", None) or {}
@@ -172,30 +215,94 @@ def build_claim_evidence(
             elif block.get("type") == "list":
                 containers = [item.get("runs") or [] for item in block.get("items") or []]
             for runs in containers:
-                for sentence, cite_keys in _claims_with_local_citations(runs):
+                claims = _claims_with_local_citations(runs)
+                for sentence, cite_keys, evidence_ids, source_refs in claims:
+                    if source_refs and not cite_keys:
+                        continue
                     claim_kind = classify_claim(sentence)
-                    is_core = claim_kind != "background"
-                    for cite_key in cite_keys or [None]:
+                    is_core = claim_kind not in {"background", "attribution"}
+                    explicit_units = [
+                        units_by_id[evidence_id]
+                        for evidence_id in evidence_ids
+                        if evidence_id in units_by_id
+                    ]
+                    comparability_ok = (
+                        _evidence_units_comparable(explicit_units)
+                        if claim_kind == "comparison"
+                        else None
+                    )
+                    cite_sources: list[str | None] = list(cite_keys) if cite_keys else [None]
+                    for cite_key in cite_sources:
                         source = evidence_sources.get(cite_key or "", {})
-                        point = _best_evidence_point(
-                            source.get("quotable_points") or [],
-                            claim=sentence,
+                        source_work_id = str(source.get("work_id") or "")
+                        matching_units = [
+                            unit
+                            for unit in explicit_units
+                            if not source_work_id
+                            or str(unit.get("work_id") or "") == source_work_id
+                        ]
+                        unit = _best_evidence_unit(matching_units, claim=sentence)
+                        point = (
+                            {
+                                "text": unit.get("text"),
+                                "page": unit.get("page"),
+                                "section": unit.get("section_path"),
+                                "paragraph": unit.get("paragraph_index"),
+                                "object_ref": unit.get("object_ref"),
+                            }
+                            if unit
+                            else _best_evidence_point(
+                                source.get("quotable_points") or [],
+                                claim=sentence,
+                            )
                         )
                         excerpt = str(point.get("text") or "").strip() or None
-                        fulltext = bool(source.get("fulltext_used"))
-                        located = fulltext and bool(
-                            point.get("page") is not None
-                            or point.get("section")
-                            or point.get("paragraph") is not None
+                        grade = str(unit.get("grade") or "") if unit else ""
+                        fulltext = (
+                            grade != "D_abstract_only"
+                            if unit
+                            else bool(source.get("fulltext_used"))
+                        )
+                        located = bool(
+                            fulltext
+                            and (
+                                point.get("page") is not None
+                                or point.get("section")
+                                or point.get("paragraph") is not None
+                                or point.get("object_ref")
+                            )
                         )
                         score = _support_score(sentence, excerpt or "") if excerpt else None
-                        supported = bool(located and score is not None and score >= 0.12)
+                        grade_ok = _evidence_grade_ok(claim_kind, sentence, grade) if unit else None
+                        numeric_locator_ok = claim_kind != "numeric" or bool(
+                            point.get("page") is not None or point.get("object_ref")
+                        )
+                        supported = bool(
+                            located
+                            and score is not None
+                            and score >= 0.12
+                            and grade_ok is not False
+                            and comparability_ok is not False
+                            and numeric_locator_ok
+                        )
                         if cite_key is None:
                             source_kind = "none"
                             support_status = "missing_citation" if is_core else "uncited_background"
+                        elif evidence_ids and unit is None:
+                            source_kind = "none"
+                            support_status = "evidence_binding_mismatch"
+                        elif unit and grade_ok is False:
+                            source_kind = "abstract" if grade == "D_abstract_only" else "fulltext"
+                            support_status = "grade_not_permitted"
+                        elif claim_kind == "comparison" and comparability_ok is False:
+                            source_kind = "fulltext" if fulltext else "abstract"
+                            support_status = "not_comparable"
+                        elif claim_kind == "numeric" and not numeric_locator_ok:
+                            source_kind = "fulltext" if fulltext else "abstract"
+                            support_status = "numeric_locator_missing"
                         elif not fulltext:
                             source_kind = "abstract"
-                            support_status = "abstract_only" if is_core else "background_supported"
+                            support_status = "abstract_only" if is_core else "attribution_supported"
                         elif not located:
                             source_kind = "fulltext"
                             support_status = "fulltext_unlocated"
@@ -207,12 +314,14 @@ def build_claim_evidence(
                             {
                                 "section_id": row.id,
                                 "work_id": source.get("work_id"),
+                                "user_asset_id": None,
                                 "section_key": row.section_key,
                                 "claim_hash": claim_hash,
                                 "claim_text": sentence,
                                 "claim_kind": claim_kind,
                                 "is_core": is_core,
                                 "cite_key": cite_key,
+                                "source_key": f"cite:{cite_key}" if cite_key else "none",
                                 "source_kind": source_kind,
                                 "source_page": point.get("page"),
                                 "source_section": point.get("section"),
@@ -223,6 +332,9 @@ def build_claim_evidence(
                                     if excerpt
                                     else None
                                 ),
+                                "evidence_unit_id": unit.get("id") if unit else None,
+                                "comparability_ok": comparability_ok,
+                                "grade_ok": grade_ok,
                                 "support_status": support_status,
                                 "support_score": score,
                                 "manual_status": "unreviewed",
@@ -231,17 +343,186 @@ def build_claim_evidence(
     return anchors
 
 
-def _claims_with_local_citations(runs: list[dict[str, Any]]) -> list[tuple[str, list[str]]]:
+def build_original_claim_grounding(
+    *,
+    rows: list[Any],
+    assets_by_ref: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build claim audit anchors for original-paper user-asset provenance."""
+    from ingest.assets import extract_numbers, normalize_number
+
+    anchors: list[dict[str, Any]] = []
+    for row in rows:
+        body = getattr(row, "body_ir_json", None) or {}
+        for block in body.get("blocks") or []:
+            if block.get("type") != "paragraph":
+                continue
+            for sentence, _cite_keys, _evidence_ids, source_refs in _claims_with_local_citations(
+                block.get("runs") or []
+            ):
+                if not source_refs:
+                    continue
+                claim_kind = classify_claim(sentence)
+                is_core = claim_kind not in {"background", "attribution"} or row.section_key in {
+                    "s2",
+                    "s3",
+                    "s4",
+                    "s5",
+                }
+                claim_numbers = {normalize_number(value) for value in extract_numbers(sentence)}
+                bound_assets = [assets_by_ref.get(source_ref) for source_ref in source_refs]
+                resolved_assets = [asset for asset in bound_assets if asset is not None]
+                source_numbers = {
+                    normalize_number(str(value))
+                    for asset in resolved_assets
+                    for value in (asset.get("numbers") or [])
+                }
+                prose_sources = [
+                    str(asset.get("text") or asset.get("_asset_description") or "")
+                    for asset in resolved_assets
+                    if asset.get("type") in {"note", "code"}
+                ]
+                support_score = max(
+                    (asset_text_support_score(sentence, text) for text in prose_sources),
+                    default=0.0,
+                )
+                binding_ok = len(resolved_assets) == len(source_refs)
+                if claim_numbers:
+                    number_match = claim_numbers.issubset(source_numbers)
+                    support_score = asset_numeric_support_score(
+                        sentence,
+                        claim_numbers,
+                        resolved_assets,
+                    )
+                    content_ok = number_match and support_score >= 0.1
+                    invalid_status = (
+                        "asset_numeric_context_mismatch"
+                        if number_match
+                        else "asset_number_mismatch"
+                    )
+                else:
+                    # A result table cannot substantiate a free-form qualitative conclusion.
+                    # Non-numeric method claims must retain enough lexical contact with the
+                    # method note/code to remain auditable without another model call.
+                    content_ok = bool(prose_sources) and support_score >= 0.15
+                    invalid_status = "asset_content_mismatch"
+                valid = binding_ok and content_ok
+                for source_ref in source_refs:
+                    asset = assets_by_ref.get(source_ref)
+                    excerpt = _asset_excerpt(asset or {})
+                    anchors.append(
+                        {
+                            "section_id": row.id,
+                            "work_id": None,
+                            "user_asset_id": (
+                                uuid.UUID(str(asset["_asset_id"]))
+                                if asset and asset.get("_asset_id")
+                                else None
+                            ),
+                            "section_key": row.section_key,
+                            "claim_hash": hashlib.sha256(sentence.encode()).hexdigest(),
+                            "claim_text": sentence,
+                            "claim_kind": claim_kind,
+                            "is_core": is_core,
+                            "cite_key": None,
+                            "source_key": f"asset:{source_ref}",
+                            "source_kind": "user_asset" if asset else "none",
+                            "source_page": None,
+                            "source_section": str((asset or {}).get("filename") or "") or None,
+                            "source_paragraph": None,
+                            "evidence_excerpt": excerpt or None,
+                            "evidence_hash": (
+                                hashlib.sha256(excerpt.encode()).hexdigest() if excerpt else None
+                            ),
+                            "evidence_unit_id": None,
+                            "comparability_ok": None,
+                            "grade_ok": valid,
+                            "support_status": (
+                                "supported"
+                                if valid
+                                else "asset_binding_mismatch"
+                                if not binding_ok
+                                else invalid_status
+                            ),
+                            "support_score": support_score if binding_ok else 0.0,
+                            "manual_status": "unreviewed",
+                        }
+                    )
+    return anchors
+
+
+def _asset_excerpt(asset: dict[str, Any]) -> str:
+    if asset.get("type") == "table":
+        return "; ".join(
+            f"{key}={value}" for key, value in list((asset.get("numeric_cells") or {}).items())[:40]
+        )[:4000]
+    return str(asset.get("text") or asset.get("_asset_description") or "")[:4000]
+
+
+def asset_text_support_score(claim: str, source: str) -> float:
+    """Deterministic lexical floor for method-note/code provenance.
+
+    English words and Chinese character bigrams are both represented so a Chinese method
+    sentence does not require verbatim equality with a long source paragraph.
+    """
+
+    def tokens(value: str) -> set[str]:
+        lowered = value.casefold()
+        result = set(re.findall(r"[a-z][a-z0-9_-]{2,}", lowered))
+        cjk = "".join(re.findall(r"[\u3400-\u9fff]", lowered))
+        result.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
+        return result
+
+    claim_tokens = tokens(claim)
+    source_tokens = tokens(source)
+    return len(claim_tokens & source_tokens) / max(1, len(claim_tokens))
+
+
+def asset_numeric_support_score(
+    claim: str,
+    claim_numbers: set[str],
+    assets: list[dict[str, Any]],
+) -> float:
+    """Require matched values to retain contact with their table locator or source prose."""
+    from ingest.assets import normalize_number
+
+    locator_parts: list[str] = []
+    for asset in assets:
+        if asset.get("type") in {"note", "code"}:
+            locator_parts.append(str(asset.get("text") or asset.get("_asset_description") or ""))
+        for locator, value in (asset.get("numeric_cells") or {}).items():
+            if normalize_number(str(value)) in claim_numbers:
+                locator_parts.append(str(locator).replace("::", " "))
+    return max(
+        (asset_text_support_score(claim, source) for source in locator_parts if source),
+        default=0.0,
+    )
+
+
+def _claims_with_local_citations(
+    runs: list[dict[str, Any]],
+) -> list[tuple[str, list[str], list[str], list[str]]]:
     """Bind CiteRuns to the nearest sentence instead of every claim in the paragraph."""
     claims: list[dict[str, Any]] = []
     buffer = ""
     pending_keys: list[str] = []
+    pending_evidence_ids: list[str] = []
+    pending_source_refs: list[str] = []
 
     def append_claim(value: str) -> None:
         text = " ".join(value.split()).strip()
         if len(text) >= 12:
-            claims.append({"text": text, "cite_keys": list(dict.fromkeys(pending_keys))})
+            claims.append(
+                {
+                    "text": text,
+                    "cite_keys": list(dict.fromkeys(pending_keys)),
+                    "evidence_ids": list(dict.fromkeys(pending_evidence_ids)),
+                    "source_refs": list(dict.fromkeys(pending_source_refs)),
+                }
+            )
         pending_keys.clear()
+        pending_evidence_ids.clear()
+        pending_source_refs.clear()
 
     for run in runs:
         if not isinstance(run, dict):
@@ -258,17 +539,122 @@ def _claims_with_local_citations(runs: list[dict[str, Any]]) -> list[tuple[str, 
                 buffer = buffer[end:].strip()
         elif run.get("t") == "cite":
             keys = [str(key) for key in run.get("keys") or []]
+            evidence_ids = [str(value) for value in run.get("evidence_ids") or []]
             if buffer.strip():
                 pending_keys.extend(keys)
+                pending_evidence_ids.extend(evidence_ids)
             elif claims:
                 claims[-1]["cite_keys"] = list(dict.fromkeys([*claims[-1]["cite_keys"], *keys]))
+                claims[-1]["evidence_ids"] = list(
+                    dict.fromkeys([*claims[-1]["evidence_ids"], *evidence_ids])
+                )
             else:
                 pending_keys.extend(keys)
+                pending_evidence_ids.extend(evidence_ids)
+        elif run.get("t") == "grounding":
+            refs = [str(value) for value in run.get("source_refs") or []]
+            if buffer.strip():
+                pending_source_refs.extend(refs)
+            elif claims:
+                claims[-1]["source_refs"] = list(dict.fromkeys([*claims[-1]["source_refs"], *refs]))
+            else:
+                pending_source_refs.extend(refs)
     if buffer.strip():
         append_claim(buffer)
-    elif pending_keys and claims:
+    elif (pending_keys or pending_source_refs) and claims:
         claims[-1]["cite_keys"] = list(dict.fromkeys([*claims[-1]["cite_keys"], *pending_keys]))
-    return [(str(item["text"]), list(item["cite_keys"])) for item in claims]
+        claims[-1]["evidence_ids"] = list(
+            dict.fromkeys([*claims[-1]["evidence_ids"], *pending_evidence_ids])
+        )
+        claims[-1]["source_refs"] = list(
+            dict.fromkeys([*claims[-1]["source_refs"], *pending_source_refs])
+        )
+    return [
+        (
+            str(item["text"]),
+            list(item["cite_keys"]),
+            list(item["evidence_ids"]),
+            list(item["source_refs"]),
+        )
+        for item in claims
+    ]
+
+
+def _best_evidence_unit(
+    units: list[dict[str, Any]],
+    *,
+    claim: str,
+) -> dict[str, Any]:
+    if not units:
+        return {}
+    return max(
+        units,
+        key=lambda unit: (
+            _support_score(claim, str(unit.get("text") or "")),
+            bool(unit.get("page") is not None or unit.get("object_ref")),
+            bool(unit.get("section_path") or unit.get("paragraph_index") is not None),
+        ),
+    )
+
+
+def _evidence_grade_ok(claim_kind: str, text: str, grade: str) -> bool:
+    if claim_kind in {"background", "attribution"}:
+        return True
+    if grade in {"A_located_structured", "B_located_prose"}:
+        return True
+    return (
+        grade == "C_fulltext_unlocated"
+        and claim_kind in {"effect", "conclusion"}
+        and bool(_UNCERTAINTY_RE.search(text))
+    )
+
+
+def _evidence_units_comparable(units: list[dict[str, Any]]) -> bool:
+    if len({str(unit.get("work_id")) for unit in units if unit.get("work_id")}) < 2:
+        return False
+    key_sets = [
+        {
+            str(item.get("comparability_key"))
+            for item in unit.get("measurements") or []
+            if item.get("comparability_key")
+        }
+        for unit in units
+    ]
+    return bool(key_sets) and all(key_sets) and bool(set.intersection(*key_sets))
+
+
+# 学术严谨档会拦下导出的那组问题码。draft 档把它们降级成 warning 照样报出来，
+# 所以这个集合也是「这份草稿里有几处值得再花一轮重写去修」的判据——
+# 概览页的修复决策卡据此计数，不能在那边另抄一份，否则两处口径迟早分叉。
+SCHOLARLY_BLOCKER_CODES = frozenset(
+    {
+        "placeholders_present",
+        "core_claim_fulltext_missing",
+        "original_claim_source_missing",
+        "asset_grounding_invalid",
+        "original_method_grounding_missing",
+        "original_results_grounding_missing",
+        "supported_core_claims_missing",
+        "review_source_diversity_low",
+        "evidence_grade_violation",
+        "comparison_not_comparable",
+        "numeric_locator_missing",
+        "evidence_binding_missing",
+        "citation_resolution_failed",
+    }
+)
+
+
+def repairable_finding_count(report: QualityReport) -> int:
+    """这份报告里有多少处「跑一轮质量修复有可能推进」的发现项。
+
+    对 draft 报告读 warnings（阻断项在那一档被降级过去），对 scholarly /
+    submission 读 blockers。两边都只认 SCHOLARLY_BLOCKER_CODES，因为收敛器
+    能做的就是重写这些码对应的章节；把「文献偏近五年」这类提示也算进去，
+    只会让用户点下修复后发现什么都没变。
+    """
+    pool = report.warnings if report.quality_profile == "draft" else report.blockers
+    return sum(1 for item in pool if str(item.get("code")) in SCHOLARLY_BLOCKER_CODES)
 
 
 def apply_readiness_gate(
@@ -294,10 +680,12 @@ def apply_readiness_gate(
         for row in rows
     )
     core = [anchor for anchor in report.claim_evidence if anchor["is_core"]]
-    supported_hashes = {
-        anchor["claim_hash"]
+    supported_core = [
+        anchor
         for anchor in core
-        if anchor["source_kind"] == "fulltext"
+        if anchor["source_kind"] in {"fulltext", "user_asset"}
+        and anchor.get("grade_ok") is not False
+        and anchor.get("comparability_ok") is not False
         and anchor.get("manual_status") != "rejected"
         and (
             anchor["support_status"] == "supported"
@@ -310,7 +698,8 @@ def apply_readiness_gate(
                 )
             )
         )
-    }
+    ]
+    supported_hashes = {anchor["claim_hash"] for anchor in supported_core}
     core_hashes = {anchor["claim_hash"] for anchor in core}
     report.core_claim_count = len(core_hashes)
     report.core_claim_fulltext_count = len(supported_hashes)
@@ -323,11 +712,86 @@ def apply_readiness_gate(
         blockers.append(_issue("placeholders_present", "正文仍含待补占位符"))
     missing_evidence = len(core_hashes - supported_hashes)
     if missing_evidence:
+        missing_code = (
+            "original_claim_source_missing"
+            if getattr(project, "paper_type", None) == "original"
+            else "core_claim_fulltext_missing"
+        )
         blockers.append(
             _issue(
-                "core_claim_fulltext_missing",
-                f"{missing_evidence} 条核心论断没有可定位且相符的全文证据",
+                missing_code,
+                (
+                    f"{missing_evidence} 条原创核心论断没有有效的素材或文献绑定"
+                    if missing_code == "original_claim_source_missing"
+                    else f"{missing_evidence} 条核心论断没有可定位且相符的全文证据"
+                ),
                 count=missing_evidence,
+            )
+        )
+    asset_binding_violations = {
+        anchor["claim_hash"]
+        for anchor in core
+        if anchor.get("support_status")
+        in {
+            "asset_binding_mismatch",
+            "asset_number_mismatch",
+            "asset_numeric_context_mismatch",
+            "asset_content_mismatch",
+        }
+    }
+    if asset_binding_violations:
+        blockers.append(
+            _issue(
+                "asset_grounding_invalid",
+                f"{len(asset_binding_violations)} 条原创论断的素材绑定无效",
+                count=len(asset_binding_violations),
+            )
+        )
+    grade_violations = {anchor["claim_hash"] for anchor in core if anchor.get("grade_ok") is False}
+    if grade_violations:
+        blockers.append(
+            _issue(
+                "evidence_grade_violation",
+                f"{len(grade_violations)} 条核心论断违反证据等级规则（R4）",
+                count=len(grade_violations),
+            )
+        )
+    comparability_violations = {
+        anchor["claim_hash"] for anchor in core if anchor.get("comparability_ok") is False
+    }
+    if comparability_violations:
+        blockers.append(
+            _issue(
+                "comparison_not_comparable",
+                f"{len(comparability_violations)} 条跨研究比较缺少共同可比较条件（R5）",
+                count=len(comparability_violations),
+            )
+        )
+    numeric_locator_violations = {
+        anchor["claim_hash"]
+        for anchor in core
+        if anchor.get("claim_kind") == "numeric"
+        and anchor.get("support_status") == "numeric_locator_missing"
+    }
+    if numeric_locator_violations:
+        blockers.append(
+            _issue(
+                "numeric_locator_missing",
+                f"{len(numeric_locator_violations)} 条数字论断未绑定页码或结构化对象（R6）",
+                count=len(numeric_locator_violations),
+            )
+        )
+    evidence_binding_violations = {
+        anchor["claim_hash"]
+        for anchor in core
+        if anchor.get("support_status") == "evidence_binding_mismatch"
+    }
+    if evidence_binding_violations:
+        blockers.append(
+            _issue(
+                "evidence_binding_missing",
+                f"{len(evidence_binding_violations)} 条核心论断的 EvidenceUnit 绑定无效",
+                count=len(evidence_binding_violations),
             )
         )
     if unresolved or citation_warnings:
@@ -339,6 +803,50 @@ def apply_readiness_gate(
                 warning_count=citation_warnings,
             )
         )
+    if getattr(project, "paper_type", None) == "review":
+        supported_works = {
+            str(anchor.get("work_id"))
+            for anchor in supported_core
+            if anchor.get("source_kind") == "fulltext" and anchor.get("work_id")
+        }
+        if not core_hashes:
+            blockers.append(_issue("supported_core_claims_missing", "正文没有可验证的核心论断"))
+        if len(supported_works) < 2:
+            blockers.append(
+                _issue(
+                    "review_source_diversity_low",
+                    "综述正文至少需要两个不同全文来源支撑核心论断",
+                    count=len(supported_works),
+                )
+            )
+    elif getattr(project, "paper_type", None) == "original":
+        supported_asset_sections = {
+            str(anchor.get("section_key"))
+            for anchor in core
+            if anchor.get("source_kind") == "user_asset"
+            and anchor.get("support_status") == "supported"
+        }
+        if not ({"s2", "s3"} & supported_asset_sections):
+            blockers.append(
+                _issue("original_method_grounding_missing", "方法或实验设置缺少素材支撑")
+            )
+        if "s4" not in supported_asset_sections:
+            blockers.append(
+                _issue("original_results_grounding_missing", "结果章节缺少素材支撑的核心结果")
+            )
+    # R11 / N6: language consistency is a scholarly readiness blocker, not only
+    # a post-pass warning on the worker.
+    if getattr(project, "language", None) == "zh":
+        language_mismatches = zh_language_mismatches(rows)
+        if language_mismatches:
+            blockers.append(
+                _issue(
+                    "language_mismatch",
+                    f"{len(language_mismatches)} 个段落主要为英文，与项目语言 zh 不一致（R11）",
+                    count=len(language_mismatches),
+                    sections=sorted({item["section_key"] for item in language_mismatches}),
+                )
+            )
     unapproved = [row.section_key for row in rows if getattr(row, "status", "") != "approved"]
     if unapproved:
         blockers.append(
@@ -443,14 +951,208 @@ def apply_readiness_gate(
         ),
         "layout": 100.0 if report.layout_checks.get("passed") is True else 0.0,
     }
-    report.blockers = blockers if report.quality_profile == "submission" else []
-    report.warnings = warnings + (blockers if report.quality_profile == "draft" else [])
+    if report.quality_profile == "submission":
+        profile_blockers = blockers
+        profile_warnings = warnings
+    elif report.quality_profile == "scholarly":
+        profile_blockers = [item for item in blockers if item["code"] in SCHOLARLY_BLOCKER_CODES]
+        profile_warnings = warnings + [
+            item for item in blockers if item["code"] not in SCHOLARLY_BLOCKER_CODES
+        ]
+    else:
+        profile_blockers = []
+        profile_warnings = warnings + blockers
+    report.blockers = profile_blockers
+    report.warnings = profile_warnings
     report.readiness_status = (
-        "preflight_ready"
-        if report.quality_profile == "submission" and not blockers
-        else ("needs_revision" if report.quality_profile == "submission" else "draft")
+        "draft"
+        if report.quality_profile == "draft"
+        else ("preflight_ready" if not profile_blockers else "needs_revision")
     )
     return report
+
+
+def zh_language_mismatches(rows: list[Any]) -> list[dict[str, Any]]:
+    """Find prose paragraphs that are predominantly Latin script.
+
+    A project may contain English model/dataset names, but an entire English
+    paragraph in a Chinese manuscript is a generation/cache failure.  The
+    threshold intentionally requires substantial text to avoid flagging a
+    glossary line or an abbreviation-heavy table cell.
+    """
+    mismatches: list[dict[str, Any]] = []
+    for row in rows:
+        for index, block in enumerate((row.body_ir_json or {}).get("blocks", [])):
+            runs = block.get("runs") if isinstance(block, dict) else None
+            if not isinstance(runs, list):
+                continue
+            text = "".join(
+                str(run.get("v") or "")
+                for run in runs
+                if isinstance(run, dict) and run.get("t") == "text"
+            ).strip()
+            latin = len(_LATIN_WORD_RE.findall(text))
+            cjk = len(_CJK_CHAR_RE.findall(text))
+            if latin >= 24 and latin / max(1, latin + cjk) > 0.58:
+                mismatches.append(
+                    {
+                        "section_key": row.section_key,
+                        "block_index": index,
+                        "latin_ratio": round(latin / max(1, latin + cjk), 3),
+                    }
+                )
+    return mismatches
+
+
+def build_depth_metrics(
+    *,
+    report: QualityReport,
+    rows: list[Any],
+    evidence_units: dict[str, dict[str, Any]],
+    selected_work_count: int,
+    questions: list[Any],
+) -> dict[str, Any]:
+    """计算问题驱动综述的 1–11 自动指标；分母为零时返回可解释的 0。"""
+
+    def ratio(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 4) if denominator else 0.0
+
+    fulltext_units = [
+        unit for unit in evidence_units.values() if unit.get("grade") != "D_abstract_only"
+    ]
+    fulltext_work_ids = {str(unit.get("work_id")) for unit in fulltext_units if unit.get("work_id")}
+    section_roles: dict[str, set[str]] = {}
+    structured_work_ids: set[str] = set()
+    for unit in fulltext_units:
+        work_id = str(unit.get("work_id") or "")
+        section = str(unit.get("section_path") or "").casefold()
+        if re.search(r"(?:method|materials|方法|实验设计)", section):
+            section_roles.setdefault(work_id, set()).add("methods")
+        if re.search(r"(?:result|finding|结果|实验结果)", section):
+            section_roles.setdefault(work_id, set()).add("results")
+        if unit.get("object_ref"):
+            structured_work_ids.add(work_id)
+    methods_results = sum(
+        {"methods", "results"}.issubset(roles) for roles in section_roles.values()
+    )
+
+    anchors = report.claim_evidence
+    core_hashes = {anchor["claim_hash"] for anchor in anchors if anchor.get("is_core")}
+    grade_d_core = {
+        anchor["claim_hash"]
+        for anchor in anchors
+        if anchor.get("is_core") and anchor.get("grade_ok") is False
+    }
+    comparison_hashes = {
+        anchor["claim_hash"] for anchor in anchors if anchor.get("claim_kind") == "comparison"
+    }
+    invalid_comparisons = {
+        anchor["claim_hash"]
+        for anchor in anchors
+        if anchor.get("claim_kind") == "comparison" and anchor.get("comparability_ok") is False
+    }
+    numeric_by_hash: dict[str, list[dict[str, Any]]] = {}
+    for anchor in anchors:
+        if anchor.get("claim_kind") == "numeric":
+            numeric_by_hash.setdefault(anchor["claim_hash"], []).append(anchor)
+    numeric_consistent = 0
+    numeric_located = 0
+    for numeric_anchors in numeric_by_hash.values():
+        claim_numbers = {
+            _normalized_number(value)
+            for value in _NUMBER_RE.findall(numeric_anchors[0]["claim_text"])
+        }
+        excerpts = " ".join(str(anchor.get("evidence_excerpt") or "") for anchor in numeric_anchors)
+        source_numbers = {_normalized_number(value) for value in _NUMBER_RE.findall(excerpts)}
+        for anchor in numeric_anchors:
+            unit = evidence_units.get(str(anchor.get("evidence_unit_id") or ""), {})
+            source_numbers.update(
+                _normalized_number(str(measurement["value"]))
+                for measurement in unit.get("measurements") or []
+                if measurement.get("value") is not None
+            )
+        if claim_numbers and claim_numbers.issubset(source_numbers):
+            numeric_consistent += 1
+        if any(
+            anchor.get("source_page") is not None
+            or (
+                anchor.get("evidence_unit_id")
+                and evidence_units.get(str(anchor["evidence_unit_id"]), {}).get("object_ref")
+            )
+            for anchor in numeric_anchors
+        ):
+            numeric_located += 1
+
+    synthesis_paragraphs = 0
+    enumeration_paragraphs = 0
+    substantive_paragraphs = 0
+    for row in rows:
+        for block in (getattr(row, "body_ir_json", None) or {}).get("blocks") or []:
+            if block.get("type") != "paragraph":
+                continue
+            runs = block.get("runs") or []
+            claims = _claims_with_local_citations(runs)
+            if not claims:
+                continue
+            substantive_paragraphs += 1
+            paragraph_keys = {
+                key for _text, keys, _evidence_ids, _source_refs in claims for key in keys
+            }
+            if len(paragraph_keys) >= 2 and block.get("stance_summary"):
+                synthesis_paragraphs += 1
+            attribution_count = sum(
+                classify_claim(text) == "attribution" for text, _keys, _ids, _source_refs in claims
+            )
+            if attribution_count >= 3 or (
+                len(paragraph_keys) == 1 and attribution_count == len(claims)
+            ):
+                enumeration_paragraphs += 1
+
+    sub_questions = [question for question in questions if question.kind == "sub"]
+    answered = [
+        question for question in sub_questions if question.answer_status != "insufficient_evidence"
+    ]
+    return {
+        "1_fulltext_acquisition_rate": report.fulltext_coverage,
+        "2_methods_results_section_coverage": ratio(
+            methods_results,
+            selected_work_count,
+        ),
+        "3_structured_object_coverage": ratio(
+            len(structured_work_ids),
+            len(fulltext_work_ids),
+        ),
+        "4_core_claim_evidence_coverage": report.core_claim_fulltext_coverage,
+        "5_numeric_locator_coverage": ratio(numeric_located, len(numeric_by_hash)),
+        "6_numeric_source_consistency": ratio(numeric_consistent, len(numeric_by_hash)),
+        "7_unsupported_strong_claim_rate": ratio(len(grade_d_core), len(core_hashes)),
+        "8_invalid_comparison_rate": ratio(
+            len(invalid_comparisons),
+            len(comparison_hashes),
+        ),
+        "9_cross_study_synthesis_paragraph_rate": ratio(
+            synthesis_paragraphs,
+            substantive_paragraphs,
+        ),
+        "10_paper_enumeration_paragraph_rate": ratio(
+            enumeration_paragraphs,
+            substantive_paragraphs,
+        ),
+        "11_question_answer_completeness": ratio(len(answered), len(sub_questions)),
+        "counts": {
+            "selected_works": selected_work_count,
+            "fulltext_works": len(fulltext_work_ids),
+            "core_claims": len(core_hashes),
+            "numeric_claims": len(numeric_by_hash),
+            "comparison_claims": len(comparison_hashes),
+            "substantive_paragraphs": substantive_paragraphs,
+            "sub_questions": len(sub_questions),
+        },
+    }
+
+
+def _normalized_number(value: str) -> float:
+    return round(float(value.replace(",", "").rstrip("%")), 8)
 
 
 def _issue(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -510,6 +1212,154 @@ def _support_score(claim: str, evidence: str) -> float:
     return len(claim_tokens & evidence_tokens) / max(1, len(claim_tokens))
 
 
+def _dominant_script(value: str) -> str:
+    """Return the script that carries the prose, ignoring a few model/dataset identifiers."""
+    cjk_chars = len(_CJK_CHAR_RE.findall(value))
+    latin_words = len(_LATIN_WORD_RE.findall(value))
+    if cjk_chars >= 4 and cjk_chars >= latin_words * 2:
+        return "cjk"
+    if latin_words >= 4 and cjk_chars < 4:
+        return "latin"
+    return "mixed"
+
+
+def _cross_language_evidence_candidates(
+    anchors: list[dict[str, Any]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Select only located anchors whose remaining failure is cross-language semantics."""
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for anchor_index, anchor in enumerate(anchors):
+        claim = str(anchor.get("claim_text") or "").strip()
+        evidence = str(anchor.get("evidence_excerpt") or "").strip()
+        scripts = {_dominant_script(claim), _dominant_script(evidence)}
+        if (
+            anchor.get("is_core")
+            and anchor.get("source_kind") == "fulltext"
+            and anchor.get("support_status") == "insufficient_support"
+            and anchor.get("manual_status") not in {"confirmed", "rejected"}
+            and anchor.get("grade_ok") is not False
+            and anchor.get("comparability_ok") is not False
+            and claim
+            and evidence
+            and scripts == {"cjk", "latin"}
+        ):
+            candidates.append((anchor_index, anchor))
+    return candidates[:MAX_CROSS_LANGUAGE_CHECKS]
+
+
+async def verify_cross_language_claim_evidence(
+    *,
+    anchors: list[dict[str, Any]],
+    runner: LLMRunner | None,
+) -> dict[str, Any]:
+    """Conservatively verify exact bilingual claim/excerpt pairs and promote direct support.
+
+    The deterministic locator, evidence-grade, numeric, and comparability rules have already run
+    before an anchor can reach this function.  This verifier replaces only the invalid assumption
+    that a Chinese claim and its English source must share surface tokens.  Failure is closed: an
+    unavailable or malformed verifier leaves the original ``insufficient_support`` status intact.
+    """
+    candidates = _cross_language_evidence_candidates(anchors)
+    summary: dict[str, Any] = {
+        "status": "not_needed" if not candidates else "unavailable",
+        "candidate_count": len(candidates),
+        "checked_count": 0,
+        "promoted_count": 0,
+        "failed_count": len(candidates),
+        "judgements": [],
+    }
+    if not candidates or runner is None or not runner.enabled:
+        return summary
+
+    checked_indexes: set[int] = set()
+    for batch_start in range(0, len(candidates), CROSS_LANGUAGE_BATCH_SIZE):
+        batch = candidates[batch_start : batch_start + CROSS_LANGUAGE_BATCH_SIZE]
+        pairs = [
+            {
+                "index": candidate_index,
+                "claim_kind": str(anchor.get("claim_kind") or ""),
+                "claim": str(anchor.get("claim_text") or "")[:600],
+                "evidence": str(anchor.get("evidence_excerpt") or "")[:1600],
+                "locator": {
+                    "page": anchor.get("source_page"),
+                    "section": anchor.get("source_section"),
+                    "paragraph": anchor.get("source_paragraph"),
+                },
+            }
+            for candidate_index, (_anchor_index, anchor) in enumerate(
+                batch,
+                start=batch_start,
+            )
+        ]
+        try:
+            result = await runner.agenerate_json(
+                "verifier",
+                system_prompt=_CROSS_LANGUAGE_EVIDENCE_PROMPT,
+                user_prompt=json.dumps({"pairs": pairs}, ensure_ascii=False),
+                max_output_tokens=2400,
+                temperature=0.0,
+                metadata={"stage": "cross_language_evidence_gate"},
+            )
+        except Exception:  # noqa: BLE001 - quality must fail closed, not fail the complete job
+            continue
+        if not result.ok or not isinstance(result.value, dict):
+            continue
+        valid_indexes = set(range(batch_start, batch_start + len(batch)))
+        for item in result.value.get("judgements") or []:
+            if not isinstance(item, dict):
+                continue
+            candidate_index = item.get("index")
+            if (
+                not isinstance(candidate_index, int)
+                or candidate_index not in valid_indexes
+                or candidate_index in checked_indexes
+            ):
+                continue
+            raw_confidence = item.get("confidence")
+            if not isinstance(raw_confidence, int | float):
+                continue
+            verdict = str(item.get("verdict") or "").strip().lower()
+            if verdict not in {
+                "supported",
+                "partial",
+                "unsupported",
+                "contradicted",
+                "uncertain",
+            }:
+                continue
+            confidence = min(1.0, max(0.0, float(raw_confidence)))
+            reason = str(item.get("reason") or "").strip()[:300]
+            checked_indexes.add(candidate_index)
+            _anchor_index, anchor = candidates[candidate_index]
+            promoted = bool(
+                verdict == "supported"
+                and confidence >= CROSS_LANGUAGE_SUPPORT_CONFIDENCE
+                and reason
+            )
+            if promoted:
+                anchor["support_status"] = "supported"
+                anchor["support_score"] = confidence
+                summary["promoted_count"] += 1
+            summary["judgements"].append(
+                {
+                    "claim_hash": str(anchor.get("claim_hash") or ""),
+                    "cite_key": str(anchor.get("cite_key") or ""),
+                    "verdict": verdict,
+                    "confidence": round(confidence, 3),
+                    "reason": reason,
+                    "promoted": promoted,
+                }
+            )
+
+    summary["checked_count"] = len(checked_indexes)
+    summary["failed_count"] = len(candidates) - len(checked_indexes)
+    if len(checked_indexes) == len(candidates):
+        summary["status"] = "completed"
+    elif checked_indexes:
+        summary["status"] = "partial"
+    return summary
+
+
 async def soft_check_citations(
     *,
     usages: list[dict[str, Any]],
@@ -535,7 +1385,7 @@ async def soft_check_citations(
         key = str(usage["cite_key"])
         lines.append(
             f"[{index}] 上下文: {str(usage['context_snippet'])[:300]}\n"
-            f"     被引文献({key})摘要: {abstracts[key][:400]}"
+            f"     被引证据({key})摘录: {abstracts[key][:400]}"
         )
     result = await runner.agenerate_json(
         "verifier",
@@ -552,12 +1402,12 @@ async def soft_check_citations(
     for item in result.value.get("judgements") or []:
         if not isinstance(item, dict):
             continue
-        index = item.get("index")
-        if not isinstance(index, int) or not 0 <= index < len(checkable):
+        judgement_index = item.get("index")
+        if not isinstance(judgement_index, int) or not 0 <= judgement_index < len(checkable):
             continue
         raw_score = item.get("score")
         score = float(raw_score) if isinstance(raw_score, int | float) else 0.5
-        usage = checkable[index]
+        usage = checkable[judgement_index]
         findings.append(
             SoftCheckFinding(
                 cite_key=str(usage["cite_key"]),
@@ -704,15 +1554,23 @@ def count_words(text: str) -> int:
 
 
 __all__ = [
+    "CROSS_LANGUAGE_SUPPORT_CONFIDENCE",
     "MAX_SOFT_CHECKS",
+    "SCHOLARLY_BLOCKER_CODES",
     "SOFT_CHECK_THRESHOLD",
     "QualityReport",
     "SoftCheckFinding",
     "apply_readiness_gate",
     "build_claim_evidence",
+    "build_depth_metrics",
+    "build_original_claim_grounding",
     "build_quality_report",
+    "asset_text_support_score",
+    "asset_numeric_support_score",
     "classify_claim",
     "count_words",
     "coverage_hints",
+    "repairable_finding_count",
     "soft_check_citations",
+    "verify_cross_language_claim_evidence",
 ]

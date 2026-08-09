@@ -4,8 +4,10 @@ import Link from 'next/link';
 import { BookOpen, ChevronLeft, FlaskConical } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
+import { getSubmissionReadiness } from '@/lib/api';
 import { CITATION_STYLE_LABEL, LANGUAGE_LABEL, PAPER_TYPE_LABEL, VENUE_TEMPLATES, WRITING_MODE_LABEL } from '@/lib/labels';
-import type { Project } from '@/lib/types';
+import type { Project, SubmissionReadiness } from '@/lib/types';
+import { useAsyncModule } from '@/lib/useAsyncModule';
 import { ProjectTitle } from './project-title';
 
 /**
@@ -22,6 +24,15 @@ export function ProjectHeader({
   project: Project | undefined;
   onRenamed?: (title: string) => void;
 }) {
+  const projectId = String(project?.id ?? '');
+  const readinessModule = useAsyncModule<SubmissionReadiness | undefined>(
+    (signal) =>
+      projectId
+        ? getSubmissionReadiness(projectId, signal).then((result) => result.data)
+        : Promise.resolve(undefined),
+    undefined,
+    [projectId],
+  );
   if (!project) {
     return (
       <div className="space-y-2">
@@ -33,6 +44,24 @@ export function ProjectHeader({
 
   const Icon = project.paper_type === 'review' ? BookOpen : FlaskConical;
   const template = VENUE_TEMPLATES.find((t) => t.id === project.venue_template);
+  const detailedReadiness = readinessModule.data;
+  const summaryReadiness = project.attention_summary?.readiness;
+  const readiness = detailedReadiness
+    ? {
+        state: detailedReadiness.state,
+        href:
+          detailedReadiness.items.find((item) => item.state !== 'pass')?.fix_href ??
+          `/projects/${project.id}/export`,
+      }
+    : readinessModule.error
+      ? { state: 'unknown' as const, href: `/projects/${project.id}` }
+      : summaryReadiness;
+  const readinessLabel = readiness ? {
+    pass: '投稿检查通过', warn: '投稿有提醒', fail: '投稿未就绪', unknown: '投稿状态未知', stale: '投稿检查已过期',
+  }[readiness.state] : null;
+  // fail 用 warning 而不是 destructive：投稿未就绪是稿件还差几步，不是系统故障。
+  // 强弱靠 warning → outline → muted 的梯度和标签文案区分，不靠红色。
+  const readinessVariant = readiness?.state === 'pass' ? 'success' : readiness?.state === 'fail' ? 'warning' : readiness?.state === 'warn' || readiness?.state === 'stale' ? 'outline' : 'muted';
 
   return (
     <div className="space-y-2">
@@ -60,6 +89,11 @@ export function ProjectHeader({
           )}
           {template && <Badge variant="outline">{template.label}</Badge>}
           <Badge variant="muted">{WRITING_MODE_LABEL[project.writing_mode]}</Badge>
+          {readiness && readinessLabel && (
+            <Link href={readiness.href} className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              <Badge variant={readinessVariant}>{readinessLabel}</Badge>
+            </Link>
+          )}
         </div>
       </div>
     </div>

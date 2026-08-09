@@ -9,10 +9,10 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.paper import UserAsset
+from db.models.paper import PaperSection, UserAsset
 
 ASSET_KINDS = frozenset({"dataset", "result_table", "figure", "method_note", "code", "bib"})
 
@@ -65,6 +65,20 @@ async def delete_asset(session: AsyncSession, asset: UserAsset) -> None:
     await session.flush()
 
 
+async def asset_document_dependency_count(
+    session: AsyncSession,
+    asset: UserAsset,
+) -> int:
+    """Count manuscript sections whose visible blocks or sentence provenance use an asset."""
+    refs = [str(asset.id), f"ua_{str(asset.id)[:8]}"]
+    value = await session.scalar(
+        select(func.count(PaperSection.id)).where(
+            or_(*(PaperSection.asset_refs_json.contains([ref]) for ref in refs))
+        )
+    )
+    return int(value or 0)
+
+
 async def parsed_asset_payloads(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -75,6 +89,28 @@ async def parsed_asset_payloads(
         for asset in await list_assets(session, project_id)
         if isinstance(asset.parsed_json, dict)
     ]
+
+
+async def grounded_asset_payloads(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Parsed assets plus stable identifiers for writing and claim audits."""
+    payloads: list[dict[str, Any]] = []
+    for asset in await list_assets(session, project_id):
+        if not isinstance(asset.parsed_json, dict):
+            continue
+        payloads.append(
+            {
+                **asset.parsed_json,
+                "_asset_id": str(asset.id),
+                "_asset_ref": f"ua_{str(asset.id)[:8]}",
+                "_asset_kind": asset.kind,
+                "_asset_title": asset.title,
+                "_asset_description": asset.description,
+            }
+        )
+    return payloads
 
 
 async def asset_render_index(

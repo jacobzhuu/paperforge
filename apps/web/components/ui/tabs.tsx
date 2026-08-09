@@ -124,7 +124,7 @@ export function TabsTrigger({ value, children }: { value: string; children: Reac
       tabIndex={active ? 0 : -1}
       onClick={() => ctx.setValue(value)}
       className={cn(
-        'inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        'inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium transition-[color,background-color,box-shadow] duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         active ? 'bg-background text-foreground shadow-sm' : 'hover:text-foreground',
       )}
     >
@@ -150,7 +150,7 @@ export function TabsContent({
       id={`${ctx.baseId}-panel-${value}`}
       aria-labelledby={`${ctx.baseId}-tab-${value}`}
       tabIndex={0}
-      className={cn('mt-4 animate-fade-in', className)}
+      className={cn('mt-4 animate-fade-in motion-reduce:animate-none', className)}
     >
       {children}
     </div>

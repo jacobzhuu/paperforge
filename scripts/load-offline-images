@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BUNDLE="${1:-}"
+
+die() {
+  printf '[paperforge-images] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[ -n "${BUNDLE}" ] || die "usage: $0 /absolute/path/paperforge-images-linux-amd64.tar.gz"
+[ -f "${BUNDLE}" ] || die "bundle not found: ${BUNDLE}"
+[ -f "${BUNDLE}.sha256" ] || die "bundle checksum not found: ${BUNDLE}.sha256"
+command -v docker >/dev/null 2>&1 || die "docker is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "${BUNDLE}" | awk '{print $1}')"
+else
+  ACTUAL="$(shasum -a 256 "${BUNDLE}" | awk '{print $1}')"
+fi
+EXPECTED="$(awk 'NR == 1 {print $1}' "${BUNDLE}.sha256")"
+[ "${ACTUAL}" = "${EXPECTED}" ] || die "bundle SHA-256 mismatch"
+
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/paperforge-images.XXXXXX")"
+cleanup() {
+  find "${TEMP_DIR}" -type f -delete 2>/dev/null || true
+  find "${TEMP_DIR}" -depth -type d -exec rmdir {} \; 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+tar -xzf "${BUNDLE}" -C "${TEMP_DIR}"
+python3 - "${TEMP_DIR}" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+payload = json.loads((root / "images-manifest.json").read_text(encoding="utf-8"))
+if payload.get("version") != 1 or len(payload.get("images", [])) != 8:
+    raise SystemExit("invalid offline image manifest")
+for item in payload["images"]:
+    name = item.get("file", "")
+    path = root / name
+    if path.parent != root or not path.is_file():
+        raise SystemExit(f"unsafe or missing image archive: {name}")
+    if path.stat().st_size != item.get("size"):
+        raise SystemExit(f"image archive size mismatch: {name}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != item.get("sha256") or item.get("platform") != "linux/amd64":
+        raise SystemExit(f"image archive verification failed: {name}")
+PY
+
+for ARCHIVE in "${TEMP_DIR}"/*.tar; do
+  docker load --input "${ARCHIVE}"
+done
+
+for IMAGE in \
+  paperforge-api:local paperforge-worker:local paperforge-web:local \
+  paperforge-texd:local paperforge-visuald:local \
+  paperforge-postgres:local paperforge-redis:local paperforge-minio:local; do
+  ARCH="$(docker image inspect --format '{{.Architecture}}' "${IMAGE}")"
+  [ "${ARCH}" = "amd64" ] || die "unexpected architecture for ${IMAGE}: ${ARCH}"
+done
+
+printf '[paperforge-images] verified and loaded 8 linux/amd64 images\n'

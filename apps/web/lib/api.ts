@@ -5,9 +5,16 @@ import type {
   JobEvent,
   LibraryEntry,
   LibraryEntryStatus,
+  LibraryPdfUpload,
+  LibraryPdfUploadResult,
+  LiteratureRole,
   Project,
   CitationAudit,
   CostDetail,
+  EligibilityDecision,
+  EvidenceMatrix,
+  EvidenceStance,
+  EvidenceUnit,
   ExportArtifact,
   RequestableExportFormat,
   MarkdownPreview,
@@ -16,18 +23,22 @@ import type {
   OutlineTree,
   PaperSection,
   ProjectCost,
+  ResearchQuestion,
   QualityReport,
   QualityProfile,
   ReviewStyle,
   ClaimEvidence,
   RefineAction,
   RefineResult,
+  SynthesisPayload,
   ScopePayload,
   SearchRun,
+  SubmissionReadiness,
   RuntimeSettings,
   SectionIR,
   UpdateProjectRequest,
   UserAsset,
+  DocumentVersion,
   VersionHistory,
   VisualAsset,
   VisualDraft,
@@ -37,6 +48,9 @@ import type {
   AuthUser,
   AcademicProfile,
   AuthorDetail,
+  AssetCapabilities,
+  MaterialPreflight,
+  RewriteSectionCandidate,
 } from './types';
 import { MOCK_LIBRARY, MOCK_PROJECTS, MOCK_SEARCH_RUNS } from './mock';
 
@@ -77,12 +91,36 @@ function notifyAuthenticationFailure(): void {
  * 统一请求；只有显式开发演示模式会将网络错误、501 或 404 转为示例数据。
  * - 其他非 2xx 抛出普通 Error，交由调用方决定是否提示。
  */
+const inflightGets = new Map<string, Promise<unknown>>();
+
+/**
+ * 同一渲染周期里多个模块经常读取同一资源（例如 sections 同时供导航进度和写作台）。
+ * 只合并仍在途的 GET，不缓存响应，也不合并带 AbortSignal 的独立生命周期请求。
+ */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (method !== 'GET' || init?.signal) return executeRequest<T>(path, init);
+  const existing = inflightGets.get(path);
+  if (existing) return existing as Promise<T>;
+  const pending = executeRequest<T>(path, init).finally(() => {
+    if (inflightGets.get(path) === pending) inflightGets.delete(path);
+  });
+  inflightGets.set(path, pending);
+  return pending;
+}
+
+async function executeRequest<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
+    const headers = new Headers(init?.headers);
+    const isFormData =
+      typeof FormData !== 'undefined' && init?.body instanceof FormData;
+    if (!isFormData && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
     res = await fetch(`${API_BASE}${API_PREFIX}${path}`, {
       ...init,
-      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+      headers,
       cache: 'no-store',
       credentials: 'include',
     });
@@ -170,6 +208,14 @@ export async function verifyEmail(token: string): Promise<string> {
   return result.message;
 }
 
+export async function resendVerification(email: string): Promise<string> {
+  const result = await request<{ message: string }>('/auth/resend-verification', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+  return result.message;
+}
+
 export async function loginAccount(account: string, password: string): Promise<AuthUser> {
   const result = await request<{ user: AuthUser }>('/auth/login', {
     method: 'POST',
@@ -205,9 +251,47 @@ export function listProjects(): Promise<ApiResult<Project[]>> {
   return withFallback(() => request<Project[]>('/projects'), MOCK_PROJECTS);
 }
 
-export async function getProject(id: string): Promise<ApiResult<Project | undefined>> {
+export function getAssetCapabilities(signal?: AbortSignal): Promise<AssetCapabilities> {
+  return request<AssetCapabilities>('/assets/capabilities', { signal });
+}
+
+export function getMaterialPreflight(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<MaterialPreflight> {
+  return request<MaterialPreflight>(`/projects/${projectId}/assets/preflight`, { signal });
+}
+
+export function rewriteSectionCandidate(
+  projectId: string,
+  sectionKey: string,
+  instruction: string,
+  expectedUpdatedAt?: string | null,
+): Promise<RewriteSectionCandidate> {
+  return request<RewriteSectionCandidate>(`/projects/${projectId}/sections/${sectionKey}/rewrite-candidate`, {
+    method: 'POST',
+    body: JSON.stringify({ instruction, expected_updated_at: expectedUpdatedAt ?? undefined }),
+  });
+}
+
+export function acceptSectionRewrite(
+  projectId: string,
+  sectionKey: string,
+  candidateBodyIr: SectionIR,
+  expectedUpdatedAt?: string | null,
+): Promise<{ document_version: number; section: PaperSection }> {
+  return request(`/projects/${projectId}/sections/${sectionKey}/rewrite-accept`, {
+    method: 'POST',
+    body: JSON.stringify({ candidate_body_ir: candidateBodyIr, expected_updated_at: expectedUpdatedAt ?? undefined }),
+  });
+}
+
+export async function getProject(
+  id: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<Project | undefined>> {
   return withFallback(
-    () => request<Project>(`/projects/${id}`),
+    () => request<Project>(`/projects/${id}`, { signal }),
     MOCK_PROJECTS.find((p) => p.id === id),
   );
 }
@@ -256,15 +340,36 @@ export async function updateProject(
   });
 }
 
+/** 回收站：只列已删除的项目。 */
+export function listDeletedProjects(): Promise<ApiResult<Project[]>> {
+  return withFallback(() => request<Project[]>('/projects?deleted=true'), []);
+}
+
+/**
+ * 删除项目（软删除，可恢复）。项目里在跑的任务会被后端一并取消。
+ *
+ * 不走 withFallback：删除是破坏性的明确指令，后端不可用时必须报错。
+ * 让用户以为删掉了、刷新后项目还在，比直接报错糟糕得多。
+ */
+export function deleteProject(id: string): Promise<void> {
+  return request<void>(`/projects/${id}`, { method: 'DELETE' });
+}
+
+/** 从回收站恢复项目。 */
+export function restoreProject(id: string): Promise<Project> {
+  return request<Project>(`/projects/${id}/restore`, { method: 'POST' });
+}
+
 // ---- Library ----
 
 export function listLibrary(
   projectId: string,
   status?: string,
+  signal?: AbortSignal,
 ): Promise<ApiResult<LibraryEntry[]>> {
   const qs = status ? `?status=${encodeURIComponent(status)}` : '';
   return withFallback(
-    () => request<LibraryEntry[]>(`/projects/${projectId}/library${qs}`),
+    () => request<LibraryEntry[]>(`/projects/${projectId}/library${qs}`, { signal }),
     MOCK_LIBRARY,
   );
 }
@@ -276,11 +381,67 @@ export function listSearchRuns(projectId: string): Promise<ApiResult<SearchRun[]
   );
 }
 
+export function listPdfUploads(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<LibraryPdfUpload[]>> {
+  return withFallback(
+    () => request<LibraryPdfUpload[]>(`/projects/${projectId}/library/pdf-uploads`, { signal }),
+    [],
+  );
+}
+
+/** 学术 PDF 走文献链路，绝不写入 user_asset。 */
+export function uploadLibraryPdf(
+  projectId: string,
+  file: File,
+): Promise<LibraryPdfUploadResult> {
+  const form = new FormData();
+  form.append('file', file);
+  return request<LibraryPdfUploadResult>(`/projects/${projectId}/library/pdf-uploads`, {
+    method: 'POST',
+    body: form,
+  });
+}
+
+export function confirmPdfUpload(
+  projectId: string,
+  uploadId: string,
+  literatureRole: LiteratureRole,
+): Promise<LibraryPdfUploadResult> {
+  return request<LibraryPdfUploadResult>(
+    `/projects/${projectId}/library/pdf-uploads/${uploadId}/confirm`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ literature_role: literatureRole }),
+    },
+  );
+}
+
+export function retryPdfUpload(
+  projectId: string,
+  uploadId: string,
+): Promise<LibraryPdfUploadResult> {
+  return request<LibraryPdfUploadResult>(
+    `/projects/${projectId}/library/pdf-uploads/${uploadId}/retry`,
+    { method: 'POST' },
+  );
+}
+
+export function rejectPdfUpload(projectId: string, uploadId: string): Promise<void> {
+  return request<void>(`/projects/${projectId}/library/pdf-uploads/${uploadId}`, {
+    method: 'DELETE',
+  });
+}
+
 // ---- Scope ----
 
-export function getScope(projectId: string): Promise<ApiResult<ScopePayload | undefined>> {
+export function getScope(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<ScopePayload | undefined>> {
   return withFallback(
-    () => request<{ project_id: string; scope: ScopePayload }>(`/projects/${projectId}/scope`)
+    () => request<{ project_id: string; scope: ScopePayload }>(`/projects/${projectId}/scope`, { signal })
       .then((r) => r.scope),
     undefined,
   );
@@ -358,8 +519,8 @@ export function getJob(projectId: string, jobId: string): Promise<ApiResult<Job 
   return withFallback(() => request<Job>(`/projects/${projectId}/jobs/${jobId}`), undefined);
 }
 
-export function listJobs(projectId: string): Promise<ApiResult<Job[]>> {
-  return withFallback(() => request<Job[]>(`/projects/${projectId}/jobs`), []);
+export function listJobs(projectId: string, signal?: AbortSignal): Promise<ApiResult<Job[]>> {
+  return withFallback(() => request<Job[]>(`/projects/${projectId}/jobs`, { signal }), []);
 }
 
 /**
@@ -370,10 +531,59 @@ export function skipPolish(projectId: string, jobId: string): Promise<Job> {
   return request<Job>(`/projects/${projectId}/jobs/${jobId}/polish/skip`, { method: 'POST' });
 }
 
+/** 首轮全流程完成后显式启动润色；返回独立的润色任务。 */
+export function startPolish(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/polish`, { method: 'POST' });
+}
+
+/**
+ * 全流程交付之后启动一轮质量修复；返回独立的修复任务。
+ *
+ * 和 startPolish 一样不走 withFallback：这是用户看过问题清单后的明确决定。
+ */
+export function startQualityRepair(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/quality-repair`, { method: 'POST' });
+}
+
+/** 记下「这一轮不修了」，避免概览页每次刷新都再邀请一遍。 */
+export function skipQualityRepair(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/quality-repair/skip`, {
+    method: 'POST',
+  });
+}
+
+/**
+ * 取消任务：已产出的内容全部保留，这一轮不再往下跑。
+ *
+ * 协作式停止——worker 跑完当前这一步（阶段/章节/条目）才会真的退出，
+ * 所以点完之后最多还要等一两分钟，按钮文案必须说清这一点。
+ */
+export function cancelJob(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/cancel`, { method: 'POST' });
+}
+
+/** 暂停任务：停在最近的安全点，断点保留，可用 resumeJob 接着跑。 */
+export function pauseJob(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/pause`, { method: 'POST' });
+}
+
+/** 从断点继续。返回的是**新建**的那个 job——已完成的阶段会被跳过。 */
+export function resumeJob(projectId: string, jobId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/resume`, { method: 'POST' });
+}
+
 /** 重连退避（毫秒）；任务运行期间另有 getJob 周期校准兜底。 */
 const SSE_RETRY_DELAYS = [1000, 2000, 4000, 8000];
-const JOB_POLL_INTERVAL = 3000;
-const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+/** SSE 健康时轮询只做低频终态校准；断线后才提升频率。 */
+export const HEALTHY_JOB_POLL_INTERVAL = 15_000;
+export const DEGRADED_JOB_POLL_INTERVAL = 3_000;
+const TERMINAL_JOB_STATUSES = new Set([
+  'paused',
+  'succeeded',
+  'failed',
+  'cancelled',
+  'needs_input',
+]);
 
 export interface JobStreamHandlers {
   onEvent?: (event: JobEvent) => void;
@@ -407,10 +617,12 @@ export function subscribeJobEvents(
   let source: EventSource | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollInterval = 0;
   let pollInFlight = false;
   let attempt = 0;
   let lastSeq = 0;
   let stopped = false;
+  let degradedPolling = false;
 
   const finish = () => {
     if (stopped) return;
@@ -426,6 +638,8 @@ export function subscribeJobEvents(
     if (pollTimer) clearInterval(pollTimer);
     retryTimer = null;
     pollTimer = null;
+    pollInterval = 0;
+    document.removeEventListener('visibilitychange', onVisibilityChange);
   };
 
   /**
@@ -456,12 +670,37 @@ export function subscribeJobEvents(
 
   const startPolling = (degraded = false) => {
     if (stopped) return;
+    degradedPolling = degraded;
     if (degraded) {
       handlers.onConnectionChange?.({ reconnecting: true, degradedToPolling: true });
     }
-    if (pollTimer) return;
-    pollTimer = setInterval(() => void pollJob(), JOB_POLL_INTERVAL);
+    if (document.hidden) {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+      pollInterval = 0;
+      return;
+    }
+    const nextInterval = degraded
+      ? DEGRADED_JOB_POLL_INTERVAL
+      : HEALTHY_JOB_POLL_INTERVAL;
+    if (pollTimer && pollInterval === nextInterval) return;
+    if (pollTimer) clearInterval(pollTimer);
+    pollInterval = nextInterval;
+    pollTimer = setInterval(() => void pollJob(), nextInterval);
   };
+
+  function onVisibilityChange() {
+    if (stopped) return;
+    if (document.hidden) {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+      pollInterval = 0;
+      return;
+    }
+    // 休眠期间可能已经结束；先立即校准，再恢复对应频率。
+    void pollJob();
+    startPolling(degradedPolling);
+  }
 
   const connect = () => {
     if (stopped) return;
@@ -470,6 +709,8 @@ export function subscribeJobEvents(
     source = es;
 
     es.onopen = () => {
+      degradedPolling = false;
+      startPolling(false);
       handlers.onConnectionChange?.({ reconnecting: false, degradedToPolling: false });
     };
 
@@ -483,6 +724,7 @@ export function subscribeJobEvents(
       if (typeof event.seq === 'number' && event.seq > lastSeq) lastSeq = event.seq;
       // 真正收到一条消息才说明这条连接可以传输数据；仅 onopen 不足以证明。
       attempt = 0;
+      if (degradedPolling) startPolling(false);
       handlers.onEvent?.(event);
       if (event.type === 'job.closed') finish();
     };
@@ -502,6 +744,7 @@ export function subscribeJobEvents(
     };
   };
 
+  document.addEventListener('visibilitychange', onVisibilityChange);
   connect();
   startPolling();
 
@@ -528,6 +771,18 @@ export function selectEntries(
   );
 }
 
+/** 单条的“纳入写作”和核心角色共用一个明确的 PATCH，不污染批量复选状态。 */
+export function updateLibraryEntry(
+  projectId: string,
+  entryId: string,
+  changes: { literature_role: LiteratureRole },
+): Promise<LibraryEntry> {
+  return request<LibraryEntry>(`/projects/${projectId}/library/entries/${entryId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(changes),
+  });
+}
+
 /** 从文献库移除条目（后端 DELETE /library/entries/{id} 一直存在，此前无 UI 入口）。 */
 export function deleteLibraryEntry(projectId: string, entryId: string): Promise<ApiResult<void>> {
   return withFallback(
@@ -538,11 +793,12 @@ export function deleteLibraryEntry(projectId: string, entryId: string): Promise<
 }
 
 /** R1 写作白名单：引用 chip 的唯一取值来源。 */
-export function getWhitelist(projectId: string): Promise<ApiResult<string[]>> {
+export function getWhitelist(projectId: string, signal?: AbortSignal): Promise<ApiResult<string[]>> {
   return withFallback(
     () =>
       request<{ project_id: string; cite_keys: string[] }>(
         `/projects/${projectId}/library/whitelist`,
+        { signal },
       ).then((r) => r.cite_keys),
     [],
   );
@@ -561,6 +817,15 @@ export function getOutline(projectId: string): Promise<ApiResult<OutlinePayload 
 export function generateOutline(projectId: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () => request<Job>(`/projects/${projectId}/outline/generate`, { method: 'POST' }),
+    undefined,
+  );
+}
+
+export function rebuildDraft(
+  projectId: string,
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () => request<Job>(`/projects/${projectId}/draft/rebuild`, { method: 'POST' }),
     undefined,
   );
 }
@@ -608,8 +873,14 @@ export function generateAll(
   );
 }
 
-export function listSections(projectId: string): Promise<ApiResult<PaperSection[]>> {
-  return withFallback(() => request<PaperSection[]>(`/projects/${projectId}/sections`), []);
+export function listSections(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<PaperSection[]>> {
+  return withFallback(
+    () => request<PaperSection[]>(`/projects/${projectId}/sections`, { signal }),
+    [],
+  );
 }
 
 /**
@@ -642,9 +913,10 @@ export function updateSection(
 
 export function getCitationAudit(
   projectId: string,
+  signal?: AbortSignal,
 ): Promise<ApiResult<CitationAudit | undefined>> {
   return withFallback(
-    () => request<CitationAudit>(`/projects/${projectId}/citations/audit`),
+    () => request<CitationAudit>(`/projects/${projectId}/citations/audit`, { signal }),
     undefined,
   );
 }
@@ -673,7 +945,7 @@ export const ALL_EXPORT_FORMATS: RequestableExportFormat[] = [
 export function startExport(
   projectId: string,
   formats?: RequestableExportFormat[],
-  qualityProfile: QualityProfile = 'draft',
+  qualityProfile: QualityProfile = 'scholarly',
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
@@ -688,13 +960,31 @@ export function startExport(
   );
 }
 
-export function listExports(projectId: string): Promise<ApiResult<ExportArtifact[]>> {
-  return withFallback(() => request<ExportArtifact[]>(`/projects/${projectId}/exports`), []);
+export function listExports(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<ExportArtifact[]>> {
+  return withFallback(
+    () => request<ExportArtifact[]>(`/projects/${projectId}/exports`, { signal }),
+    [],
+  );
 }
 
 /** 产物下载直链（浏览器直接跳转，不经过 fetch）。 */
 export function exportDownloadUrl(projectId: string, artifactId: string): string {
   return `${API_BASE}${API_PREFIX}/projects/${projectId}/exports/${artifactId}/download`;
+}
+
+/** 一个真实导出任务下全部可用文件的 zip 下载直链。 */
+export function exportRunDownloadUrl(projectId: string, runId: string): string {
+  return `${API_BASE}${API_PREFIX}/projects/${projectId}/exports/runs/${runId}/download`;
+}
+
+/** 使用失败批次中持久化的格式、质量档位与正文快照参数重新导出。 */
+export function retryExportRun(projectId: string, runId: string): Promise<Job> {
+  return request<Job>(`/projects/${projectId}/exports/runs/${runId}/retry`, {
+    method: 'POST',
+  });
 }
 
 /**
@@ -709,8 +999,11 @@ export function exportPreviewUrl(projectId: string, artifactId: string): string 
 
 // ---- 素材中心（M4） ----
 
-export function listAssets(projectId: string): Promise<ApiResult<UserAsset[]>> {
-  return withFallback(() => request<UserAsset[]>(`/projects/${projectId}/assets`), []);
+export function listAssets(projectId: string, signal?: AbortSignal): Promise<ApiResult<UserAsset[]>> {
+  return withFallback(
+    () => request<UserAsset[]>(`/projects/${projectId}/assets`, { signal }),
+    [],
+  );
 }
 
 /** 上传素材：后端确定性解析入 parsed_json（正文数字的唯一合法出处）。 */
@@ -786,9 +1079,12 @@ export function listVisuals(projectId: string): Promise<ApiResult<VisualAsset[]>
  * 导航状态点、项目概览与导出提醒只要这几个数字；让它们各自拉一遍完整视觉
  * 列表（含 spec 与 renditions）纯属浪费。降级值全 0——摘要拿不到不该让导航消失。
  */
-export function getVisualSummary(projectId: string): Promise<ApiResult<VisualSummary>> {
+export function getVisualSummary(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<VisualSummary>> {
   return withFallback(
-    () => request<VisualSummary>(`/projects/${projectId}/visuals/summary`),
+    () => request<VisualSummary>(`/projects/${projectId}/visuals/summary`, { signal }),
     {
       project_id: projectId,
       pending: 0,
@@ -877,6 +1173,23 @@ export function generateVisual(
 }
 
 /**
+ * 在付费确认框出现前，让 DeepSeek 读取当前论文全文并生成最终生图提示词。
+ * 已经绑定当前正文快照的提示词由后端直接复用；旧草稿或正文变化后会重新分析。
+ */
+export function prepareVisualGeneration(
+  projectId: string,
+  visualId: string,
+): Promise<ApiResult<VisualAsset | undefined>> {
+  return withFallback(
+    () =>
+      request<VisualAsset>(`/projects/${projectId}/visuals/${visualId}/prepare-generation`, {
+        method: 'POST',
+      }),
+    undefined,
+  );
+}
+
+/**
  * 批准并插入。
  *
  * 与 `updateSection` 共用同一套乐观并发协议：`expectedSectionUpdatedAt` 让
@@ -939,8 +1252,8 @@ export function visualRenditionUrl(
   return `${API_BASE}${API_PREFIX}/projects/${projectId}/visuals/${visualId}/renditions/${format}`;
 }
 
-export function getNumLint(projectId: string): Promise<ApiResult<NumLintReport | undefined>> {
-  return withFallback(() => request<NumLintReport>(`/projects/${projectId}/numlint`), undefined);
+export function getNumLint(projectId: string, signal?: AbortSignal): Promise<ApiResult<NumLintReport | undefined>> {
+  return withFallback(() => request<NumLintReport>(`/projects/${projectId}/numlint`, { signal }), undefined);
 }
 
 // ---- 雪球 / 全文 / 质量 / 润色（M5） ----
@@ -972,12 +1285,14 @@ export function startIngest(projectId: string): Promise<ApiResult<Job | undefine
 
 export function getQuality(
   projectId: string,
-  qualityProfile: QualityProfile = 'draft',
+  qualityProfile: QualityProfile = 'scholarly',
+  signal?: AbortSignal,
 ): Promise<ApiResult<QualityReport | undefined>> {
   return withFallback(
     () =>
       request<QualityReport>(
         `/projects/${projectId}/quality?quality_profile=${qualityProfile}`,
+        { signal },
       ),
     undefined,
   );
@@ -997,6 +1312,20 @@ export function generateQuality(
   );
 }
 
+export function repairQuality(
+  projectId: string,
+  options: { quality_profile?: QualityProfile; review_style?: ReviewStyle } = {},
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/quality/repair`, {
+        method: 'POST',
+        body: JSON.stringify(options),
+      }),
+    undefined,
+  );
+}
+
 export function getClaimEvidence(
   projectId: string,
   reportId?: string,
@@ -1009,6 +1338,140 @@ export function getClaimEvidence(
   return withFallback(
     () => request<ClaimEvidence[]>(`/projects/${projectId}/quality/evidence${query}`),
     [],
+  );
+}
+
+export function getResearchQuestions(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<ResearchQuestion[]>> {
+  return withFallback(
+    () => request<ResearchQuestion[]>(`/projects/${projectId}/questions`, { signal }),
+    [],
+  );
+}
+
+export function generateResearchQuestions(
+  projectId: string,
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/questions/generate`, {
+        method: 'POST',
+      }),
+    undefined,
+  );
+}
+
+export function updateResearchQuestion(
+  projectId: string,
+  questionId: string,
+  changes: Partial<
+    Pick<
+      ResearchQuestion,
+      | 'text'
+      | 'comparison_dimensions'
+      | 'expected_evidence_kinds'
+      | 'answer_status'
+      | 'search_query'
+      | 'locked'
+    >
+  >,
+): Promise<ResearchQuestion> {
+  return request<ResearchQuestion>(`/projects/${projectId}/questions/${questionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(changes),
+  });
+}
+
+export function getEligibilityDecisions(
+  projectId: string,
+  decision?: 'include' | 'exclude' | 'uncertain',
+): Promise<ApiResult<EligibilityDecision[]>> {
+  const query = decision ? `?decision=${decision}` : '';
+  return withFallback(
+    () =>
+      request<EligibilityDecision[]>(
+        `/projects/${projectId}/library/eligibility-decisions${query}`,
+      ),
+    [],
+  );
+}
+
+export function getEvidenceUnits(projectId: string): Promise<ApiResult<EvidenceUnit[]>> {
+  return withFallback(
+    () => request<EvidenceUnit[]>(`/projects/${projectId}/evidence-units`),
+    [],
+  );
+}
+
+export function generateEvidenceUnits(
+  projectId: string,
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/evidence-units/generate`, {
+        method: 'POST',
+      }),
+    undefined,
+  );
+}
+
+export function getEvidenceMatrix(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<EvidenceMatrix | undefined>> {
+  return withFallback(
+    () => request<EvidenceMatrix>(`/projects/${projectId}/evidence-matrix`, { signal }),
+    undefined,
+  );
+}
+
+export function generateEvidenceMatrix(
+  projectId: string,
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/evidence-matrix/generate`, {
+        method: 'POST',
+      }),
+    undefined,
+  );
+}
+
+export function generateSynthesis(
+  projectId: string,
+): Promise<ApiResult<Job | undefined>> {
+  return withFallback(
+    () =>
+      request<Job>(`/projects/${projectId}/synthesis/generate`, {
+        method: 'POST',
+      }),
+    undefined,
+  );
+}
+
+export function getSynthesis(
+  projectId: string,
+): Promise<ApiResult<SynthesisPayload | undefined>> {
+  return withFallback(
+    () => request<SynthesisPayload>(`/projects/${projectId}/synthesis`),
+    undefined,
+  );
+}
+
+export function updateEvidenceMatrixLink(
+  projectId: string,
+  linkId: string,
+  stance: EvidenceStance,
+  conditionNote?: string | null,
+): Promise<EvidenceMatrix['links'][number]> {
+  return request<EvidenceMatrix['links'][number]>(
+    `/projects/${projectId}/evidence-matrix/${linkId}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ stance, condition_note: conditionNote }),
+    },
   );
 }
 
@@ -1046,12 +1509,33 @@ export function getRuntimeSettings(): Promise<ApiResult<RuntimeSettings | undefi
   return withFallback(() => request<RuntimeSettings>('/settings'), undefined);
 }
 
-export function getCostDetail(projectId: string): Promise<ApiResult<CostDetail | undefined>> {
-  return withFallback(() => request<CostDetail>(`/projects/${projectId}/cost/detail`), undefined);
+export function getCostDetail(projectId: string, signal?: AbortSignal): Promise<ApiResult<CostDetail | undefined>> {
+  return withFallback(() => request<CostDetail>(`/projects/${projectId}/cost/detail`, { signal }), undefined);
 }
 
 export function getVersionHistory(
   projectId: string,
+  signal?: AbortSignal,
 ): Promise<ApiResult<VersionHistory | undefined>> {
-  return withFallback(() => request<VersionHistory>(`/projects/${projectId}/versions`), undefined);
+  return withFallback(() => request<VersionHistory>(`/projects/${projectId}/versions`, { signal }), undefined);
+}
+
+export function getSubmissionReadiness(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<SubmissionReadiness | undefined>> {
+  return withFallback(
+    () => request<SubmissionReadiness>(`/projects/${projectId}/readiness`, { signal }),
+    undefined,
+  );
+}
+
+/** 把历史文稿复制为一个新的当前版本；旧版本永不原地覆盖。 */
+export function restoreDocumentVersion(
+  projectId: string,
+  documentId: string,
+): Promise<DocumentVersion> {
+  return request<DocumentVersion>(`/projects/${projectId}/versions/${documentId}/restore`, {
+    method: 'POST',
+  });
 }

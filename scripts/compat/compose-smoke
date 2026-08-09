@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ENV_FILE="${PAPERFORGE_ENV_FILE:-}"
+COMPOSE_FILE="${ROOT_DIR}/infra/docker-compose.prod.yml"
+PUBLIC_ORIGIN="${PAPERFORGE_SMOKE_ORIGIN:-https://ci.ts.net}"
+WEB_BASE="${PAPERFORGE_SMOKE_WEB_BASE:-http://127.0.0.1:3000}"
+ADMIN_EMAIL="${PAPERFORGE_SMOKE_EMAIL:-compat@example.com}"
+ADMIN_PASSWORD="${PAPERFORGE_SMOKE_PASSWORD:-correct-horse-battery-staple-2026}"
+
+say() {
+  printf '[paperforge-smoke] %s\n' "$*"
+}
+
+die() {
+  printf '[paperforge-smoke] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[ -n "${ENV_FILE}" ] || die "PAPERFORGE_ENV_FILE is required"
+[ -f "${ENV_FILE}" ] || die "environment file not found: ${ENV_FILE}"
+export PAPERFORGE_ENV_FILE="${ENV_FILE}"
+
+compose() {
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+}
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/paperforge-smoke.XXXXXX")"
+cleanup() {
+  find "${TMP_DIR}" -type f -delete 2>/dev/null || true
+  rmdir "${TMP_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+request() {
+  curl --fail --silent --show-error \
+    --header "Origin: ${PUBLIC_ORIGIN}" \
+    --header "Cookie: ${SESSION_COOKIE}" \
+    "$@"
+}
+
+json_field() {
+  local field="$1"
+  python3 -c "import json,sys; print(json.load(sys.stdin)['${field}'])"
+}
+
+wait_for_job() {
+  local project_id="$1" job_id="$2" status attempt
+  attempt=0
+  while [ "${attempt}" -lt 180 ]; do
+    status="$(request "${WEB_BASE}/api/v1/projects/${project_id}/jobs/${job_id}" | json_field status)"
+    case "${status}" in
+      succeeded) return 0 ;;
+      failed|cancelled) die "job ${job_id} ended with status ${status}" ;;
+    esac
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  die "job ${job_id} did not finish within 15 minutes"
+}
+
+say "starting production stack"
+"${ROOT_DIR}/scripts/ops" up
+
+say "creating a real administrator through the production administration path"
+printf '%s\n' "${ADMIN_PASSWORD}" | compose --profile tools run --rm --no-deps storage-tools \
+  paperforge-admin bootstrap-admin --email "${ADMIN_EMAIL}" --password-stdin
+
+curl --fail --silent --show-error "${WEB_BASE}/login" >/dev/null
+LOGIN_HEADERS="${TMP_DIR}/login-headers"
+curl --fail --silent --show-error --dump-header "${LOGIN_HEADERS}" --output /dev/null \
+  --header "Origin: ${PUBLIC_ORIGIN}" --header 'Content-Type: application/json' \
+  --data "{\"email\":\"${ADMIN_EMAIL}\",\"password\":\"${ADMIN_PASSWORD}\"}" \
+  "${WEB_BASE}/api/v1/auth/login"
+SESSION_COOKIE="$(awk 'tolower($1) == "set-cookie:" {sub(/\r$/, ""); split($2, parts, ";"); print parts[1]; exit}' "${LOGIN_HEADERS}")"
+[ -n "${SESSION_COOKIE}" ] || die "login did not return a session cookie"
+
+say "checking authenticated project, upload, task, SSE, PDF and DOCX paths"
+PROJECT_JSON="$(request --header 'Content-Type: application/json' \
+  --data '{"title":"Cross-platform smoke","paper_type":"review","writing_mode":"auto","language":"en","topic":"retrieval augmented generation for science","citation_style":"author_year"}' \
+  "${WEB_BASE}/api/v1/projects")"
+PROJECT_ID="$(printf '%s' "${PROJECT_JSON}" | json_field id)"
+printf 'step,value\nfirst,1\nsecond,2\n' >"${TMP_DIR}/input.csv"
+request --form "file=@${TMP_DIR}/input.csv;type=text/csv" \
+  "${WEB_BASE}/api/v1/projects/${PROJECT_ID}/assets" >/dev/null
+
+JOB_JSON="$(request --header 'Content-Type: application/json' \
+  --data '{"quality_profile":"draft","review_style":"narrative"}' \
+  "${WEB_BASE}/api/v1/projects/${PROJECT_ID}/generate")"
+JOB_ID="$(printf '%s' "${JOB_JSON}" | json_field id)"
+curl --silent --show-error --max-time 30 \
+  --header "Origin: ${PUBLIC_ORIGIN}" --header "Cookie: ${SESSION_COOKIE}" \
+  "${WEB_BASE}/api/v1/projects/${PROJECT_ID}/jobs/${JOB_ID}/events" \
+  >"${TMP_DIR}/events.txt" || true
+grep -Eq '^(event|data):' "${TMP_DIR}/events.txt" || die "SSE endpoint returned no events"
+wait_for_job "${PROJECT_ID}" "${JOB_ID}"
+
+EXPORTS="$(request "${WEB_BASE}/api/v1/projects/${PROJECT_ID}/exports")"
+printf '%s' "${EXPORTS}" >"${TMP_DIR}/exports.json"
+python3 - "${TMP_DIR}/exports.json" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))
+formats = {row["format"] for row in rows}
+missing = {"pdf", "docx"} - formats
+if missing:
+    raise SystemExit(f"missing production export formats: {sorted(missing)}")
+PY
+for format in pdf docx; do
+  download_url="$(python3 - "${TMP_DIR}/exports.json" "${format}" <<'PY'
+import json
+import sys
+
+rows = json.load(open(sys.argv[1], encoding="utf-8"))
+print(next(row["download_url"] for row in rows if row["format"] == sys.argv[2]))
+PY
+)"
+  request "${WEB_BASE}${download_url}" >"${TMP_DIR}/artifact.${format}"
+  [ -s "${TMP_DIR}/artifact.${format}" ] || die "${format} download was empty"
+done
+compose exec -T worker pandoc --version >/dev/null
+compose exec -T api python -c \
+  "import urllib.request; urllib.request.urlopen('http://texd:8081/healthz'); urllib.request.urlopen('http://visuald:8082/healthz')"
+
+say "checking backup, empty-volume restore, and object/database verification"
+BACKUP_DIR="${PAPERFORGE_SMOKE_BACKUP_DIR:-${ROOT_DIR}/.paperforge/compat-backup}"
+if [ -d "${BACKUP_DIR}" ]; then
+  die "smoke backup directory already exists: ${BACKUP_DIR}"
+fi
+"${ROOT_DIR}/scripts/ops" backup "${BACKUP_DIR}"
+"${ROOT_DIR}/scripts/ops" down
+compose down --volumes --remove-orphans
+"${ROOT_DIR}/scripts/ops" restore "${BACKUP_DIR}" --target-empty
+"${ROOT_DIR}/scripts/ops" up
+request "${WEB_BASE}/api/v1/projects/${PROJECT_ID}" >/dev/null
+
+say "checking that only the loopback Web port is published"
+for port in 5432 6379 9000 9001 8080 8081 8082; do
+  if ss -ltn | awk -v suffix=":${port}" '$4 ~ suffix "$" {found=1} END {exit !found}'; then
+    die "internal application port ${port} is published on the host"
+  fi
+done
+ss -ltn | awk '$4 == "127.0.0.1:3000" {found=1} END {exit !found}' || \
+  die "Web is not bound to 127.0.0.1:3000"
+
+say "production Compose smoke test passed"

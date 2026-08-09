@@ -11,7 +11,16 @@ from observability import configure_logging, get_logger
 
 from paperforge_api.config import get_settings
 from paperforge_api.deps import create_arq_pool, dispose_engine
-from paperforge_api.routers import assets, auth, events, health, projects, visuals, writing
+from paperforge_api.routers import (
+    assets,
+    auth,
+    events,
+    health,
+    library_pdf,
+    projects,
+    visuals,
+    writing,
+)
 
 # 别名：create_app 内的局部变量 settings 是配置对象，避免与路由模块重名。
 from paperforge_api.routers import settings as settings_router
@@ -94,6 +103,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(projects.router)
+    app.include_router(library_pdf.router)
     app.include_router(writing.router)
     app.include_router(assets.router)
     app.include_router(visuals.router)

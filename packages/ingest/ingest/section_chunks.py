@@ -145,28 +145,47 @@ def classify_content_role(text: str) -> ContentRoleDecision:
 
 def parse_markdown_table(text: str) -> StructuredTableEvidence | None:
     """Parse a bounded Markdown table while retaining row/cell source locators."""
-    lines = text.splitlines(keepends=True)
-    if len(lines) < 3:
+    all_lines = text.splitlines(keepends=True)
+    if len(all_lines) < 3:
         return None
+    start_index: int | None = None
+    for index in range(len(all_lines) - 2):
+        header_candidate = _table_cells(all_lines[index])
+        separator_candidate = _table_cells(all_lines[index + 1])
+        row_candidate = _table_cells(all_lines[index + 2])
+        if (
+            header_candidate
+            and separator_candidate
+            and row_candidate
+            and len(header_candidate) >= 2
+            and len(separator_candidate) == len(header_candidate)
+            and len(row_candidate) == len(header_candidate)
+            and all(re.fullmatch(r":?-{3,}:?", cell[0].strip()) for cell in separator_candidate)
+        ):
+            start_index = index
+            break
+    if start_index is None:
+        return None
+    lines = all_lines[start_index:]
     parsed_lines = [_table_cells(line) for line in lines]
-    if any(cells is None for cells in parsed_lines[:3]):
-        return None
     header = parsed_lines[0] or []
-    separator = parsed_lines[1] or []
-    if len(header) < 2 or len(separator) != len(header):
-        return None
-    if not all(re.fullmatch(r":?-{3,}:?", cell[0].strip()) for cell in separator):
-        return None
-    rows = parsed_lines[2:]
-    if not rows or any(row is None or len(row) != len(header) for row in rows):
+    rows: list[list[tuple[str, int, int]]] = []
+    row_lines: list[str] = []
+    for line, row in zip(lines[2:], parsed_lines[2:], strict=True):
+        if row is None or len(row) != len(header):
+            break
+        rows.append(row)
+        row_lines.append(line)
+    if not rows:
         return None
     columns = tuple(cell[0].strip() for cell in header)
     if any(not column for column in columns):
         return None
     cells: list[StructuredTableCell] = []
-    line_offset = sum(len(line) for line in lines[:2])
-    for row_index, (line, row) in enumerate(zip(lines[2:], rows, strict=True), start=1):
-        assert row is not None
+    line_offset = sum(len(line) for line in all_lines[:start_index]) + sum(
+        len(line) for line in lines[:2]
+    )
+    for row_index, (line, row) in enumerate(zip(row_lines, rows, strict=True), start=1):
         for column_index, (value, local_start, local_end) in enumerate(row):
             cells.append(
                 StructuredTableCell(

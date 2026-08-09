@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="${ROOT_DIR}/infra/docker-compose.prod.yml"
+ENV_FILE="${PAPERFORGE_ENV_FILE:-}"
+COMMAND="${1:-}"
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage: PAPERFORGE_ENV_FILE=/absolute/path/to/paperforge.env ./scripts/ops COMMAND [ARGS]
+
+Commands:
+  preflight                 Validate the host, Docker toolchain, and production configuration
+  up                        Build and start the production stack
+  restart                   Reconcile and restart the production stack
+  down                      Stop the production stack without deleting volumes
+  status                    Show service state
+  logs [SERVICE...]         Follow production logs
+  backup BACKUP_DIR         Create a PostgreSQL and object-storage backup
+  restore BACKUP_DIR --target-empty
+                            Restore only into an empty database and object store
+  purge-projects [--days N] [--dry-run]
+                            Permanently delete projects that have been in the
+                            recycle bin longer than N days (default 30) and
+                            reclaim the objects they own
+EOF
+}
+
+say() {
+  printf '[paperforge] %s\n' "$*"
+}
+
+die() {
+  printf '[paperforge] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+prepare_env() {
+  [ -n "${ENV_FILE}" ] || die "PAPERFORGE_ENV_FILE must point to a production env file outside the repository"
+  [ -f "${ENV_FILE}" ] || die "environment file not found: ${ENV_FILE}"
+  case "${ENV_FILE}" in
+    /*) ;;
+    *) ENV_FILE="$(cd "$(dirname "${ENV_FILE}")" && pwd)/$(basename "${ENV_FILE}")" ;;
+  esac
+  case "${ENV_FILE}" in
+    "${ROOT_DIR}"|"${ROOT_DIR}"/*) die "production env file must live outside the repository" ;;
+  esac
+  export PAPERFORGE_ENV_FILE="${ENV_FILE}"
+}
+
+compose() {
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+}
+
+env_value() {
+  local key="$1"
+  awk -v wanted="${key}" '
+    $0 !~ /^[[:space:]]*#/ && index($0, "=") > 0 {
+      name=$0
+      sub(/=.*/, "", name)
+      if (name == wanted) {
+        value=$0
+        sub(/^[^=]*=/, "", value)
+        print value
+        exit
+      }
+    }
+  ' "${ENV_FILE}"
+}
+
+skip_build() {
+  local value
+  value="${PAPERFORGE_SKIP_BUILD:-$(env_value PAPERFORGE_SKIP_BUILD)}"
+  case "${value}" in 1|true|TRUE|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+version_at_least() {
+  local current required current_major current_minor current_patch required_major required_minor required_patch
+  current="${1#v}"
+  required="${2#v}"
+  current="${current%%-*}"
+  required="${required%%-*}"
+  IFS=. read -r current_major current_minor current_patch <<EOF
+${current}
+EOF
+  IFS=. read -r required_major required_minor required_patch <<EOF
+${required}
+EOF
+  current_minor="${current_minor:-0}"
+  current_patch="${current_patch:-0}"
+  required_minor="${required_minor:-0}"
+  required_patch="${required_patch:-0}"
+  [ "${current_major}" -gt "${required_major}" ] || {
+    [ "${current_major}" -eq "${required_major}" ] &&
+      { [ "${current_minor}" -gt "${required_minor}" ] ||
+        { [ "${current_minor}" -eq "${required_minor}" ] &&
+          [ "${current_patch}" -ge "${required_patch}" ]; }; }
+  }
+}
+
+file_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+validate_env() {
+  local mode key value public_url proxy_url origins duplicates origin
+  mode="$(file_mode "${ENV_FILE}")"
+  mode="${mode#0}"
+  [ "${mode}" = "600" ] || die "production env file must have mode 0600 (found ${mode})"
+  duplicates="$(awk '
+    $0 !~ /^[[:space:]]*#/ && index($0, "=") > 0 {
+      name=$0
+      sub(/=.*/, "", name)
+      count[name]++
+    }
+    END {for (name in count) if (count[name] > 1) print name}
+  ' "${ENV_FILE}")"
+  [ -z "${duplicates}" ] || die "production env file contains duplicate keys: ${duplicates}"
+
+  for key in POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB DATABASE_URL REDIS_URL \
+    MINIO_ROOT_USER MINIO_ROOT_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY MINIO_BUCKET \
+    PUBLIC_APP_URL PAPERFORGE_PUBLIC_APP_URL CORS_ALLOW_ORIGINS SMTP_HOST SMTP_USERNAME \
+    SMTP_PASSWORD SMTP_FROM_EMAIL; do
+    value="$(env_value "${key}")"
+    [ -n "${value}" ] || die "missing production setting: ${key}"
+    case "${value}" in
+      *CHANGE_ME*) die "replace placeholder value for ${key}" ;;
+    esac
+  done
+
+  [ "$(env_value STORAGE_BACKEND)" = "minio" ] || die "production STORAGE_BACKEND must be minio"
+  [ "$(env_value AUTH_COOKIE_SECURE)" = "true" ] || die "AUTH_COOKIE_SECURE must be true"
+  [ "$(env_value AUTH_DEV_LOGIN_ENABLED)" = "false" ] || die "AUTH_DEV_LOGIN_ENABLED must be false"
+  [ "$(env_value AUTH_EMAIL_MODE)" = "smtp" ] || die "AUTH_EMAIL_MODE must be smtp"
+  public_url="$(env_value PUBLIC_APP_URL)"
+  proxy_url="$(env_value PAPERFORGE_PUBLIC_APP_URL)"
+  origins="$(env_value CORS_ALLOW_ORIGINS)"
+  case "${public_url}" in https://*) ;; *) die "PUBLIC_APP_URL must use HTTPS" ;; esac
+  [ "${proxy_url}" = "${public_url}" ] || \
+    die "PAPERFORGE_PUBLIC_APP_URL must exactly match PUBLIC_APP_URL"
+  case "${origins}" in *'*'*) die "CORS_ALLOW_ORIGINS must not contain a wildcard" ;; esac
+  while IFS= read -r origin; do
+    origin="$(printf '%s' "${origin}" | awk '{$1=$1; print}')"
+    case "${origin}" in https://*) ;; *) die "CORS_ALLOW_ORIGINS must contain only exact HTTPS origins" ;; esac
+  done <<EOF
+$(printf '%s' "${origins}" | tr ',' '\n')
+EOF
+  [ "$(env_value MINIO_ROOT_USER)" = "$(env_value MINIO_ACCESS_KEY)" ] || \
+    die "MINIO_ACCESS_KEY must match MINIO_ROOT_USER unless a separate user is provisioned"
+  [ "$(env_value MINIO_ROOT_PASSWORD)" = "$(env_value MINIO_SECRET_KEY)" ] || \
+    die "MINIO_SECRET_KEY must match MINIO_ROOT_PASSWORD unless a separate user is provisioned"
+}
+
+detect_host() {
+  local os_release_file
+  HOST_KIND="${PAPERFORGE_HOST_KIND_OVERRIDE:-$(uname -s)}"
+  UBUNTU_VERSION=""
+  if [ "${HOST_KIND}" = "Darwin" ]; then
+    return
+  fi
+  [ "${HOST_KIND}" = "Linux" ] || die "supported hosts are macOS and Ubuntu 20.04/22.04"
+  os_release_file="${PAPERFORGE_OS_RELEASE_FILE:-/etc/os-release}"
+  [ -r "${os_release_file}" ] || die "cannot read ${os_release_file}"
+  # shellcheck disable=SC1091
+  . "${os_release_file}"
+  [ "${ID:-}" = "ubuntu" ] || die "Linux production hosts must run Ubuntu"
+  UBUNTU_VERSION="${VERSION_ID:-}"
+  case "${UBUNTU_VERSION}" in 20.04|22.04) ;; *) die "Ubuntu ${UBUNTU_VERSION} is not a supported baseline" ;; esac
+}
+
+check_focal_esm() {
+  local status
+  [ "${UBUNTU_VERSION}" = "20.04" ] || return 0
+  require_command pro
+  status="$(pro status 2>/dev/null)" || die "Ubuntu Pro status could not be read"
+  printf '%s\n' "${status}" | grep -Eq '^esm-infra[[:space:]]+yes[[:space:]]+enabled' || \
+    die "Ubuntu 20.04 requires esm-infra to be entitled and enabled"
+  printf '%s\n' "${status}" | grep -Eq '^esm-apps[[:space:]]+yes[[:space:]]+enabled' || \
+    die "Ubuntu 20.04 requires esm-apps to be entitled and enabled"
+}
+
+check_docker() {
+  local engine compose_version buildx_version driver cgroup kernel
+  require_command docker
+  docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
+  engine="$(docker version --format '{{.Server.Version}}')"
+  version_at_least "${engine}" 26.0.0 || die "Docker Engine 26 or newer is required (found ${engine})"
+
+  compose_version="$(docker compose version --short 2>/dev/null || true)"
+  [ -n "${compose_version}" ] || die "Docker Compose v2 plugin is unavailable"
+  version_at_least "${compose_version}" 2.35.1 || \
+    die "Docker Compose 2.35.1 or newer is required (found ${compose_version})"
+
+  buildx_version="$(docker buildx version 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i ~ /^v[0-9]+\./) {print $i; exit}}')"
+  [ -n "${buildx_version}" ] || die "Docker Buildx plugin is unavailable"
+  version_at_least "${buildx_version}" 0.23.0 || \
+    die "Docker Buildx 0.23.0 or newer is required (found ${buildx_version})"
+
+  if [ "${UBUNTU_VERSION}" = "20.04" ]; then
+    [ "${engine%%.*}" = "26" ] || die "Ubuntu 20.04 compatibility baseline requires Docker Engine 26.x"
+    [ "${compose_version#v}" = "2.35.1" ] || die "Ubuntu 20.04 requires Compose 2.35.1 exactly"
+    [ "${buildx_version#v}" = "0.23.0" ] || die "Ubuntu 20.04 requires Buildx 0.23.0 exactly"
+    kernel="${PAPERFORGE_KERNEL_RELEASE_OVERRIDE:-$(uname -r)}"
+    case "${kernel}" in 5.4.*|5.15.*) ;; *) die "Ubuntu 20.04 requires a supported 5.4 or 5.15 kernel (found ${kernel})" ;; esac
+  fi
+
+  if [ "${HOST_KIND}" = "Linux" ]; then
+    driver="$(docker info --format '{{.Driver}}')"
+    [ "${driver}" = "overlay2" ] || die "Docker storage driver must be overlay2 (found ${driver})"
+    cgroup="$(docker info --format '{{.CgroupVersion}}')"
+    case "${cgroup}" in 1|2) ;; *) die "Docker must report cgroup v1 or v2" ;; esac
+    systemctl is-enabled docker >/dev/null 2>&1 || die "Docker must be enabled at boot"
+    systemctl is-active docker >/dev/null 2>&1 || die "Docker service is not active"
+  fi
+}
+
+check_resources() {
+  local cpus memory_bytes memory_gib disk_kib disk_gib
+  if [ "${HOST_KIND}" = "Darwin" ]; then
+    cpus="$(sysctl -n hw.logicalcpu)"
+    memory_bytes="$(sysctl -n hw.memsize)"
+  else
+    cpus="$(getconf _NPROCESSORS_ONLN)"
+    memory_bytes="$(awk '/^MemTotal:/ {printf "%.0f", $2 * 1024; exit}' /proc/meminfo)"
+  fi
+  memory_gib=$((memory_bytes / 1024 / 1024 / 1024))
+  disk_kib="$(df -Pk "$(dirname "${ENV_FILE}")" | awk 'NR == 2 {print $4}')"
+  disk_gib=$((disk_kib / 1024 / 1024))
+  if [ "${CI:-false}" != "true" ] || [ "${PAPERFORGE_CI_ALLOW_LOW_RESOURCES:-0}" != "1" ]; then
+    [ "${cpus}" -ge 4 ] || die "at least 4 CPU cores are required (found ${cpus})"
+    [ "${memory_gib}" -ge 8 ] || die "at least 8 GiB RAM is required (found ${memory_gib})"
+    [ "${disk_gib}" -ge 50 ] || die "at least 50 GiB free disk is required (found ${disk_gib})"
+  else
+    say "CI-only resource threshold override is active"
+  fi
+  say "resources: ${cpus} CPU, ${memory_gib} GiB RAM, ${disk_gib} GiB free disk"
+}
+
+check_port() {
+  local port bound
+  port="$(env_value PAPERFORGE_WEB_PORT)"
+  port="${port:-3000}"
+  bound=0
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk -v port=":${port}" '$4 ~ port "$" {found=1} END {exit !found}' && bound=1
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && bound=1
+  fi
+  if [ "${bound}" -eq 1 ]; then
+    compose ps --status running --services 2>/dev/null | grep -qx web || \
+      die "127.0.0.1:${port} is already in use by another process"
+  fi
+}
+
+preflight() {
+  prepare_env
+  detect_host
+  validate_env
+  check_focal_esm
+  check_docker
+  check_resources
+  compose config --quiet
+  check_port
+  say "preflight passed for ${HOST_KIND}${UBUNTU_VERSION:+ ${UBUNTU_VERSION}}"
+}
+
+database_counts() {
+  local output="$1" user database table rows tables
+  user="$(env_value POSTGRES_USER)"
+  database="$(env_value POSTGRES_DB)"
+  tables="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+    "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")"
+  printf 'table\trows\n' >"${output}"
+  while IFS= read -r table; do
+    [ -n "${table}" ] || continue
+    rows="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+      "SELECT count(*) FROM public.\"${table}\"")"
+    printf '%s\t%s\n' "${table}" "${rows}" >>"${output}"
+  done <<EOF
+${tables}
+EOF
+}
+
+checksum_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"
+  else
+    shasum -a 256 "$1"
+  fi
+}
+
+verify_checksums() {
+  local backup_dir="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "${backup_dir}" && sha256sum -c SHA256SUMS)
+  else
+    (cd "${backup_dir}" && shasum -a 256 -c SHA256SUMS)
+  fi
+}
+
+backup_stack() {
+  local backup_dir="${1:-}" user database active file
+  [ -n "${backup_dir}" ] || die "backup requires BACKUP_DIR"
+  prepare_env
+  preflight
+  case "${backup_dir}" in /*) ;; *) backup_dir="$(pwd)/${backup_dir}" ;; esac
+  if [ -d "${backup_dir}" ] && [ -n "$(find "${backup_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    die "backup directory must be empty: ${backup_dir}"
+  fi
+  mkdir -p "${backup_dir}"
+  chmod 700 "${backup_dir}"
+  user="$(env_value POSTGRES_USER)"
+  database="$(env_value POSTGRES_DB)"
+
+  compose up -d --wait postgres minio
+  active="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+    "SELECT count(*) FROM generation_job WHERE status IN ('queued','running')")"
+  [ "${active}" = "0" ] || die "refusing backup while ${active} generation jobs are queued or running"
+
+  say "creating PostgreSQL custom dump"
+  compose exec -T postgres pg_dump -U "${user}" -d "${database}" -Fc >"${backup_dir}/database.dump"
+  database_counts "${backup_dir}/database-counts.tsv"
+  compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+    "SELECT version_num FROM alembic_version" >"${backup_dir}/alembic-version.txt"
+
+  say "exporting and verifying object storage"
+  compose build storage-tools
+  compose --profile tools run --rm --no-deps --user "$(id -u):$(id -g)" \
+    -v "${backup_dir}:/backup" storage-tools \
+    paperforge-admin export-storage --archive /backup/objects.tar.gz \
+    --manifest /backup/objects-manifest.json
+
+  {
+    printf 'created_at_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'host=%s\n' "$(hostname)"
+    printf 'compose_project=%s\n' "${PAPERFORGE_COMPOSE_PROJECT:-paperforge-prod}"
+  } >"${backup_dir}/metadata.txt"
+
+  : >"${backup_dir}/SHA256SUMS"
+  for file in database.dump database-counts.tsv alembic-version.txt objects.tar.gz \
+    objects-manifest.json metadata.txt; do
+    (cd "${backup_dir}" && checksum_file "${file}") >>"${backup_dir}/SHA256SUMS"
+  done
+  chmod 600 "${backup_dir}"/*
+  say "backup complete: ${backup_dir}"
+}
+
+restore_stack() {
+  local backup_dir="${1:-}" confirmation="${2:-}" user database table_count current_counts current_alembic expected_alembic
+  [ -n "${backup_dir}" ] || die "restore requires BACKUP_DIR"
+  [ "${confirmation}" = "--target-empty" ] || die "restore requires explicit --target-empty confirmation"
+  prepare_env
+  preflight
+  case "${backup_dir}" in /*) ;; *) backup_dir="$(cd "$(dirname "${backup_dir}")" && pwd)/$(basename "${backup_dir}")" ;; esac
+  [ -d "${backup_dir}" ] || die "backup directory not found: ${backup_dir}"
+  [ -f "${backup_dir}/SHA256SUMS" ] || die "backup checksum manifest is missing"
+  verify_checksums "${backup_dir}"
+  user="$(env_value POSTGRES_USER)"
+  database="$(env_value POSTGRES_DB)"
+
+  compose up -d --wait postgres minio
+  table_count="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+    "SELECT count(*) FROM pg_tables WHERE schemaname='public'")"
+  [ "${table_count}" = "0" ] || die "target database is not empty"
+  compose build storage-tools
+  compose --profile tools run --rm --no-deps storage-tools \
+    paperforge-admin storage-count --require-empty
+
+  say "restoring PostgreSQL and object storage"
+  compose exec -T postgres pg_restore -U "${user}" -d "${database}" <"${backup_dir}/database.dump"
+  compose --profile tools run --rm --no-deps --user "$(id -u):$(id -g)" \
+    -v "${backup_dir}:/backup:ro" storage-tools \
+    paperforge-admin restore-storage --archive /backup/objects.tar.gz \
+    --manifest /backup/objects-manifest.json
+  compose run --rm --no-deps migrate alembic upgrade head
+
+  current_counts="$(mktemp "${TMPDIR:-/tmp}/paperforge-counts.XXXXXX")"
+  trap 'rm -f "${current_counts:-}"' EXIT HUP INT TERM
+  database_counts "${current_counts}"
+  cmp -s "${backup_dir}/database-counts.tsv" "${current_counts}" || \
+    die "restored database table counts do not match the backup"
+  current_alembic="$(compose exec -T postgres psql -v ON_ERROR_STOP=1 -U "${user}" -d "${database}" -Atc \
+    "SELECT version_num FROM alembic_version")"
+  expected_alembic="$(tr -d '\r\n' <"${backup_dir}/alembic-version.txt")"
+  [ "${current_alembic}" = "${expected_alembic}" ] || \
+    die "restored Alembic version does not match the backup"
+  compose --profile tools run --rm --no-deps --user "$(id -u):$(id -g)" \
+    -v "${backup_dir}:/backup:ro" storage-tools \
+    paperforge-admin restore-storage --archive /backup/objects.tar.gz \
+    --manifest /backup/objects-manifest.json --verify-only
+  rm -f "${current_counts}"
+  trap - EXIT HUP INT TERM
+  say "restore verified; run ./scripts/ops up when ready to serve traffic"
+}
+
+if [ "${PAPERFORGE_OPS_LIBRARY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+case "${COMMAND}" in
+  preflight)
+    preflight
+    ;;
+  up)
+    preflight
+    if skip_build; then
+      say "using preloaded images without rebuilding"
+      compose up -d --wait --no-build --remove-orphans
+    else
+      compose up -d --wait --build --remove-orphans
+    fi
+    compose ps
+    ;;
+  restart)
+    preflight
+    if skip_build; then
+      say "using preloaded images without rebuilding"
+      compose up -d --wait --no-build --force-recreate --remove-orphans
+    else
+      compose up -d --wait --build --force-recreate --remove-orphans
+    fi
+    compose ps
+    ;;
+  down)
+    prepare_env
+    compose down --remove-orphans
+    ;;
+  status)
+    prepare_env
+    compose ps
+    ;;
+  logs)
+    prepare_env
+    shift
+    compose logs --tail=200 --follow "$@"
+    ;;
+  backup)
+    shift
+    backup_stack "${1:-}"
+    ;;
+  restore)
+    shift
+    restore_stack "${1:-}" "${2:-}"
+    ;;
+  purge-projects)
+    prepare_env
+    shift
+    # 走 api 容器：它已经装好 paperforge-admin，也已经指向同一套 DB 与对象存储。
+    compose exec -T api paperforge-admin purge-projects "$@"
+    ;;
+  -h|--help|help|'')
+    usage
+    ;;
+  *)
+    usage >&2
+    die "unknown command: ${COMMAND}"
+    ;;
+esac

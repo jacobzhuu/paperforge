@@ -70,9 +70,18 @@ const config: Config = {
         serif: ['var(--font-serif)', 'Georgia', 'serif'],
         mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
+      fontSize: {
+        display: ['30px', { lineHeight: '1.2' }],
+        title: ['24px', { lineHeight: '1.3' }],
+        heading: ['20px', { lineHeight: '1.4' }],
+        subheading: ['18px', { lineHeight: '1.4' }],
+        body: ['15px', { lineHeight: '1.6' }],
+        meta: ['13px', { lineHeight: '1.5' }],
+        micro: ['12px', { lineHeight: '1.4' }],
+      },
       keyframes: {
         'fade-in': {
-          from: { opacity: '0', transform: 'translateY(4px)' },
+          from: { opacity: '0', transform: 'translateY(3px)' },
           to: { opacity: '1', transform: 'translateY(0)' },
         },
         'slide-in-right': {
@@ -81,8 +90,9 @@ const config: Config = {
         },
       },
       animation: {
-        'fade-in': 'fade-in 0.2s ease-out',
-        'slide-in-right': 'slide-in-right 0.25s cubic-bezier(0.32, 0.72, 0, 1)',
+        'fade-in': 'fade-in var(--motion-enter) var(--motion-ease-out)',
+        'slide-in-right':
+          'slide-in-right var(--motion-panel) var(--motion-ease-emphasized)',
       },
     },
   },

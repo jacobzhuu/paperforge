@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 from llm_runtime import LLMConfig, LLMRunner
 from llm_runtime.types import LLMResponse
 from paperforge_worker.pipelines.quality import (
+    CROSS_LANGUAGE_SUPPORT_CONFIDENCE,
     SOFT_CHECK_THRESHOLD,
     SoftCheckFinding,
     build_quality_report,
     count_words,
     coverage_hints,
     soft_check_citations,
+    verify_cross_language_claim_evidence,
+    zh_language_mismatches,
 )
 
 NOW = datetime(2026, 7, 25, tzinfo=UTC)
@@ -122,6 +126,114 @@ async def test_soft_check_survives_unparsable_output() -> None:
     assert findings == []
 
 
+# ---- 跨语言硬证据核验 ----
+
+
+def _bilingual_anchor(**overrides: Any) -> dict[str, Any]:
+    anchor: dict[str, Any] = {
+        "claim_hash": "claim-1",
+        "claim_text": "狄利克雷邻域采样能够降低污染节点对目标物品表示的影响。",
+        "claim_kind": "effect",
+        "cite_key": "yue2022defending",
+        "is_core": True,
+        "source_kind": "fulltext",
+        "source_section": "Methodology",
+        "source_page": None,
+        "source_paragraph": 2,
+        "evidence_excerpt": (
+            "Dirichlet neighborhood sampling reduces the influence of polluted nodes "
+            "on the target-item representation."
+        ),
+        "support_status": "insufficient_support",
+        "support_score": 0.0,
+        "grade_ok": True,
+        "comparability_ok": None,
+        "manual_status": "unreviewed",
+    }
+    anchor.update(overrides)
+    return anchor
+
+
+async def test_cross_language_verifier_promotes_only_confident_direct_support() -> None:
+    anchors = [_bilingual_anchor()]
+    summary = await verify_cross_language_claim_evidence(
+        anchors=anchors,
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "supported",
+                        "confidence": CROSS_LANGUAGE_SUPPORT_CONFIDENCE,
+                        "reason": "The excerpt directly states the same effect.",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert summary["status"] == "completed"
+    assert summary["promoted_count"] == 1
+    assert anchors[0]["support_status"] == "supported"
+    assert anchors[0]["support_score"] == CROSS_LANGUAGE_SUPPORT_CONFIDENCE
+
+
+async def test_cross_language_verifier_does_not_promote_partial_or_low_confidence_support() -> None:
+    partial = _bilingual_anchor(claim_hash="partial")
+    uncertain = _bilingual_anchor(claim_hash="uncertain")
+    summary = await verify_cross_language_claim_evidence(
+        anchors=[partial, uncertain],
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "partial",
+                        "confidence": 0.99,
+                        "reason": "Only the method name overlaps.",
+                    },
+                    {
+                        "index": 1,
+                        "verdict": "supported",
+                        "confidence": CROSS_LANGUAGE_SUPPORT_CONFIDENCE - 0.01,
+                        "reason": "Support is not sufficiently certain.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    assert summary["checked_count"] == 2
+    assert summary["promoted_count"] == 0
+    assert partial["support_status"] == "insufficient_support"
+    assert uncertain["support_status"] == "insufficient_support"
+
+
+async def test_cross_language_verifier_fails_closed_and_preserves_other_hard_rules() -> None:
+    unavailable = _bilingual_anchor()
+    summary = await verify_cross_language_claim_evidence(
+        anchors=[unavailable],
+        runner=_runner("<html>not json</html>"),
+    )
+    assert summary["status"] == "unavailable"
+    assert summary["failed_count"] == 1
+    assert unavailable["support_status"] == "insufficient_support"
+
+    numeric_without_locator = _bilingual_anchor(
+        claim_kind="numeric",
+        support_status="numeric_locator_missing",
+    )
+    same_language = _bilingual_anchor(
+        claim_text="Dirichlet sampling reduced polluted-node influence.",
+    )
+    not_needed = await verify_cross_language_claim_evidence(
+        anchors=[numeric_without_locator, same_language],
+        runner=_runner({"judgements": []}),
+    )
+    assert not_needed["status"] == "not_needed"
+    assert not_needed["candidate_count"] == 0
+
+
 # ---- 覆盖建议 ----
 
 
@@ -209,6 +321,49 @@ def test_frame_sections_are_not_hinted_for_missing_citations() -> None:
 
 
 # ---- 质量评分 ----
+
+
+def test_zh_language_check_flags_a_full_english_prose_paragraph() -> None:
+    row = SimpleNamespace(
+        section_key="s1",
+        body_ir_json={
+            "blocks": [
+                {
+                    "runs": [
+                        {
+                            "t": "text",
+                            "v": "This is a complete English paragraph with enough words to "
+                            "trigger the Chinese manuscript language quality check reliably and "
+                            "ensure that an untranslated generated discussion cannot pass export.",
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    assert zh_language_mismatches([row])[0]["section_key"] == "s1"
+
+
+def test_zh_language_check_allows_chinese_prose_with_english_terms() -> None:
+    row = SimpleNamespace(
+        section_key="s1",
+        body_ir_json={
+            "blocks": [
+                {
+                    "runs": [
+                        {
+                            "t": "text",
+                            "v": (
+                                "该方法在 MIBiG 数据集上使用 Transformer 模型进行"
+                                "生物合成基因簇识别。"
+                            ),
+                        }
+                    ]
+                }
+            ]
+        },
+    )
+    assert zh_language_mismatches([row]) == []
 
 
 def test_quality_report_computes_density_and_coverage() -> None:

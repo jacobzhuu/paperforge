@@ -91,7 +91,7 @@ export function normalizeSectionIR(section: SectionIR): SectionIR {
     const runs = normalizeRuns(block.runs ?? []);
     // 空段落不落库：它不携带内容，留着只会让往返不幂等。
     if (runs.length === 0) continue;
-    blocks.push({ type: 'paragraph', runs });
+    blocks.push({ ...block, type: 'paragraph', runs });
   }
   return {
     ...section,
@@ -132,7 +132,17 @@ function normalizeRuns(runs: IRRun[]): IRRun[] {
       // 去重但保序：同一段落里重复插入同一个 key 没有意义。
       const keys = Array.from(new Set(run.keys ?? []));
       if (keys.length === 0) continue;
-      out.push({ t: 'cite', keys });
+      const evidenceIds = Array.from(new Set(run.evidence_ids ?? []));
+      out.push({
+        t: 'cite',
+        keys,
+        ...(evidenceIds.length > 0 ? { evidence_ids: evidenceIds } : {}),
+      });
+      continue;
+    }
+    if (run.t === 'grounding') {
+      const sourceRefs = Array.from(new Set(run.source_refs ?? [])).filter(Boolean);
+      if (sourceRefs.length > 0) out.push({ t: 'grounding', source_refs: sourceRefs });
       continue;
     }
     if (run.t === 'math_inline') {
@@ -156,7 +166,11 @@ export function irToTiptap(section: SectionIR): TiptapDoc {
 }
 
 function runsToNodes(runs: IRRun[]): TiptapNode[] {
-  return normalizeRuns(runs).map(runToNode);
+  // Grounding remains in normalized IR but has no editor node: it is restored only when
+  // the corresponding visible paragraph is unchanged.
+  return normalizeRuns(runs)
+    .filter((run) => run.t !== 'grounding')
+    .map(runToNode);
 }
 
 function blockToNode(block: IRBlock): TiptapNode {
@@ -187,11 +201,20 @@ function runToNode(run: IRRun): TiptapNode {
       ? { type: 'text', text: run.v, marks }
       : { type: 'text', text: run.v };
   }
-  if (run.t === 'cite') return { type: CITE_NODE, attrs: { keys: run.keys } };
+  if (run.t === 'cite') {
+    return {
+      type: CITE_NODE,
+      attrs: { keys: run.keys, evidenceIds: run.evidence_ids ?? [] },
+    };
+  }
   if (run.t === 'xref') {
     return { type: XREF_NODE, attrs: { target: run.target, kind: run.kind } };
   }
-  return { type: MATH_NODE, attrs: { latex: run.v } };
+  if (run.t === 'math_inline') {
+    return { type: MATH_NODE, attrs: { latex: run.v } };
+  }
+  // runsToNodes filters audit-only grounding before this point.
+  return { type: 'text', text: '' };
 }
 
 export function tiptapToIR(doc: TiptapDoc | undefined, base: SectionIR): SectionIR {
@@ -201,7 +224,42 @@ export function tiptapToIR(doc: TiptapDoc | undefined, base: SectionIR): Section
     const block = nodeToBlock(node);
     if (block) blocks.push(block);
   }
-  return normalizeSectionIR({ ...base, blocks });
+  const stances = (base.blocks ?? [])
+    .filter(isParagraph)
+    .map((block) => block.stance_summary);
+  let paragraphIndex = 0;
+  const withStances = blocks.map((block) => {
+    if (!isParagraph(block)) return block;
+    const stance = stances[paragraphIndex++];
+    return stance ? { ...block, stance_summary: stance } : block;
+  });
+  return normalizeSectionIR({
+    ...base,
+    blocks: restoreUnchangedGrounding(withStances, base.blocks ?? []),
+  });
+}
+
+function restoreUnchangedGrounding(blocks: IRBlock[], baseBlocks: IRBlock[]): IRBlock[] {
+  const signature = (block: IRParagraph) =>
+    (block.runs ?? [])
+      .filter((run) => run.t !== 'grounding')
+      .map((run) =>
+        run.t === 'text'
+          ? `t:${run.v}`
+          : run.t === 'cite'
+            ? `c:${run.keys.join(',')}:${(run.evidence_ids ?? []).join(',')}`
+            : JSON.stringify(run),
+      )
+      .join('|');
+  return blocks.map((block, index) => {
+    const previous = baseBlocks[index];
+    if (!isParagraph(block) || !previous || !isParagraph(previous)) return block;
+    const groundings = (previous.runs ?? []).filter((run) => run.t === 'grounding');
+    if (groundings.length === 0 || signature(block) !== signature(previous)) return block;
+    // Exact content/citation match: retain the original interleaving so every
+    // grounding remains attached to its sentence.
+    return previous;
+  });
 }
 
 function nodesToRuns(nodes: TiptapNode[] | undefined): IRRun[] {
@@ -250,7 +308,14 @@ function nodeToRun(node: TiptapNode): IRRun | null {
   }
   if (node.type === CITE_NODE) {
     const keys = (node.attrs?.keys as string[] | undefined) ?? [];
-    return keys.length > 0 ? { t: 'cite', keys } : null;
+    const evidenceIds = (node.attrs?.evidenceIds as string[] | undefined) ?? [];
+    return keys.length > 0
+      ? {
+          t: 'cite',
+          keys,
+          ...(evidenceIds.length > 0 ? { evidence_ids: evidenceIds } : {}),
+        }
+      : null;
   }
   if (node.type === MATH_NODE) {
     const latex = String(node.attrs?.latex ?? '');

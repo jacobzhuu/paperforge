@@ -183,6 +183,8 @@ async def export_document(
         visual_assets=visual_assets,
         store=store,
     )
+    # 只裁 LaTeX 编译通道；Markdown 包不走 texd，没有这些限制，图片保持完整。
+    outcome.warnings.extend(_enforce_binary_channel_limits(render_assets, latex_figures))
     project_files = build_latex_project(
         ir,
         references=references,
@@ -392,8 +394,14 @@ async def _compile_pdf(
             visual_preflight_issues=visual_preflight_issues or [],
         )
         layout_passed = bool(outcome.layout_checks.get("passed"))
-        if quality.profile == "submission":
-            outcome.readiness_status = "submission_ready" if layout_passed else "needs_revision"
+        if quality.profile in {"submission", "scholarly"}:
+            outcome.readiness_status = (
+                "submission_ready"
+                if quality.profile == "submission" and layout_passed
+                else "preflight_ready"
+                if layout_passed
+                else "needs_revision"
+            )
             if not layout_passed:
                 outcome.blockers = list(outcome.layout_checks.get("blockers") or [])
         await _update_quality_after_layout(
@@ -569,12 +577,7 @@ def inspect_pdf_layout(
                 page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_TEXT]), start=1
             ):
                 left, bottom, right, top = item.get_pos()
-                if (
-                    left < -1
-                    or bottom < -1
-                    or right > page_width + 1
-                    or top > page_height + 1
-                ):
+                if left < -1 or bottom < -1 or right > page_width + 1 or top > page_height + 1:
                     text_bounds_violations.append(
                         {
                             "page": page_index + 1,
@@ -628,11 +631,24 @@ def inspect_pdf_layout(
         re.search(r"Citation .* undefined|There were undefined references", compile_log, re.I)
         or any("[?]" in text or "??" in text for text in page_texts)
     )
+    overfull = [
+        float(match.group(1))
+        for match in re.finditer(r"Overfull \\hbox \((\d+(?:\.\d+)?)pt too wide\)", compile_log)
+    ]
     if missing_glyphs:
         blockers.append({"code": "missing_glyphs", "message": "编译日志检测到 Unicode 缺字"})
     if unresolved_citations:
         blockers.append(
             {"code": "unresolved_citations", "message": "PDF 中存在未解析引用或交叉引用"}
+        )
+    if any(width > 5.0 for width in overfull):
+        blockers.append(
+            {
+                "code": "overfull_hbox",
+                "message": "编译日志存在超过 5pt 的表格或正文溢出",
+                "count": sum(width > 5.0 for width in overfull),
+                "max_pt": max(overfull),
+            }
         )
     if caption_count != expected_figure_count:
         blockers.append(
@@ -696,6 +712,7 @@ def inspect_pdf_layout(
         "expected_figure_count": expected_figure_count,
         "caption_count": caption_count,
         "caption_numbers": caption_numbers,
+        "overfull_hbox_points": overfull,
         "reference_start_page": reference_page + 1 if reference_page is not None else None,
         "image_count_by_page": image_counts,
         "images_after_references": images_after_references,
@@ -829,7 +846,27 @@ def _build_ir(
             for run in block.get("runs", [])
             if run.get("t") == "text"
         ).strip()
-    body = [s for s in sections if s.key != "abstract"]
+    # 摘要正文进入模板的 abstract 环境，但摘要里的 FigureBlock/TableBlock 不能
+    # 随章节一起被丢掉。全流程生成的唯一论文摘要图正是插在 abstract 末尾；
+    # 旧逻辑只提取 text run，导致视觉已批准、正文也有 FigureBlock，导出工程却
+    # 没有 figures/ 和 includegraphics。把非段落块保留为无标题前置区块，
+    # 渲染后紧跟摘要、位于引言之前。
+    front_matter_blocks = (
+        [block for block in abstract_section.blocks if block.type != "paragraph"]
+        if abstract_section is not None
+        else []
+    )
+    body: list[IRSection] = []
+    if front_matter_blocks:
+        body.append(
+            IRSection(
+                key="abstract-visuals",
+                level=1,
+                title="",
+                blocks=front_matter_blocks,
+            )
+        )
+    body.extend(s for s in sections if s.key != "abstract")
     return PaperIR(
         meta=PaperMeta(
             title=title,
@@ -951,6 +988,59 @@ def _resolve_visual_files(
             }
         )
     return render_assets, latex_files, markdown_files, provenance
+
+
+# texd 的二进制通道契约（services/texd/paperforge_texd/main.py 的
+# MAX_BINARY_FILES / MAX_BINARY_FILE_BYTES / MAX_BINARY_TOTAL_BYTES）。
+# 超限时 texd 拒收**整个请求**并只回一行 `too many binary files`——日志里
+# 没有任何 TeX 输出，修复轮次无从下手，PDF 直接没了。所以必须在这一侧先收口：
+# 宁可少放几张图（渲染器会给出显式占位），也不能让整篇论文编不出来。
+MAX_FIGURE_FILES = 32
+MAX_FIGURE_FILE_BYTES = 16 * 1024 * 1024
+MAX_FIGURE_TOTAL_BYTES = 64 * 1024 * 1024
+
+
+def _enforce_binary_channel_limits(
+    render_assets: dict[str, dict[str, Any]],
+    latex_files: dict[str, bytes],
+) -> list[dict[str, Any]]:
+    """把图片文件裁到 texd 收得下的范围，返回告警（降级要可见，不能装作没发生）。"""
+    by_path = {
+        str(asset["figure_path"]): ref
+        for ref, asset in render_assets.items()
+        if asset.get("figure_path")
+    }
+    dropped: list[str] = []
+    kept = 0
+    total = 0
+    for path in sorted(latex_files):
+        content = latex_files[path]
+        if (
+            kept >= MAX_FIGURE_FILES
+            or len(content) > MAX_FIGURE_FILE_BYTES
+            or total + len(content) > MAX_FIGURE_TOTAL_BYTES
+        ):
+            dropped.append(path)
+            continue
+        kept += 1
+        total += len(content)
+    for path in dropped:
+        del latex_files[path]
+        ref = by_path.get(path)
+        if ref is not None:
+            # 去掉 figure_path，渲染器就会排一个「缺少图片素材」的 TODO 占位，
+            # 而不是 \includegraphics 一个工程里并不存在的文件（那必挂）。
+            render_assets[ref].pop("figure_path", None)
+    if not dropped:
+        return []
+    return [
+        {
+            "stage": "export",
+            "reason": "figures_dropped_for_compile_limits",
+            "count": len(dropped),
+            "paths": sorted(dropped)[:10],
+        }
+    ]
 
 
 def _image_suffix(content: bytes) -> str | None:
@@ -1094,6 +1184,7 @@ async def _store(
             session.add(
                 ExportArtifact(
                     project_id=context.project_id,
+                    export_run_id=context.job_id,
                     document_version=document_version,
                     format=kind,
                     object_key=key,

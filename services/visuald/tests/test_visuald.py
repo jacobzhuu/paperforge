@@ -123,6 +123,47 @@ def test_normalize_removes_metadata_and_returns_png() -> None:
     assert response.json()["provenance"]["visual_qa"]["passed"] is False
 
 
+def test_normalize_repairs_provider_output_to_requested_publication_canvas() -> None:
+    """Provider 忽略 size 返回极端宽图时，应自动适配而不是在计费后判失败。"""
+    source = io.BytesIO()
+    Image.new("RGB", (1200, 120), "#2563eb").save(source, format="PNG")
+    response = TestClient(app).post(
+        "/normalize",
+        json={
+            "image_base64": base64.b64encode(source.getvalue()).decode(),
+            "target_size": "1536x1024",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    item = body["renditions"][0]
+    assert (item["width"], item["height"]) == (1536, 1024)
+    assert body["provenance"]["source_size"] == [1200, 120]
+    assert body["provenance"]["canvas_adjusted"] is True
+    assert body["provenance"]["visual_qa"]["passed"] is True
+
+
+def test_normalize_allows_sparse_white_background_for_ai_illustrations() -> None:
+    """AI 论文摘要图常见中心主体 + 大白底，不应套用图表的 75% 留白上限。"""
+    source = Image.new("RGB", (1536, 1024), "white")
+    for x in range(700, 836):
+        for y in range(450, 574):
+            source.putpixel((x, y), (37, 99, 235))
+    encoded = io.BytesIO()
+    source.save(encoded, format="PNG")
+    response = TestClient(app).post(
+        "/normalize",
+        json={
+            "image_base64": base64.b64encode(encoded.getvalue()).decode(),
+            "target_size": "1536x1024",
+        },
+    )
+    assert response.status_code == 200, response.text
+    qa = response.json()["provenance"]["visual_qa"]
+    assert qa["metrics"]["outer_whitespace_ratio"] > 0.75
+    assert qa["passed"] is True
+
+
 def test_normalize_rejects_invalid_base64_corrupt_and_oversize(monkeypatch) -> None:
     import paperforge_visuald.main as visuald_main
 
@@ -265,6 +306,60 @@ def test_grouped_diagram_renders_all_formats() -> None:
     # 分组标签与中文都要真的进入产物。
     assert "编码阶段" in svg
     assert 'font-family="Noto Sans CJK SC"' in svg
+
+
+@pytest.mark.skipif(shutil.which("dot") is None, reason="graphviz 未安装")
+def test_column_lr_diagram_uses_printable_vertical_layout_and_300_dpi() -> None:
+    """窄栏横向长链不能生成 994×77 这类不可印刷的极端画布。"""
+    response = TestClient(app).post(
+        "/render/diagram",
+        json={
+            "spec": {
+                "kind": "diagram",
+                "direction": "LR",
+                "width": "column",
+                "nodes": [{"id": f"n{index}", "label": f"阶段 {index}"} for index in range(1, 6)],
+                "edges": [
+                    {"source": f"n{index}", "target": f"n{index + 1}"} for index in range(1, 5)
+                ],
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["provenance"]["requested_direction"] == "LR"
+    assert body["provenance"]["effective_direction"] == "TB"
+    assert body["provenance"]["visual_qa"]["passed"] is True
+    png = next(item for item in body["renditions"] if item["format"] == "png")
+    # 96 DPI 下同类图只有约 350 px 高；300 DPI 应提供可印刷的像素预算。
+    assert png["height"] >= 600
+
+
+@pytest.mark.skipif(shutil.which("dot") is None, reason="graphviz 未安装")
+def test_full_width_parallel_flow_allows_a_wide_publication_layout() -> None:
+    """全宽双流程约 5.2:1 是合法版式，不应套用照片的 4:1 上限。"""
+    response = TestClient(app).post(
+        "/render/diagram",
+        json={
+            "spec": {
+                "kind": "diagram",
+                "direction": "LR",
+                "width": "full",
+                "nodes": [
+                    {"id": f"a{index}", "label": f"攻击阶段 {index}"} for index in range(1, 6)
+                ]
+                + [{"id": f"d{index}", "label": f"防御阶段 {index}"} for index in range(1, 4)],
+                "edges": [
+                    {"source": f"a{index}", "target": f"a{index + 1}"} for index in range(1, 5)
+                ]
+                + [{"source": f"d{index}", "target": f"d{index + 1}"} for index in range(1, 3)],
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    qa = response.json()["provenance"]["visual_qa"]
+    assert qa["passed"] is True
+    assert qa["metrics"]["height"] >= 160
 
 
 def test_in_filter_matches_the_same_rows_as_eq() -> None:

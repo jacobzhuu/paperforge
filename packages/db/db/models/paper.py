@@ -51,6 +51,125 @@ class PaperProject(Base, TimestampMixin):
     citation_style: Mapped[str] = mapped_column(String(32), default="author_year", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     scope_json: Mapped[dict | None] = mapped_column(JSONB)
+    # 软删除：删掉的项目动辄是几小时 LLM 花费的产物，误删不可逆太贵。
+    # 置位后所有 project 作用域路由一律 404（收口在 get_owned_project），
+    # 真正的行删除与对象回收由保留期后的 `paperforge-admin purge-projects` 执行。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ResearchQuestion(Base, TimestampMixin):
+    """核心问题与子问题的两层树。"""
+
+    __tablename__ = "research_question"
+    __table_args__ = (
+        UniqueConstraint("project_id", "kind", "order_index", name="uq_question_project_order"),
+        Index("ix_research_question_project_parent", "project_id", "parent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("research_question.id", ondelete="CASCADE"), index=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    comparison_dimensions_json: Mapped[list | None] = mapped_column(JSONB)
+    expected_evidence_kinds_json: Mapped[list | None] = mapped_column(JSONB)
+    answer_status: Mapped[str] = mapped_column(
+        String(32), default="insufficient_evidence", nullable=False
+    )
+    generator: Mapped[str | None] = mapped_column(String(128))
+    # auto | user —— 谁定义了这个问题。`generator` 记的是最后一次写入者，会被重生成覆盖，
+    # 因此不能用它判断「是否是用户的意图」；`origin` 一旦置为 user 就不再回退。
+    origin: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
+    # 锁定的问题文本与检索面不得被自动重生成或自动适配改写（只有用户能解锁）。
+    locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("task_definition.slug", ondelete="SET NULL"), index=True
+    )
+    # English retrieval surface for cross-language QMATRIX bridging (R13).
+    search_query: Mapped[str | None] = mapped_column(Text)
+    term_aliases_json: Mapped[dict | list | None] = mapped_column(JSONB)
+
+
+class ResearchQuestionRevision(Base, TimestampMixin):
+    """「原问题 → 调整后问题」审计轨迹。
+
+    自动问题适配必须可复核：任何一次系统改写都留下原文、新文与触发原因，
+    否则问题漂移在成稿里是不可见的。
+    """
+
+    __tablename__ = "research_question_revision"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    research_question_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("research_question.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    old_text: Mapped[str] = mapped_column(Text, nullable=False)
+    new_text: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail_json: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class TaskDefinition(Base, TimestampMixin):
+    """Domain task schema; new topics are data additions rather than code forks."""
+
+    __tablename__ = "task_definition"
+
+    slug: Mapped[str] = mapped_column(String(96), primary_key=True)
+    domain: Mapped[str] = mapped_column(String(64), nullable=False)
+    label_i18n_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    metric_whitelist_json: Mapped[list | None] = mapped_column(JSONB)
+    dataset_whitelist_json: Mapped[list | None] = mapped_column(JSONB)
+    dimension_schema_json: Mapped[list | None] = mapped_column(JSONB)
+    exclusion_cues_json: Mapped[list | None] = mapped_column(JSONB)
+    inclusion_cues_json: Mapped[list | None] = mapped_column(JSONB)
+
+
+class ProjectTaskProfile(Base, TimestampMixin):
+    __tablename__ = "project_task_profile"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), primary_key=True
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("task_definition.slug", ondelete="RESTRICT"), primary_key=True
+    )
+    is_core: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class QuestionEvidenceLink(Base, TimestampMixin):
+    """问题—证据矩阵中的一个可人工修正单元。"""
+
+    __tablename__ = "question_evidence_link"
+    __table_args__ = (
+        UniqueConstraint(
+            "research_question_id",
+            "evidence_unit_id",
+            name="uq_question_evidence_link",
+        ),
+        Index("ix_question_evidence_stance", "research_question_id", "stance"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    research_question_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("research_question.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    evidence_unit_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence_unit.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    stance: Mapped[str] = mapped_column(String(24), nullable=False)
+    condition_note: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    manually_overridden: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # lexical | bridged | degraded_lexical_bypass
+    routing_mode: Mapped[str | None] = mapped_column(String(32))
+    # text | dimensions | search_query | aliases | degraded
+    bridge_source: Mapped[str | None] = mapped_column(String(32))
 
 
 class GenerationJob(Base):
@@ -60,9 +179,9 @@ class GenerationJob(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
     )
-    # kind: search|ingest|cards|outline|write|compile|visual|full
+    # kind: search|ingest|cards|qdecomp|evidence|qmatrix|synth|outline|write|compile|visual|full
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
-    # status: queued|running|succeeded|failed|cancelled（Draft-first：无「拒绝产出」终态）
+    # status: queued|running|paused|succeeded|failed|cancelled|needs_input
     status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False)
     progress: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     stage: Mapped[str | None] = mapped_column(String(32))
@@ -310,8 +429,8 @@ class ClaimEvidenceAnchor(Base):
         UniqueConstraint(
             "quality_report_id",
             "claim_hash",
-            "cite_key",
-            name="uq_claim_evidence_report_claim_cite",
+            "source_key",
+            name="uq_claim_evidence_report_claim_source",
         ),
         Index("ix_claim_evidence_project_core", "project_id", "is_core"),
     )
@@ -332,19 +451,28 @@ class ClaimEvidenceAnchor(Base):
     work_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("scholarly_work.id", ondelete="SET NULL"), index=True
     )
+    user_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("user_asset.id", ondelete="SET NULL"), index=True
+    )
     section_key: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_text: Mapped[str] = mapped_column(Text, nullable=False)
     claim_kind: Mapped[str] = mapped_column(String(24), nullable=False)
     is_core: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     cite_key: Mapped[str | None] = mapped_column(String(128))
+    source_key: Mapped[str] = mapped_column(String(160), nullable=False)
     source_kind: Mapped[str] = mapped_column(String(24), nullable=False)
     source_page: Mapped[int | None] = mapped_column(Integer)
     source_section: Mapped[str | None] = mapped_column(Text)
     source_paragraph: Mapped[int | None] = mapped_column(Integer)
     evidence_excerpt: Mapped[str | None] = mapped_column(Text)
     evidence_hash: Mapped[str | None] = mapped_column(String(64))
-    support_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    evidence_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evidence_unit.id", ondelete="SET NULL"), index=True
+    )
+    comparability_ok: Mapped[bool | None] = mapped_column(Boolean)
+    grade_ok: Mapped[bool | None] = mapped_column(Boolean)
+    support_status: Mapped[str] = mapped_column(String(48), nullable=False)
     support_score: Mapped[float | None] = mapped_column(Float)
     manual_status: Mapped[str] = mapped_column(String(24), default="unreviewed", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -380,6 +508,9 @@ class ExportArtifact(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
     )
+    export_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="SET NULL"), index=True
+    )
     document_version: Mapped[int | None] = mapped_column(Integer)
     # format: latex_zip|pdf|docx|bibtex|markdown|markdown_bundle|compile_log
     format: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -403,16 +534,29 @@ class LlmCallLog(Base):
     __tablename__ = "llm_call_log"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
-    project_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("paper_project.id"), index=True)
-    job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("generation_job.id"))
+    # 其余 project 关联表都是 CASCADE，唯独成本台账此前没写 ondelete（默认 NO ACTION），
+    # 于是硬删除项目会被这两条外键顶回来。保留期后的 purge 要能真删，这里必须级联。
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="CASCADE")
+    )
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32))
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     cost_estimate: Mapped[float | None] = mapped_column(Float)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     # 失败调用也要留痕：否则成本面板里「失败」与「零 token 成功」无法区分。
     error_code: Mapped[str | None] = mapped_column(String(64))
+    metadata_json: Mapped[dict | None] = mapped_column(JSONB)
+    # Keep a server default for blue/green compatibility: an older worker may
+    # finish an in-flight job after this column exists and omit it on INSERT.
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

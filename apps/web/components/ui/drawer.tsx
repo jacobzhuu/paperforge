@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useFocusTrap, useId } from '@/lib/useFocusTrap';
@@ -40,10 +41,10 @@ export function Drawer({
 
   if (!open) return null;
 
-  return (
+  const content = (
     <div className="fixed inset-0 z-50 flex justify-end">
       <div
-        className="absolute inset-0 bg-black/45 backdrop-blur-[2px] animate-fade-in dark:bg-black/70"
+        className="absolute inset-0 bg-black/45 animate-fade-in motion-reduce:animate-none dark:bg-black/70"
         onClick={onClose}
         aria-hidden="true"
       />
@@ -55,7 +56,7 @@ export function Drawer({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cn(
-          'relative z-10 flex h-[100dvh] w-full max-w-xl flex-col bg-card/95 shadow-xl backdrop-blur-xl animate-slide-in-right sm:border-l',
+          'relative z-10 flex h-[100dvh] w-full max-w-xl flex-col bg-card shadow-xl will-change-transform animate-slide-in-right motion-reduce:animate-none sm:border-l',
           className,
         )}
       >
@@ -78,11 +79,12 @@ export function Drawer({
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain scrollbar-thin p-5">{children}</div>
         {footer && (
-          <footer className="shrink-0 border-t bg-card/95 px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-4 backdrop-blur-xl">
+          <footer className="shrink-0 border-t bg-card px-4 pb-[max(1rem,env(safe-area-inset-bottom))] pt-4">
             {footer}
           </footer>
         )}
       </aside>
     </div>
   );
+  return typeof document === 'undefined' ? null : createPortal(content, document.body);
 }

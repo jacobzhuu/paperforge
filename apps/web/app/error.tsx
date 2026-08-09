@@ -19,7 +19,7 @@ export default function Error({
   return (
     <div
       role="alert"
-      className="flex flex-col items-center justify-center gap-4 rounded-xl border border-destructive/40 bg-destructive/5 px-6 py-20 text-center"
+      className="flex flex-col items-center justify-center gap-4 rounded-lg border border-destructive/40 bg-destructive/5 px-6 py-20 text-center"
     >
       <AlertTriangle className="h-8 w-8 text-destructive-strong" />
       <div>

@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import { Info, Loader2, Plus, Save, Search, Sparkles, X } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Callout } from '@/components/ui/callout';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
@@ -146,18 +146,18 @@ export function ScopeEditor() {
         <div className="grid gap-6 lg:grid-cols-[1fr,18rem]">
           <div className="space-y-4">
             {empty && (
-              <div className="rounded-xl border border-dashed py-12 text-center text-sm text-muted-foreground">
+              <div className="rounded-lg border border-dashed py-12 text-center text-body text-muted-foreground">
                 还没有研究范围。点「重新生成」由 LLM 起草，或直接在下面手工填写。
                 <br />
                 这一步可以跳过——直接去文献工作台检索也能跑通。
               </div>
             )}
 
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm">研究问题</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
+            <section>
+              <header className="pb-3">
+                <h3 className="text-body">研究问题</h3>
+              </header>
+              <div className="space-y-3">
                 <div className="space-y-1.5">
                   <Label htmlFor="topic">主题</Label>
                   <Input
@@ -187,19 +187,19 @@ export function ScopeEditor() {
                     className="min-h-[72px]"
                   />
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
 
             <KeywordGroups
               groups={scope.keyword_groups ?? []}
               onChange={(keyword_groups) => patch({ keyword_groups })}
             />
 
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-sm">时间范围与纳入排除</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
+            <section>
+              <header className="pb-3">
+                <h3 className="text-body">时间范围与纳入排除</h3>
+              </header>
+              <div className="space-y-3">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1.5">
                     <Label htmlFor="from">起始年份</Label>
@@ -244,38 +244,38 @@ export function ScopeEditor() {
                   value={scope.exclusion_notes ?? []}
                   onChange={(exclusion_notes) => patch({ exclusion_notes })}
                 />
-              </CardContent>
-            </Card>
+              </div>
+            </section>
           </div>
 
           <aside className="space-y-4 lg:sticky lg:top-4 lg:self-start">
             {isFallback && (
-              <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
+              <Callout variant="warning" className="flex items-start gap-2">
                 <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>
                   这份范围是 LLM 当时不可用留下的<strong className="font-semibold">确定性回退</strong>，
                   检索前会被自动重新生成。手工改一处并保存后，就会固定使用你的版本。
                 </span>
-              </div>
+              </Callout>
             )}
             {isUserOwned && (
-              <div className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-xs">
+              <div className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-meta">
                 已固定为你的版本，后续检索不会覆盖它。
               </div>
             )}
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">这一步的作用</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-1.5 text-xs text-muted-foreground">
+            <section>
+              <header className="pb-2">
+                <h3 className="text-body">这一步的作用</h3>
+              </header>
+              <div className="space-y-1.5 text-meta text-muted-foreground">
                 <p>关键词组会被展开成检索矩阵，投给五个学术源。</p>
                 <p>只索引英文的检索源打不中中文关键词——中文主题建议补一组英文同义词。</p>
                 <p className="border-t pt-1.5">
                   生成来源：<span className="font-mono">{generator || '未记录'}</span>
                 </p>
-              </CardContent>
-            </Card>
+              </div>
+            </section>
 
             <Button className="w-full" onClick={saveAndSearch} disabled={busy || saving}>
               <Search className="h-4 w-4" /> 保存并触发检索
@@ -300,13 +300,13 @@ function KeywordGroups({
     onChange(groups.map((g, i) => (i === index ? { ...g, ...patch } : g)));
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm">关键词组（{groups.length}）</CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
+    <section>
+      <header className="pb-3">
+        <h3 className="text-body">关键词组（{groups.length}）</h3>
+      </header>
+      <div className="space-y-3">
         {groups.length === 0 && (
-          <p className="text-xs text-muted-foreground">
+          <p className="text-meta text-muted-foreground">
             还没有关键词组。检索会退回用主题原文查询，命中率通常明显更低。
           </p>
         )}
@@ -317,7 +317,7 @@ function KeywordGroups({
                 value={group.name}
                 onChange={(e) => update(index, { name: e.target.value })}
                 aria-label="关键词组名称"
-                className="h-8 font-medium"
+                className="font-medium md:h-9"
                 placeholder="组名，如「攻击方法」"
               />
               <button
@@ -342,8 +342,8 @@ function KeywordGroups({
         >
           <Plus className="h-4 w-4" /> 新增关键词组
         </Button>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -382,7 +382,7 @@ function TagInput({
             </button>
           </Badge>
         ))}
-        {values.length === 0 && <span className="text-xs text-muted-foreground">暂无关键词</span>}
+        {values.length === 0 && <span className="text-meta text-muted-foreground">暂无关键词</span>}
       </div>
       <Input
         value={draft}
@@ -396,7 +396,7 @@ function TagInput({
         }}
         placeholder="输入关键词后回车"
         aria-label="新增关键词"
-        className="h-8 text-xs"
+        className="md:h-9"
       />
     </div>
   );
@@ -428,7 +428,7 @@ function LineList({
               .filter(Boolean),
           )
         }
-        className="min-h-[60px] text-xs"
+        className="min-h-[60px] text-meta"
       />
     </div>
   );

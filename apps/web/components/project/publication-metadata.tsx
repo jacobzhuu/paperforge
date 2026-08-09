@@ -272,7 +272,7 @@ export function PublicationMetadata({
         </div>
       </div>
 
-      <div className="rounded-xl border bg-card px-5 py-8 text-center shadow-sm sm:px-10">
+      <div className="rounded-lg border bg-card px-5 py-8 text-center shadow-sm sm:px-10">
         <Input
           value={title}
           onChange={(event) => {

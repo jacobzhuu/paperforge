@@ -1,10 +1,22 @@
 'use client';
 
 import * as React from 'react';
-import { getScope, getVisualSummary, listAssets, listExports, listSections } from './api';
+import {
+  getEvidenceMatrix,
+  getResearchQuestions,
+  getScope,
+  getVisualSummary,
+  listAssets,
+  listExports,
+  listSections,
+} from './api';
 import type { VisualSummary } from './types';
 import type { PaperType } from './types';
 import type { PipelineProgressMap, PipelineStepId } from './pipeline';
+import { describeError } from './errors';
+
+export type ProgressSource = 'scope' | 'sections' | 'exports' | 'assets' | 'visuals' | 'questions' | 'evidence';
+export type ProgressKnowledge = Record<ProgressSource, boolean>;
 
 /**
  * 项目进度推断。
@@ -20,6 +32,8 @@ export interface ProjectProgress {
   scopeIsFallback: boolean;
   assetCount: number;
   libraryCount: number;
+  questionCount: number;
+  evidenceLinkCount: number;
   sectionCount: number;
   wordCount: number;
   exportCount: number;
@@ -30,6 +44,10 @@ export interface ProjectProgress {
    */
   visuals: VisualSummary;
   approvedVisualCount: number;
+  /** 每个推断来源是否真的成功返回；false 绝不能解释为“数量为 0”。 */
+  known: ProgressKnowledge;
+  errors: Partial<Record<ProgressSource, string>>;
+  partial: boolean;
   loading: boolean;
 }
 
@@ -50,12 +68,25 @@ export const EMPTY_PROGRESS: ProjectProgress = {
   scopeIsFallback: false,
   assetCount: 0,
   libraryCount: 0,
+  questionCount: 0,
+  evidenceLinkCount: 0,
   sectionCount: 0,
   wordCount: 0,
   exportCount: 0,
   hasPdf: false,
   visuals: EMPTY_VISUALS,
   approvedVisualCount: 0,
+  known: {
+    scope: false,
+    sections: false,
+    exports: false,
+    assets: false,
+    visuals: false,
+    questions: false,
+    evidence: false,
+  },
+  errors: {},
+  partial: false,
   loading: true,
 };
 
@@ -72,7 +103,7 @@ export function useProjectProgress(
       setProgress({ ...EMPTY_PROGRESS, loading: false });
       return;
     }
-    let alive = true;
+    const controller = new AbortController();
     const wantAssets = paperType === 'original';
     /*
      * allSettled 而不是 all：这里是**导航状态点**的数据源。一个接口 500 不该让
@@ -80,14 +111,35 @@ export function useProjectProgress(
      * 单项失败就按「这一项没有产物」处理，其余照常显示。
      */
     Promise.allSettled([
-      getScope(projectId),
-      listSections(projectId),
-      listExports(projectId),
-      wantAssets ? listAssets(projectId) : Promise.resolve({ data: [] as unknown[] }),
-      getVisualSummary(projectId),
+      getScope(projectId, controller.signal),
+      listSections(projectId, controller.signal),
+      listExports(projectId, controller.signal),
+      wantAssets ? listAssets(projectId, controller.signal) : Promise.resolve({ data: [] as unknown[] }),
+      getVisualSummary(projectId, controller.signal),
+      paperType === 'review'
+        ? getResearchQuestions(projectId, controller.signal)
+        : Promise.resolve({ data: [] as unknown[] }),
+      paperType === 'review'
+        ? getEvidenceMatrix(projectId, controller.signal)
+        : Promise.resolve({ data: undefined }),
     ])
-      .then(([scope, sections, exports, assets, visuals]) => {
-        if (!alive) return;
+      .then(([scope, sections, exports, assets, visuals, questions, matrix]) => {
+        if (controller.signal.aborted) return;
+        const known: ProgressKnowledge = {
+          scope: scope.status === 'fulfilled',
+          sections: sections.status === 'fulfilled',
+          exports: exports.status === 'fulfilled',
+          assets: !wantAssets || assets.status === 'fulfilled',
+          visuals: visuals.status === 'fulfilled',
+          questions: paperType !== 'review' || questions.status === 'fulfilled',
+          evidence: paperType !== 'review' || matrix.status === 'fulfilled',
+        };
+        const settled = { scope, sections, exports, assets, visuals, questions, evidence: matrix };
+        const errors = Object.fromEntries(
+          Object.entries(settled)
+            .filter(([, result]) => result.status === 'rejected')
+            .map(([key, result]) => [key, describeError((result as PromiseRejectedResult).reason)]),
+        ) as Partial<Record<ProgressSource, string>>;
         const scopeData = scope.status === 'fulfilled' ? scope.value.data : undefined;
         const sectionRows = sections.status === 'fulfilled' ? sections.value.data : [];
         const exportRows = exports.status === 'fulfilled' ? exports.value.data : [];
@@ -95,27 +147,43 @@ export function useProjectProgress(
           assets.status === 'fulfilled' ? (assets.value.data as unknown[]) : [];
         const visualSummary =
           visuals.status === 'fulfilled' ? visuals.value.data : EMPTY_VISUALS;
+        const questionRows =
+          questions.status === 'fulfilled' ? (questions.value.data as unknown[]) : [];
+        const matrixData = matrix.status === 'fulfilled' ? matrix.value.data : undefined;
         const generator = String(scopeData?.generator ?? '');
         setProgress({
           hasScope: Boolean(scopeData && Object.keys(scopeData).length > 0),
           scopeIsFallback: generator.startsWith('deterministic'),
           assetCount: assetRows.length,
           libraryCount,
+          questionCount: questionRows.length,
+          evidenceLinkCount: matrixData?.links.length ?? 0,
           sectionCount: sectionRows.length,
           wordCount: sectionRows.reduce((sum, s) => sum + (s.word_count ?? 0), 0),
           exportCount: exportRows.length,
           hasPdf: exportRows.some((a) => a.format === 'pdf'),
           visuals: visualSummary,
           approvedVisualCount: visualSummary.approved,
+          known,
+          errors,
+          partial: Object.values(known).some((value) => !value),
           loading: false,
         });
       })
       .catch(() => {
         // 进度推断失败不该阻断任何页面——退化为「什么都还没有」。
-        if (alive) setProgress({ ...EMPTY_PROGRESS, libraryCount, loading: false });
+        if (!controller.signal.aborted) {
+          setProgress({
+            ...EMPTY_PROGRESS,
+            libraryCount,
+            partial: true,
+            errors: { scope: '项目状态暂不可用' },
+            loading: false,
+          });
+        }
       });
     return () => {
-      alive = false;
+      controller.abort();
     };
   }, [projectId, paperType, libraryCount, reloadToken]);
 
@@ -126,14 +194,16 @@ export function useProjectProgress(
 export function stepCompletion(progress: ProjectProgress): PipelineProgressMap {
   return {
     overview: true,
-    scope: progress.hasScope,
-    assets: progress.assetCount > 0,
+    scope: progress.known.scope && progress.hasScope,
+    assets: progress.known.assets && progress.assetCount > 0,
     library: progress.libraryCount > 0,
-    outline: progress.sectionCount > 0 || progress.libraryCount > 0,
-    write: progress.sectionCount > 0,
+    questions: progress.known.questions && progress.questionCount > 0,
+    evidence: progress.known.evidence && progress.evidenceLinkCount > 0,
+    outline: progress.known.sections && (progress.sectionCount > 0 || progress.libraryCount > 0),
+    write: progress.known.sections && progress.sectionCount > 0,
     // 「有产物」= 至少插了一张图。有待处理建议不算完成——那正是需要用户去做的事。
-    visuals: progress.approvedVisualCount > 0,
-    export: progress.exportCount > 0,
+    visuals: progress.known.visuals && progress.approvedVisualCount > 0,
+    export: progress.known.exports && progress.exportCount > 0,
   };
 }
 
@@ -142,6 +212,13 @@ export function nextAction(
   progress: ProjectProgress,
   paperType: PaperType,
 ): { step: PipelineStepId; label: string; reason: string } {
+  if (progress.partial) {
+    return {
+      step: 'overview',
+      label: '部分状态暂不可用',
+      reason: '至少一个进度来源未能加载；系统不会把未知状态当成未开始或已通过。请刷新后重试，现有内容仍可继续编辑。',
+    };
+  }
   if (paperType === 'original' && progress.assetCount === 0) {
     return {
       step: 'assets',

@@ -25,10 +25,7 @@ async def send_auth_email(
     route = "/verify-email" if purpose == "verify_email" else "/reset-password"
     link = f"{settings.public_app_url.rstrip('/')}{route}?{urlencode({'token': token})}"
     subject = "验证 PaperForge 邮箱" if purpose == "verify_email" else "重置 PaperForge 密码"
-    body = (
-        f"请打开下面的链接完成操作：\n\n{link}\n\n"
-        "如果不是你发起的请求，可以忽略这封邮件。"
-    )
+    body = f"请打开下面的链接完成操作：\n\n{link}\n\n如果不是你发起的请求，可以忽略这封邮件。"
     if settings.auth_email_mode in {"file", "console"}:
         await asyncio.to_thread(
             _write_development_email,

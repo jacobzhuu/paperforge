@@ -15,7 +15,13 @@ import {
 } from '@/components/writing/extensions/ir-block';
 import { irToTiptap, tiptapToIR, type TiptapDoc } from '@/lib/ir-serde';
 import { EMPTY_NUMBERING, type FigureNumbering } from '@/lib/figure-numbering';
-import type { RefineAction, SectionIR, SoftCheckFinding, VisualAsset } from '@/lib/types';
+import type {
+  EvidenceUnit,
+  RefineAction,
+  SectionIR,
+  SoftCheckFinding,
+  VisualAsset,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 
 const REFINE_ACTIONS: { action: RefineAction; label: string }[] = [
@@ -61,6 +67,7 @@ export function SectionEditor({
   visuals = [],
   numbering = EMPTY_NUMBERING,
   onReplaceFigure,
+  evidenceUnits = [],
 }: {
   section: SectionIR;
   whitelist: string[];
@@ -74,6 +81,8 @@ export function SectionEditor({
   numbering?: FigureNumbering;
   /** 正文里点「替换」时打开共用的视觉编辑器。 */
   onReplaceFigure?: (assetRef: string) => void;
+  /** 引用 chip 悬停时展示的原始 EvidenceUnit 与定位。 */
+  evidenceUnits?: EvidenceUnit[];
 }) {
   const [picking, setPicking] = React.useState(false);
   const [pickingFigure, setPickingFigure] = React.useState(false);
@@ -82,6 +91,26 @@ export function SectionEditor({
   const weakKeys = React.useMemo(
     () => new Set(softChecks.filter((f) => f.weak).map((f) => f.cite_key)),
     [softChecks],
+  );
+  const evidenceLabels = React.useMemo(
+    () =>
+      Object.fromEntries(
+        evidenceUnits.map((unit) => [
+          unit.id,
+          [
+            `[${unit.grade}] ${unit.cite_key ?? unit.title ?? 'evidence'}`,
+            [
+              unit.page != null ? `p.${unit.page}` : '',
+              unit.section_path ?? '',
+              unit.object_ref ?? '',
+            ]
+              .filter(Boolean)
+              .join(' · ') || '未定位',
+            unit.text,
+          ].join('\n'),
+        ]),
+      ),
+    [evidenceUnits],
   );
 
   // section 换了才重建文档；否则每次按键都会重置光标。
@@ -122,7 +151,7 @@ export function SectionEditor({
           hardBreak: false,
           strike: false,
         }),
-        CiteChip.configure({ weakKeys }),
+        CiteChip.configure({ weakKeys, evidenceLabels }),
         MathInline,
         FigureXref.configure({ numbering }),
         FigureBlockNode.configure({
@@ -167,9 +196,10 @@ export function SectionEditor({
     const ext = editor.extensionManager.extensions.find((e) => e.name === CiteChip.name);
     if (ext) {
       ext.options.weakKeys = weakKeys;
+      ext.options.evidenceLabels = evidenceLabels;
       editor.view.dispatch(editor.state.tr);
     }
-  }, [editor, weakKeys]);
+  }, [editor, evidenceLabels, weakKeys]);
 
   /**
    * 视觉列表刷新后就地更新图片映射与编号。

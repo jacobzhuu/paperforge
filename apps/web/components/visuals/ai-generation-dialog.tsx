@@ -6,8 +6,6 @@ import { Button } from '@/components/ui/button';
 import { Dialog } from '@/components/ui/dialog';
 import type { ImageProviderCapabilities, VisualAsset } from '@/lib/types';
 
-const STEPS: Record<string, number> = { low: 4, medium: 6, high: 8 };
-
 /**
  * AI 生图前的显式确认。
  *
@@ -35,13 +33,22 @@ export function AIGenerationDialog({
   const prompt =
     visual?.resolved_prompt ??
     (typeof visual?.spec?.prompt === 'string' ? visual.spec.prompt : '');
+  const negativePrompt =
+    capabilities?.supports_negative_prompt &&
+    typeof visual?.spec?.negative_prompt === 'string'
+      ? visual.spec.negative_prompt
+      : '';
+  const seed =
+    capabilities?.supports_seed && typeof visual?.spec?.seed === 'number'
+      ? visual.spec.seed
+      : null;
 
   return (
     <Dialog
       open={visual !== null}
       onClose={onCancel}
-      title="调用外部图像服务生成插图？"
-      description="这一步会把下面的提示词发送到第三方图像服务，并可能产生费用。"
+      title="确认使用 AI 生成插图？"
+      description="请确认生成参数和提示词；生成图片可能消耗可用额度。"
       footer={
         <>
           <Button variant="outline" onClick={onCancel}>
@@ -53,37 +60,56 @@ export function AIGenerationDialog({
     >
       <div className="space-y-3 text-sm">
         <dl className="grid grid-cols-[6rem,minmax(0,1fr)] gap-x-3 gap-y-1.5">
-          <dt className="text-muted-foreground">提供商</dt>
-          <dd>{capabilities?.provider ?? '未配置'}</dd>
-          <dt className="text-muted-foreground">模型</dt>
-          <dd className="break-all font-mono text-xs">{capabilities?.model ?? '—'}</dd>
+          <dt className="text-muted-foreground">生成方式</dt>
+          <dd>AI 生成</dd>
           <dt className="text-muted-foreground">质量</dt>
           <dd>
             {quality === 'low' ? '低' : quality === 'high' ? '高' : '中'}
-            （约 {STEPS[quality] ?? 6} 步）
           </dd>
           <dt className="text-muted-foreground">输出尺寸</dt>
           <dd>
             {capabilities && capabilities.supported_sizes.length > 0
               ? (typeof visual?.spec?.size === 'string' ? visual.spec.size : '默认')
-              : '由提供商决定（生成后显示实际尺寸）'}
+              : '自动适配（生成后显示实际尺寸）'}
           </dd>
+          {seed !== null ? (
+            <>
+              <dt className="text-muted-foreground">随机种子</dt>
+              <dd className="font-mono">{seed}</dd>
+            </>
+          ) : null}
         </dl>
 
         <div className="space-y-1">
-          <p className="text-xs text-muted-foreground">将发送的最终提示词：</p>
+          <p className="text-xs text-muted-foreground">
+            将发送的最终提示词
+            {visual?.spec?.prompt_override
+              ? '（用户手动覆盖）'
+              : visual?.spec?.refined_prompt
+                ? '（已自动优化）'
+                : ''}：
+          </p>
           <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap rounded border bg-muted/50 p-2 font-mono text-xs">
             {prompt || '（空）'}
           </pre>
         </div>
+        {negativePrompt ? (
+          <div className="space-y-1">
+            <p className="text-xs text-muted-foreground">负面提示词：</p>
+            <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap rounded border bg-muted/50 p-2 font-mono text-xs">
+              {negativePrompt}
+            </pre>
+          </div>
+        ) : null}
 
         <ul className="space-y-1 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs text-warning-foreground">
           <li className="flex items-start gap-1.5">
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>会调用外部服务，可能产生费用。</span>
+            <span>AI 生成可能消耗可用额度。</span>
           </li>
-          <li>· 只发送上面这段提示词，<b>不会</b>把论文原文、数据表或上传文件发给图像服务商。</li>
-          <li>· 图中的文字大概率无法正确生成——需要文字的信息请改用示意图。</li>
+          <li>· 上述提示词已由 DeepSeek 读取当前论文全文并结合本次意图生成。</li>
+          <li>· Yunwu 只接收上面这段最终提示词，<b>不会</b>附带论文原文、数据表或上传文件。</li>
+          <li>· 图中文字可能出错，生成后请核对；承载数据的图请改用图表或示意图。</li>
         </ul>
       </div>
     </Dialog>

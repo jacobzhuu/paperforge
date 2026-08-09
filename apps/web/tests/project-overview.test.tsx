@@ -24,15 +24,26 @@ vi.mock('@/components/ui/toast', () => ({
 }));
 
 const generateAll = vi.fn();
+const startPolish = vi.fn();
+const skipPolish = vi.fn();
+const startQualityRepair = vi.fn();
+const skipQualityRepair = vi.fn();
+let listedJobs: Job[] = [];
 
 vi.mock('@/lib/api', () => ({
   generateAll: (...args: unknown[]) => generateAll(...args),
+  startPolish: (...args: unknown[]) => startPolish(...args),
+  skipPolish: (...args: unknown[]) => skipPolish(...args),
+  startQualityRepair: (...args: unknown[]) => startQualityRepair(...args),
+  skipQualityRepair: (...args: unknown[]) => skipQualityRepair(...args),
   getCitationAudit: () => ok(undefined),
   getCostDetail: () => ok(undefined),
   getNumLint: () => ok(undefined),
+  getSubmissionReadiness: () => ok(undefined),
   getVersionHistory: () => ok(undefined),
+  restoreDocumentVersion: vi.fn(),
   listExports: () => ok([]),
-  listJobs: () => ok([]),
+  listJobs: () => ok(listedJobs),
   updateProject: vi.fn(),
   exportDownloadUrl: () => '#',
 }));
@@ -85,6 +96,9 @@ function runAllButton(): HTMLButtonElement {
 describe('项目概览的「跑通全管线」按钮', () => {
   beforeEach(() => {
     generateAll.mockReset();
+    startPolish.mockReset();
+    skipPolish.mockReset();
+    listedJobs = [];
     projectCtx.current = mockProjectContext({ project: makeProject(), progress: freshProgress });
   });
 
@@ -122,6 +136,17 @@ describe('项目概览的「跑通全管线」按钮', () => {
   });
 
   it('跑完之后文案变成「重跑全管线」，不再假装从没跑过', async () => {
+    listedJobs = [
+      {
+        id: 'full-done',
+        project_id: 'p1',
+        kind: 'full',
+        status: 'succeeded',
+        stage: 'done',
+        progress: 1,
+        checkpoint: { render: { pdf: true } },
+      },
+    ];
     projectCtx.current = mockProjectContext({ progress: doneProgress });
     await renderOverview();
     const button = runAllButton();
@@ -133,7 +158,7 @@ describe('项目概览的「跑通全管线」按钮', () => {
     await renderOverview();
     // 收起时页面上不该有任何下拉——它们此前一直并排立在主 CTA 旁边。
     expect(screen.queryAllByRole('combobox')).toHaveLength(0);
-    expect(screen.getByText('快速草稿 · 叙述性综述')).toBeInTheDocument();
+    expect(screen.getByText('一次跑到稿（推荐） · 叙述性综述')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '调整' }));
     expect(screen.getAllByRole('combobox')).toHaveLength(2);
@@ -146,7 +171,7 @@ describe('项目概览的「跑通全管线」按钮', () => {
       progress: freshProgress,
     });
     await renderOverview();
-    expect(screen.getByText('快速草稿')).toBeInTheDocument();
+    expect(screen.getByText('一次跑到稿（推荐）')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '调整' }));
     expect(screen.getAllByRole('combobox')).toHaveLength(1);
   });
@@ -194,5 +219,169 @@ describe('项目概览的「跑通全管线」按钮', () => {
     await act(async () => {
       resolve({ data: { id: 'j1' } as Job });
     });
+  });
+
+  it('首稿完成后让用户选择开始润色或跳过，不自动启动', async () => {
+    const source = {
+      id: 'full-1',
+      project_id: 'p1',
+      kind: 'full',
+      status: 'succeeded',
+      stage: 'done',
+      progress: 1,
+      checkpoint: { polish_decision: 'pending' },
+    } as Job;
+    listedJobs = [source];
+    startPolish.mockResolvedValue({
+      id: 'polish-1',
+      project_id: 'p1',
+      kind: 'write',
+      status: 'queued',
+      progress: 0,
+    } as Job);
+    await renderOverview();
+
+    expect(screen.getByText('初稿已交付，可选做连贯性润色')).toBeInTheDocument();
+    expect(startPolish).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '开始润色' }));
+    await waitFor(() => expect(startPolish).toHaveBeenCalledWith('p1', 'full-1'));
+    expect(projectCtx.current.startJob).toHaveBeenCalled();
+  });
+
+  it('可明确保留首稿并跳过润色', async () => {
+    const source = {
+      id: 'full-2',
+      project_id: 'p1',
+      kind: 'full',
+      status: 'succeeded',
+      stage: 'done',
+      progress: 1,
+      checkpoint: { polish_decision: 'pending' },
+    } as Job;
+    listedJobs = [source];
+    skipPolish.mockResolvedValue({
+      ...source,
+      checkpoint: { polish_decision: 'skipped' },
+    });
+    await renderOverview();
+
+    fireEvent.click(screen.getByRole('button', { name: '保留首稿，跳过润色' }));
+    await waitFor(() => expect(skipPolish).toHaveBeenCalledWith('p1', 'full-2'));
+    expect(toastSpy.calls.at(-1)?.title).toBe('已保留首稿');
+  });
+
+  it('质检发现项交付后邀请修复，不在管线里自动跑', async () => {
+    const source = {
+      id: 'full-3',
+      project_id: 'p1',
+      kind: 'full',
+      status: 'succeeded',
+      stage: 'done',
+      progress: 1,
+      checkpoint: { quality_repair_decision: 'pending', quality_finding_count: 4 },
+    } as Job;
+    listedJobs = [source];
+    startQualityRepair.mockResolvedValue({
+      id: 'repair-1',
+      project_id: 'p1',
+      kind: 'write',
+      status: 'queued',
+      progress: 0,
+    } as Job);
+    await renderOverview();
+
+    expect(screen.getByText('初稿已完成，另有 4 处论断可以再加强')).toBeInTheDocument();
+    expect(startQualityRepair).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '开始修复' }));
+    await waitFor(() => expect(startQualityRepair).toHaveBeenCalledWith('p1', 'full-3'));
+    expect(projectCtx.current.startJob).toHaveBeenCalled();
+  });
+
+  it('可以明确放弃这一轮质量修复', async () => {
+    const source = {
+      id: 'full-4',
+      project_id: 'p1',
+      kind: 'full',
+      status: 'succeeded',
+      stage: 'done',
+      progress: 1,
+      checkpoint: { quality_repair_decision: 'pending', quality_finding_count: 2 },
+    } as Job;
+    listedJobs = [source];
+    skipQualityRepair.mockResolvedValue({
+      ...source,
+      checkpoint: { quality_repair_decision: 'skipped' },
+    });
+    await renderOverview();
+
+    fireEvent.click(screen.getByRole('button', { name: '暂不处理' }));
+    await waitFor(() => expect(skipQualityRepair).toHaveBeenCalledWith('p1', 'full-4'));
+    expect(toastSpy.calls.at(-1)?.title).toBe('已保留当前稿');
+  });
+
+  it('未通过质量门时显示具体阻断原因，不冒充全流程完成', async () => {
+    listedJobs = [
+      {
+        id: 'full-blocked',
+        project_id: 'p1',
+        kind: 'full',
+        status: 'needs_input',
+        stage: 'done',
+        progress: 1,
+        checkpoint: {},
+        error: {
+          readiness_status: 'needs_revision',
+          blockers: [
+            {
+              code: 'core_claim_fulltext_missing',
+              message: '2 条核心论断没有可定位且相符的全文证据',
+            },
+          ],
+        },
+      },
+    ];
+    projectCtx.current = mockProjectContext({ progress: doneProgress });
+    await renderOverview();
+
+    expect(runAllButton().textContent).toContain('跑通全管线');
+    fireEvent.click(screen.getByRole('button', { name: /需补充材料/ }));
+    expect(screen.getByText('需补充材料')).toBeInTheDocument();
+    expect(
+      screen.getByText('2 条核心论断没有可定位且相符的全文证据'),
+    ).toBeInTheDocument();
+  });
+
+  it('证据门禁在写作前停止时引导到问题证据矩阵', async () => {
+    listedJobs = [
+      {
+        id: 'full-evidence-blocked',
+        project_id: 'p1',
+        kind: 'full',
+        status: 'needs_input',
+        stage: 'done',
+        progress: 1,
+        checkpoint: {},
+        error: {
+          readiness_status: 'evidence_insufficient',
+          blockers: [
+            {
+              code: 'question_evidence_coverage_low',
+              message: '仅 1/5 个子问题具备至少两篇文献的可用全文证据',
+            },
+          ],
+        },
+      },
+    ];
+    projectCtx.current = mockProjectContext({ progress: doneProgress });
+    await renderOverview();
+
+    fireEvent.click(screen.getByRole('button', { name: /需补充材料/ }));
+    expect(
+      screen.getByText('证据就绪门禁未通过，流程已在正文写作前停止。'),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /去查看问题—证据矩阵/ })).toHaveAttribute(
+      'href',
+      '/projects/p1/questions',
+    );
   });
 });

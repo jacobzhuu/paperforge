@@ -1,0 +1,20 @@
+{
+  "routes": {
+    "首页": {
+      "manifest_key": "/page",
+      "max_gzip_kb": 140
+    },
+    "项目概览": {
+      "manifest_key": "/projects/[id]/page",
+      "max_gzip_kb": 157
+    },
+    "文献库": {
+      "manifest_key": "/projects/[id]/library/page",
+      "max_gzip_kb": 160
+    },
+    "写作台": {
+      "manifest_key": "/projects/[id]/write/page",
+      "max_gzip_kb": 163
+    }
+  }
+}

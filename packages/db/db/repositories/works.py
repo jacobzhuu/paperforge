@@ -13,7 +13,13 @@ from typing import Any, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.library import ScholarlyWork, WorkAuthor, WorkIdentifier, WorkUrl
+from db.models.library import (
+    ScholarlyWork,
+    WorkAuthor,
+    WorkIdentifier,
+    WorkUrl,
+    WorkVersionRelation,
+)
 
 # 强标识符：命中即认为同一文献（与 scholar_gateway.dedupe 的 EXACT_IDENTIFIER_TYPES 对齐）。
 STRONG_IDENTIFIER_FIELDS = (
@@ -67,13 +73,86 @@ async def find_existing_work(
             select(ScholarlyWork).where(getattr(ScholarlyWork, field) == value)
         )
         if existing is not None:
-            return existing
+            return await resolve_canonical_work(session, existing)
+    for identifier in getattr(candidate, "identifiers", ()) or ():
+        existing_id = await session.scalar(
+            select(WorkIdentifier).where(
+                WorkIdentifier.id_type == identifier.id_type,
+                WorkIdentifier.id_value == identifier.id_value,
+            )
+        )
+        if existing_id is not None:
+            existing = await session.get(ScholarlyWork, existing_id.work_id)
+            if existing is not None:
+                return await resolve_canonical_work(session, existing)
     title_hash = getattr(candidate, "normalized_title_hash", None)
     if title_hash:
-        return await session.scalar(
+        work = await session.scalar(
             select(ScholarlyWork).where(ScholarlyWork.normalized_title_hash == title_hash)
         )
+        return await resolve_canonical_work(session, work) if work is not None else None
     return None
+
+
+async def resolve_canonical_work(
+    session: AsyncSession,
+    work: ScholarlyWork,
+) -> ScholarlyWork:
+    """Follow explicit version links to the one project-facing master work."""
+    seen = {work.id}
+    current = work
+    while current.canonical_work_id is not None and current.canonical_work_id not in seen:
+        seen.add(current.canonical_work_id)
+        parent = await session.get(ScholarlyWork, current.canonical_work_id)
+        if parent is None:
+            break
+        current = parent
+    return current
+
+
+async def link_work_versions(
+    session: AsyncSession,
+    *,
+    version_work_id: uuid.UUID,
+    canonical_work_id: uuid.UUID,
+    relation_type: str,
+    confidence: float = 1.0,
+    rationale: dict[str, Any] | None = None,
+) -> ScholarlyWork:
+    """Explicitly merge preprint/conference/journal manifestations safely.
+
+    The version row remains available for provenance and its URLs/identifiers,
+    while project library entries resolve to the single canonical entity.
+    """
+    if version_work_id == canonical_work_id:
+        raise ValueError("a work cannot be a version of itself")
+    version = await session.get(ScholarlyWork, version_work_id)
+    canonical = await session.get(ScholarlyWork, canonical_work_id)
+    if version is None or canonical is None:
+        raise ValueError("version and canonical works must exist")
+    root = await resolve_canonical_work(session, canonical)
+    version.canonical_work_id = root.id
+    relation = await session.scalar(
+        select(WorkVersionRelation).where(
+            WorkVersionRelation.source_work_id == version.id,
+            WorkVersionRelation.target_work_id == root.id,
+            WorkVersionRelation.relation_type == relation_type,
+        )
+    )
+    if relation is None:
+        relation = WorkVersionRelation(
+            source_work_id=version.id,
+            target_work_id=root.id,
+            relation_type=relation_type,
+            confidence=confidence,
+            rationale_json=rationale,
+        )
+        session.add(relation)
+    else:
+        relation.confidence = confidence
+        relation.rationale_json = rationale
+    await session.flush()
+    return root
 
 
 async def upsert_work(
@@ -172,6 +251,17 @@ async def _sync_identifiers(
     for identifier in getattr(candidate, "identifiers", ()) or ():
         key = (identifier.id_type, identifier.id_value)
         if key in existing:
+            continue
+        # Identifiers are globally canonical even before the migration can add a
+        # global unique constraint to old installations.  Never duplicate one
+        # onto a second manifestation.
+        owner = await session.scalar(
+            select(WorkIdentifier).where(
+                WorkIdentifier.id_type == identifier.id_type,
+                WorkIdentifier.id_value == identifier.id_value,
+            )
+        )
+        if owner is not None and owner.work_id != work.id:
             continue
         existing.add(key)
         session.add(

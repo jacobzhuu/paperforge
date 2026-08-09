@@ -59,14 +59,29 @@ class SemanticScholarDiscoveryAdapter(HttpScholarlyDiscoveryAdapter):
         return headers
 
     def _request(self, query: ScholarlyDiscoveryQuery) -> tuple[str, dict[str, Any]]:
+        # Cap length — S2 silently 400s on extremely long boolean strings.
+        text = (query.query_text or "").strip()[:300]
         params: dict[str, Any] = {
-            "query": query.query_text,
-            "limit": max(0, query.limit),
+            "query": text,
+            "limit": max(0, min(query.limit, 100)),
             "offset": max(0, query.offset),
             "fields": SEARCH_FIELDS,
         }
         params.update(semantic_scholar_time_params(query.filters))
         return f"{self.base_url}/graph/v1/paper/search", params
+
+    def discover(self, query: ScholarlyDiscoveryQuery) -> ScholarlyDiscoveryResult:
+        # Empty queries burn the anonymous shared pool and open the circuit (N3).
+        if not (query.query_text or "").strip():
+            retrieved_at = datetime.now(UTC)
+            return self._error_result(
+                query=query,
+                retrieved_at=retrieved_at,
+                error_code="empty_query",
+                message="semantic_scholar query must be non-empty",
+                retryable=False,
+            )
+        return super().discover(query)
 
     def rate_limit_hint(self, fetched: FetchedHttpResponse) -> str | None:
         if self._api_key:

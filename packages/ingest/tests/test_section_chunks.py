@@ -13,3 +13,11 @@ def test_parse_markdown_table_extracts_columns_and_cells():
     assert table is not None
     assert table.columns == ("Method", "Acc")
     assert len(table.cells) == 4
+
+
+def test_parse_markdown_table_accepts_a_caption_prefix_and_retains_offsets():
+    text = "Table 2. Main results\n| Method | F1 |\n| --- | --- |\n| Ours | 91.3 |\nNotes."
+    table = parse_markdown_table(text)
+    assert table is not None
+    ours = next(cell for cell in table.cells if cell.value.strip() == "91.3")
+    assert text[ours.start_offset : ours.end_offset].strip() == "91.3"

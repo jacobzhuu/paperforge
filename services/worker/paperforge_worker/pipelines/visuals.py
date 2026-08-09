@@ -30,21 +30,27 @@ from db import (
 )
 from storage import make_object_store
 from visuals import (
+    AIImageSemantics,
     AIImageSpec,
     ChartSpec,
     DiagramSpec,
     ImageProvider,
-    ImageProviderConfig,
     ImageProviderError,
     ImageRequest,
+    ImageResult,
     VisualdClient,
     classify_visual_error,
     create_image_provider,
+    image_provider_configured,
     parse_visual_spec,
 )
-from visuals.errors import PROVIDER_NOT_CONFIGURED
+from visuals.errors import CONTENT_REJECTED, INVALID_REQUEST, PROVIDER_NOT_CONFIGURED
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.pipelines.image_prompt import (
+    analyze_image_prompt,
+    rewrite_rejected_image_prompt,
+)
 from paperforge_worker.pipelines.visual_planner import (
     MAX_AI_IMAGES,
     MAX_PROPOSALS,
@@ -78,6 +84,8 @@ class VisualPlanOutcome:
     ai_image_count: int
     preview_ready_count: int = 0
     preview_failed_count: int = 0
+    auto_generated_count: int = 0
+    generation_deferred_count: int = 0
     #: `llm:<model>` 或 `deterministic*`——排查「为什么建议这么烂」时的第一个问题
     #: 就是它到底走了哪条路。
     generator: str = "deterministic"
@@ -90,22 +98,100 @@ class VisualPlanOutcome:
             "ai_image_count": self.ai_image_count,
             "preview_ready_count": self.preview_ready_count,
             "preview_failed_count": self.preview_failed_count,
+            "auto_generated_count": self.auto_generated_count,
+            "generation_deferred_count": self.generation_deferred_count,
             "generator": self.generator,
         }
 
 
-async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
-    """提出最多 6 条建议；**绝不**调用 ImageProvider 或修改章节 IR。
+@dataclass(frozen=True)
+class _ImageGenerationOutcome:
+    generated: ImageResult | None = None
+    error: Exception | None = None
+    first_rejection: ImageProviderError | None = None
+    compliance_audit: dict[str, Any] | None = None
 
-    两条来源：
+
+async def _generate_image_with_compliance_retry(
+    provider: ImageProvider,
+    request: ImageRequest,
+    *,
+    runner: Any,
+) -> _ImageGenerationOutcome:
+    """调用图像厂商；内容拒绝时至多做一次安全改写和一次额外调用。"""
+    try:
+        generated = await asyncio.to_thread(provider.generate, request)
+        return _ImageGenerationOutcome(generated=generated)
+    except ImageProviderError as first_error:
+        if first_error.code != CONTENT_REJECTED:
+            return _ImageGenerationOutcome(error=first_error)
+        rejection = first_error
+
+    original_error = str(rejection)[:500]
+    try:
+        rewrite = await rewrite_rejected_image_prompt(request.prompt, runner=runner)
+    except Exception:  # noqa: BLE001 - 改写失败不能掩盖原始内容拒绝
+        rewrite = None
+
+    audit: dict[str, Any] = {
+        "original_prompt": request.prompt,
+        "rewritten_prompt": rewrite.prompt if rewrite else None,
+        "original_error_code": rejection.code,
+        "original_error_reason": original_error,
+        "original_request_id": rejection.request_id,
+        "retry_count": 1 if rewrite else 0,
+        "max_retries": 1,
+        "rewrite_reason": rewrite.reason if rewrite else None,
+    }
+    if rewrite is None:
+        return _ImageGenerationOutcome(
+            error=rejection,
+            first_rejection=rejection,
+            compliance_audit=audit,
+        )
+
+    retry_request = ImageRequest(
+        prompt=rewrite.prompt,
+        size=request.size,
+        quality=request.quality,
+        output_format=request.output_format,
+        negative_prompt=request.negative_prompt,
+        seed=request.seed,
+    )
+    # 没有循环：第二次调用无论成功或失败都直接返回给最终记录。
+    try:
+        generated = await asyncio.to_thread(provider.generate, retry_request)
+    except Exception as retry_error:  # noqa: BLE001 - caller 统一分类并落库
+        return _ImageGenerationOutcome(
+            error=retry_error,
+            first_rejection=rejection,
+            compliance_audit=audit,
+        )
+    return _ImageGenerationOutcome(
+        generated=generated,
+        first_rejection=rejection,
+        compliance_audit=audit,
+    )
+
+
+async def suggest_visuals(
+    context: JobContext,
+    *,
+    summary_only: bool = False,
+    auto_generate: bool = False,
+) -> VisualPlanOutcome:
+    """提出视觉建议；普通入口绝不调用 ImageProvider 或修改章节 IR。
+
+    普通视觉工作台最多提出 6 条，来源有两条：
       - 数据图表由已上传的结果表格确定性推导——模型不得凭空造数据图，
         图表的每个数字都必须能追回某一份素材；
       - 示意图与 AI 插图交给结构化规划器（`visual_planner`）。模型不可用、
         超时或输出不合法时，回退到「论文结构概览 + 概念插图」这套原有的
         确定性建议，`visual_plan` 永远有产物。
 
-    规划调用**会**把章节摘要发给文本模型（记入 llm_call_log），但这条路径上
-    结构上不存在任何 ImageProvider 调用——生图只可能由用户显式确认后触发。
+    ``summary_only`` 是“跑通全流程”的专用策略：只创建一张论文摘要图；
+    ``auto_generate`` 同时开启时只通过 Yunwu 自动生成这一张。Yunwu 未配置或
+    临时失败会保留为可重试建议，不把可选视觉失败升级成全流程错误。
     """
     if not context.settings.visuals_enabled:
         return VisualPlanOutcome(0, 0, 0, 0)
@@ -119,14 +205,22 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
         sections = await list_sections(session, document.id) if document else []
         existing = await list_visuals(session, context.project_id)
         existing_hashes = {item.input_hash for item in existing}
+        existing_by_hash: dict[str, Any] = {}
+        for item in existing:
+            # list_visuals 按 created_at 倒序；同哈希存在历史版本时始终选择最新一张。
+            existing_by_hash.setdefault(item.input_hash, item)
         # 建议依据的正文指纹：正文一改，界面就能提示「建议基于旧版正文」。
         snapshot = document_snapshot_hash(sections) if sections else None
         document_version = document.version if document else None
         project_title = project.title if project is not None else "the research topic"
         paper_type = project.paper_type if project is not None else "review"
 
-        chart_proposals = _chart_proposals(assets, sections)
-        body_sections = [row for row in sections if row.section_key != "abstract"][:6]
+        abstract_section = next(
+            (row for row in sections if row.section_key == "abstract"),
+            None,
+        )
+        chart_proposals = [] if summary_only else _chart_proposals(assets, sections)
+        body_sections = [row for row in sections if row.section_key != "abstract"]
         briefs = [
             SectionBrief(
                 key=row.section_key,
@@ -136,25 +230,67 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
             for row in body_sections
         ]
         short_review = _is_short_review(paper_type, briefs)
+        full_paper_context = _paper_context(project_title, sections)
 
-    # 第二段：规划。allow_ai_images 只控制**是否提出**插图建议——即使允许，
-    # 也仍然只是 proposal，生图要用户再确认一次。
-    planned, generator = await plan_visuals(
-        sections=briefs,
-        runner=context.llm_runner(),
-        allow_ai_images=context.settings.ai_images_enabled,
-    )
-    if short_review:
-        # 短综述保留至多一张真正解释关系的示意图；装饰性 AI 插图会稀释信息密度。
-        planned = [item for item in planned if item.kind == "diagram"][:1]
-    if not planned and not short_review:
-        planned = _fallback_proposals(
-            body_sections,
+    deepseek_prompt_ready = True
+    if summary_only:
+        summary = _summary_visual_proposal(
             project_title,
-            allow_ai_images=context.settings.ai_images_enabled,
+            abstract_section=abstract_section,
+            body_sections=body_sections,
         )
-    elif not planned and short_review:
-        generator = f"{generator}:short_review_no_generic_fallback"
+        analysis = await analyze_image_prompt(
+            user_intent=(
+                "Create a publication-ready graphical abstract that synthesizes the entire paper."
+            ),
+            full_paper=full_paper_context,
+            runner=context.llm_runner(),
+            current_spec=summary.spec,
+        )
+        if analysis:
+            summary.spec.update(
+                {
+                    "prompt": analysis.prompt,
+                    "refined_prompt": analysis.prompt,
+                    "quality": "high",
+                    "semantics": {
+                        "subject": analysis.subject,
+                        "composition": analysis.composition,
+                        "elements": list(analysis.elements),
+                        "text_policy": analysis.text_policy,
+                        "aspect_ratio": "3:2",
+                    },
+                }
+            )
+            summary.title = analysis.title
+            summary.caption = analysis.caption
+            summary.alt_text = analysis.alt_text
+        else:
+            # 全流程不得绕过 DeepSeek 把模板提示词直接发给 Yunwu。草稿保留，
+            # 用户之后可在工作台重试全文分析。
+            deepseek_prompt_ready = False
+        planned = [summary]
+        generator = "graphical_abstract"
+    else:
+        # 第二段：规划。allow_ai_images 只控制**是否提出**插图建议——即使允许，
+        # 也仍然只是 proposal，生图要用户再确认一次。
+        planned, generator = await plan_visuals(
+            sections=briefs,
+            runner=context.llm_runner(),
+            allow_ai_images=context.settings.ai_images_enabled,
+            paper_context=full_paper_context,
+        )
+        if short_review:
+            # 短综述保留至多一张真正解释关系的示意图；装饰性 AI 插图会稀释信息密度。
+            planned = [item for item in planned if item.kind == "diagram"][:1]
+        if not planned and not short_review:
+            planned = _fallback_proposals(
+                body_sections,
+                project_title,
+                allow_ai_images=context.settings.ai_images_enabled,
+            )
+        elif not planned and short_review:
+            generator = f"{generator}:short_review_no_generic_fallback"
 
     proposals: list[tuple[dict[str, Any], dict[str, Any]]] = [
         *chart_proposals,
@@ -178,11 +314,21 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
     async with context.session() as session:
         assets = await list_assets(session, context.project_id)
         created = []
+        generation_candidates: list[uuid.UUID] = []
         ai_images = 0
         for spec, metadata in proposals[:MAX_PROPOSALS]:
-            if visual_input_hash(spec) in existing_hashes:
+            input_hash = visual_input_hash(spec)
+            if input_hash in existing_hashes:
                 # 同一条建议已经提过。哈希走语义投影，因此给 spec 加可选字段
                 # 不会让历史资产失效、被重复提出。
+                existing_visual = existing_by_hash.get(input_hash)
+                if (
+                    summary_only
+                    and existing_visual is not None
+                    and existing_visual.review_status == "pending"
+                    and existing_visual.generation_status in {"proposed", "failed"}
+                ):
+                    generation_candidates.append(existing_visual.id)
                 continue
             if spec["kind"] == "ai_image":
                 if ai_images >= MAX_AI_IMAGES:
@@ -198,6 +344,8 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
                 **metadata,
             )
             created.append(visual)
+            if summary_only and visual.kind == "ai_image":
+                generation_candidates.append(visual.id)
             if spec["kind"] == "chart":
                 source_ref = str(spec["source_asset_ref"])
                 source = next(
@@ -229,6 +377,33 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
             for visual_id in deterministic_ids
         )
     )
+    auto_results: list[VisualOutcome] = []
+    generation_deferred = 0
+    if summary_only and auto_generate and generation_candidates and deepseek_prompt_ready:
+        yunwu_config = context.settings.image_provider_config("yunwu")
+        if context.settings.ai_images_enabled and image_provider_configured(yunwu_config):
+            # 全流程的唯一一张付费图固定走 Yunwu。generate_visual 自己会完成网络重试、
+            # 内容合规改写、画布修复和预检；它返回失败状态而不会向外抛异常。
+            auto_results = [
+                await generate_visual(
+                    context,
+                    generation_candidates[0],
+                    provider_override="yunwu",
+                )
+            ]
+            if auto_results[0].status != "ready":
+                # 可选摘要图失败不应在视觉工作台留下红色报错卡，也不能让全流程失败；
+                # provider attempt 仍完整保留用于排查，资产退回 proposed 供用户重试。
+                await _defer_failed_auto_generation(context, generation_candidates[0])
+                generation_deferred = 1
+        else:
+            generation_deferred = 1
+
+    elif summary_only and auto_generate and generation_candidates:
+        generation_deferred = 1
+
+    if summary_only:
+        counts = {"chart": 0, "diagram": 0, "ai_image": 1 if proposals else 0}
     return VisualPlanOutcome(
         proposed=proposed,
         chart_count=counts["chart"],
@@ -236,6 +411,8 @@ async def suggest_visuals(context: JobContext) -> VisualPlanOutcome:
         ai_image_count=counts["ai_image"],
         preview_ready_count=sum(item.status == "ready" for item in previews),
         preview_failed_count=sum(item.status == "failed" for item in previews),
+        auto_generated_count=sum(item.status == "ready" for item in auto_results),
+        generation_deferred_count=generation_deferred,
         generator=generator,
     )
 
@@ -286,6 +463,97 @@ def _chart_proposals(
     return proposals
 
 
+def _summary_visual_proposal(
+    project_title: str,
+    *,
+    abstract_section: Any | None,
+    body_sections: list[Any],
+) -> PlannedProposal:
+    """为“一键全流程”构造唯一的论文摘要图，不引入虚构数字或结论。"""
+    abstract = _image_safe_text(
+        _section_excerpt(abstract_section) if abstract_section is not None else "",
+        limit=900,
+    )
+    title = _image_safe_text(project_title, limit=140) or "the paper's central research topic"
+    concepts = [
+        _image_safe_text(item, limit=120)
+        for item in re.split(r"[。！？.!?;；]\s*", abstract)
+        if item.strip()
+    ][:4]
+    if not concepts:
+        concepts = [
+            _image_safe_text(getattr(row, "title", ""), limit=80)
+            for row in body_sections[:4]
+            if _image_safe_text(getattr(row, "title", ""), limit=80)
+        ]
+    subject = f"Graphical abstract of {title}"
+    if abstract:
+        subject = f"{subject}: {abstract[: max(0, 197 - len(subject))]}".rstrip(": ")
+    summary_text = abstract or (
+        "the central question, research approach, and main synthesis of the paper"
+    )
+    spec = AIImageSpec(
+        prompt=(
+            f"Create one publication-ready graphical abstract for {title}. "
+            f"Faithfully synthesize this paper abstract without inventing measurements: "
+            f"{summary_text}."
+        ),
+        size="1536x1024",
+        quality="high",
+        style="clean journal graphical abstract, restrained scientific palette, uncluttered",
+        semantics=AIImageSemantics(
+            subject=subject[:200],
+            composition=(
+                "one coherent left-to-right visual narrative connecting the research question, "
+                "approach, core mechanism, and conclusion"
+            ),
+            elements=concepts,
+            text_policy="auto",
+            aspect_ratio="3:2",
+        ),
+    ).model_dump(mode="json")
+    target = getattr(abstract_section, "section_key", None) or (
+        getattr(body_sections[0], "section_key", None) if body_sections else None
+    )
+    source_keys = [
+        key
+        for key in (
+            getattr(abstract_section, "section_key", None),
+            *(getattr(row, "section_key", None) for row in body_sections[:4]),
+        )
+        if key
+    ]
+    return PlannedProposal(
+        kind="ai_image",
+        spec=spec,
+        title="论文摘要图",
+        caption="论文核心问题、研究路径与主要结论的视觉摘要",
+        alt_text="以单幅横向学术插图概括论文核心问题、研究路径与主要结论",
+        target_section_key=target,
+        reason="“跑通全流程”仅生成一张可概览全文的论文摘要图",
+        source_section_keys=source_keys,
+    )
+
+
+def _image_safe_text(value: Any, *, limit: int) -> str:
+    """清除 VisualSpec 明确禁止的 URL/代码片段，同时保留论文语义。"""
+    text = str(value or "")
+    text = re.sub(r"https?://\S+", "", text, flags=re.IGNORECASE)
+    text = text.replace("```", " ")
+    text = re.sub(r"\b(?:import|exec|eval|subprocess)\b", "process", text, flags=re.IGNORECASE)
+    return " ".join(text.split())[:limit].strip()
+
+
+async def _defer_failed_auto_generation(context: JobContext, visual_id: uuid.UUID) -> None:
+    """全流程的可选付费图失败后退回可重试状态；attempt 审计记录不删除。"""
+    async with context.session() as session:
+        visual = await get_visual(session, visual_id)
+        if visual is not None and visual.generation_status == "failed":
+            visual.generation_status = "proposed"
+            visual.error_code = None
+            visual.error_message = None
+
+
 def _fallback_proposals(
     body_sections: list[Any],
     project_title: str,
@@ -333,17 +601,18 @@ def _fallback_proposals(
     try:
         ai_spec = AIImageSpec(
             prompt=(
-                f"A clean academic conceptual illustration representing {project_title}, "
-                "abstract scientific forms, no text and no quantitative content"
+                f"A clean conceptual illustration for an academic paper on {project_title}. "
+                "Restrained palette, soft even lighting, uncluttered background, "
+                "publication quality."
             )
         ).model_dump(mode="json")
     except ValueError:
-        # 项目标题本身可能包含“准确率”等词；它不能绕过 AI 图禁区，
+        # 项目标题里可能带着 URL 之类的内容；它不能混进提示词，
         # 也不应让一条可选建议拖垮整个 visual_plan。
         ai_spec = AIImageSpec(
             prompt=(
-                "A clean abstract academic illustration of scientific inquiry and "
-                "collaboration, organic geometric forms, no text or quantitative content"
+                "A clean conceptual illustration of scientific inquiry and collaboration, "
+                "organic geometric forms, restrained palette, publication quality."
             )
         ).model_dump(mode="json")
     planned.append(
@@ -381,6 +650,14 @@ def _section_excerpt(row: Any) -> str:
     return " ".join(parts).strip()
 
 
+def _paper_context(project_title: str, sections: list[Any]) -> str:
+    """完整论文上下文；交给 DeepSeek 时不按章节数或字符数截断。"""
+    parts = [f"Paper title: {project_title}"]
+    for row in sections:
+        parts.append(f"[{row.section_key}] {row.title}\n{_section_excerpt(row)}")
+    return "\n\n".join(parts)
+
+
 def _is_short_review(paper_type: str, sections: list[SectionBrief]) -> bool:
     if paper_type != "review":
         return False
@@ -395,6 +672,7 @@ async def generate_visual(
     visual_id: uuid.UUID,
     *,
     timeout_seconds: float | None = None,
+    provider_override: str | None = None,
 ) -> VisualOutcome:
     if not context.settings.visuals_enabled:
         return VisualOutcome(str(visual_id), "failed", [], PROVIDER_NOT_CONFIGURED)
@@ -443,34 +721,64 @@ async def generate_visual(
                 raise ImageProviderError(
                     "AI images are disabled", code=PROVIDER_NOT_CONFIGURED, retryable=False
                 )
-            provider_name = context.settings.image_provider.strip().lower()
-            provider_model = context.settings.image_model
-            provider = create_image_provider(
-                ImageProviderConfig(
-                    provider=provider_name,
-                    api_key=context.settings.image_api_key,
-                    model=context.settings.image_model,
-                    base_url=context.settings.image_base_url,
-                    account_id=context.settings.image_account_id,
-                    timeout_seconds=context.settings.image_timeout_seconds,
-                    max_retries=context.settings.image_max_retries,
+            if not spec.refined_prompt or spec.prompt_override:
+                raise ImageProviderError(
+                    "AI image prompt has not been analyzed by DeepSeek",
+                    code=INVALID_REQUEST,
+                    retryable=False,
                 )
+            image_config = context.settings.image_provider_config(provider_override)
+            provider_name = image_config.provider
+            provider_model = image_config.model
+            provider = create_image_provider(image_config)
+            image_request = ImageRequest(
+                # 与 `VisualResponse.resolved_prompt` 同一个方法：确认框里
+                # 展示的就是这里真正发出去的字符串。
+                prompt=spec.render_prompt(),
+                size=spec.size,
+                quality=spec.quality,
+                negative_prompt=spec.negative_prompt,
+                seed=spec.seed,
             )
-            generated = await asyncio.to_thread(
-                provider.generate,
-                ImageRequest(
-                    # 与 `VisualResponse.resolved_prompt` 同一个方法：确认框里
-                    # 展示的就是这里真正发出去的字符串。
-                    prompt=spec.render_prompt(),
-                    size=spec.size,
-                    quality=spec.quality,
-                ),
+            generation = await _generate_image_with_compliance_retry(
+                provider,
+                image_request,
+                runner=context.llm_runner(),
             )
+            if generation.compliance_audit is not None:
+                usage = {"compliance_retry": generation.compliance_audit}
+            if (
+                generation.first_rejection is not None
+                and generation.compliance_audit is not None
+                and generation.compliance_audit["retry_count"] == 1
+            ):
+                # 第一笔拒绝必须单独落 attempt；即使第二次成功，也不能把原始提示词、
+                # 拒绝原因和实际发生过的重试覆盖掉。
+                async with context.session() as session:
+                    await record_visual_attempt(
+                        session,
+                        visual_id=visual_id,
+                        provider=provider_name,
+                        model=provider_model,
+                        request_id=generation.first_rejection.request_id,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        usage={"compliance_retry": generation.compliance_audit},
+                        error_code=CONTENT_REJECTED,
+                    )
+            if generation.error is not None:
+                raise generation.error
+            if generation.generated is None:
+                raise RuntimeError("image provider returned no result")
+            generated = generation.generated
             provider_name = generated.provider
             provider_model = generated.model
             request_id = generated.request_id
-            usage = generated.usage
-            result = await asyncio.to_thread(visuald.normalize_result, generated.data)
+            usage = {**generated.usage, **usage}
+            result = await asyncio.to_thread(
+                visuald.normalize_result,
+                generated.data,
+                target_size=spec.size,
+            )
 
         visual_qa = result.provenance.get("visual_qa")
         if isinstance(visual_qa, dict) and not visual_qa.get("passed", False):
