@@ -32,14 +32,19 @@ describe('项目切换器键盘模型', () => {
     const listbox = await screen.findByRole('listbox');
     await waitFor(() => expect(listbox).toHaveAttribute('aria-activedescendant', 'project-option-p1'));
     await userEvent.keyboard('{End}');
-    expect(listbox).toHaveAttribute('aria-activedescendant', 'project-option-p3');
+    // 活动项由 React 状态驱动，按键之后并不同步落到 DOM 上。上一条断言用了
+    // waitFor，这几条却是裸 expect——在快的 Linux runner 上碰巧赢了竞态，
+    // 在负载高的 macOS runner 上就输。断言口径必须一致。
+    await waitFor(() =>
+      expect(listbox).toHaveAttribute('aria-activedescendant', 'project-option-p3'),
+    );
     await userEvent.keyboard('{Enter}');
-    expect(push).toHaveBeenCalledWith('/projects/p3/write');
-    expect(trigger).toHaveFocus();
+    await waitFor(() => expect(push).toHaveBeenCalledWith('/projects/p3/write'));
+    await waitFor(() => expect(trigger).toHaveFocus());
 
     await userEvent.click(trigger);
     await userEvent.keyboard('{Home}{Escape}');
-    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
-    expect(trigger).toHaveFocus();
+    await waitFor(() => expect(screen.queryByRole('listbox')).not.toBeInTheDocument());
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 });
