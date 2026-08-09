@@ -1130,3 +1130,25 @@ export interface VersionHistory {
   outlines: OutlineVersion[];
   documents: DocumentVersion[];
 }
+
+/** 任务本体目录里的一条（绑定选择器用）。 */
+export interface TaskDefinitionSummary {
+  slug: string;
+  domain: string;
+  label: string;
+  metric_count: number;
+  dataset_count: number;
+  has_vocabulary: boolean;
+}
+
+/** 项目实际生效的任务集及其来源。 */
+export interface ProjectTaskProfile {
+  project_id: string;
+  /** explicit = 用户绑定；inferred = QDECOMP 推断；fallback = 未绑定，按开关回退。 */
+  source: 'explicit' | 'inferred' | 'fallback';
+  bound: boolean;
+  task_ids: string[];
+  effective_tasks: TaskDefinitionSummary[];
+  fallback_mode: string;
+  fallback_note: string | null;
+}

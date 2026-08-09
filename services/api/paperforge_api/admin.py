@@ -27,11 +27,12 @@ from db.models.auth import AppUser
 from db.models.library import DocumentFile, LiteraturePdfUpload
 from db.models.paper import ExportArtifact, PaperProject, UserAsset, VisualAsset
 from db.session import make_engine, make_session_factory
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from storage import make_object_store
 
 from paperforge_api.auth_service import hash_password
 from paperforge_api.config import get_settings
+from paperforge_api.routers.projects import TASK_PROFILE_USER_BOUND_KEY
 from paperforge_api.storage_migration import (
     export_storage,
     migrate_storage,
@@ -114,6 +115,10 @@ def main() -> None:
         action="store_true",
         help="validate and print the diff without writing",
     )
+    task_commands.add_parser(
+        "coverage",
+        help="report how many projects are bound, i.e. whether generic_only is safe yet",
+    )
 
     args = parser.parse_args()
     if args.command == "bootstrap-admin":
@@ -194,6 +199,10 @@ async def _tasks_command(args: argparse.Namespace) -> None:
                 print(f"\n{len(specs)} task definition(s)")
                 return
 
+            if args.task_command == "coverage":
+                await _task_coverage(session)
+                return
+
             if args.task_command == "export":
                 specs = await list_task_definitions(session)
                 payload = [task_spec_to_payload(spec) for spec in specs]
@@ -241,6 +250,63 @@ async def _tasks_command(args: argparse.Namespace) -> None:
             )
     finally:
         await engine.dispose()
+
+
+async def _task_coverage(session: Any) -> None:
+    """报告任务绑定覆盖率——这是能否安全切到 generic_only 的唯一判据。
+
+    未绑定的项目当前继承**全部**领域的白名单。切换回退开关会把它们改成通用任务，
+    也就是缩小匹配面；覆盖率越高，这个切换影响的项目越少。
+    """
+    from db.models.paper import ProjectTaskProfile
+
+    total = int(
+        await session.scalar(
+            select(func.count()).select_from(PaperProject).where(PaperProject.deleted_at.is_(None))
+        )
+        or 0
+    )
+    bound_rows = list(
+        (
+            await session.execute(
+                select(ProjectTaskProfile.project_id, func.count())
+                .join(PaperProject, PaperProject.id == ProjectTaskProfile.project_id)
+                .where(PaperProject.deleted_at.is_(None))
+                .group_by(ProjectTaskProfile.project_id)
+            )
+        ).all()
+    )
+    bound = len(bound_rows)
+    user_bound = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(PaperProject)
+            .where(
+                PaperProject.deleted_at.is_(None),
+                PaperProject.scope_json[TASK_PROFILE_USER_BOUND_KEY].astext == "true",
+            )
+        )
+        or 0
+    )
+    unbound = total - bound
+    coverage = (bound / total) if total else 1.0
+
+    print(f"projects (not deleted) : {total}")
+    print(f"  bound                : {bound}  ({coverage:.0%})")
+    print(f"    of which user-bound: {user_bound}")
+    print(f"  unbound              : {unbound}")
+    print()
+    if unbound:
+        print(
+            f"{unbound} project(s) currently inherit EVERY domain's metric and dataset "
+            "whitelist via TASK_PROFILE_FALLBACK=all_tasks."
+        )
+        print(
+            "Bind them (UI: project scope page, or PUT /api/v1/projects/{id}/tasks) "
+            "before switching the fallback to generic_only."
+        )
+    else:
+        print("Every project is bound; TASK_PROFILE_FALLBACK no longer affects any project.")
 
 
 def _normalized_task(payload: dict[str, Any]) -> str:

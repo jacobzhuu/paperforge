@@ -30,11 +30,15 @@ from db import (
     list_eligibility_decisions,
     list_entries,
     list_jobs,
+    list_project_task_bindings,
+    list_project_task_specs,
     list_projects,
     list_search_runs,
+    list_task_definitions,
     parsed_asset_payloads,
     project_counters,
     project_llm_cost,
+    replace_project_task_profile,
     request_job_stop,
     request_polish_skip,
     restore_project,
@@ -90,14 +94,17 @@ from paperforge_api.schemas import (
     LibraryUtilizationResponse,
     LiteratureCardResponse,
     ProjectResponse,
+    ProjectTaskProfileResponse,
     ScholarlyWorkResponse,
     ScopeResponse,
     SearchRequest,
     SearchRunResponse,
     SelectEntriesRequest,
     SubmissionReadinessResponse,
+    TaskDefinitionResponse,
     UpdateLibraryEntryRequest,
     UpdateProjectRequest,
+    UpdateProjectTasksRequest,
     UpdateScopeRequest,
     WhitelistResponse,
 )
@@ -485,6 +492,112 @@ async def put_scope(
     # 手改过的必须豁免，否则用户调好的关键词会被下一次检索悄悄覆盖。
     await update_project_scope(session, project, {**request.scope, "generator": "user"})
     return ScopeResponse(project_id=str(project.id), scope=project.scope_json or {})
+
+
+@router.get("/tasks", response_model=list[TaskDefinitionResponse])
+async def list_tasks(
+    session: SessionDep,
+    domain: str | None = None,
+) -> list[TaskDefinitionResponse]:
+    """任务本体目录（非项目作用域），供绑定选择器渲染。"""
+    return [_task_response(spec) for spec in await list_task_definitions(session, domain=domain)]
+
+
+@router.get("/projects/{project_id}/tasks", response_model=ProjectTaskProfileResponse)
+async def get_project_tasks(
+    project_id: str,
+    session: SessionDep,
+) -> ProjectTaskProfileResponse:
+    """项目实际生效的任务集及其来源。"""
+    from paperforge_api.config import get_settings
+
+    project = await _require_project(session, project_id)
+    settings = get_settings()
+    bound = await list_project_task_bindings(session, project.id)
+    effective = await list_project_task_specs(
+        session,
+        project.id,
+        fallback=settings.task_profile_fallback,
+    )
+    if bound:
+        source = "explicit" if _has_user_bound_marker(project) else "inferred"
+        note = None
+    else:
+        source = "fallback"
+        note = (
+            "该项目未绑定任务，正在继承全部领域的指标与数据集白名单；"
+            "绑定后抽取只会使用相关领域的术语。"
+            if settings.task_profile_fallback == "all_tasks"
+            else "该项目未绑定任务，按通用学术任务处理。"
+        )
+    return ProjectTaskProfileResponse(
+        project_id=str(project.id),
+        source=source,
+        bound=bool(bound),
+        task_ids=[row.task_id for row in bound],
+        effective_tasks=[_task_response(spec) for spec in effective],
+        fallback_mode=settings.task_profile_fallback,
+        fallback_note=note,
+    )
+
+
+@router.put("/projects/{project_id}/tasks", response_model=ProjectTaskProfileResponse)
+async def put_project_tasks(
+    project_id: str,
+    request: UpdateProjectTasksRequest,
+    session: SessionDep,
+) -> ProjectTaskProfileResponse:
+    """显式绑定任务集；空列表解除绑定并回到回退行为。
+
+    绑定会被打上用户标记，之后 QDECOMP 的自动推断不再覆盖它——与 SCOPE 的
+    ``generator='user'`` 豁免、以及研究问题的 ``locked`` 是同一套约定。
+    """
+    project = await _require_project(session, project_id)
+    requested = list(
+        dict.fromkeys(task_id.strip() for task_id in request.task_ids if task_id.strip())
+    )
+    known = {spec.slug for spec in await list_task_definitions(session)}
+    unknown = [task_id for task_id in requested if task_id not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "unknown_task_ids", "task_ids": unknown},
+        )
+    await replace_project_task_profile(session, project_id=project.id, task_ids=requested)
+    await _set_user_bound_marker(session, project, bound=bool(requested))
+    return await get_project_tasks(project_id, session)
+
+
+def _task_response(spec: Any) -> TaskDefinitionResponse:
+    labels = spec.labels or {}
+    return TaskDefinitionResponse(
+        slug=spec.slug,
+        domain=spec.domain,
+        label=str(labels.get("zh") or labels.get("en") or spec.slug),
+        metric_count=len(spec.metrics),
+        dataset_count=len(spec.datasets),
+        has_vocabulary=not spec.vocabulary.empty,
+    )
+
+
+#: 用户是否亲手定过任务集。存在 ``scope_json`` 里而不是新开一列：这只是一个布尔
+#: 意图标记，``project_task_profile`` 的行本身仍是唯一的绑定真相。加一列会需要一次
+#: 迁移，而迁移应当由 schema 的真实需要驱动，不是由一个标记驱动。
+#: worker 侧在 ``pipelines.qdecomp`` 读同一个键。
+TASK_PROFILE_USER_BOUND_KEY = "task_profile_user_bound"
+
+
+def _has_user_bound_marker(project: Any) -> bool:
+    return bool((project.scope_json or {}).get(TASK_PROFILE_USER_BOUND_KEY))
+
+
+async def _set_user_bound_marker(session: AsyncSession, project: Any, *, bound: bool) -> None:
+    scope = dict(project.scope_json or {})
+    if bound:
+        scope[TASK_PROFILE_USER_BOUND_KEY] = True
+    else:
+        scope.pop(TASK_PROFILE_USER_BOUND_KEY, None)
+    await update_project_scope(session, project, scope)
 
 
 @router.post(

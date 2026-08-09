@@ -223,6 +223,49 @@ class UpdateScopeRequest(BaseModel):
     scope: dict[str, Any]
 
 
+class TaskDefinitionResponse(BaseModel):
+    """任务本体目录里的一条，供绑定选择器渲染。"""
+
+    slug: str
+    domain: str
+    label: str
+    metric_count: int = 0
+    dataset_count: int = 0
+    has_vocabulary: bool = False
+
+
+class ProjectTaskProfileResponse(BaseModel):
+    """项目当前**实际生效**的任务集，以及它是怎么来的。
+
+    ``source`` 是这个响应的重点：三种来源在证据抽取时表现完全不同，而此前界面上
+    根本看不出区别。
+
+    * ``explicit``  —— 用户显式绑定，管线不会覆盖它；
+    * ``inferred``  —— QDECOMP 从子问题里推断出来的（只在本体线索命中时才会发生）；
+    * ``fallback``  —— 没有任何绑定，按 TASK_PROFILE_FALLBACK 回退。当前默认
+      ``all_tasks`` 意味着这个项目继承了**每一个**领域的指标与数据集白名单。
+    """
+
+    project_id: str
+    source: str
+    bound: bool
+    task_ids: list[str] = Field(default_factory=list)
+    effective_tasks: list[TaskDefinitionResponse] = Field(default_factory=list)
+    fallback_mode: str = "all_tasks"
+    #: 回退生效时给用户看的一句话解释；显式绑定时为 None。
+    fallback_note: str | None = None
+
+
+class UpdateProjectTasksRequest(BaseModel):
+    """空列表表示解除绑定，回到回退行为——这是"撤销"，不是"绑定到零个任务"。
+
+    想表达"这是一篇通用学术论文"应当显式绑定 ``generic.scholarly``，那会写入一行，
+    因而与"从未绑定"可区分，也不再受回退开关影响。
+    """
+
+    task_ids: list[str] = Field(default_factory=list)
+
+
 class GenerateScopeRequest(BaseModel):
     topic: str | None = None
 

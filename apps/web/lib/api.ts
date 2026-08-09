@@ -9,6 +9,8 @@ import type {
   LibraryPdfUploadResult,
   LiteratureRole,
   Project,
+  ProjectTaskProfile,
+  TaskDefinitionSummary,
   CitationAudit,
   CostDetail,
   EligibilityDecision,
@@ -457,6 +459,36 @@ export function generateScope(
         `/projects/${projectId}/scope/generate`,
         { method: 'POST', body: JSON.stringify({ topic: topic ?? null }) },
       ).then((r) => r.scope),
+    undefined,
+  );
+}
+
+export function listTaskDefinitions(
+  signal?: AbortSignal,
+): Promise<ApiResult<TaskDefinitionSummary[]>> {
+  return withFallback(() => request<TaskDefinitionSummary[]>('/tasks', { signal }), []);
+}
+
+export function getProjectTasks(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ApiResult<ProjectTaskProfile | undefined>> {
+  return withFallback(
+    () => request<ProjectTaskProfile>(`/projects/${projectId}/tasks`, { signal }),
+    undefined,
+  );
+}
+
+export function updateProjectTasks(
+  projectId: string,
+  taskIds: string[],
+): Promise<ApiResult<ProjectTaskProfile | undefined>> {
+  return withFallback(
+    () =>
+      request<ProjectTaskProfile>(`/projects/${projectId}/tasks`, {
+        method: 'PUT',
+        body: JSON.stringify({ task_ids: taskIds }),
+      }),
     undefined,
   );
 }

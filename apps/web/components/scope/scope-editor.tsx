@@ -14,6 +14,7 @@ import { useToast } from '@/components/ui/toast';
 import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobFinished, useProject } from '@/components/project/project-context';
+import { TaskBinding } from '@/components/scope/task-binding';
 import { generateScope, getScope, startSearch, updateScope } from '@/lib/api';
 import { describeError } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
@@ -152,6 +153,8 @@ export function ScopeEditor() {
                 这一步可以跳过——直接去文献工作台检索也能跑通。
               </div>
             )}
+
+            <TaskBinding projectId={projectId} />
 
             <section>
               <header className="pb-3">

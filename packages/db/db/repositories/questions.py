@@ -167,6 +167,26 @@ async def list_research_questions(
     return list((await session.scalars(stmt)).all())
 
 
+async def list_project_task_bindings(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[ProjectTaskProfile]:
+    """项目的原始绑定行。
+
+    与 ``list_project_task_specs`` 不同：那个解析出**生效**的任务集（无绑定时会回退），
+    这个只回答「有没有显式绑定过」。界面要区分这两者才能说清任务集是从哪来的。
+    """
+    return list(
+        (
+            await session.scalars(
+                select(ProjectTaskProfile)
+                .where(ProjectTaskProfile.project_id == project_id)
+                .order_by(ProjectTaskProfile.order_index, ProjectTaskProfile.task_id)
+            )
+        ).all()
+    )
+
+
 async def replace_project_task_profile(
     session: AsyncSession,
     *,
@@ -324,6 +344,7 @@ __all__ = [
     "clear_automatic_question_evidence_links",
     "list_question_evidence_links",
     "list_research_questions",
+    "list_project_task_bindings",
     "replace_project_task_profile",
     "replace_research_questions",
     "set_question_answer_status",
