@@ -127,6 +127,9 @@ class TaskDefinition(Base, TimestampMixin):
     dimension_schema_json: Mapped[list | None] = mapped_column(JSONB)
     exclusion_cues_json: Mapped[list | None] = mapped_column(JSONB)
     inclusion_cues_json: Mapped[list | None] = mapped_column(JSONB)
+    # 模型族 / 输入表征 / 预训练骨干 / 划分策略 / 任务变体（R16：领域词表住在数据里）。
+    # 结构见 migrations/0024_task_vocabulary。
+    vocabulary_json: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class ProjectTaskProfile(Base, TimestampMixin):

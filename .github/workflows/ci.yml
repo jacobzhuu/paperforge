@@ -38,6 +38,10 @@ jobs:
         run: uv sync --all-packages --frozen
       - name: Ruff
         run: uv run ruff check .
+      # R16：领域词表必须住在 task_definition 行里。这条 lint 写好很久却从未被调用，
+      # 于是 evidence.py 里的模型族/骨干/划分策略词表一路留到了 Phase 3。
+      - name: Ontology literal lint
+        run: uv run python scripts/ontology_literal_lint.py
       - name: Alembic migration
         run: uv run alembic upgrade head
         env:

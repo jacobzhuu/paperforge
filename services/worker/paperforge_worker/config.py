@@ -45,6 +45,14 @@ class WorkerSettings(BaseSettings):
     experiment_extraction_max_works: int = 20
     experiment_extraction_max_chars: int = 60_000
 
+    # 未绑定任务的项目如何解析任务集（P0-5 / 审计修正 C-6）。
+    #   all_tasks    —— 历史行为：继承**全部**任务定义。由于没有任何路由创建
+    #                   ProjectTaskProfile，实践中每个项目都拿到了 recsys + BGC 的
+    #                   指标与数据集白名单。
+    #   generic_only —— 解析到 generic.scholarly：空词表、空数据集，只留跨领域指标核心。
+    # 切换会缩小未绑定项目的匹配面，因此先发 all_tasks，量过再翻。
+    task_profile_fallback: str = "all_tasks"
+
     @property
     def experiment_extraction_enabled(self) -> bool:
         return self.experiment_extraction_mode.strip().lower() in {"shadow", "on"}

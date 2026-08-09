@@ -1,0 +1,1412 @@
+[
+  {
+    "slug": "benchmark.dataset_construction",
+    "domain": "bgc",
+    "labels": {
+      "en": "Benchmark and dataset construction",
+      "zh": "基准与数据集构建"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "bgc.classification",
+    "domain": "bgc",
+    "labels": {
+      "en": "BGC classification",
+      "zh": "生物合成基因簇分类"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "bgc.identification",
+    "domain": "bgc",
+    "labels": {
+      "en": "BGC identification",
+      "zh": "生物合成基因簇识别"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "bgc.product_activity_prediction",
+    "domain": "bgc",
+    "labels": {
+      "en": "BGC product activity prediction",
+      "zh": "产物活性预测"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "bgc.product_structure_prediction",
+    "domain": "bgc",
+    "labels": {
+      "en": "BGC product structure prediction",
+      "zh": "产物结构预测"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "tool.engineering",
+    "domain": "bgc",
+    "labels": {
+      "en": "Tool engineering",
+      "zh": "工具工程与部署"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "validation.wetlab",
+    "domain": "bgc",
+    "labels": {
+      "en": "Wet-lab validation",
+      "zh": "湿实验验证"
+    },
+    "metrics": [
+      "AUROC",
+      "AUPRC",
+      "F1",
+      "macro-F1",
+      "F-measure",
+      "MCC",
+      "precision",
+      "recall",
+      "Tanimoto",
+      "top-k accuracy"
+    ],
+    "datasets": [
+      "MIBiG",
+      "antiSMASH-DB",
+      "IMG-ABC"
+    ],
+    "dimensions": [
+      "dataset",
+      "dataset_version",
+      "split_strategy",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "biosynthetic gene cluster",
+      "bgc",
+      "secondary metabolite",
+      "antiSMASH",
+      "DeepBGC",
+      "MIBiG"
+    ],
+    "exclusion_cues": [
+      "RNA secondary structure",
+      "histopathology grading"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF",
+        "BERT"
+      ],
+      "input_representations": [
+        "nucleotide",
+        "amino acid",
+        "Pfam domain",
+        "domain graph"
+      ],
+      "pretrained_backbones": [
+        "ESM2",
+        "ProtBERT",
+        "DNABERT",
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "generic.scholarly",
+    "domain": "generic",
+    "labels": {
+      "en": "General scholarly work",
+      "zh": "通用学术研究"
+    },
+    "metrics": [],
+    "datasets": [],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [],
+      "input_representations": [],
+      "pretrained_backbones": [],
+      "split_strategies": [],
+      "task_variants": []
+    }
+  },
+  {
+    "slug": "recsys.adversarial_defense",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Adversarial defense for recommenders",
+      "zh": "推荐系统对抗防御"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "detection rate",
+      "F1",
+      "precision",
+      "recall"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Amazon Books",
+      "Steam",
+      "Yelp"
+    ],
+    "dimensions": [
+      "dataset",
+      "threat_model",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "adversarial defense",
+      "robust recommendation",
+      "poison detection",
+      "sequential recommendation"
+    ],
+    "exclusion_cues": [
+      "intrusion detection",
+      "IoT vision",
+      "breast cancer",
+      "blockchain"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "recsys.benchmark_dataset",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Attack evaluation datasets and metrics",
+      "zh": "攻击评估数据集与指标"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "ER@K",
+      "Recall@K"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Amazon Books",
+      "Amazon Games",
+      "Steam",
+      "Yelp",
+      "LastFM"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split_strategy"
+    ],
+    "inclusion_cues": [
+      "MovieLens",
+      "Amazon Beauty",
+      "attack success rate",
+      "NDCG",
+      "sequential recommendation"
+    ],
+    "exclusion_cues": [
+      "histopathology",
+      "blockchain",
+      "image quality assessment"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "recsys.model_extraction",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Recommendation model extraction",
+      "zh": "推荐模型窃取"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "accuracy",
+      "F1"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Steam",
+      "Yelp"
+    ],
+    "dimensions": [
+      "dataset",
+      "threat_model",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "model extraction",
+      "steal recommendation",
+      "sequential recommendation"
+    ],
+    "exclusion_cues": [
+      "blockchain",
+      "prompt injection",
+      "intrusion detection"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "recsys.poisoning_attack",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Sequential recommendation poisoning attack",
+      "zh": "序列推荐投毒攻击"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "ER@K",
+      "Recall@K",
+      "precision",
+      "recall",
+      "F1"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Amazon Books",
+      "Amazon Games",
+      "Steam",
+      "Yelp",
+      "LastFM"
+    ],
+    "dimensions": [
+      "dataset",
+      "attack_goal",
+      "threat_model",
+      "attack_budget",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "sequential recommendation",
+      "session-based recommendation",
+      "poisoning attack",
+      "fake user",
+      "profile pollution"
+    ],
+    "exclusion_cues": [
+      "intrusion detection",
+      "histopathology",
+      "blockchain",
+      "prompt injection",
+      "image quality assessment",
+      "breast cancer",
+      "financial fraud",
+      "IoT vision"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "recsys.profile_pollution",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Profile pollution / fake-user injection",
+      "zh": "用户画像污染与虚假用户注入"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "ER@K",
+      "Recall@K"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Amazon Books",
+      "Steam",
+      "Yelp",
+      "LastFM"
+    ],
+    "dimensions": [
+      "dataset",
+      "attack_goal",
+      "threat_model",
+      "attack_budget",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "profile pollution",
+      "fake user",
+      "injected profile",
+      "sequential recommendation"
+    ],
+    "exclusion_cues": [
+      "intrusion detection",
+      "histopathology",
+      "blockchain",
+      "prompt injection"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "recsys.robust_training",
+    "domain": "recsys_attack",
+    "labels": {
+      "en": "Robust training for sequential recommenders",
+      "zh": "序列推荐鲁棒训练"
+    },
+    "metrics": [
+      "HR@K",
+      "NDCG@K",
+      "MRR",
+      "ASR",
+      "Recall@K"
+    ],
+    "datasets": [
+      "MovieLens-1M",
+      "MovieLens-20M",
+      "Amazon Beauty",
+      "Steam",
+      "Yelp"
+    ],
+    "dimensions": [
+      "dataset",
+      "threat_model",
+      "metric_name"
+    ],
+    "inclusion_cues": [
+      "robust training",
+      "adversarial training",
+      "sequential recommendation"
+    ],
+    "exclusion_cues": [
+      "intrusion detection",
+      "blockchain",
+      "prompt injection"
+    ],
+    "vocabulary": {
+      "model_families": [
+        "SASRec",
+        "BERT4Rec",
+        "GRU4Rec",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "item sequence",
+        "user sequence"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa"
+      ],
+      "split_strategies": [
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  }
+]

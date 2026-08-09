@@ -567,16 +567,34 @@ def test_measurements_are_extracted_from_prose_and_structured_tables() -> None:
     assert prose[0].dataset == "TestSet"
     assert prose[0].sample_size == 1200
 
-    table = _measurement_candidates(
-        "Table 2\n| Dataset | nDCG@10 |\n| --- | --- |\n| ML-1M | 0.412 |"
+    bgc = _measurement_candidates("The classifier achieved an AUROC of 0.982 and MCC: 0.71.")
+    assert {(item.metric_name, item.value) for item in bgc} == {("AUROC", 0.982), ("MCC", 0.71)}
+
+
+def test_domain_metrics_require_the_ontology_to_admit_them() -> None:
+    """NDCG@K 是推荐领域的指标，不是「通用」指标（P0-5）。
+
+    此前它硬编码在一份名为 universal 的列表里，于是任何论文——包括临床论文里的
+    "HR"（风险比）——都会被按推荐指标抽取。现在它只有在项目的任务本体声明了它时
+    才可见。
+    """
+    from db.repositories.tasks import compile_metric_name_pattern, compile_metric_pattern
+
+    table = "Table 2\n| Dataset | nDCG@10 |\n| --- | --- |\n| ML-1M | 0.412 |"
+
+    without_ontology = _measurement_candidates(table)
+    assert not any(item.metric_name.startswith("NDCG") for item in without_ontology)
+
+    recsys_metrics = ["NDCG@K", "HR@K"]
+    with_ontology = _measurement_candidates(
+        table,
+        metric_pattern=compile_metric_pattern(recsys_metrics),
+        metric_name_pattern=compile_metric_name_pattern(recsys_metrics),
     )
     assert any(
         item.metric_name == "NDCG@10" and item.value == 0.412 and item.dataset == "ML-1M"
-        for item in table
+        for item in with_ontology
     )
-
-    bgc = _measurement_candidates("The classifier achieved an AUROC of 0.982 and MCC: 0.71.")
-    assert {(item.metric_name, item.value) for item in bgc} == {("AUROC", 0.982), ("MCC", 0.71)}
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

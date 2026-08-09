@@ -26,10 +26,12 @@ from db.models.library import (
 from db.repositories.tasks import (
     TaskSpec,
     compile_dataset_pattern,
+    compile_metric_name_pattern,
     compile_metric_pattern,
     datasets_for_tasks,
     infer_task_id,
     metrics_for_tasks,
+    vocabulary_for_tasks,
 )
 from db.repositories.tasks import (
     topical_status as ontology_topical_status,
@@ -59,14 +61,10 @@ _RESULT_CUES = re.compile(
     r"(?:结果|实验|评估|优于|提升|下降|增加|结论|发现|观察|证明|数据集|样本|定理|局限)",
     re.IGNORECASE,
 )
-_METRIC_RE = re.compile(
-    r"(?P<metric>auroc|auprc|auc|accuracy|precision|recall|macro[- ]?f1|"
-    r"f[- ]?measure|f1(?:-score)?|mcc|tanimoto|top[- ]?k\s+accuracy|bleu|rouge(?:-[L12])?|"
-    r"mrr|map|ndcg@\d+|hr@\d+|hit\s*rate(?:@\d+)?|asr|er@\d+|recall@\d+|ndcg|hr)"
-    r"\s*(?:score\s*)?(?:=|:|of|was|is|reached|达到|为)?\s*"
-    r"(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>%|percent|percentage points?|百分点)?",
-    re.IGNORECASE,
-)
+# 无本体时的兜底：只用真正跨领域的指标核心。领域指标（NDCG@K、ASR、Tanimoto…）
+# 只能经由 task_definition 的 metric_whitelist_json 进入。
+_METRIC_RE = compile_metric_pattern([])
+_METRIC_NAME_RE = compile_metric_name_pattern([])
 _SAMPLE_RE = re.compile(
     r"(?:\bn\s*=\s*|sample(?: size)?(?: of|=|:)?\s*|样本(?:量|数)?(?:为|=|:)?\s*)"
     r"(?P<value>\d[\d,]*)",
@@ -196,8 +194,14 @@ async def extract_evidence_units(
 
     outcome.selected_works = len(entries)
     async with context.session() as session:
-        task_specs = await list_project_task_specs(session, context.project_id)
-    metric_pattern = compile_metric_pattern(metrics_for_tasks(task_specs))
+        task_specs = await list_project_task_specs(
+            session,
+            context.project_id,
+            fallback=context.settings.task_profile_fallback,
+        )
+    ontology_metrics = metrics_for_tasks(task_specs)
+    metric_pattern = compile_metric_pattern(ontology_metrics)
+    metric_name_pattern = compile_metric_name_pattern(ontology_metrics)
     dataset_pattern = compile_dataset_pattern(datasets_for_tasks(task_specs))
     # LLM 抽取按 job 计预算，用完的文献静默退回纯正则路径（并计数留痕）。
     llm_budget = (
@@ -222,6 +226,7 @@ async def extract_evidence_units(
                 document=document,
                 tasks=task_specs,
                 metric_pattern=metric_pattern,
+                metric_name_pattern=metric_name_pattern,
                 dataset_pattern=dataset_pattern,
                 llm_budget_remaining=llm_budget,
             )
@@ -284,6 +289,7 @@ async def _extract_work_evidence(
     document: DocumentFile | None,
     tasks: list[TaskSpec],
     metric_pattern: re.Pattern[str],
+    metric_name_pattern: re.Pattern[str] | None,
     dataset_pattern: re.Pattern[str] | None,
     llm_budget_remaining: int = 0,
 ) -> EvidenceOutcome:
@@ -338,6 +344,7 @@ async def _extract_work_evidence(
             for measurement in _measurement_candidates(
                 candidate.text,
                 metric_pattern=metric_pattern,
+                metric_name_pattern=metric_name_pattern,
                 dataset_pattern=dataset_pattern,
             ):
                 await upsert_evidence_measurement(
@@ -402,6 +409,7 @@ async def _extract_work_evidence(
         evidence_unit_ids=unit_ids_by_text,
         tasks=tasks,
         metric_pattern=metric_pattern,
+        metric_name_pattern=metric_name_pattern,
         dataset_pattern=dataset_pattern,
         llm_extraction=extraction,
     )
@@ -548,6 +556,7 @@ async def _persist_structured_experiment_data(
     evidence_unit_ids: dict[str, Any],
     tasks: list[TaskSpec],
     metric_pattern: re.Pattern[str],
+    metric_name_pattern: re.Pattern[str] | None,
     dataset_pattern: re.Pattern[str] | None,
     llm_extraction: ExperimentExtraction | None = None,
 ) -> list[dict[str, Any]]:
@@ -600,6 +609,7 @@ async def _persist_structured_experiment_data(
             for measurement in _measurement_candidates(
                 candidate.text,
                 metric_pattern=metric_pattern,
+                metric_name_pattern=metric_name_pattern,
                 dataset_pattern=dataset_pattern,
             ):
                 metrics.add(measurement.metric_name)
@@ -835,9 +845,9 @@ def _structured_payload(
     dataset_pattern: re.Pattern[str] | None = None,
 ) -> dict[str, Any]:
     tasks = list(tasks or [])
-
-    def matches(pattern: str, limit: int = 12) -> list[str]:
-        return list(dict.fromkeys(re.findall(pattern, fulltext, re.IGNORECASE)))[:limit]
+    # R16：模型族 / 输入表征 / 预训练骨干 / 划分策略 / 任务变体全部来自 task_definition。
+    # 词表为空时这些字段留空——对领域外论文，留空严格优于填错。
+    vocabulary = vocabulary_for_tasks(tasks)
 
     object_payload = [
         {
@@ -865,19 +875,21 @@ def _structured_payload(
     return {
         "schema": "experiment_v2",
         "task_id": infer_task_id(fulltext, tasks),
-        "task_variant": _task_variant(fulltext),
+        "task_variant": _cue_lookup(fulltext, vocabulary.task_variants),
         "datasets": datasets or fallback_datasets,
         "dataset_version": _dataset_version(fulltext, ontology_datasets),
-        "split_strategy": _split_strategy(fulltext),
-        "model_families": matches(
-            r"\b(?:CNN|BiLSTM|Transformer|GNN|CRF|BERT|LSTM|GRU|SASRec|BERT4Rec|GRU4Rec)\b"
+        "split_strategy": _cue_lookup(fulltext, vocabulary.split_strategies),
+        "model_families": _vocabulary_matches(fulltext, vocabulary.model_families),
+        "input_representations": _vocabulary_matches(fulltext, vocabulary.input_representations),
+        "pretrained_backbone": _first_vocabulary_match(
+            fulltext,
+            vocabulary.pretrained_backbones,
+            # 骨干常带版本后缀（ESM2-650M）；原实现的 `ESM2[- ]?\d+[A-Z]?` 就是为此。
+            # 词表里存裸名，后缀在这里补，手写 JSON 因此不必写正则。
+            version_suffix=True,
         ),
-        "input_representations": matches(
-            r"\b(?:nucleotide|amino acid|Pfam domain|domain graph|item sequence|user sequence)\b"
-        ),
-        "pretrained_backbone": _first_match(
-            fulltext, r"\b(?:ESM2[- ]?\d+[A-Z]?|ProtBERT|DNABERT|BERT|RoBERTa)\b"
-        ),
+        # 下面三条是跨学科通用的训练超参，不属于领域词表，保持在代码里。
+        # 唯一的例外是 BPR（推荐领域的损失），见 Phase 3 报告的残留项。
         "loss_function": _first_match(
             fulltext, r"\b(?:cross[- ]entropy|focal loss|contrastive loss|mean squared error|BPR)\b"
         ),
@@ -889,7 +901,10 @@ def _structured_payload(
         "batch_size": _integer_hyperparameter(fulltext, r"batch size\s*(?:=|:|of)?\s*"),
         "epochs": _epoch_count(fulltext),
         "regularization": _first_match(fulltext, r"\b(?:dropout|weight decay|early stopping)\b"),
-        "baselines": matches(r"\b(?:[A-Z][A-Za-z0-9+-]{2,24})\b")[:8],
+        # `baselines` 曾是 `[A-Z][A-Za-z0-9+-]{2,24}`——它匹配任何首字母大写的词，
+        # 于是把 The / We / Table / 作者姓氏当成"基线方法"存进 payload。
+        # 空列表不如真实基线有用，但比结构化噪声强；真正的基线由 experiment_v3_llm
+        # 的 baseline_name 提供。
         "metrics": metrics,
         "main_results": records,
         "ablation_results": [
@@ -946,15 +961,49 @@ def _locator_display(candidate: EvidenceCandidate) -> str | None:
     return ", ".join(part for part in parts if part) or None
 
 
-def _task_variant(text: str) -> str | None:
-    lower = text.casefold()
-    if "multi-class" in lower or "multiclass" in lower:
-        return "multi-class"
-    if "binary" in lower or "detection" in lower:
-        return "binary detection"
-    if "targeted" in lower:
-        return "targeted attack"
+def _cue_lookup(text: str, pairs: tuple[tuple[str, str], ...]) -> str | None:
+    """先命中先赢的提示词 → 规范名查找（替换原来的 if 链）。
+
+    保留原实现的子串匹配语义（不是词边界）：``"multiclass"`` 要能在
+    ``"multiclass classification"`` 里命中。列表顺序即优先级，由 task_definition 决定。
+    """
+    lower = (text or "").casefold()
+    for cue, name in pairs:
+        if cue.casefold() in lower:
+            return name
     return None
+
+
+def _vocabulary_pattern(terms: tuple[str, ...], *, version_suffix: bool = False) -> str | None:
+    """把词表编成带词边界的交替式，长词优先以免短名吃掉长名。"""
+    cleaned = [term.strip() for term in terms if term and term.strip()]
+    if not cleaned:
+        return None
+    alternatives = "|".join(
+        re.escape(term) for term in sorted(set(cleaned), key=len, reverse=True)
+    )
+    tail = r"(?:[- ]?\d+[A-Z]?)?" if version_suffix else ""
+    return rf"\b(?:{alternatives}){tail}\b"
+
+
+def _vocabulary_matches(text: str, terms: tuple[str, ...], *, limit: int = 12) -> list[str]:
+    """词表里出现在正文中的词，按**正文顺序**去重（与原 findall 语义一致）。"""
+    pattern = _vocabulary_pattern(terms)
+    if pattern is None:
+        return []
+    return list(dict.fromkeys(re.findall(pattern, text, re.IGNORECASE)))[:limit]
+
+
+def _first_vocabulary_match(
+    text: str,
+    terms: tuple[str, ...],
+    *,
+    version_suffix: bool = False,
+) -> str | None:
+    pattern = _vocabulary_pattern(terms, version_suffix=version_suffix)
+    if pattern is None:
+        return None
+    return _first_match(text, pattern)
 
 
 def _dataset_version(text: str, datasets: list[str]) -> str | None:
@@ -986,19 +1035,6 @@ def _epoch_count(text: str) -> int | None:
     if not match:
         return None
     return int(match.group(1) or match.group(2))
-
-
-def _split_strategy(text: str) -> str | None:
-    lower = text.casefold()
-    for cue, name in (
-        ("leave-one-genome-out", "leave-one-genome-out"),
-        ("cluster-based", "cluster-based"),
-        ("temporal split", "temporal"),
-        ("random split", "random"),
-    ):
-        if cue in lower:
-            return name
-    return None
 
 
 def _evidence_candidates(
@@ -1118,11 +1154,17 @@ def _measurement_candidates(
     text: str,
     *,
     metric_pattern: re.Pattern[str] | None = None,
+    metric_name_pattern: re.Pattern[str] | None = None,
     dataset_pattern: re.Pattern[str] | None = None,
 ) -> list[MeasurementCandidate]:
-    """从散文或 Markdown 表格中抽取保守的显式指标值，不推断缺失维度。"""
+    """从散文或 Markdown 表格中抽取保守的显式指标值，不推断缺失维度。
+
+    散文与表头用同一份指标词表，只是编成两条正则：散文那条要匹配「指标 = 数值」，
+    表头那条只认名字。两者都由 ``compile_metric_*_pattern`` 从本体生成。
+    """
     candidates: list[MeasurementCandidate] = []
     pattern = metric_pattern or _METRIC_RE
+    header_pattern = metric_name_pattern or _METRIC_NAME_RE
     dataset = None
     if dataset_pattern is not None:
         dataset_match = dataset_pattern.search(text)
@@ -1158,7 +1200,7 @@ def _measurement_candidates(
                 dataset,
             )
             for column, raw_value in row.items():
-                metric = _metric_from_header(column)
+                metric = _metric_from_header(column, header_pattern)
                 numeric = _parse_numeric_value(raw_value)
                 if metric is None or numeric is None:
                     continue
@@ -1202,14 +1244,10 @@ def _fulltext_grade(
     return "C_fulltext_unlocated"
 
 
-def _metric_from_header(value: str) -> str | None:
+def _metric_from_header(value: str, pattern: re.Pattern[str] | None = None) -> str | None:
+    """表头单元格 → 规范指标名。词表与散文抽取共用一条交替式。"""
     cleaned = " ".join(value.split()).casefold()
-    match = re.search(
-        r"auroc|auprc|auc|accuracy|precision|recall|macro[- ]?f1|f[- ]?measure|"
-        r"f1(?:-score)?|mcc|tanimoto|top[- ]?k\s+accuracy|bleu|rouge(?:-[l12])?|"
-        r"mrr|map|ndcg@\d+|hr@\d+|hit\s*rate(?:@\d+)?",
-        cleaned,
-    )
+    match = (pattern or _METRIC_NAME_RE).search(cleaned)
     return _normalize_metric(match.group()) if match else None
 
 

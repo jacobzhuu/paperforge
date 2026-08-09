@@ -5,13 +5,24 @@ import asyncio
 import csv
 import getpass
 import hashlib
+import json
 import sys
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from db import create_user, get_user_by_email, list_purgeable_projects, purge_project
+from db import (
+    create_user,
+    get_user_by_email,
+    list_purgeable_projects,
+    list_task_definitions,
+    purge_project,
+    task_ontology_warnings,
+    task_spec_to_payload,
+    upsert_task_definitions,
+    validate_task_payloads,
+)
 from db.models.auth import AppUser
 from db.models.library import DocumentFile, LiteraturePdfUpload
 from db.models.paper import ExportArtifact, PaperProject, UserAsset, VisualAsset
@@ -89,6 +100,21 @@ def main() -> None:
         help="retention window in days; only projects deleted before it are purged",
     )
     purge.add_argument("--dry-run", action="store_true")
+
+    tasks = commands.add_parser("tasks", help="inspect and author the task ontology (R16)")
+    task_commands = tasks.add_subparsers(dest="task_command", required=True)
+    task_list = task_commands.add_parser("list", help="print the task ontology")
+    task_list.add_argument("--domain")
+    task_export = task_commands.add_parser("export", help="write the ontology to JSON")
+    task_export.add_argument("--output", type=Path, required=True)
+    task_upsert = task_commands.add_parser("upsert", help="load an ontology JSON file")
+    task_upsert.add_argument("--file", type=Path, required=True)
+    task_upsert.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and print the diff without writing",
+    )
+
     args = parser.parse_args()
     if args.command == "bootstrap-admin":
         if args.password_stdin:
@@ -106,6 +132,8 @@ def main() -> None:
         asyncio.run(_migrate_objects(dry_run=args.dry_run))
     elif args.command == "purge-projects":
         asyncio.run(_purge_projects(days=args.days, dry_run=args.dry_run))
+    elif args.command == "tasks":
+        asyncio.run(_tasks_command(args))
     elif args.command == "storage-manifest":
         entries = write_source_manifest(args.source_root, args.manifest)
         print(f"object manifest created: {len(entries)} objects")
@@ -139,6 +167,98 @@ def main() -> None:
         print(count)
         if args.require_empty and count:
             raise SystemExit("configured object store is not empty")
+
+
+async def _tasks_command(args: argparse.Namespace) -> None:
+    """任务本体的读写入口。
+
+    在此之前，写 ``task_definition`` 的唯一途径是新增一条 Alembic 迁移——所谓
+    「可配置的任务定义」其实并不成立（审计修正 C-5）。
+    """
+    settings = get_settings()
+    engine = make_engine(settings.database_url, application_name="paperforge-admin")
+    session_factory = make_session_factory(engine)
+    try:
+        async with session_factory() as session:
+            if args.task_command == "list":
+                specs = await list_task_definitions(session, domain=args.domain)
+                for spec in specs:
+                    vocabulary = spec.vocabulary
+                    print(
+                        f"{spec.domain:<16} {spec.slug:<34} "
+                        f"metrics={len(spec.metrics):<3} datasets={len(spec.datasets):<3} "
+                        f"models={len(vocabulary.model_families):<3} "
+                        f"splits={len(vocabulary.split_strategies):<3} "
+                        f"{'(empty vocabulary)' if vocabulary.empty else ''}"
+                    )
+                print(f"\n{len(specs)} task definition(s)")
+                return
+
+            if args.task_command == "export":
+                specs = await list_task_definitions(session)
+                payload = [task_spec_to_payload(spec) for spec in specs]
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+                    encoding="utf-8",
+                )
+                print(f"exported {len(payload)} task definition(s) to {args.output}")
+                return
+
+            raw = json.loads(args.file.read_text(encoding="utf-8"))
+            errors = validate_task_payloads(raw)
+            if errors:
+                for error in errors:
+                    print(f"  {error}", file=sys.stderr)
+                raise SystemExit(f"{len(errors)} validation error(s); nothing was written")
+            for warning in task_ontology_warnings(raw):
+                print(f"  warning: {warning}", file=sys.stderr)
+            current = await list_task_definitions(session)
+            before = {spec.slug: task_spec_to_payload(spec) for spec in current}
+            incoming = {str(item["slug"]): item for item in raw}
+            added = sorted(set(incoming) - set(before))
+            changed = sorted(
+                slug
+                for slug in set(incoming) & set(before)
+                if _normalized_task(incoming[slug]) != _normalized_task(before[slug])
+            )
+            # upsert 不删任何行：本体是共享的，一份局部文件不应该悄悄抹掉别人的任务。
+            untouched = sorted(set(before) - set(incoming))
+            for slug in added:
+                print(f"  + {slug}")
+            for slug in changed:
+                print(f"  ~ {slug}")
+            if untouched:
+                print(f"  (left alone, not in file: {', '.join(untouched)})")
+            if args.dry_run:
+                print(f"dry run: {len(added)} to add, {len(changed)} to update; nothing written")
+                return
+            result = await upsert_task_definitions(session, raw)
+            await session.commit()
+            print(
+                f"task ontology written: {result['created']} created, "
+                f"{result['updated']} updated"
+            )
+    finally:
+        await engine.dispose()
+
+
+def _normalized_task(payload: dict[str, Any]) -> str:
+    """按稳定形状比较，好让 diff 不受键顺序和缺省字段影响。"""
+    return json.dumps(
+        {
+            "domain": payload.get("domain"),
+            "labels": payload.get("labels") or {},
+            "metrics": payload.get("metrics") or [],
+            "datasets": payload.get("datasets") or [],
+            "dimensions": payload.get("dimensions") or [],
+            "inclusion_cues": payload.get("inclusion_cues") or [],
+            "exclusion_cues": payload.get("exclusion_cues") or [],
+            "vocabulary": payload.get("vocabulary") or {},
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _storage_result(operation: str, result: dict[str, int]) -> str:
