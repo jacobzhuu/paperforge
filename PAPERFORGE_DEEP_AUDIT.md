@@ -47,6 +47,23 @@ These three are load-bearing and mutually reinforcing: because extraction is reg
 
 **The repository is not under version control.** There is no `.git` anywhere in or above the project tree. `.github/workflows/ci.yml` exists and is well-designed, but has never executed — which is directly demonstrated by the fact that `ruff check .` currently exits 1 on a trivial unused import, a state CI would have rejected. Every quality control this project has designed for itself (CI, migration drift check, multiarch build validation, macOS host verification) is inert.
 
+> **Correction (2026-08-09, Phase 1.5).** Two claims above are wrong and are corrected here rather
+> than silently edited, because the reasoning that produced them is instructive.
+>
+> 1. **The project *is* under version control** — at `github.com/jacobzhuu/paperforge`, with 24
+>    commits through 2026-07-27. What is true is that the *working tree* lost its `.git` directory
+>    after `a498f20`, and roughly ten days of work (334 files, +48,434 / −3,151) then accumulated
+>    outside version control. I inferred "no version control" from the local absence of `.git`
+>    without checking for a remote.
+> 2. **CI had run, and had been green** — the last pre-existing run succeeded on 2026-07-27. It had
+>    simply never seen the ten days of unversioned work, which is precisely why the Ruff failure and
+>    the migration drift accumulated undetected.
+>
+> The operative finding therefore stands, but its shape is different: the problem was not "CI was
+> never set up," it was "CI stopped seeing the code." Both are now resolved — the unversioned work
+> was grafted onto the real history (preserving all 24 commits) and CI is green on all four jobs at
+> `61c656e`. See `docs/reports/PAPERFORGE_PHASE1_BASELINE_REPORT.md` §15.
+
 ---
 
 ## 2. Current Architecture and Core Data Flows
@@ -198,7 +215,7 @@ The four-tier evidence grade is a real, persisted, enforced distinction — not 
 |---|---|
 | README: "五源" / provider list naming `semantic_scholar.py` | 4 reachable adapters (§4.5) |
 | `pyproject.toml` `[tool.mypy]` config | never run in CI; 207 errors accumulated (§4.9) |
-| `.github/workflows/ci.yml` | no git repository exists; CI has never run (§4.10) |
+| `.github/workflows/ci.yml` | ~~no git repository exists; CI has never run~~ — **corrected §1.3**: a remote exists and CI was green through 2026-07-27; it had not seen the subsequent unversioned work. Resolved 2026-08-09. |
 | README: cost panel `估算 $…` in `project-overview.tsx:1053` | always `$0.0000` (§4.8) |
 | `evals/review_depth/` (G1/G2/G3 fixtures, analysis, ablation manifest) | harness + fixtures exist; no evidence of an executed evaluation producing scores |
 
@@ -312,7 +329,7 @@ The entire "problem-driven synthesis" stage contains no model call. It:
 
 ---
 
-### 4.4 [P0] No version control; CI has never run and is currently red
+### 4.4 [P0] No version control; CI has never run and is currently red *(corrected — see §1.3; resolved 2026-08-09)*
 
 **Evidence:**
 
@@ -814,7 +831,7 @@ Actual state:
 
 - 3 accumulated generations, 18 containers (§4.10)
 - No git → the deployed code cannot be identified from a commit
-- CI has never validated the Compose configs or multiarch builds it is written to validate
+- ~~CI has never validated the Compose configs or multiarch builds it is written to validate~~ — corrected: those two jobs did not exist before the unversioned work added them; they first executed on 2026-08-09 and both passed.
 
 ---
 

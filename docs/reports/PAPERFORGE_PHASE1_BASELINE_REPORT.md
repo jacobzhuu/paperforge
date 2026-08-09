@@ -34,8 +34,14 @@ Live credentials are held **outside the repository** at a path referenced by
 start unless that variable points outside the repo. **The project's secret hygiene was already
 correct.** The audit finding was a false positive and its P0-1 rotation sub-item is withdrawn.
 
-The remaining, genuine parts of audit §4.4 stand and are addressed here: there was no version
-control, CI had never run, and `ruff check .` exited 1.
+The remaining, genuine parts of audit §4.4 stand and are addressed here: the working tree was not
+under version control and `ruff check .` exited 1.
+
+> **Further correction (2026-08-09, §15.2).** "There was no version control / CI had never run" is
+> also wrong, though less severely. A remote *did* exist with 24 commits and a passing CI history
+> through 2026-07-27; the working tree had lost its `.git` directory, and ten days of work then
+> accumulated outside version control. The accurate statement is **"CI stopped seeing the code,"**
+> which is why the Ruff failure and the migration drift went undetected.
 
 ---
 
@@ -329,7 +335,9 @@ in §10 with a ready-to-apply remedy.
 > **Status update (2026-08-09, Phase 1.5 baseline closure).**
 > **B-1 is RESOLVED** by migration `0022_index_alignment` (commit `4451d46`); `alembic check` now
 > exits 0. The analysis below is retained as the historical record of how the drift was found.
-> **B-2 remains open** — see §10.B-2 for its current state.
+> **B-2 is RESOLVED** — remote configured, history grafted (all 24 pre-existing commits preserved),
+> and CI is green on all four jobs at `61c656e`. See §15.2, which also corrects the audit's
+> "no version control / CI never ran" claim.
 > **B-3** stays withdrawn. **B-4** remains an open observation tracked as plan item P1-1.
 
 ### B-1 — `alembic check` fails on pre-existing index drift *(RESOLVED — see §15)*
@@ -352,7 +360,7 @@ reserves for Phase 2; and because older deployment generations are still running
 `CREATE INDEX CONCURRENTLY` should be considered so the migration does not lock tables an active
 worker is writing to.
 
-### B-2 — No Git remote; CI cannot run *(requires user action)*
+### B-2 — No Git remote; CI cannot run *(RESOLVED — see §15.2)*
 
 **Owner:** user. No remote URL, `gh` authentication, SSH key or credential helper exists on this
 host, so I could not push or verify the workflow. Nothing was fabricated.
@@ -526,7 +534,82 @@ Production was never contacted; all verification ran on a disposable `postgres:1
 **Rollback:** `alembic downgrade 0021_question_locking`, then `git revert 4451d46`. Verified to
 restore the exact prior index set.
 
-### 15.2 B-2 — remote and CI: still open
+### 15.2 B-2 — remote and CI: RESOLVED
+
+**Outcome:** `origin` = `github.com/jacobzhuu/paperforge`, pushed as a fast-forward
+`a498f20..61c656e`, **CI run 31298257690 green on all four jobs**.
+
+#### 15.2.1 The repository was not new — a correction to the audit
+
+The remote already held **24 commits** through 2026-07-27, with a **passing** CI history. The audit's
+"the project is not under version control / CI has never run" was inferred from the local absence of
+`.git` without checking for a remote. Corrected in `PAPERFORGE_DEEP_AUDIT.md` §1.3.
+
+What actually happened: the working tree lost its `.git` directory some time after `a498f20`, and
+roughly ten days of work continued unversioned. `git init` therefore produced a history with **no
+common ancestor** — `git merge-base` returned nothing.
+
+The real finding is not "CI was never set up" but **"CI stopped seeing the code."** That is exactly
+why the Ruff failure (§6) and the index drift (§9) accumulated undetected: both post-date `a498f20`.
+
+#### 15.2.2 Graft, not force-push
+
+A force-push would have destroyed 24 commits. Instead the local work was replayed onto the real
+history, with operator approval:
+
+```
+a498f20  (24 commits of preserved history)
+  └─ 728c51f  chore: import unversioned work 2026-07-27..2026-08-06 + CI baseline
+       └─ 2a16e56  docs: add Phase 1 engineering baseline report
+            └─ 6d4ac1c  db: align index definitions with ORM models (0022)
+                 └─ f82e940  docs: record Phase 1.5 baseline closure
+                      └─ 61c656e  chore: ignore debug probe files
+```
+
+**Integrity check:** the grafted tree hash `d4f403d9…` is **byte-identical** to the pre-graft tree —
+nothing was lost or altered. A `pre-graft-backup` branch (`d1e870c`) was retained locally.
+
+Two files present at `a498f20` were removed, with approval:
+`apps/web/components/projects/new-project-wizard.tsx` (13.8 KB; zero references remained after the
+project-centric rework — content still reachable at `a498f20`) and `apps/web/_probe_ovr.txt` (7-byte
+debug leftover). `_probe_*` was added to `.gitignore` so that class cannot recur.
+
+#### 15.2.3 Push mechanics
+
+Three obstacles, all resolved:
+
+| Obstacle | Resolution |
+|---|---|
+| `gh` not installed | installed v2.97.0 to `~/.local/bin` (userspace, no sudo) |
+| `fatal: could not read Username` | `gh auth login` does not wire git — `gh auth setup-git` was required |
+| `refusing to allow an OAuth App to … workflow … without workflow scope` | the unversioned work legitimately changed `.github/workflows/` (added `macos-host` + `multiarch-images`, added `ubuntu-compat.yml`, pinned runners to `ubuntu-22.04`, added `pnpm test`); operator ran `gh auth refresh -s workflow` |
+
+#### 15.2.4 CI result — run 31298257690 @ `61c656e`
+
+| Job | Result | Note |
+|---|---|---|
+| `backend` | **SUCCESS** | |
+| `frontend` | **SUCCESS** | |
+| `macos-host` | **SUCCESS** | first execution ever |
+| `multiarch-images` | **SUCCESS** | first execution ever |
+
+Backend steps of specific interest:
+
+| Step | Result |
+|---|---|
+| Ruff | **SUCCESS** — the failure fixed in §6 |
+| Alembic migration | **SUCCESS** |
+| **Migration drift check** (`alembic check`) | **SUCCESS** — the blocker fixed in §15.1 |
+| Tests | **SUCCESS** — `764 passed, 4 skipped` in 610.76s |
+
+CI's `764 passed, 4 skipped` is **identical** to the local figure in §8.1, confirming the
+CI-equivalence claim made there was accurate.
+
+#### 15.2.5 Residual note
+
+`gh` stores its token in plain text at `~/.config/gh/hosts.yml` (it warns about this at login). That
+is `gh`'s standard behaviour on a host without a secret store; the file is user-readable only. Worth
+knowing, not a blocker.
 
 Re-checked on 2026-08-09; the prerequisites are unchanged:
 
