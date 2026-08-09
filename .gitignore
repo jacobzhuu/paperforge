@@ -57,6 +57,9 @@ progress.md
 findings.md
 _tmp_*
 apps/web/_tmp_*
+# 调试探针文件：apps/web/_probe_ovr.txt 曾经被误提交进仓库。
+_probe_*
+apps/web/_probe_*
 
 # Local research notes / tool outputs (not project code)
 本周研究汇报_*.md
