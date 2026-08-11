@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -326,16 +327,14 @@ def _run_lint_against(tmp_path: Path, body: str) -> tuple[int, str]:
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir(exist_ok=True)
     source = (ROOT / "scripts/ontology_literal_lint.py").read_text(encoding="utf-8")
-    source = source.replace(
-        'ROOT / "services/worker/paperforge_worker/pipelines/evidence.py",',
-        'ROOT / "offender.py",',
+    # 用 fixture 换掉**全部**真实目标，而不是逐个列举：新增一个受检文件不该让这个
+    # 辅助函数失效（它已经失效过一次）。
+    source = re.sub(
+        r"TARGETS = \[.*?\n\]",
+        'TARGETS = [\n    ROOT / "offender.py",\n]',
+        source,
+        flags=re.DOTALL,
     )
-    for path in (
-        "services/worker/paperforge_worker/pipelines/qdecomp.py",
-        "services/worker/paperforge_worker/pipelines/experiment_extraction.py",
-        "packages/db/db/repositories/tasks.py",
-    ):
-        source = source.replace(f'    ROOT / "{path}",\n', "")
     (scripts_dir / "lint.py").write_text(source, encoding="utf-8")
     (tmp_path / "offender.py").write_text(body, encoding="utf-8")
     result = subprocess.run(

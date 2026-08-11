@@ -856,3 +856,63 @@ def test_single_source_section_is_flagged_and_written_under_an_explicit_limit() 
     assert "仅来自 1 篇独立文献" in limited
     assert "不得推广" in limited
     assert _evidence_limitation_line(sections[1], language="zh") == ""
+
+
+def test_synthesis_block_guides_argument_without_relaxing_binding():
+    """[SYNTHESIS] 是"怎么论证"的指引；句子级 evidence_ids 仍然强制。"""
+    from paperforge_worker.pipelines.writing import _evidence_context_block
+
+    section = {
+        "title": "Does X hold?",
+        "stance_summary": "conflicting",
+        "comparison_clusters": [
+            {
+                "comparability_key": "k1",
+                "classification": "conflicting",
+                "evidence_ids": ["e1", "e2"],
+            }
+        ],
+        "synthesis": {
+            "claim": "The effect reverses on the larger split.",
+            "agreement": [{"statement": "Both report a gain.", "evidence_ids": ["e1", "e2"]}],
+            "conditional": [
+                {
+                    "dimension": "split",
+                    "statement": "Only under leave-one-out.",
+                    "evidence_ids": ["e1"],
+                }
+            ],
+            "conflict": [
+                {
+                    "statement": "Directions disagree.",
+                    "evidence_ids": ["e1", "e2"],
+                    "comparability_key": "k1",
+                }
+            ],
+            "gap": [{"statement": "No study covers the cold-start case."}],
+        },
+    }
+    evidence = [
+        {"evidence_id": "e1", "cite_key": "a2024", "grade": "B_located_prose", "text": "t1"},
+        {"evidence_id": "e2", "cite_key": "b2024", "grade": "B_located_prose", "text": "t2"},
+    ]
+
+    block = _evidence_context_block(section=section, evidence=evidence, language="en")
+
+    assert "[SYNTHESIS claim] The effect reverses on the larger split." in block
+    assert "[SYNTHESIS agreement] Both report a gain. (EVIDENCE_ID=e1, e2)" in block
+    assert "[SYNTHESIS conditional dimension=split]" in block
+    assert "[SYNTHESIS conflict key=k1]" in block
+    assert "[SYNTHESIS gap] No study covers the cold-start case." in block
+
+
+def test_the_prompt_is_unchanged_when_no_synthesis_is_attached():
+    """关掉该特性时 section 里没有这个键，提示词必须逐字节不变。"""
+    from paperforge_worker.pipelines.writing import _evidence_context_block
+
+    section = {"title": "Does X hold?", "stance_summary": "consistent"}
+    evidence = [{"evidence_id": "e1", "cite_key": "a2024", "grade": "B_located_prose", "text": "t"}]
+
+    assert "SYNTHESIS" not in _evidence_context_block(
+        section=section, evidence=evidence, language="en"
+    )

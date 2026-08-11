@@ -53,6 +53,12 @@ class WorkerSettings(BaseSettings):
     # 切换会缩小未绑定项目的匹配面，因此先发 all_tasks，量过再翻。
     task_profile_fallback: str = "all_tasks"
 
+    # 叙述性跨研究综合（P0-4 / Phase 4）。关闭时 SYNTH bundle 与引入前逐字节相同：
+    # 不加 `synthesis` 键、不读表、不调用。开启后综合只是**增补**——
+    # answer_status、证据归属、comparison_clusters 一个都不由它改写。
+    synthesis_llm_enabled: bool = False
+    synthesis_llm_max_questions: int = 8
+
     @property
     def experiment_extraction_enabled(self) -> bool:
         return self.experiment_extraction_mode.strip().lower() in {"shadow", "on"}

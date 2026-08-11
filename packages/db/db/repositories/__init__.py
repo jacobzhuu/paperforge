@@ -153,6 +153,11 @@ from db.repositories.questions import (
 )
 from db.repositories.rollup import list_paper_evidence_rollups
 from db.repositories.search_runs import list_search_runs, record_search_run
+from db.repositories.synthesis import (
+    DETERMINISTIC_GENERATOR,
+    list_question_syntheses,
+    upsert_question_synthesis,
+)
 from db.repositories.tasks import (
     TaskSpec,
     TaskVocabulary,
@@ -199,6 +204,7 @@ from db.repositories.works import (
 
 __all__ = [
     "ANSWER_STATUSES",
+    "DETERMINISTIC_GENERATOR",
     "DOCUMENT_ACCESS_SCOPES",
     "EVIDENCE_GRADES",
     "EVIDENCE_KINDS",
@@ -286,6 +292,7 @@ __all__ = [
     "list_pdf_uploads",
     "list_literature_pdf_uploads",
     "list_question_evidence_links",
+    "list_question_syntheses",
     "list_research_questions",
     "list_purgeable_projects",
     "list_claim_evidence",
@@ -345,6 +352,7 @@ __all__ = [
     "upsert_evidence_unit",
     "upsert_entry",
     "upsert_question_evidence_link",
+    "upsert_question_synthesis",
     "upsert_work",
     "visual_input_hash",
     "sanitize_figure_caption",

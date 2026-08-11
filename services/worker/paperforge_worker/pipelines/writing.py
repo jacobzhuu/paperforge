@@ -717,6 +717,7 @@ def _evidence_context_block(
                 str(item.get("comparability_key")) for item in section["not_comparable_groups"]
             )
         )
+    lines.extend(_synthesis_block(section.get("synthesis")))
     grade_order = {
         "A_located_structured": 0,
         "B_located_prose": 1,
@@ -766,6 +767,41 @@ def _evidence_context_block(
     if section.get("evidence_gap"):
         lines.append(f"[EVIDENCE GAP] {section['evidence_gap']}")
     return "\n".join(lines)
+
+
+def _synthesis_block(synthesis: Any) -> list[str]:
+    """SYNTH 的叙述性结论（Phase 4）。
+
+    这是**怎么论证**的指引，不是可以少写绑定的许可：句子级 evidence_ids 仍然强制，
+    `enforce_sentence_evidence_rules` 照跑。关闭该特性时 section 里没有这个键，
+    这里返回空列表，提示词逐字节不变。
+    """
+    if not isinstance(synthesis, dict):
+        return []
+    lines: list[str] = []
+    if synthesis.get("claim"):
+        lines.append(f"[SYNTHESIS claim] {synthesis['claim']}")
+    for entry in synthesis.get("agreement") or []:
+        lines.append(f"[SYNTHESIS agreement] {_synthesis_entry(entry)}")
+    for entry in synthesis.get("conditional") or []:
+        dimension = str(entry.get("dimension") or "unspecified")
+        lines.append(f"[SYNTHESIS conditional dimension={dimension}] {_synthesis_entry(entry)}")
+    for entry in synthesis.get("conflict") or []:
+        key = str(entry.get("comparability_key") or "")
+        lines.append(f"[SYNTHESIS conflict key={key}] {_synthesis_entry(entry)}")
+    for entry in synthesis.get("gap") or []:
+        lines.append(f"[SYNTHESIS gap] {_synthesis_entry(entry)}")
+    return lines
+
+
+def _synthesis_entry(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    statement = str(entry.get("statement") or "")
+    ids = [str(value) for value in entry.get("evidence_ids") or []]
+    if not ids:
+        return statement
+    return f"{statement} (EVIDENCE_ID={', '.join(ids)})"
 
 
 def _asset_block(

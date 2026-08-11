@@ -22,6 +22,9 @@ TARGETS = [
     ROOT / "services/worker/paperforge_worker/pipelines/evidence.py",
     ROOT / "services/worker/paperforge_worker/pipelines/qdecomp.py",
     ROOT / "services/worker/paperforge_worker/pipelines/experiment_extraction.py",
+    # 综合的提示词与维度白名单同样只能从本体来：一旦某个领域的指标名混进
+    # CORE_DIMENSIONS 或提示词里，跨领域项目就会拿到别人的比较轴。
+    ROOT / "services/worker/paperforge_worker/pipelines/synthesis_llm.py",
     ROOT / "packages/db/db/repositories/tasks.py",
 ]
 

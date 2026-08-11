@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from db import (
+    DETERMINISTIC_GENERATOR,
+    get_project,
     list_entries,
     list_evidence_measurements,
     list_evidence_units,
+    list_project_task_specs,
     list_question_evidence_links,
+    list_question_syntheses,
     list_research_questions,
     set_question_answer_status,
+    upsert_question_synthesis,
 )
 
-from paperforge_worker.context import JobContext
-
-FULLTEXT_GRADES = frozenset({"A_located_structured", "B_located_prose", "C_fulltext_unlocated"})
+from paperforge_worker.context import JobContext, JobStopped
+from paperforge_worker.pipelines.synthesis_llm import (
+    CORE_DIMENSIONS,
+    FULLTEXT_GRADES,
+    QuestionSynthesisResult,
+    bundle_fingerprint,
+    should_synthesize,
+    synthesize_bundle,
+)
 
 
 @dataclass
@@ -27,9 +39,14 @@ class SynthesisOutcome:
     contested: int = 0
     insufficient: int = 0
     comparison_clusters: int = 0
+    # 叙述性综合（Phase 4）。关闭时全为 0，payload 里也不出现。
+    synthesis_generated: int = 0
+    synthesis_reused: int = 0
+    synthesis_skipped: int = 0
+    synthesis_rejected: int = 0
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "sub_questions": len(self.bundles),
             "answered": self.answered,
             "partial": self.partial,
@@ -46,6 +63,14 @@ class SynthesisOutcome:
                 for bundle in self.bundles
             ],
         }
+        if self.synthesis_generated or self.synthesis_reused or self.synthesis_skipped:
+            payload["synthesis"] = {
+                "generated": self.synthesis_generated,
+                "reused": self.synthesis_reused,
+                "skipped": self.synthesis_skipped,
+                "rejected_entries": self.synthesis_rejected,
+            }
+        return payload
 
 
 async def synthesize_questions(context: JobContext) -> SynthesisOutcome:
@@ -75,6 +100,9 @@ async def synthesize_questions(context: JobContext) -> SynthesisOutcome:
                 else "answered"
             )
             await set_question_answer_status(session, core_questions[0], core_status)
+    # 叙述性综合放在判定之后，且不回写任何判定：readiness 与写作前置门禁看到的
+    # answer_status 与开关状态无关。
+    await enrich_with_synthesis(context, outcome)
     return outcome
 
 
@@ -125,7 +153,149 @@ async def load_synthesis_bundles(context: JobContext) -> SynthesisOutcome:
             outcome.contested += 1
         else:
             outcome.insufficient += 1
+    await _attach_persisted_synthesis(context, outcome)
     return outcome
+
+
+async def _attach_persisted_synthesis(context: JobContext, outcome: SynthesisOutcome) -> None:
+    """把已存在的综合挂回 bundle。纯读，不会产生任何调用。
+
+    ``load_synthesis_bundles`` 有五个调用点（大纲、写作、补充、对齐），它们都该看到
+    同一段叙述；生成只发生在 ``synthesize_questions`` 里。
+    """
+    if not context.settings.synthesis_llm_enabled:
+        return
+    fingerprints = {
+        bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles
+    }
+    for bundle in outcome.bundles:
+        bundle["synthesis"] = None
+    if not fingerprints:
+        return
+    async with context.session() as session:
+        rows = await list_question_syntheses(
+            session,
+            project_id=context.project_id,
+            bundle_hashes=list(fingerprints.values()),
+        )
+    stored = {(str(row.research_question_id), row.bundle_hash): row for row in rows}
+    for bundle in outcome.bundles:
+        row = stored.get((bundle["question_id"], fingerprints[bundle["question_id"]]))
+        if row is not None and row.generator != DETERMINISTIC_GENERATOR:
+            bundle["synthesis"] = _synthesis_payload(row)
+
+
+def _synthesis_payload(row: Any) -> dict[str, Any]:
+    return {
+        "generator": row.generator,
+        "claim": row.claim,
+        "agreement": row.agreement_json or [],
+        "conditional": row.conditional_json or [],
+        "conflict": row.conflict_json or [],
+        "gap": row.gap_json or [],
+    }
+
+
+async def enrich_with_synthesis(context: JobContext, outcome: SynthesisOutcome) -> None:
+    """为还没有综合的 bundle 各跑一次调用，落库并挂回。
+
+    失败一律降级成"没有综合"：bundle 保持确定性结构，正文照写。
+    """
+    if not context.settings.synthesis_llm_enabled or not outcome.bundles:
+        return
+    fingerprints = {
+        bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles
+    }
+
+    async with context.session() as session:
+        project = await get_project(session, context.project_id)
+        specs = await list_project_task_specs(
+            session,
+            context.project_id,
+            fallback=context.settings.task_profile_fallback,
+        )
+        rows = await list_question_syntheses(
+            session,
+            project_id=context.project_id,
+            bundle_hashes=list(fingerprints.values()),
+        )
+    # 已有行（包括 generator='deterministic' 的负缓存）一律不重跑：那正是
+    # bundle_hash 存在的意义——SYNTH 在一次完整流水线里最多跑 4 次。
+    stored = {(str(row.research_question_id), row.bundle_hash) for row in rows}
+    dimensions = frozenset(
+        {str(value).casefold() for spec in specs for value in spec.dimensions}
+    ) | frozenset(CORE_DIMENSIONS)
+
+    runner = context.llm_runner()
+    budget = max(0, int(context.settings.synthesis_llm_max_questions))
+    language = str(getattr(project, "language", "en") or "en")
+
+    for bundle in outcome.bundles:
+        if (bundle["question_id"], fingerprints[bundle["question_id"]]) in stored:
+            outcome.synthesis_reused += 1
+            continue
+        if not should_synthesize(bundle):
+            outcome.synthesis_skipped += 1
+            continue
+        if budget <= 0:
+            outcome.synthesis_skipped += 1
+            continue
+        budget -= 1
+        await context.raise_if_stopped()
+        try:
+            result = await synthesize_bundle(
+                bundle=bundle,
+                runner=runner,
+                allowed_dimensions=dimensions,
+                language=language,
+            )
+        except JobStopped:
+            raise
+        except Exception:  # noqa: BLE001 - 综合是增补，失败绝不能拖垮 SYNTH 阶段
+            context.warn("synth", "llm_call_failed", {"question_id": bundle["question_id"]})
+            continue
+        if result is None:
+            outcome.synthesis_skipped += 1
+            continue
+        await _persist_synthesis(context, bundle=bundle, result=result, outcome=outcome)
+
+
+async def _persist_synthesis(
+    context: JobContext,
+    *,
+    bundle: dict[str, Any],
+    result: QuestionSynthesisResult,
+    outcome: SynthesisOutcome,
+) -> None:
+    outcome.synthesis_rejected += len(result.rejected)
+    empty = result.is_empty
+    if empty:
+        # 一条都没留下也要落行：它是负缓存，同一个 bundle 不再重复付费。
+        context.warn(
+            "synth",
+            "llm_rejected",
+            {
+                "question_id": bundle["question_id"],
+                "rejected": [item["reason"] for item in result.rejected][:8],
+            },
+        )
+    async with context.session() as session:
+        await upsert_question_synthesis(
+            session,
+            project_id=context.project_id,
+            research_question_id=uuid.UUID(bundle["question_id"]),
+            bundle_hash=bundle_fingerprint(bundle),
+            generator=DETERMINISTIC_GENERATOR if empty else result.generator,
+            claim=result.claim,
+            agreement=[entry.to_payload() for entry in result.agreement],
+            conditional=[entry.to_payload() for entry in result.conditional],
+            conflict=[entry.to_payload() for entry in result.conflict],
+            gap=[entry.to_payload() for entry in result.gap],
+        )
+    if empty:
+        return
+    bundle["synthesis"] = result.to_payload()
+    outcome.synthesis_generated += 1
 
 
 def _synthesize_bundle(
@@ -256,6 +426,7 @@ def _synthesize_bundle(
 __all__ = [
     "FULLTEXT_GRADES",
     "SynthesisOutcome",
+    "enrich_with_synthesis",
     "load_synthesis_bundles",
     "synthesize_questions",
 ]

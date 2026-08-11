@@ -377,6 +377,9 @@ def question_driven_sections(
                 "comparison_clusters": bundle.get("comparison_clusters") or [],
                 "not_comparable_groups": bundle.get("not_comparable_groups") or [],
                 "evidence_gap": bundle.get("evidence_gap"),
+                # Phase 4：叙述性综合只是随小节透传给写作器的指引，不参与
+                # argument_points 的确定性构造，关闭时为 None。
+                "synthesis": bundle.get("synthesis"),
                 "kind": "body",
             }
         )

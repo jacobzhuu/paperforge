@@ -175,6 +175,47 @@ class QuestionEvidenceLink(Base, TimestampMixin):
     bridge_source: Mapped[str | None] = mapped_column(String(32))
 
 
+class QuestionSynthesis(Base):
+    """一个子问题的叙述性综合结论（P0-4 / Phase 4）。
+
+    确定性的 SYNTH 判定（``answer_status`` / ``comparison_clusters``）仍然是权威结构，
+    本表**只做增补**：它不改判定、不改证据归属，只多出一段"这些研究在同一可比条件下
+    到底说了什么"的推理。因此 ``readiness`` 与写作前置门禁看到的输入不受影响。
+
+    ``bundle_hash`` 是幂等键：完整流水线里 SYNTH 最多跑 4 次（初次 + 两轮补充 + PDF
+    上传刷新），bundle 没变就复用同一行，一次调用都不额外花。
+    """
+
+    __tablename__ = "question_synthesis"
+    __table_args__ = (
+        UniqueConstraint(
+            "research_question_id",
+            "bundle_hash",
+            name="uq_question_synthesis_bundle",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    research_question_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("research_question.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    # 'llm:<model>' | 'deterministic'（后者表示调用发生过但校验后一条不剩，
+    # 记下来是为了不再对同一个 bundle 重复付费）。
+    generator: Mapped[str] = mapped_column(String(128), nullable=False)
+    bundle_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim: Mapped[str | None] = mapped_column(Text)
+    agreement_json: Mapped[list | None] = mapped_column(JSONB)
+    conditional_json: Mapped[list | None] = mapped_column(JSONB)
+    conflict_json: Mapped[list | None] = mapped_column(JSONB)
+    gap_json: Mapped[list | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class GenerationJob(Base):
     __tablename__ = "generation_job"
 
