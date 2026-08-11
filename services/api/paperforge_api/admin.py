@@ -119,6 +119,20 @@ def main() -> None:
         "coverage",
         help="report how many projects are bound, i.e. whether generic_only is safe yet",
     )
+    task_suggest = task_commands.add_parser(
+        "suggest",
+        help="propose a task binding for every unbound project (dry run unless --apply)",
+    )
+    task_suggest.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the proposals; without it nothing is changed",
+    )
+    task_suggest.add_argument(
+        "--include-bound",
+        action="store_true",
+        help="also re-propose for projects that already have a binding",
+    )
 
     args = parser.parse_args()
     if args.command == "bootstrap-admin":
@@ -203,6 +217,16 @@ async def _tasks_command(args: argparse.Namespace) -> None:
                 await _task_coverage(session)
                 return
 
+            if args.task_command == "suggest":
+                await _task_suggest(
+                    session,
+                    apply=args.apply,
+                    include_bound=args.include_bound,
+                )
+                if args.apply:
+                    await session.commit()
+                return
+
             if args.task_command == "export":
                 specs = await list_task_definitions(session)
                 payload = [task_spec_to_payload(spec) for spec in specs]
@@ -250,6 +274,124 @@ async def _tasks_command(args: argparse.Namespace) -> None:
             )
     finally:
         await engine.dispose()
+
+
+async def _task_suggest(session: Any, *, apply: bool, include_bound: bool) -> None:
+    """为每个项目提出任务绑定；默认只打印，不写库。
+
+    与 QDECOMP 的自动推断有两点不同，正是这两点让它能把覆盖率真正推到 100%：
+
+    * **判据用题名 + 主题 + 研究问题**，而不是只用子问题。29 个项目里有 23 个从未跑过
+      QDECOMP，一条研究问题都没有，自动推断对它们完全无从下手。
+    * **匹配到领域就绑定该领域的全部任务**，而不是单个最佳任务。这些几乎都是综述，
+      一篇综述会横跨该领域的多个任务，指标白名单取并集才对。
+
+    匹配不到任何领域时提议 ``generic.scholarly``——那是一个**明确的判断**（"本项目
+    没有适用的专用本体"），不是"没绑定"。两者在库里可区分，后者会继续吃回退。
+    """
+    from db import list_project_task_bindings, list_task_definitions, replace_project_task_profile
+    from db.repositories.tasks import GENERIC_TASK_SLUG, infer_task_id
+
+    tasks = await list_task_definitions(session)
+    by_slug = {spec.slug: spec for spec in tasks}
+    if GENERIC_TASK_SLUG not in by_slug:
+        raise SystemExit(
+            f"{GENERIC_TASK_SLUG} is missing; run `tasks upsert` with the seed file first"
+        )
+    by_domain: dict[str, list[str]] = {}
+    for spec in tasks:
+        by_domain.setdefault(spec.domain, []).append(spec.slug)
+    # 通用任务不参与领域推断：它是兜底，不该和真实领域竞争线索。
+    inferable = [spec for spec in tasks if spec.slug != GENERIC_TASK_SLUG]
+    exclusions_by_domain: dict[str, list[str]] = {}
+    for spec in tasks:
+        exclusions_by_domain.setdefault(spec.domain, []).extend(spec.exclusion_cues)
+
+    projects = list(
+        (
+            await session.scalars(
+                select(PaperProject)
+                .where(PaperProject.deleted_at.is_(None))
+                .order_by(PaperProject.created_at)
+            )
+        ).all()
+    )
+
+    changed = 0
+    generic = 0
+    print(f"{'project':<38} {'topic':<34} {'->':<3} proposal")
+    print("-" * 110)
+    for project in projects:
+        current = [row.task_id for row in await list_project_task_bindings(session, project.id)]
+        if current and not include_bound:
+            continue
+        evidence = await _project_domain_evidence(session, project)
+        slug = infer_task_id(evidence, inferable)
+        domain = by_slug[slug].domain if slug else None
+        # `infer_task_id` 只看纳入线索。排除线索在这里生效：例如"根际微生物次级代谢
+        # 产物与植物抗病机制"会命中 bgc 的"次级代谢"，但它是生物学机制论文，不是
+        # 计算 BGC 预测——绑到 bgc（AUROC/MCC、MIBiG）就是自信地绑错。
+        excluded_by = (
+            next(
+                (
+                    cue
+                    for cue in exclusions_by_domain.get(domain, [])
+                    if cue.casefold() in evidence.casefold()
+                ),
+                None,
+            )
+            if domain
+            else None
+        )
+        if domain is None or excluded_by:
+            proposal = [GENERIC_TASK_SLUG]
+            generic += 1
+        else:
+            proposal = sorted(by_domain[domain])
+        topic = str((project.scope_json or {}).get("topic") or project.title)[:32]
+        label = (
+            proposal[0]
+            if len(proposal) == 1
+            else f"{by_slug[proposal[0]].domain} ({len(proposal)} tasks)"
+        )
+        if excluded_by:
+            label = f"{label}  [excluded from {domain}: {excluded_by!r}]"
+        marker = " " if current == proposal else "*"
+        print(f"{marker}{str(project.id)[:36]:<37} {topic:<34} ->  {label}")
+        if current != proposal:
+            changed += 1
+            if apply:
+                await replace_project_task_profile(
+                    session,
+                    project_id=project.id,
+                    task_ids=proposal,
+                )
+
+    print("-" * 110)
+    print(f"{len(projects)} project(s) considered; {changed} would change; {generic} -> generic")
+    if not apply:
+        print("dry run — nothing was written. Re-run with --apply to persist.")
+
+
+async def _project_domain_evidence(session: Any, project: Any) -> str:
+    """推断领域时读哪些文本。题名与主题优先，研究问题作为补充。"""
+    from db.models.paper import ResearchQuestion
+
+    questions = list(
+        (
+            await session.scalars(
+                select(ResearchQuestion.text).where(ResearchQuestion.project_id == project.id)
+            )
+        ).all()
+    )
+    scope = project.scope_json or {}
+    parts = [
+        str(project.title or ""),
+        str(scope.get("topic") or ""),
+        str(scope.get("research_question") or ""),
+        *(str(text) for text in questions),
+    ]
+    return " \n".join(part for part in parts if part)
 
 
 async def _task_coverage(session: Any) -> None:

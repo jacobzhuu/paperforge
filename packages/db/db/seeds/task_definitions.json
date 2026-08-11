@@ -35,11 +35,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -143,11 +159,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -251,11 +283,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -359,11 +407,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -467,11 +531,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -575,11 +655,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -683,11 +779,27 @@
       "secondary metabolite",
       "antiSMASH",
       "DeepBGC",
-      "MIBiG"
+      "MIBiG",
+      "天然产物",
+      "次级代谢",
+      "次生代谢",
+      "生物合成",
+      "基因簇",
+      "非核糖体肽",
+      "聚酮",
+      "微生物天然产物"
     ],
     "exclusion_cues": [
       "RNA secondary structure",
-      "histopathology grading"
+      "histopathology grading",
+      "植物抗病",
+      "根际",
+      "植物—微生物",
+      "植物-微生物",
+      "互作",
+      "化学信号",
+      "系统抗性",
+      "田间"
     ],
     "vocabulary": {
       "model_families": [
@@ -780,6 +892,1224 @@
     }
   },
   {
+    "slug": "medical_imaging.evaluation",
+    "domain": "medical_imaging",
+    "labels": {
+      "en": "Segmentation evaluation and benchmarks",
+      "zh": "分割评测与基准"
+    },
+    "metrics": [
+      "Dice",
+      "DSC",
+      "IoU",
+      "Jaccard",
+      "Hausdorff distance",
+      "HD95",
+      "ASSD",
+      "sensitivity",
+      "specificity",
+      "NSD",
+      "FID",
+      "SSIM",
+      "PSNR",
+      "LPIPS"
+    ],
+    "datasets": [
+      "BraTS",
+      "ACDC",
+      "ISIC",
+      "LiTS",
+      "Synapse",
+      "MSD",
+      "AMOS",
+      "KiTS",
+      "CHAOS",
+      "Medical Segmentation Decathlon",
+      "REFUGE",
+      "MoNuSeg"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "segmentation benchmark",
+      "分割基准",
+      "evaluation protocol"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "U-Net",
+        "nnU-Net",
+        "TransUNet",
+        "Swin-UNet",
+        "SAM",
+        "MedSAM",
+        "V-Net",
+        "diffusion model",
+        "DDPM",
+        "latent diffusion",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "voxel",
+        "slice",
+        "patch",
+        "3D volume",
+        "2D slice",
+        "multi-modal MRI"
+      ],
+      "pretrained_backbones": [
+        "ViT",
+        "Swin Transformer",
+        "ResNet",
+        "SAM",
+        "CLIP",
+        "BERT"
+      ],
+      "split_strategies": [
+        {
+          "cue": "5-fold",
+          "name": "5-fold CV"
+        },
+        {
+          "cue": "cross-validation",
+          "name": "cross-validation"
+        },
+        {
+          "cue": "hold-out",
+          "name": "hold-out"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "semantic segmentation",
+          "name": "semantic segmentation"
+        },
+        {
+          "cue": "instance segmentation",
+          "name": "instance segmentation"
+        },
+        {
+          "cue": "zero-shot",
+          "name": "zero-shot"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "medical_imaging.generative",
+    "domain": "medical_imaging",
+    "labels": {
+      "en": "Generative models for medical imaging",
+      "zh": "医学影像生成模型"
+    },
+    "metrics": [
+      "Dice",
+      "DSC",
+      "IoU",
+      "Jaccard",
+      "Hausdorff distance",
+      "HD95",
+      "ASSD",
+      "sensitivity",
+      "specificity",
+      "NSD",
+      "FID",
+      "SSIM",
+      "PSNR",
+      "LPIPS"
+    ],
+    "datasets": [
+      "BraTS",
+      "ACDC",
+      "ISIC",
+      "LiTS",
+      "Synapse",
+      "MSD",
+      "AMOS",
+      "KiTS",
+      "CHAOS",
+      "Medical Segmentation Decathlon",
+      "REFUGE",
+      "MoNuSeg"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "diffusion model",
+      "扩散模型",
+      "image synthesis",
+      "generative model",
+      "data augmentation",
+      "图像生成"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "U-Net",
+        "nnU-Net",
+        "TransUNet",
+        "Swin-UNet",
+        "SAM",
+        "MedSAM",
+        "V-Net",
+        "diffusion model",
+        "DDPM",
+        "latent diffusion",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "voxel",
+        "slice",
+        "patch",
+        "3D volume",
+        "2D slice",
+        "multi-modal MRI"
+      ],
+      "pretrained_backbones": [
+        "ViT",
+        "Swin Transformer",
+        "ResNet",
+        "SAM",
+        "CLIP",
+        "BERT"
+      ],
+      "split_strategies": [
+        {
+          "cue": "5-fold",
+          "name": "5-fold CV"
+        },
+        {
+          "cue": "cross-validation",
+          "name": "cross-validation"
+        },
+        {
+          "cue": "hold-out",
+          "name": "hold-out"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "semantic segmentation",
+          "name": "semantic segmentation"
+        },
+        {
+          "cue": "instance segmentation",
+          "name": "instance segmentation"
+        },
+        {
+          "cue": "zero-shot",
+          "name": "zero-shot"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "medical_imaging.segmentation",
+    "domain": "medical_imaging",
+    "labels": {
+      "en": "Medical image segmentation",
+      "zh": "医学影像分割"
+    },
+    "metrics": [
+      "Dice",
+      "DSC",
+      "IoU",
+      "Jaccard",
+      "Hausdorff distance",
+      "HD95",
+      "ASSD",
+      "sensitivity",
+      "specificity",
+      "NSD",
+      "FID",
+      "SSIM",
+      "PSNR",
+      "LPIPS"
+    ],
+    "datasets": [
+      "BraTS",
+      "ACDC",
+      "ISIC",
+      "LiTS",
+      "Synapse",
+      "MSD",
+      "AMOS",
+      "KiTS",
+      "CHAOS",
+      "Medical Segmentation Decathlon",
+      "REFUGE",
+      "MoNuSeg"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "medical image segmentation",
+      "医学影像分割",
+      "医学图像分割",
+      "organ segmentation",
+      "lesion segmentation",
+      "tumour segmentation",
+      "tumor segmentation"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "U-Net",
+        "nnU-Net",
+        "TransUNet",
+        "Swin-UNet",
+        "SAM",
+        "MedSAM",
+        "V-Net",
+        "diffusion model",
+        "DDPM",
+        "latent diffusion",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "voxel",
+        "slice",
+        "patch",
+        "3D volume",
+        "2D slice",
+        "multi-modal MRI"
+      ],
+      "pretrained_backbones": [
+        "ViT",
+        "Swin Transformer",
+        "ResNet",
+        "SAM",
+        "CLIP",
+        "BERT"
+      ],
+      "split_strategies": [
+        {
+          "cue": "5-fold",
+          "name": "5-fold CV"
+        },
+        {
+          "cue": "cross-validation",
+          "name": "cross-validation"
+        },
+        {
+          "cue": "hold-out",
+          "name": "hold-out"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "semantic segmentation",
+          "name": "semantic segmentation"
+        },
+        {
+          "cue": "instance segmentation",
+          "name": "instance segmentation"
+        },
+        {
+          "cue": "zero-shot",
+          "name": "zero-shot"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "nlp_rag.evaluation",
+    "domain": "nlp_rag",
+    "labels": {
+      "en": "RAG evaluation and benchmarks",
+      "zh": "RAG 评测与基准"
+    },
+    "metrics": [
+      "nDCG@K",
+      "Recall@K",
+      "MRR",
+      "MAP",
+      "Hit@K",
+      "exact match",
+      "EM",
+      "BLEU",
+      "ROUGE-L",
+      "METEOR",
+      "BERTScore",
+      "faithfulness",
+      "answer relevance",
+      "context precision",
+      "context recall",
+      "hallucination rate",
+      "citation accuracy"
+    ],
+    "datasets": [
+      "Natural Questions",
+      "TriviaQA",
+      "HotpotQA",
+      "MS MARCO",
+      "BEIR",
+      "FEVER",
+      "ELI5",
+      "QASPER",
+      "SciFact",
+      "PubMedQA",
+      "MultiHop-RAG"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "RAG evaluation",
+      "RAG benchmark",
+      "评测基准",
+      "RAGAS"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "DPR",
+        "ColBERT",
+        "BM25",
+        "SPLADE",
+        "RAG",
+        "FiD",
+        "REALM",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "dense vector",
+        "sparse vector",
+        "passage",
+        "chunk",
+        "document embedding",
+        "query embedding"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "E5",
+        "BGE",
+        "Contriever"
+      ],
+      "split_strategies": [
+        {
+          "cue": "dev split",
+          "name": "dev"
+        },
+        {
+          "cue": "test split",
+          "name": "test"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "open-domain",
+          "name": "open-domain"
+        },
+        {
+          "cue": "multi-hop",
+          "name": "multi-hop"
+        },
+        {
+          "cue": "closed-book",
+          "name": "closed-book"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "nlp_rag.generation",
+    "domain": "nlp_rag",
+    "labels": {
+      "en": "Grounded generation",
+      "zh": "有据生成"
+    },
+    "metrics": [
+      "nDCG@K",
+      "Recall@K",
+      "MRR",
+      "MAP",
+      "Hit@K",
+      "exact match",
+      "EM",
+      "BLEU",
+      "ROUGE-L",
+      "METEOR",
+      "BERTScore",
+      "faithfulness",
+      "answer relevance",
+      "context precision",
+      "context recall",
+      "hallucination rate",
+      "citation accuracy"
+    ],
+    "datasets": [
+      "Natural Questions",
+      "TriviaQA",
+      "HotpotQA",
+      "MS MARCO",
+      "BEIR",
+      "FEVER",
+      "ELI5",
+      "QASPER",
+      "SciFact",
+      "PubMedQA",
+      "MultiHop-RAG"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "grounded generation",
+      "answer generation",
+      "生成式问答",
+      "RAG generation"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "DPR",
+        "ColBERT",
+        "BM25",
+        "SPLADE",
+        "RAG",
+        "FiD",
+        "REALM",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "dense vector",
+        "sparse vector",
+        "passage",
+        "chunk",
+        "document embedding",
+        "query embedding"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "E5",
+        "BGE",
+        "Contriever"
+      ],
+      "split_strategies": [
+        {
+          "cue": "dev split",
+          "name": "dev"
+        },
+        {
+          "cue": "test split",
+          "name": "test"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "open-domain",
+          "name": "open-domain"
+        },
+        {
+          "cue": "multi-hop",
+          "name": "multi-hop"
+        },
+        {
+          "cue": "closed-book",
+          "name": "closed-book"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "nlp_rag.hallucination",
+    "domain": "nlp_rag",
+    "labels": {
+      "en": "Hallucination and faithfulness",
+      "zh": "幻觉与忠实性"
+    },
+    "metrics": [
+      "nDCG@K",
+      "Recall@K",
+      "MRR",
+      "MAP",
+      "Hit@K",
+      "exact match",
+      "EM",
+      "BLEU",
+      "ROUGE-L",
+      "METEOR",
+      "BERTScore",
+      "faithfulness",
+      "answer relevance",
+      "context precision",
+      "context recall",
+      "hallucination rate",
+      "citation accuracy"
+    ],
+    "datasets": [
+      "Natural Questions",
+      "TriviaQA",
+      "HotpotQA",
+      "MS MARCO",
+      "BEIR",
+      "FEVER",
+      "ELI5",
+      "QASPER",
+      "SciFact",
+      "PubMedQA",
+      "MultiHop-RAG"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "hallucination",
+      "faithfulness",
+      "幻觉",
+      "事实一致性",
+      "attribution"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "DPR",
+        "ColBERT",
+        "BM25",
+        "SPLADE",
+        "RAG",
+        "FiD",
+        "REALM",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "dense vector",
+        "sparse vector",
+        "passage",
+        "chunk",
+        "document embedding",
+        "query embedding"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "E5",
+        "BGE",
+        "Contriever"
+      ],
+      "split_strategies": [
+        {
+          "cue": "dev split",
+          "name": "dev"
+        },
+        {
+          "cue": "test split",
+          "name": "test"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "open-domain",
+          "name": "open-domain"
+        },
+        {
+          "cue": "multi-hop",
+          "name": "multi-hop"
+        },
+        {
+          "cue": "closed-book",
+          "name": "closed-book"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "nlp_rag.retrieval",
+    "domain": "nlp_rag",
+    "labels": {
+      "en": "Retrieval for RAG",
+      "zh": "面向检索增强生成的检索"
+    },
+    "metrics": [
+      "nDCG@K",
+      "Recall@K",
+      "MRR",
+      "MAP",
+      "Hit@K",
+      "exact match",
+      "EM",
+      "BLEU",
+      "ROUGE-L",
+      "METEOR",
+      "BERTScore",
+      "faithfulness",
+      "answer relevance",
+      "context precision",
+      "context recall",
+      "hallucination rate",
+      "citation accuracy"
+    ],
+    "datasets": [
+      "Natural Questions",
+      "TriviaQA",
+      "HotpotQA",
+      "MS MARCO",
+      "BEIR",
+      "FEVER",
+      "ELI5",
+      "QASPER",
+      "SciFact",
+      "PubMedQA",
+      "MultiHop-RAG"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "retrieval augmented",
+      "retrieval-augmented",
+      "检索增强",
+      "dense retrieval",
+      "passage retrieval",
+      "reranking",
+      "retriever"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "DPR",
+        "ColBERT",
+        "BM25",
+        "SPLADE",
+        "RAG",
+        "FiD",
+        "REALM",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "dense vector",
+        "sparse vector",
+        "passage",
+        "chunk",
+        "document embedding",
+        "query embedding"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "E5",
+        "BGE",
+        "Contriever"
+      ],
+      "split_strategies": [
+        {
+          "cue": "dev split",
+          "name": "dev"
+        },
+        {
+          "cue": "test split",
+          "name": "test"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "open-domain",
+          "name": "open-domain"
+        },
+        {
+          "cue": "multi-hop",
+          "name": "multi-hop"
+        },
+        {
+          "cue": "closed-book",
+          "name": "closed-book"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
+    "slug": "nlp_rag.scientific_writing",
+    "domain": "nlp_rag",
+    "labels": {
+      "en": "AI-assisted scientific writing",
+      "zh": "科研写作辅助"
+    },
+    "metrics": [
+      "nDCG@K",
+      "Recall@K",
+      "MRR",
+      "MAP",
+      "Hit@K",
+      "exact match",
+      "EM",
+      "BLEU",
+      "ROUGE-L",
+      "METEOR",
+      "BERTScore",
+      "faithfulness",
+      "answer relevance",
+      "context precision",
+      "context recall",
+      "hallucination rate",
+      "citation accuracy"
+    ],
+    "datasets": [
+      "Natural Questions",
+      "TriviaQA",
+      "HotpotQA",
+      "MS MARCO",
+      "BEIR",
+      "FEVER",
+      "ELI5",
+      "QASPER",
+      "SciFact",
+      "PubMedQA",
+      "MultiHop-RAG"
+    ],
+    "dimensions": [
+      "dataset",
+      "metric_name",
+      "split"
+    ],
+    "inclusion_cues": [
+      "scientific writing",
+      "科研写作",
+      "literature review generation",
+      "综述生成",
+      "citation generation",
+      "paper writing"
+    ],
+    "exclusion_cues": [],
+    "vocabulary": {
+      "model_families": [
+        "DPR",
+        "ColBERT",
+        "BM25",
+        "SPLADE",
+        "RAG",
+        "FiD",
+        "REALM",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "CNN",
+        "BiLSTM",
+        "LSTM",
+        "GRU",
+        "Transformer",
+        "GNN",
+        "CRF"
+      ],
+      "input_representations": [
+        "dense vector",
+        "sparse vector",
+        "passage",
+        "chunk",
+        "document embedding",
+        "query embedding"
+      ],
+      "pretrained_backbones": [
+        "BERT",
+        "RoBERTa",
+        "T5",
+        "GPT",
+        "LLaMA",
+        "E5",
+        "BGE",
+        "Contriever"
+      ],
+      "split_strategies": [
+        {
+          "cue": "dev split",
+          "name": "dev"
+        },
+        {
+          "cue": "test split",
+          "name": "test"
+        },
+        {
+          "cue": "leave-one-genome-out",
+          "name": "leave-one-genome-out"
+        },
+        {
+          "cue": "cluster-based",
+          "name": "cluster-based"
+        },
+        {
+          "cue": "temporal split",
+          "name": "temporal"
+        },
+        {
+          "cue": "random split",
+          "name": "random"
+        }
+      ],
+      "task_variants": [
+        {
+          "cue": "open-domain",
+          "name": "open-domain"
+        },
+        {
+          "cue": "multi-hop",
+          "name": "multi-hop"
+        },
+        {
+          "cue": "closed-book",
+          "name": "closed-book"
+        },
+        {
+          "cue": "multi-class",
+          "name": "multi-class"
+        },
+        {
+          "cue": "multiclass",
+          "name": "multi-class"
+        },
+        {
+          "cue": "binary",
+          "name": "binary detection"
+        },
+        {
+          "cue": "detection",
+          "name": "binary detection"
+        },
+        {
+          "cue": "targeted",
+          "name": "targeted attack"
+        }
+      ]
+    }
+  },
+  {
     "slug": "recsys.adversarial_defense",
     "domain": "recsys_attack",
     "labels": {
@@ -813,7 +2143,15 @@
       "adversarial defense",
       "robust recommendation",
       "poison detection",
-      "sequential recommendation"
+      "sequential recommendation",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "intrusion detection",
@@ -919,7 +2257,15 @@
       "Amazon Beauty",
       "attack success rate",
       "NDCG",
-      "sequential recommendation"
+      "sequential recommendation",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "histopathology",
@@ -1019,7 +2365,15 @@
     "inclusion_cues": [
       "model extraction",
       "steal recommendation",
-      "sequential recommendation"
+      "sequential recommendation",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "blockchain",
@@ -1129,7 +2483,15 @@
       "session-based recommendation",
       "poisoning attack",
       "fake user",
-      "profile pollution"
+      "profile pollution",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "intrusion detection",
@@ -1239,7 +2601,15 @@
       "profile pollution",
       "fake user",
       "injected profile",
-      "sequential recommendation"
+      "sequential recommendation",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "intrusion detection",
@@ -1339,7 +2709,15 @@
     "inclusion_cues": [
       "robust training",
       "adversarial training",
-      "sequential recommendation"
+      "sequential recommendation",
+      "序列推荐",
+      "推荐系统",
+      "投毒攻击",
+      "数据投毒",
+      "推荐攻击",
+      "虚假用户",
+      "鲁棒推荐",
+      "推荐模型"
     ],
     "exclusion_cues": [
       "intrusion detection",
