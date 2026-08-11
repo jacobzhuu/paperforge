@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeProject, makeToastSpy, mockProjectContext, ok } from './helpers';
 import { EMPTY_PROGRESS } from '@/lib/useProjectProgress';
-import type { Job } from '@/lib/types';
+import type { CostDetail, Job } from '@/lib/types';
 
 const projectCtx = { current: mockProjectContext() };
 const toastSpy = makeToastSpy();
@@ -29,6 +29,7 @@ const skipPolish = vi.fn();
 const startQualityRepair = vi.fn();
 const skipQualityRepair = vi.fn();
 let listedJobs: Job[] = [];
+let costDetail: CostDetail | undefined;
 
 vi.mock('@/lib/api', () => ({
   generateAll: (...args: unknown[]) => generateAll(...args),
@@ -37,7 +38,7 @@ vi.mock('@/lib/api', () => ({
   startQualityRepair: (...args: unknown[]) => startQualityRepair(...args),
   skipQualityRepair: (...args: unknown[]) => skipQualityRepair(...args),
   getCitationAudit: () => ok(undefined),
-  getCostDetail: () => ok(undefined),
+  getCostDetail: () => ok(costDetail),
   getNumLint: () => ok(undefined),
   getSubmissionReadiness: () => ok(undefined),
   getVersionHistory: () => ok(undefined),
@@ -99,6 +100,7 @@ describe('项目概览的「跑通全管线」按钮', () => {
     startPolish.mockReset();
     skipPolish.mockReset();
     listedJobs = [];
+    costDetail = undefined;
     projectCtx.current = mockProjectContext({ project: makeProject(), progress: freshProgress });
   });
 
@@ -384,4 +386,58 @@ describe('项目概览的「跑通全管线」按钮', () => {
       '/projects/p1/questions',
     );
   });
+
+  // ---- 成本面板（P1-4）------------------------------------------------------
+  //
+  // 修好之前 cost_estimate 永远是 0，一次几百万 token 的运行看起来是免费的。
+  // 现在真正的风险换成了「部分定价」：金额非零、看起来权威，却漏掉整个模型。
+
+  function costWith(totals: Partial<CostDetail['totals']>): CostDetail {
+    return {
+      project_id: 'p1',
+      totals: {
+        project_id: 'p1',
+        call_count: 10,
+        input_tokens: 1000,
+        output_tokens: 500,
+        cost_estimate: 1.25,
+        failed_call_count: 0,
+        priced_call_count: 10,
+        unpriced_call_count: 0,
+        cost_complete: true,
+        ...totals,
+      },
+      by_role: [],
+    };
+  }
+
+  it('全部定价时直接给出金额，不加下界符号', async () => {
+    costDetail = costWith({});
+    await renderOverview();
+
+    await waitFor(() => expect(screen.getByText('$1.2500')).toBeTruthy());
+    expect(screen.queryByText(/无法估价/)).toBeNull();
+  });
+
+  it('有未定价调用时金额显示为下界，并说明原因', async () => {
+    costDetail = costWith({ priced_call_count: 7, unpriced_call_count: 3, cost_complete: false });
+    await renderOverview();
+
+    await waitFor(() => expect(screen.getByText('≥ $1.2500')).toBeTruthy());
+    const note = screen.getByText(/无法估价/);
+    expect(note.textContent).toContain('3 次调用无法估价');
+    expect(note.textContent).toContain('下界');
+  });
+
+  it('图片生成没有价格来源时同样把总额降级为下界', async () => {
+    costDetail = {
+      ...costWith({}),
+      images: { call_count: 2, failed_call_count: 0, cost_estimate: 0, unpriced_call_count: 2 },
+    };
+    await renderOverview();
+
+    await waitFor(() => expect(screen.getByText('≥ $1.2500')).toBeTruthy());
+    expect(screen.getByText(/无法估价/).textContent).toContain('图片生成暂无价格来源');
+  });
+
 });

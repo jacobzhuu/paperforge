@@ -287,6 +287,13 @@ class LLMRunner:
                 provider=provider,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                # 没配价格或没拿到用量时留 None。写 0.0 会让成本面板把"不知道"
+                # 显示成"免费"，那正是这条记账线路此前形同虚设的原因。
+                cost_estimate=self._config.estimate_cost(
+                    model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ),
                 latency_ms=latency_ms,
                 error_code=error_code,
                 metadata=dict(metadata or {}),

@@ -26,6 +26,7 @@ from db import (
 from db.models.auth import AppUser
 from db.models.library import DocumentFile, LiteraturePdfUpload
 from db.models.paper import ExportArtifact, PaperProject, UserAsset, VisualAsset
+from db.repositories.jobs import unpriced_call_count
 from db.session import make_engine, make_session_factory
 from sqlalchemy import func, select, update
 from storage import make_object_store
@@ -134,6 +135,15 @@ def main() -> None:
         help="also re-propose for projects that already have a binding",
     )
 
+    cost = commands.add_parser(
+        "cost",
+        help="LLM spend by role and model, and which models are still unpriced",
+    )
+    cost.add_argument("--project", help="restrict to one project id")
+    cost.add_argument("--job", help="restrict to one generation job id")
+    cost.add_argument("--role", help="restrict to one LLM role, e.g. synthesizer")
+    cost.add_argument("--since", help="ISO date; only calls at or after it")
+
     args = parser.parse_args()
     if args.command == "bootstrap-admin":
         if args.password_stdin:
@@ -153,6 +163,8 @@ def main() -> None:
         asyncio.run(_purge_projects(days=args.days, dry_run=args.dry_run))
     elif args.command == "tasks":
         asyncio.run(_tasks_command(args))
+    elif args.command == "cost":
+        asyncio.run(_cost_command(args))
     elif args.command == "storage-manifest":
         entries = write_source_manifest(args.source_root, args.manifest)
         print(f"object manifest created: {len(entries)} objects")
@@ -186,6 +198,110 @@ def main() -> None:
         print(count)
         if args.require_empty and count:
             raise SystemExit("configured object store is not empty")
+
+
+async def _cost_command(args: argparse.Namespace) -> None:
+    """成本记账的读出口。
+
+    面板给的是一个项目的总数；做 shadow 评估要问的是另一类问题——
+    「打开某个特性之后，那个角色单独花了多少」。角色是可靠的切分维度
+    （每一行都有 role），stage 元数据只覆盖不到两成的调用。
+
+    未定价的调用单独列出并给出原因，因为把它们混进 0 元里正是这条线路
+    此前形同虚设的方式。
+    """
+    from db.models.paper import LlmCallLog
+
+    settings = get_settings()
+    engine = make_engine(settings.database_url, application_name="paperforge-admin")
+    session_factory = make_session_factory(engine)
+    filters = []
+    if args.project:
+        filters.append(LlmCallLog.project_id == uuid.UUID(args.project))
+    if args.job:
+        filters.append(LlmCallLog.job_id == uuid.UUID(args.job))
+    if args.role:
+        filters.append(LlmCallLog.role == args.role)
+    if args.since:
+        filters.append(LlmCallLog.occurred_at >= datetime.fromisoformat(args.since))
+    try:
+        async with session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        LlmCallLog.role,
+                        LlmCallLog.model,
+                        func.count(LlmCallLog.id),
+                        func.count(LlmCallLog.error_code),
+                        func.coalesce(func.sum(LlmCallLog.input_tokens), 0),
+                        func.coalesce(func.sum(LlmCallLog.output_tokens), 0),
+                        func.count(LlmCallLog.cost_estimate),
+                        func.coalesce(func.sum(LlmCallLog.cost_estimate), 0.0),
+                        unpriced_call_count(),
+                        func.count(1).filter(
+                            LlmCallLog.error_code.is_(None),
+                            LlmCallLog.input_tokens.is_(None),
+                        ),
+                    )
+                    .where(*filters)
+                    .group_by(LlmCallLog.role, LlmCallLog.model)
+                    .order_by(func.count(LlmCallLog.id).desc())
+                )
+            ).all()
+    finally:
+        await engine.dispose()
+
+    if not rows:
+        print("no LLM calls match the filter")
+        return
+
+    header = (
+        f"{'role':<30} {'model':<22} {'calls':>7} {'failed':>7} "
+        f"{'in_tok':>11} {'out_tok':>11} {'cost':>12} {'unpriced':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    totals = dict.fromkeys(("calls", "failed", "in", "out", "unpriced", "no_usage"), 0)
+    spend = 0.0
+    unpriced_models: dict[str, int] = {}
+    for role, model, calls, failed, in_tok, out_tok, priced, cost, unpriced, no_usage in rows:
+        print(
+            f"{role:<30} {model:<22} {calls:>7} {failed:>7} "
+            f"{int(in_tok):>11} {int(out_tok):>11} "
+            f"{('$' + format(float(cost), '.4f')) if priced else '—':>12} {unpriced:>9}"
+        )
+        totals["calls"] += calls
+        totals["failed"] += failed
+        totals["in"] += int(in_tok)
+        totals["out"] += int(out_tok)
+        totals["unpriced"] += unpriced
+        totals["no_usage"] += no_usage
+        spend += float(cost)
+        if unpriced and no_usage < unpriced:
+            unpriced_models[model] = unpriced_models.get(model, 0) + (unpriced - no_usage)
+
+    print("-" * len(header))
+    bound = "" if totals["unpriced"] == 0 else "≥ "
+    print(
+        f"{'TOTAL':<30} {'':<22} {totals['calls']:>7} {totals['failed']:>7} "
+        f"{totals['in']:>11} {totals['out']:>11} "
+        f"{bound + '$' + format(spend, '.4f'):>12} {totals['unpriced']:>9}"
+    )
+    if totals["unpriced"]:
+        print(
+            f"\n{totals['unpriced']} successful call(s) could not be priced, so the total "
+            "above is a lower bound, not a bill."
+        )
+        if totals["no_usage"]:
+            print(f"  {totals['no_usage']} of them returned no token usage at all.")
+        for model, count in sorted(unpriced_models.items(), key=lambda item: -item[1]):
+            print(f"  {count:>6} call(s) on an unpriced model: {model}")
+        print(
+            "  Add them to LLM_MODEL_PRICES, e.g. "
+            '{"' + (next(iter(unpriced_models), "model-name")) + '": {"input": 0.0, "output": 0.0}}'
+        )
+    else:
+        print("\nEvery successful call is priced.")
 
 
 async def _tasks_command(args: argparse.Namespace) -> None:

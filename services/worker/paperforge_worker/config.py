@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from llm_runtime import LLMConfig
+from llm_runtime import LLMConfig, parse_model_prices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from scholar_gateway.providers import ProviderConfig
 from visuals import ImageProviderConfig
@@ -29,6 +29,10 @@ class WorkerSettings(BaseSettings):
     llm_openai_api_key: str = ""
     llm_role_models: str = "{}"
     llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled"}'
+    # 模型 → 单价（每百万 token）。留空则所有调用记为**未定价**，成本面板会
+    # 明说金额不完整，而不是显示一个看起来很划算的 $0.00。
+    #   {"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}
+    llm_model_prices: str = "{}"
 
     # Independent structured tasks can safely share the provider concurrently.
     # Keep the bounds below the default SQLAlchemy overflow capacity.
@@ -111,12 +115,17 @@ class WorkerSettings(BaseSettings):
             role_thinking = json.loads(self.llm_role_thinking) if self.llm_role_thinking else {}
         except json.JSONDecodeError:
             role_thinking = {}
+        try:
+            model_prices = json.loads(self.llm_model_prices) if self.llm_model_prices else {}
+        except json.JSONDecodeError:
+            model_prices = {}
         return LLMConfig(
             provider=self.llm_default_provider,
             base_url=self.llm_openai_base_url,
             api_key=self.llm_openai_api_key,
             role_models=role_models if isinstance(role_models, dict) else {},
             role_thinking=role_thinking if isinstance(role_thinking, dict) else {},
+            model_prices=parse_model_prices(model_prices),
         )
 
     def user_agent(self) -> str:

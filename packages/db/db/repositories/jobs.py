@@ -313,6 +313,18 @@ async def record_llm_call(
     return row
 
 
+def unpriced_call_count() -> Any:
+    """未能算出金额的**成功**调用数。
+
+    失败调用没有用量也不该有费用，不算进来；剩下的两种成因——没配价格、
+    provider 没回 usage——都意味着「不知道花了多少」，在面板上必须与「花了 0」分开。
+    """
+    return func.count(1).filter(
+        LlmCallLog.error_code.is_(None),
+        LlmCallLog.cost_estimate.is_(None),
+    )
+
+
 async def project_llm_cost(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -325,13 +337,21 @@ async def project_llm_cost(
                 func.coalesce(func.sum(LlmCallLog.output_tokens), 0),
                 func.coalesce(func.sum(LlmCallLog.cost_estimate), 0.0),
                 func.count(LlmCallLog.error_code),
+                func.count(LlmCallLog.cost_estimate),
+                unpriced_call_count(),
             ).where(LlmCallLog.project_id == project_id)
         )
     ).one()
+    unpriced = int(row[6] or 0)
     return {
         "call_count": int(row[0] or 0),
         "input_tokens": int(row[1] or 0),
         "output_tokens": int(row[2] or 0),
         "cost_estimate": float(row[3] or 0.0),
         "failed_call_count": int(row[4] or 0),
+        "priced_call_count": int(row[5] or 0),
+        "unpriced_call_count": unpriced,
+        # 金额是否覆盖了全部成功调用。为假时 `cost_estimate` 是**下界**，
+        # 界面必须照实说，否则未定价的模型会让账单看起来便宜得多。
+        "cost_complete": unpriced == 0,
     }

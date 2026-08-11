@@ -2,6 +2,7 @@ import importlib
 
 import paperforge_worker.config as worker_config
 import paperforge_worker.worker as worker
+import pytest
 from arq.connections import RedisSettings
 
 
@@ -33,6 +34,27 @@ def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
     assert llm.thinking_for_role("extractor") == "disabled"
     assert llm.thinking_for_role("reranker") == "disabled"
     assert llm.thinking_for_role("writer") is None
+
+
+def test_model_prices_reach_the_llm_config_and_default_to_unpriced():
+    """P1-4：没配价格时每次调用都记为未定价，而不是记成 $0。"""
+    unconfigured = worker_config.WorkerSettings(_env_file=None).llm_config()
+    assert unconfigured.estimate_cost("deepseek-v4-pro", input_tokens=10, output_tokens=10) is None
+
+    settings = worker_config.WorkerSettings(
+        _env_file=None,
+        llm_model_prices='{"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}',
+    )
+    assert settings.llm_config().estimate_cost(
+        "deepseek-v4-pro", input_tokens=1_000_000, output_tokens=0
+    ) == pytest.approx(0.27)
+
+
+def test_malformed_model_prices_do_not_break_startup():
+    """价目表写坏了只该让成本记账退回未定价，不该让 worker 起不来。"""
+    settings = worker_config.WorkerSettings(_env_file=None, llm_model_prices="not json")
+
+    assert settings.llm_config().model_prices == {}
 
 
 def test_full_pipeline_can_force_yunwu_even_if_manual_provider_is_cloudflare():

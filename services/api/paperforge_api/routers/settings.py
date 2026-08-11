@@ -248,6 +248,7 @@ async def restore_document_version(
 async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
     """成本面板：按角色聚合的 LLM 调用记账（设计 §4.9）。"""
     from db.models.paper import LlmCallLog
+    from db.repositories.jobs import unpriced_call_count
     from sqlalchemy import func
 
     project = await _require_project(session, project_id)
@@ -263,6 +264,7 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
                 func.coalesce(func.sum(LlmCallLog.cost_estimate), 0.0),
                 func.coalesce(func.avg(LlmCallLog.latency_ms), 0),
                 func.count(LlmCallLog.error_code),
+                unpriced_call_count(),
             )
             .where(LlmCallLog.project_id == project.id)
             .group_by(LlmCallLog.role, LlmCallLog.model, LlmCallLog.provider)
@@ -278,6 +280,10 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
                 func.count(VisualGenerationAttempt.id),
                 func.count(VisualGenerationAttempt.error_code),
                 func.coalesce(func.sum(VisualGenerationAttempt.cost_estimate), 0.0),
+                func.count(1).filter(
+                    VisualGenerationAttempt.error_code.is_(None),
+                    VisualGenerationAttempt.cost_estimate.is_(None),
+                ),
             )
             .join(VisualAsset, VisualAsset.id == VisualGenerationAttempt.visual_id)
             .where(VisualAsset.project_id == project.id)
@@ -319,6 +325,7 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
                 "cost_estimate": float(row[6] or 0.0),
                 "avg_latency_ms": int(row[7] or 0),
                 "failed_call_count": int(row[8] or 0),
+                "unpriced_call_count": int(row[9] or 0),
             }
             for row in rows
         ],
@@ -326,6 +333,9 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
             "call_count": int(image_row[0] or 0),
             "failed_call_count": int(image_row[1] or 0),
             "cost_estimate": float(image_row[2] or 0.0),
+            # 三个图像 provider 都声明 cost_estimate_available=False，所以这里
+            # 目前恒等于成功次数。照实报出来，好过让面板显示生图免费。
+            "unpriced_call_count": int(image_row[3] or 0),
             "by_size": [
                 {
                     "provider": row[0],

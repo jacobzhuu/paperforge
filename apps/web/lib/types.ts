@@ -415,6 +415,11 @@ export interface ProjectCost {
   cost_estimate: number;
   /** 失败调用数：draft-first 下失败会静默降级，面板必须能看见它。 */
   failed_call_count?: number;
+  priced_call_count?: number;
+  /** 算不出金额的成功调用数（没配价格，或 provider 没回 usage）。 */
+  unpriced_call_count?: number;
+  /** 为假时 cost_estimate 只是下界，界面必须显示为「≥」而不是确定值。 */
+  cost_complete?: boolean;
 }
 
 // ---- 大纲与章节（设计 §4.3 outline / paper_section） ----
@@ -1086,6 +1091,7 @@ export interface CostByRole {
   output_tokens: number;
   cost_estimate: number;
   avg_latency_ms: number;
+  unpriced_call_count?: number;
 }
 
 export interface CostDetail {
@@ -1096,6 +1102,7 @@ export interface CostDetail {
     call_count: number;
     failed_call_count: number;
     cost_estimate: number;
+    unpriced_call_count?: number;
     by_size?: Array<{
       provider: string;
       model?: string | null;

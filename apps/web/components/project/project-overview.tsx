@@ -1016,6 +1016,12 @@ function jobState(
 
 function CostSummary({ cost }: { cost: CostDetail | undefined }) {
   const failed = cost?.totals.failed_call_count ?? 0;
+  const spend = cost?.totals.cost_estimate ?? 0;
+  // 未定价的调用（没配价格，或 provider 没回 usage）让金额只是一个下界。
+  // 图片生成目前三个 provider 都不报价，所以它也计入不完整。
+  const unpricedCalls = cost?.totals.unpriced_call_count ?? 0;
+  const unpricedImages = cost?.images?.unpriced_call_count ?? 0;
+  const complete = (cost?.totals.cost_complete ?? true) && unpricedImages === 0;
   return (
     <section className="space-y-3">
       <SectionTitle>成本</SectionTitle>
@@ -1031,7 +1037,23 @@ function CostSummary({ cost }: { cost: CostDetail | undefined }) {
             <Figure value={cost?.images?.call_count ?? 0} unit="次图片生成" />
           </>
         )}
+        {spend > 0 && (
+          <>
+            <Sep />
+            <span className="font-medium tabular-nums text-foreground">
+              {complete ? '' : '≥ '}${spend.toFixed(4)}
+            </span>
+          </>
+        )}
       </p>
+      {!complete && (
+        <p className="text-sm text-muted-foreground">
+          {unpricedCalls + unpricedImages} 次调用无法估价
+          {unpricedCalls > 0 ? '（该模型未配置 LLM_MODEL_PRICES，或供应商未返回 usage）' : ''}
+          {unpricedImages > 0 ? '（图片生成暂无价格来源）' : ''}
+          ，因此上面的金额是下界而不是账单。
+        </p>
+      )}
       {failed > 0 && (
         <p className="text-sm text-warning-strong">
           <span className="font-medium tabular-nums">{failed}</span> 次调用失败

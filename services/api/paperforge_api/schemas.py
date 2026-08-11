@@ -448,6 +448,11 @@ class CostResponse(BaseModel):
     cost_estimate: float = 0.0
     # 失败调用数：draft-first 下失败会静默降级，成本面板必须能看见它。
     failed_call_count: int = 0
+    priced_call_count: int = 0
+    # 算不出金额的成功调用数（没配价格，或 provider 没回 usage）。
+    unpriced_call_count: int = 0
+    # 为假时 cost_estimate 只是**下界**；界面必须照实说，不能显示成确定值。
+    cost_complete: bool = True
 
 
 # ---- M2：大纲 / 章节 / 引用审计 / 预览 ----

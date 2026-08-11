@@ -4,7 +4,15 @@
 """
 
 from llm_runtime.client import create_llm_provider, preflight_llm_provider
-from llm_runtime.config import DEFAULT_ROLE_MODELS, DEFAULT_ROLE_THINKING, LLMConfig, Role
+from llm_runtime.config import (
+    DEFAULT_MODEL_PRICES,
+    DEFAULT_ROLE_MODELS,
+    DEFAULT_ROLE_THINKING,
+    LLMConfig,
+    ModelPrice,
+    Role,
+    parse_model_prices,
+)
 from llm_runtime.json_utils import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 from llm_runtime.providers import (
     LLMProvider,
@@ -19,6 +27,7 @@ from llm_runtime.runner import JsonResult, LLMCallRecord, LLMRunner
 from llm_runtime.types import LLMError, LLMRequest, LLMResponse
 
 __all__ = [
+    "DEFAULT_MODEL_PRICES",
     "DEFAULT_ROLE_MODELS",
     "DEFAULT_ROLE_THINKING",
     "CiteKeyViolation",
@@ -30,6 +39,7 @@ __all__ = [
     "LLMRequest",
     "LLMResponse",
     "LLMRunner",
+    "ModelPrice",
     "NoopLLMProvider",
     "OpenAICompatibleLLMProvider",
     "Role",
@@ -38,6 +48,7 @@ __all__ = [
     "clamp_max_output_tokens",
     "clean_and_parse_json",
     "create_llm_provider",
+    "parse_model_prices",
     "preflight_llm_provider",
     "purify_llm_json",
     "sanitize_openai_compatible_base_url",
