@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,6 +42,7 @@ CORE_DIMENSIONS = frozenset(
 )
 
 MAX_ENTRIES_PER_KIND = 6
+MAX_OUTPUT_TOKENS = 6000
 MAX_RAW_ENTRIES = 24
 MIN_ELIGIBLE_UNITS = 2
 MAX_STATEMENT_CHARS = 400
@@ -143,7 +145,11 @@ async def synthesize_bundle(
         SYNTHESIZER_ROLE,
         system_prompt=_system_prompt(language=language, dimensions=allowed_dimensions),
         user_prompt=render_bundle(bundle),
-        max_output_tokens=1600,
+        # 综合本身只输出几百 token，但这是个推理档位的角色（synthesizer → planner），
+        # 思考 token 同样计入输出预算。影子评估实测：1600 会让 6 个子问题中的 4 个被
+        # `output_truncated` 打掉（最坏的一种结果：钱花了，一条都没拿到）；成功调用的
+        # 平均输出是 3663 token，4000 仍有 24% 的调用要重试。
+        max_output_tokens=MAX_OUTPUT_TOKENS,
         temperature=0.0,
         metadata={"stage": "synthesis", "question_id": str(bundle.get("question_id") or "")},
     )
@@ -198,7 +204,14 @@ def build_synthesis(
             )
             if entry is None:
                 rejected.append(
-                    {"kind": kind, "reason": reason, "statement": _clean(item)[:160]}
+                    {
+                        "kind": kind,
+                        "reason": reason,
+                        "statement": _clean(item)[:160],
+                        # 被拒的那个值本身。只记"维度不认识"无法判断该扩本体还是该改
+                        # 提示词——影子评估正是靠这一条定位本体缺口。
+                        "value": _rejected_value(item, reason),
+                    }
                 )
                 continue
             if entry.kind == "gap":
@@ -231,6 +244,16 @@ def build_synthesis(
         gap=tuple(gaps),
         rejected=tuple(rejected),
     )
+
+
+def _rejected_value(item: Any, reason: str) -> str:
+    if not isinstance(item, dict):
+        return ""
+    if reason == "unknown_dimension":
+        return _clean(item.get("dimension"))[:64]
+    if reason in {"unknown_comparability_key", "evidence_outside_cluster"}:
+        return _clean(item.get("comparability_key"))[:64]
+    return ""
 
 
 def _accept_entry(
@@ -417,8 +440,20 @@ Hard rules — violations are discarded, so a smaller honest answer beats a full
 Use `gap` to state what the evidence does not settle. An empty list is a valid answer."""
 
 
+# 「Qin等人（2025）」这类署名归属。提示词第 6 条禁止它，但提示词不是防线：
+# 影子评估里 92 条通过校验的条目仍出现了一条。综合语句是给写作器的论证指引，
+# 里面的作者—年份既没有绑定也没有白名单，删掉比留着安全（与 `writing._clean_paragraph`
+# 对正文的处理一致）。删的是署名，不是内容——语句本身仍由 evidence_ids 承担出处。
+_ATTRIBUTION_RE = re.compile(
+    r"(?:[A-Z][A-Za-z\-]+|[\u4e00-\u9fff]{1,4})\s*(?:et\s+al\.|等人|等)?\s*"
+    r"[（(]\s*(?:19|20)\d{2}[a-z]?\s*[)）]"
+    r"|[（(]\s*(?:19|20)\d{2}[a-z]?\s*[)）]"
+)
+
+
 def _statement(value: Any) -> str:
-    return _clean(value)[:MAX_STATEMENT_CHARS]
+    cleaned = _ATTRIBUTION_RE.sub("", _clean(value))
+    return " ".join(cleaned.split())[:MAX_STATEMENT_CHARS]
 
 
 def _clean(value: Any) -> str:
@@ -429,6 +464,7 @@ def _clean(value: Any) -> str:
 
 __all__ = [
     "CORE_DIMENSIONS",
+    "MAX_OUTPUT_TOKENS",
     "FULLTEXT_GRADES",
     "MAX_ENTRIES_PER_KIND",
     "MIN_ELIGIBLE_UNITS",

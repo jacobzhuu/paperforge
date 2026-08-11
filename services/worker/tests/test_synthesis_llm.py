@@ -424,3 +424,84 @@ def test_an_oversized_response_is_bounded_on_both_ends():
 
     assert len(result.agreement) == MAX_ENTRIES_PER_KIND
     assert len(result.gap) == MAX_ENTRIES_PER_KIND
+
+
+# --- 署名归属：提示词第 6 条不能只靠提示词 -------------------------------------
+
+
+def test_an_author_year_attribution_is_stripped_from_a_statement():
+    """影子评估实测：92 条通过校验的条目里仍有一条写了「Qin等人（2025）」。
+
+    综合语句是给写作器的论证指引，里面的作者—年份既没有绑定也不在白名单里；
+    删掉署名、保留内容，出处仍由 evidence_ids 承担。
+    """
+    result = _build(
+        {
+            "gap": [
+                {"statement": "Qin等人（2025）在摘要中提及联邦序列推荐的防御策略，具体机制未描述。"}
+            ]
+        }
+    )
+
+    statement = result.gap[0].statement
+    assert "Qin" not in statement
+    assert "2025" not in statement
+    assert "在摘要中提及联邦序列推荐的防御策略" in statement
+
+
+def test_the_latin_form_is_stripped_too():
+    result = _build(
+        {
+            "agreement": [
+                {
+                    "statement": "Smith et al. (2020) report the same trend.",
+                    "evidence_ids": [E1],
+                }
+            ]
+        }
+    )
+
+    assert result.agreement[0].statement == "report the same trend."
+
+
+def test_a_year_without_a_citation_shape_survives():
+    """"2020 年的基准" 不是署名；过度删除会把正常句子改坏。"""
+    result = _build(
+        {
+            "agreement": [
+                {"statement": "Both studies use the 2020 benchmark.", "evidence_ids": [E1]}
+            ]
+        }
+    )
+
+    assert result.agreement[0].statement == "Both studies use the 2020 benchmark."
+
+
+def test_a_rejection_records_the_offending_value():
+    """只记"维度不认识"没法行动；要能追到是哪个维度才知道该不该扩本体。"""
+    result = _build(
+        {
+            "conditional": [
+                {"dimension": "retriever", "statement": "It depends.", "evidence_ids": [E1]}
+            ],
+            "conflict": [
+                {
+                    "statement": "They disagree.",
+                    "evidence_ids": [E1, E2],
+                    "comparability_key": "made-up",
+                }
+            ],
+        }
+    )
+
+    values = {item["reason"]: item["value"] for item in result.rejected}
+    assert values["unknown_dimension"] == "retriever"
+    assert values["unknown_comparability_key"] == "made-up"
+
+
+def test_rejections_without_a_specific_value_leave_it_empty():
+    result = _build(
+        {"agreement": [{"statement": "Gains of 99%.", "evidence_ids": [E1]}]}
+    )
+
+    assert result.rejected[0]["value"] == ""

@@ -237,6 +237,12 @@ The plan's **quality** criterion — on ≥3 `g2` topics, more cross-study compa
 run. It requires the flag on against a live LLM provider and a full pipeline run per topic. It belongs
 to step 3 of the rollout below.
 
+> **Update 2026-08-12.** A shadow evaluation against 23 production bundles has since run and is
+> reported in `PAPERFORGE_PHASE4_SHADOW_EVALUATION.md`. It found two defects in the code above —
+> an output-token budget that silently killed 4 of 6 sub-questions, and an unenforced
+> no-attribution instruction — both now fixed. It also established that **rule 2 is currently
+> unexercisable in production**, because zero comparison clusters exist until Phase 2 runs.
+
 ---
 
 ## 8. Rollout
