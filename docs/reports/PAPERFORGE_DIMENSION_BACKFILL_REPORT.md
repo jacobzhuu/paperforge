@@ -5,8 +5,9 @@
 results, and Phase 4's conflict rule finally sees real data
 **Command:** `paperforge-admin backfill-dimensions --project <id> --linked-only --apply`
 **Applied to:** project `21016fe8` (近3年序列推荐攻击的文献综述), 13 works
-**Result:** two blocking defects found and fixed; comparability demonstrably works; **bundles still
-contain zero clusters, for a different and now precisely located reason**
+**Result:** two blocking defects found and fixed, plus two more found while validating; dimensions
+are populated and tasks canonicalised; **no cross-paper comparability exists in this corpus, so
+Phase 4's conflict rule remains untested — and that is a property of the papers, not of the code**
 
 ---
 
@@ -81,8 +82,8 @@ responses straight to the parser and never exercise the token budget.
 ```
 11 work(s), 64 cell(s), 60 locator-verified (93.8%), 28 rejected
   skipped (extraction_unavailable): 2
-spend: 16 call(s), 138,121 in / 45,704 out
-39 measurement(s) written
+spend: 17 call(s), 151,951 in / 48,595 out
+40 measurement(s) written
 ```
 
 93.8% clears the plan's 0.8 promotion gate. The command buffers every extraction, computes the
@@ -101,18 +102,45 @@ distinct comparability_key 306 / 359    323 / 398
 
 The `before` numbers are the pathology: 306 distinct keys for 359 rows means the key was effectively
 a unique id, because it salts with the evidence-unit id whenever task, dataset **or** split is
-missing. Among the 41 LLM-written measurements there are only **17** distinct keys — results now
-genuinely collide:
+missing. Among the 40 LLM-written measurements results do now collide within a paper — the salting no longer
+fires, because task, dataset and split are all present:
 
 ```
-HR@10  | Beauty | test | sequential recommendation  → d5294afc…  (×3)
-NDCG@10| Beauty | test | sequential recommendation  → 2331cae4…  (×2)
+recsys.adversarial_defense   31
+recsys.poisoning_attack       9
 ```
 
-Pooling every measured unit in this project would form **9 comparison clusters over 18 evidence
-units and 9 distinct works.** The dimensions are good enough to cluster.
+Grouping every measured unit in this project yields **8 clusters over 16 evidence units — every one
+of them confined to a single paper.** See §2.1: that is the corrected number, and it is the finding.
 
 ---
+
+### 2.1 Correction — and the real conclusion
+
+An earlier version of this report said the backfill produced *"9 comparison clusters over 18 evidence
+units and 9 distinct works."* **That was wrong.** `sum(works)` across 9 clusters was read as a
+distinct-work count; each cluster spans exactly one work:
+
+```
+works_spanned | clusters | units
+            1 |        8 |    16
+```
+
+**No cross-paper cluster exists in this corpus.** A follow-up hypothesis — that free-text `task` was
+splitting apart genuine comparisons — was also wrong. After canonicalisation the two candidate pairs
+resolve to:
+
+```
+HR@10 | Beauty | test | recsys.poisoning_attack     → "Potent but Stealthy: Rethink Profile Pollution Attack…"
+HR@10 | Beauty | test | recsys.adversarial_defense  → "SimRec: Mitigating the Cold-Start Problem…"
+```
+
+Same metric, same dataset, same split — a profile-pollution attack paper and a cold-start mitigation
+paper. They are **not** comparable, and `task` keeping them apart is the mechanism working.
+
+So the conclusion is not "one more fix away". Of 13 works, 11 yielded extractions and each runs a
+genuinely different experiment. **Testing Phase 4's rule 2 requires a corpus with real head-to-head
+evaluation** — a benchmark-heavy topic where papers compete on one task — not more pipeline work.
 
 ## 3. Why bundles still have zero clusters
 
@@ -149,24 +177,45 @@ but it is not the same as done.
 
 ---
 
-## 4. A smaller leak: free-text `task` fragments keys
+## 4. Two fixes worth keeping regardless
+
+### 4.1 `task` is canonicalised against the bound ontology
 
 `ExperimentExtraction.task` is whatever prose the model returns, and it is part of the key. The same
-setup arrived three ways:
+setup arrived three ways — `sequential recommendation`, `Sequential recommendation with …`,
+`Profile Pollution Attack against …` — so one setup became three keys.
+
+`_canonical_task` now routes it through `infer_task_id` against the project's bound task specs,
+falling back to case/whitespace normalisation when nothing matches, so an unmatched task loses only
+its formatting rather than being forced into someone else's slug. Production now stores:
 
 ```
-sequential recommendation
-Sequential recommendation with …
-Profile Pollution Attack against …
+recsys.adversarial_defense   31
+recsys.poisoning_attack       9
 ```
 
-Cost, measured: keying on `metric|dataset|split` alone would give 9 clusters over **20 units and 11
-works** instead of 18 and 9. Two units and two works lost to phrasing.
+This did **not** create cross-paper clusters (§2.1 explains why it should not have), but it removes a
+real source of spurious fragmentation.
 
-The project is bound to `recsys.*` tasks and the ontology exists precisely to canonicalise this, so
-normalising the extracted task against the project's bound task set is the natural fix. Not done
-here — it is a change to what gets written, and it belongs with a decision about whether to re-run
-the backfill.
+### 4.2 A re-run replaces its own rows
+
+The upsert matches on `(unit, metric, value, dataset, split)`, and a re-extraction need not reproduce
+cells byte-identically — so rows from an earlier run survived. Production briefly held **one paper
+carrying two different task values at once**, which fragments keys exactly the way §4.1 fixes.
+`apply_work_dimensions` now clears that work's `extraction_source='llm'` rows before writing. Regex
+rows are untouched; both behaviours have a test.
+
+## 5. The comparability bridge (unproven here)
+
+`_diverse_ranked_candidates` now pulls the members of a cross-paper comparable cluster into the
+candidate pool, bounded by `MAX_COMPARABILITY_BRIDGE` and the per-work cap. The scarcity it targets
+is slot allocation, not the lexical floor: a probe showed `_rank_candidates` already admits ~615 of
+618 units, and the measured ones simply lose the top-24 cut.
+
+Its production effect today is **+0 candidates**, because the admission rule requires a key spanning
+two papers and no such key exists (§2.1). Six tests cover the mechanism, including that a salted key
+can never bridge and that a cluster inside one paper does not qualify. It is kept as correct code
+with unproven production value, not as a demonstrated improvement.
 
 ---
 

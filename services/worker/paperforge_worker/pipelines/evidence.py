@@ -20,6 +20,7 @@ from db.models.library import (
     DocumentChunk,
     DocumentFile,
     DocumentParse,
+    EvidenceMeasurement,
     EvidenceUnit,
     ExperimentResult,
     StructuredExtraction,
@@ -38,7 +39,7 @@ from db.repositories.tasks import (
     topical_status as ontology_topical_status,
 )
 from ingest import classify_content_role, parse_markdown_table
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.experiment_extraction import (
@@ -431,6 +432,7 @@ async def _extract_work_evidence(
             extraction=extraction,
             candidates=candidates[:MAX_EVIDENCE_UNITS_PER_WORK],
             evidence_unit_ids=unit_ids_by_text,
+            tasks=tasks,
         )
     return outcome
 
@@ -479,12 +481,28 @@ async def _llm_structured_extraction(
     )
 
 
+def _canonical_task(task: str | None, tasks: list[TaskSpec]) -> str | None:
+    """把模型写的任务描述归一到本体里的任务，否则同一套设定会被措辞拆散。
+
+    ``comparability_key`` 含 ``task``，而模型返回的是自由文本。生产实测：同一批
+    结果里出现了「sequential recommendation」「Sequential recommendation with…」
+    「Profile Pollution Attack against…」三种写法，于是 ``HR@10|Beauty|test``
+    被拆成三个键——**跨论文可比簇因此一个都形成不了**。命不中本体时退到大小写与
+    空白归一，至少不再因排版差异分裂。
+    """
+    text = " ".join((task or "").split())
+    if not text:
+        return None
+    return infer_task_id(text, tasks) or text.casefold()
+
+
 async def _apply_llm_measurements(
     context: JobContext,
     *,
     extraction: ExperimentExtraction,
     candidates: list[EvidenceCandidate],
     evidence_unit_ids: dict[str, Any],
+    tasks: list[TaskSpec] | None = None,
 ) -> int:
     """把模型读出的维度写成 EvidenceMeasurement，绑定到最贴近的证据单元。
 
@@ -499,6 +517,7 @@ async def _apply_llm_measurements(
         if unit_id is not None:
             by_location.setdefault(_source_location(candidate), unit_id)
 
+    task = _canonical_task(extraction.task, tasks or [])
     written = 0
     async with context.session() as session:
         for cell in extraction.cells:
@@ -518,7 +537,7 @@ async def _apply_llm_measurements(
                 value=cell.value,
                 unit=cell.unit,
                 dataset=cell.dataset,
-                task=extraction.task,
+                task=task,
                 model_family=cell.model_family,
                 sample_size=cell.sample_size,
                 split=cell.split,
@@ -632,11 +651,29 @@ async def apply_work_dimensions(
     """把抽出的维度写进 EvidenceMeasurement（走生产同一条写入路径）。"""
     if extracted.extraction is None:
         return 0
+    async with context.session() as session:
+        tasks = await list_project_task_specs(
+            session,
+            context.project_id,
+            fallback=context.settings.task_profile_fallback,
+        )
+        # 先清掉这篇论文上一轮的 llm 维度行。重跑时模型不必给出逐字节相同的单元格，
+        # upsert 的匹配键（unit+metric+value+dataset+split）对不上就会留下旧行——
+        # 于是同一篇论文出现两个 task 值，把本该合并的键又拆开。正则行不动。
+        await session.execute(
+            delete(EvidenceMeasurement).where(
+                EvidenceMeasurement.extraction_source == "llm",
+                EvidenceMeasurement.evidence_unit_id.in_(
+                    list(extracted.evidence_unit_ids.values())
+                ),
+            )
+        )
     return await _apply_llm_measurements(
         context,
         extraction=extracted.extraction,
         candidates=extracted.candidates,
         evidence_unit_ids=extracted.evidence_unit_ids,
+        tasks=tasks,
     )
 
 

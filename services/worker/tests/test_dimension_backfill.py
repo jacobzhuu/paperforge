@@ -185,6 +185,58 @@ async def test_a_work_with_fulltext_but_no_evidence_is_skipped(
 
 
 @pytest.mark.asyncio
+async def test_a_rerun_replaces_the_previous_dimensions(session_factory, monkeypatch) -> None:
+    """重跑要覆盖，不能叠加。
+
+    模型两次给出的单元格不必逐字节相同，upsert 的匹配键对不上就会留下旧行——生产
+    上因此出现过同一篇论文带两个 task 值，把本该合并的可比键又拆开。
+    """
+    project_id = await _seed_project(session_factory)
+    work_id = await _seed_work(session_factory, project_id, title="A", doi="10.1/a")
+    unit_id = await _seed_unit(session_factory, project_id, work_id)
+    context = _context(project_id, session_factory, "off")
+
+    _patch_extractor(monkeypatch, _stub_extraction(dataset="OLD-BENCH"))
+    await apply_work_dimensions(
+        context, await extract_work_dimensions(context, work_id=work_id)
+    )
+    _patch_extractor(monkeypatch, _stub_extraction(dataset="NEW-BENCH"))
+    await apply_work_dimensions(
+        context, await extract_work_dimensions(context, work_id=work_id)
+    )
+
+    async with session_factory() as session:
+        rows = (await list_evidence_measurements(session, [unit_id]))[unit_id]
+    assert [row.dataset for row in rows] == ["NEW-BENCH"]
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_leaves_regex_measurements_alone(session_factory, monkeypatch) -> None:
+    """只清自己写过的行；正则通道的结果不属于回填的管辖范围。"""
+    from db import upsert_evidence_measurement
+
+    project_id = await _seed_project(session_factory)
+    work_id = await _seed_work(session_factory, project_id, title="A", doi="10.1/a")
+    unit_id = await _seed_unit(session_factory, project_id, work_id)
+    async with session_factory() as session:
+        await upsert_evidence_measurement(
+            session, evidence_unit_id=unit_id, metric_name="F1", value=0.5,
+            extraction_source="regex",
+        )
+        await session.commit()
+    _patch_extractor(monkeypatch, _stub_extraction())
+    context = _context(project_id, session_factory, "off")
+
+    await apply_work_dimensions(
+        context, await extract_work_dimensions(context, work_id=work_id)
+    )
+
+    async with session_factory() as session:
+        rows = (await list_evidence_measurements(session, [unit_id]))[unit_id]
+    assert {row.extraction_source for row in rows} == {"regex", "llm"}
+
+
+@pytest.mark.asyncio
 async def test_running_twice_does_not_duplicate_measurements(
     session_factory, monkeypatch
 ) -> None:
@@ -243,3 +295,37 @@ async def test_extraction_is_independent_of_the_production_mode_flag(
 
     async with session_factory() as session:
         assert await list_evidence_measurements(session, [unit_id])
+
+
+# --- 任务归一：措辞不能把同一套设定拆散 ---------------------------------------
+
+
+def test_a_free_text_task_is_canonicalised_to_the_bound_ontology():
+    """生产实测：同一批结果里「sequential recommendation」有三种写法，于是
+    ``HR@10|Beauty|test`` 被拆成三个键，跨论文可比簇一个都形成不了。"""
+    from db.repositories.tasks import TaskSpec
+    from paperforge_worker.pipelines.evidence import _canonical_task
+
+    spec = TaskSpec(
+        slug="recsys.poisoning_attack",
+        domain="recsys_attack",
+        inclusion_cues=("sequential recommendation", "poisoning"),
+    )
+
+    variants = [
+        "sequential recommendation",
+        "Sequential recommendation with adversarial training",
+        "Poisoning attack against sequential recommenders",
+    ]
+
+    assert {_canonical_task(value, [spec]) for value in variants} == {"recsys.poisoning_attack"}
+
+
+def test_an_unmatched_task_still_loses_only_its_formatting():
+    """命不中本体就退到大小写/空白归一——不再因排版分裂，也不硬塞进别的任务。"""
+    from paperforge_worker.pipelines.evidence import _canonical_task
+
+    assert _canonical_task("  Protein  Folding ", []) == "protein folding"
+    assert _canonical_task("protein folding", []) == "protein folding"
+    assert _canonical_task("   ", []) is None
+    assert _canonical_task(None, []) is None

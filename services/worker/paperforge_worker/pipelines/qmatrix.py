@@ -26,6 +26,10 @@ from paperforge_worker.context import JobContext
 MAX_CANDIDATES_PER_QUESTION = 24
 MAX_CANDIDATES_PER_WORK = 4
 MIN_LEXICAL_SCORE = 0.02
+# 可比性桥接的上限：桥进来的是"同一比较的另一条臂"，不是新的检索面。
+MAX_COMPARABILITY_BRIDGE = 8
+# 与 `_deterministic_links` 的准入分级一致；C/D 级不参与跨研究比较。
+_COMPARABLE_GRADES = frozenset({"A_located_structured", "B_located_prose"})
 # When absolute lexical overlap fails (typical for zh question × en evidence),
 # keep a grade-ranked degraded pool so the LLM can still classify.
 DEGRADED_CANDIDATE_LIMIT = 12
@@ -257,6 +261,7 @@ async def _classify_question(
             expected_kinds=set(question.expected_evidence_kinds_json or []),
             task_id=question.task_id,
             work_context=work_context,
+            measurements=measurements,
             return_diagnostics=True,
         ),
     )
@@ -265,7 +270,7 @@ async def _classify_question(
     if bridge_source and bridge_source != "text":
         routing_mode = "bridged"
         bridge_source_count = bridge_source
-    candidates = _diverse_ranked_candidates(ranked)
+    candidates = _diverse_ranked_candidates(ranked, measurements=measurements)
     warning = None
     if not candidates and evidence:
         # N0-2: never silently produce zero candidates for a question that has
@@ -455,6 +460,7 @@ def _rank_candidates(
     expected_kinds: set[str],
     task_id: str | None = None,
     work_context: dict[Any, dict[str, Any]] | None = None,
+    measurements: dict[Any, list[Any]] | None = None,
     return_diagnostics: bool = False,
     return_rejected: bool = False,
 ) -> (
@@ -542,6 +548,63 @@ def _rank_candidates(
     return result
 
 
+def _comparability_bridge(
+    selected: list[tuple[Any, float]],
+    *,
+    pool: list[tuple[Any, float]],
+    measurements: dict[Any, list[Any]] | None,
+    per_work: dict[Any, int],
+    per_work_limit: int,
+) -> int:
+    """把**跨研究可比簇**的成员补进候选池，就地扩充 ``selected``，返回补入条数。
+
+    稀缺的不是检索面而是名额：候选池按词面得分取前 24 条、每篇最多 4 条，而结果表
+    那一段几乎全是数字和模型名，中文子问题的词一个都对不上，于是它排在名额之外。
+    生产实测——某项目 618 条证据里 11 条带可比测量、68 条被链接到子问题，两者**只
+    重叠 1 条**（随机期望 1.2）。可比簇因此只能靠巧合形成，Phase 4 的规则 2 从来
+    没有真实数据可判。
+
+    准入条件是"这个键在**已通过词面判定的**候选里跨了至少两篇论文"——也就是说，
+    补进来的正好是会构成一个跨研究比较的那几条，而不是任何带数字的段落。安全性
+    来自 ``comparability_key`` 自身：任务/数据集/划分缺一个，键就用证据单元 id 加盐，
+    于是天生唯一、永远凑不出跨论文的簇。每篇上限照旧生效。
+    """
+    if not measurements or not pool:
+        return 0
+    clusters: dict[str, dict[str, Any]] = {}
+    for item in pool:
+        unit, _score = item
+        if unit.grade not in _COMPARABLE_GRADES:
+            continue
+        for row in measurements.get(unit.id, []):
+            key = str(getattr(row, "comparability_key", "") or "")
+            if not key:
+                continue
+            entry = clusters.setdefault(key, {"works": set(), "units": []})
+            entry["works"].add(getattr(unit, "work_id", None))
+            entry["units"].append(item)
+
+    chosen = {id(unit) for unit, _score in selected}
+    bridged = 0
+    for entry in clusters.values():
+        if len(entry["works"]) < 2:
+            continue
+        for item in entry["units"]:
+            if bridged >= MAX_COMPARABILITY_BRIDGE:
+                return bridged
+            unit, _score = item
+            if id(unit) in chosen:
+                continue
+            work_id = getattr(unit, "work_id", None)
+            if per_work.get(work_id, 0) >= per_work_limit:
+                continue
+            selected.append(item)
+            chosen.add(id(unit))
+            per_work[work_id] = per_work.get(work_id, 0) + 1
+            bridged += 1
+    return bridged
+
+
 def _relative_threshold(overlaps: list[float]) -> float:
     """Keep absolute floor when there is no signal; soften only for weak-but-nonzero hits."""
     if not overlaps:
@@ -561,6 +624,7 @@ def _diverse_ranked_candidates(
     *,
     limit: int = MAX_CANDIDATES_PER_QUESTION,
     per_work_limit: int = MAX_CANDIDATES_PER_WORK,
+    measurements: dict[Any, list[Any]] | None = None,
 ) -> list[tuple[Any, float]]:
     """Keep a strong lexical pool without letting one long paper occupy it.
 
@@ -579,6 +643,13 @@ def _diverse_ranked_candidates(
         per_work[work_id] = per_work.get(work_id, 0) + 1
         if len(selected) >= limit:
             break
+    _comparability_bridge(
+        selected,
+        pool=ranked,
+        measurements=measurements,
+        per_work=per_work,
+        per_work_limit=per_work_limit,
+    )
     return selected
 
 
