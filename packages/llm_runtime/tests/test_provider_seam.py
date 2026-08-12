@@ -342,3 +342,27 @@ def test_runner_does_not_retry_forever_on_truncation():
     assert result is None
     # 最多重试一次：绝不无界重试烧钱。
     assert len(attempts) == 2
+
+
+def test_a_new_role_inherits_the_built_in_thinking_policy():
+    """部署的 LLM_ROLE_THINKING 是写死的全量映射，不会因为代码新增角色而更新。
+
+    生产实测：`experiment_extractor` 因此一直开着思考跑，26 次调用里 15 次
+    output_truncated，13 篇论文有 6 篇一条结果都没抽出来。
+    """
+    deployed = LLMConfig(
+        provider="openai",
+        role_thinking={"extractor": "disabled", "reranker": "disabled"},
+    )
+
+    assert deployed.thinking_for_role("experiment_extractor") == "disabled"
+    # 综合是推理，不该被顺手关掉。
+    assert deployed.thinking_for_role("synthesizer") is None
+    # qmatrix 分类与卡片抽取共用模型档位但思考策略分开，这一条不能被回退改掉。
+    assert deployed.thinking_for_role("evidence_classifier") is None
+
+
+def test_an_explicit_deployment_override_still_wins():
+    config = LLMConfig(provider="openai", role_thinking={"experiment_extractor": "enabled"})
+
+    assert config.thinking_for_role("experiment_extractor") == "enabled"

@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import uuid
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,29 @@ def main() -> None:
     cost.add_argument("--role", help="restrict to one LLM role, e.g. synthesizer")
     cost.add_argument("--since", help="ISO date; only calls at or after it")
 
+    backfill = commands.add_parser(
+        "backfill-dimensions",
+        help="run LLM experiment extraction over existing evidence so comparability_key works",
+    )
+    backfill.add_argument("--project", action="append", required=True, help="project id")
+    backfill.add_argument(
+        "--linked-only",
+        action="store_true",
+        help="only works whose evidence a sub-question links to (what synthesis reads)",
+    )
+    backfill.add_argument("--limit", type=int, default=20, help="cap on works per run")
+    backfill.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the dimensions; without it nothing is changed",
+    )
+    backfill.add_argument(
+        "--min-verified-rate",
+        type=float,
+        default=0.8,
+        help="refuse to apply below this locator-verified rate (Phase 2 promotion gate)",
+    )
+
     args = parser.parse_args()
     if args.command == "bootstrap-admin":
         if args.password_stdin:
@@ -165,6 +189,8 @@ def main() -> None:
         asyncio.run(_tasks_command(args))
     elif args.command == "cost":
         asyncio.run(_cost_command(args))
+    elif args.command == "backfill-dimensions":
+        asyncio.run(_backfill_dimensions(args))
     elif args.command == "storage-manifest":
         entries = write_source_manifest(args.source_root, args.manifest)
         print(f"object manifest created: {len(entries)} objects")
@@ -198,6 +224,137 @@ def main() -> None:
         print(count)
         if args.require_empty and count:
             raise SystemExit("configured object store is not empty")
+
+
+async def _backfill_dimensions(args: argparse.Namespace) -> None:
+    """给历史证据补上 task/dataset/split，让 comparability_key 第一次真正成立。
+
+    这些项目的证据是在 ``EXPERIMENT_EXTRACTION_MODE=off`` 时抽的：359 条 measurement
+    里 task 与 split 全为空，于是 ``comparability_key`` 退化成按证据单元加盐的唯一值，
+    306 个不同的键对应 359 行——没有任何两条结果落进同一个可比簇。SYNTH 的冲突判定
+    与 Phase 4 的规则 2 因此从未被真实数据检验过。
+
+    先抽全部、再统一决定写不写：Phase 2 的推广门槛是定位核验率 ≥80%，而那是**整批**
+    的性质，逐篇写入就没有门槛可言了。抽取只跑一次，门槛不额外花钱。
+    """
+    import httpx
+    from db.models.library import EvidenceUnit
+    from db.models.paper import QuestionEvidenceLink, ResearchQuestion
+    from paperforge_worker.config import WorkerSettings
+    from paperforge_worker.context import JobContext
+    from paperforge_worker.pipelines.evidence import (
+        apply_work_dimensions,
+        extract_work_dimensions,
+    )
+    from scholar_gateway import InMemoryHttpCache
+
+    worker_settings = WorkerSettings()
+    engine = make_engine(worker_settings.database_url, application_name="paperforge-admin")
+    session_factory = make_session_factory(engine)
+    totals = dict.fromkeys(("works", "cells", "verified", "rejected", "written"), 0)
+    skipped: dict[str, int] = {}
+    calls: list[Any] = []
+    try:
+        for raw_project in args.project:
+            project_id = uuid.UUID(raw_project)
+            async with session_factory() as session:
+                stmt = select(EvidenceUnit.work_id).distinct()
+                if args.linked_only:
+                    stmt = (
+                        stmt.join(
+                            QuestionEvidenceLink,
+                            QuestionEvidenceLink.evidence_unit_id == EvidenceUnit.id,
+                        )
+                        .join(
+                            ResearchQuestion,
+                            ResearchQuestion.id == QuestionEvidenceLink.research_question_id,
+                        )
+                        .where(
+                            ResearchQuestion.project_id == project_id,
+                            ResearchQuestion.kind == "sub",
+                        )
+                    )
+                else:
+                    stmt = stmt.where(EvidenceUnit.project_id == project_id)
+                work_ids = list((await session.scalars(stmt.limit(args.limit))).all())
+            if not work_ids:
+                print(f"{raw_project}: no matching works")
+                continue
+
+            context = JobContext(
+                project_id=project_id,
+                job_id=None,
+                settings=worker_settings,
+                session_factory=session_factory,
+                http_client=httpx.Client(),
+                scholar_cache=InMemoryHttpCache(),
+            )
+            context.llm_calls = calls
+            extractions = []
+            for work_id in work_ids:
+                extracted = await extract_work_dimensions(context, work_id=work_id)
+                if extracted.skipped:
+                    skipped[extracted.skipped] = skipped.get(extracted.skipped, 0) + 1
+                    continue
+                extractions.append(extracted)
+                totals["works"] += 1
+                totals["cells"] += extracted.cells
+                totals["verified"] += extracted.locator_verified
+                totals["rejected"] += extracted.rejected
+
+            rate = totals["verified"] / totals["cells"] if totals["cells"] else 0.0
+            print(
+                f"{raw_project}: {len(extractions)} work(s), {totals['cells']} cell(s), "
+                f"{totals['verified']} locator-verified ({rate:.1%}), "
+                f"{totals['rejected']} rejected"
+            )
+            if not args.apply:
+                continue
+            if rate < args.min_verified_rate:
+                print(
+                    f"  refusing to apply: {rate:.1%} is below the "
+                    f"{args.min_verified_rate:.0%} promotion gate"
+                )
+                continue
+            for extracted in extractions:
+                totals["written"] += await apply_work_dimensions(context, extracted)
+    finally:
+        await engine.dispose()
+
+    for reason, count in sorted(skipped.items()):
+        print(f"  skipped ({reason}): {count}")
+    print(_llm_spend_line(calls))
+    if args.apply:
+        print(f"{totals['written']} measurement(s) written")
+    else:
+        print("dry run: nothing was written (pass --apply)")
+
+
+def _llm_spend_line(calls: list[Any]) -> str:
+    """用 P1-4 的记账把这次运维动作的开销说清楚，包括说不清的那部分。"""
+    ok = [record for record in calls if not record.error_code]
+    failed = len(calls) - len(ok)
+    input_tokens = sum(record.input_tokens or 0 for record in ok)
+    output_tokens = sum(record.output_tokens or 0 for record in ok)
+    priced = [record.cost_estimate for record in ok if record.cost_estimate is not None]
+    unpriced = len(ok) - len(priced)
+    amount = (
+        "unpriced (set LLM_MODEL_PRICES)"
+        if not priced
+        else f"{'≥ ' if unpriced else ''}${sum(priced):.4f}"
+    )
+    reasons = Counter(record.error_code for record in calls if record.error_code)
+    failures = (
+        f", {failed} failed call(s) ["
+        + ", ".join(f"{reason}={count}" for reason, count in reasons.most_common())
+        + "]"
+        if failed
+        else ""
+    )
+    return (
+        f"\nspend: {len(ok)} call(s), {input_tokens} in / {output_tokens} out, "
+        f"{amount}{failures}"
+    )
 
 
 async def _cost_command(args: argparse.Namespace) -> None:

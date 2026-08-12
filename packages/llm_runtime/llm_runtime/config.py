@@ -44,6 +44,10 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
 DEFAULT_ROLE_THINKING: dict[str, str] = {
     "extractor": "disabled",
     "reranker": "disabled",
+    # 结构化实验抽取是按封闭 schema 读文本，和卡片抽取同类。开着思考会把输出预算
+    # 烧在推理上：生产实测 26 次调用里 15 次 `output_truncated`，13 篇论文有 6 篇
+    # 一条结果都没抽出来。
+    "experiment_extractor": "disabled",
 }
 
 
@@ -162,5 +166,15 @@ class LLMConfig:
         return self.model
 
     def thinking_for_role(self, role: Role) -> str | None:
-        value = str(self.role_thinking.get(role) or "").strip().lower()
-        return value if value in {"enabled", "disabled"} else None
+        """部署显式配置优先，其次落到本文件的默认档位。
+
+        没有这层回退，新增角色就永远拿不到自己该有的思考策略——部署的
+        ``LLM_ROLE_THINKING`` 是一份写死的全量映射，不会因为代码里多了个角色而更新。
+        故意**不**沿用 ``ROLE_MODEL_FALLBACKS``：``evidence_classifier`` 与
+        ``extractor`` 共用模型档位，但思考策略是分开的（见上方注释）。
+        """
+        for source in (self.role_thinking, DEFAULT_ROLE_THINKING):
+            value = str(source.get(role) or "").strip().lower()
+            if value in {"enabled", "disabled"}:
+                return value
+        return None

@@ -410,3 +410,40 @@ def test_a_missing_dimension_still_salts_the_key_apart() -> None:
         unknown_salt="work-b",
     )
     assert key_a != key_b
+
+
+# --- 核验面：证据锚点 ---------------------------------------------------------
+
+
+def test_evidence_anchors_extend_the_verification_surface():
+    """生产实测：18,302 条 document_chunk 的 page/section/object_ref **全部为空**。
+
+    核验面若只认 chunk 与解析元数据，落在「Abstract」这类真实章节上的结果一律核验
+    失败，Phase 2 打开后会一条都写不进去。证据候选的定位来自同一份解析，而且
+    `_apply_llm_measurements` 随后正是按它做绑定，因此必须进核验面。
+    """
+    from types import SimpleNamespace
+
+    bare_chunk = SimpleNamespace(page=None, section_path=None, object_ref=None)
+    anchor = SimpleNamespace(page=None, section_path="Abstract", object_ref=None)
+
+    without = build_locator_index(chunks=[bare_chunk], structured_objects=[])
+    with_anchor = build_locator_index(chunks=[bare_chunk], structured_objects=[], anchors=[anchor])
+
+    assert without.empty
+    assert with_anchor.verifies({"section": "Abstract"})
+
+
+def test_anchors_do_not_admit_a_location_nobody_recorded():
+    """扩的是"流水线自己记过的位置"，不是"任何位置"。"""
+    from types import SimpleNamespace
+
+    index = build_locator_index(
+        chunks=[],
+        structured_objects=[],
+        anchors=[SimpleNamespace(page=4, section_path="Results", object_ref=None)],
+    )
+
+    assert index.verifies({"page": 4})
+    assert not index.verifies({"page": 9})
+    assert not index.verifies({"section": "Appendix"})

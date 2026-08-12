@@ -174,8 +174,19 @@ def build_locator_index(
     *,
     chunks: list[Any],
     structured_objects: list[dict[str, Any]] | None = None,
+    anchors: list[Any] | None = None,
 ) -> LocatorIndex:
-    """从 DocumentChunk 行与解析元数据构造核验面。"""
+    """从 DocumentChunk 行、解析元数据与已有证据锚点构造核验面。
+
+    ``anchors`` 是本文档已经产出的证据候选/单元。它们不是额外的信任来源——那些
+    页码与章节正是流水线自己从同一份解析里记下来的，而且 ``_apply_llm_measurements``
+    随后就按这个 ``source_location`` 把单元格绑到单元上。不带上它们，核验面和绑定面
+    就是两套坐标。
+
+    生产上这一条是决定性的：18,302 条 document_chunk 的 page / section_path /
+    object_ref **全部为空**，核验面于是只剩解析元数据里的图与公式，任何落在
+    「Abstract」「Experiments / RQ1」这类真实章节上的结果都核验不过。
+    """
     pages: set[int] = set()
     sections: set[str] = set()
     object_refs: set[str] = set()
@@ -187,6 +198,16 @@ def build_locator_index(
         if section:
             sections.add(section)
         object_ref = str(getattr(chunk, "object_ref", None) or "").strip().casefold()
+        if object_ref:
+            object_refs.add(object_ref)
+    for item in anchors or []:
+        page = getattr(item, "page", None)
+        if isinstance(page, int):
+            pages.add(page)
+        section = _normalize_section(getattr(item, "section_path", None))
+        if section:
+            sections.add(section)
+        object_ref = str(getattr(item, "object_ref", None) or "").strip().casefold()
         if object_ref:
             object_refs.add(object_ref)
     for item in structured_objects or []:

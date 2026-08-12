@@ -20,6 +20,7 @@ from db.models.library import (
     DocumentChunk,
     DocumentFile,
     DocumentParse,
+    EvidenceUnit,
     ExperimentResult,
     StructuredExtraction,
 )
@@ -37,7 +38,7 @@ from db.repositories.tasks import (
     topical_status as ontology_topical_status,
 )
 from ingest import classify_content_role, parse_markdown_table
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.experiment_extraction import (
@@ -384,6 +385,7 @@ async def _extract_work_evidence(
                 context,
                 document=document,
                 fulltext=fulltext,
+                anchors=candidates,
             )
             if extraction is not None:
                 outcome.llm_extraction_works = 1
@@ -438,8 +440,9 @@ async def _llm_structured_extraction(
     *,
     document: DocumentFile,
     fulltext: str,
+    anchors: list[EvidenceCandidate] | None = None,
 ) -> ExperimentExtraction | None:
-    """跑一次模型抽取，定位面取自本文档真实的 chunk 行。"""
+    """跑一次模型抽取；核验面取自本文档的 chunk 行、解析元数据与已有证据锚点。"""
     async with context.session() as session:
         parsed = await session.scalar(
             select(DocumentParse)
@@ -461,7 +464,11 @@ async def _llm_structured_extraction(
         structured_objects = (
             list((parsed.metadata_json or {}).get("structured_objects") or []) if parsed else []
         )
-    locators = build_locator_index(chunks=chunks, structured_objects=structured_objects)
+    locators = build_locator_index(
+        chunks=chunks,
+        structured_objects=structured_objects,
+        anchors=anchors,
+    )
     return await extract_experiment_results(
         fulltext=fulltext,
         locators=locators,
@@ -524,6 +531,113 @@ async def _apply_llm_measurements(
             )
             written += 1
     return written
+
+
+@dataclass
+class WorkDimensionExtraction:
+    """一篇论文的维度回填素材：抽取结果 + 写回所需的绑定信息。
+
+    抽取与写入分成两步，是为了让调用方能先看**整批**的定位核验率再决定写不写
+    （Phase 2 的推广门槛是 ≥80%），同时只付一次调用的钱。
+    """
+
+    work_id: Any
+    skipped: str | None = None
+    extraction: ExperimentExtraction | None = None
+    candidates: list[EvidenceCandidate] = field(default_factory=list)
+    evidence_unit_ids: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def cells(self) -> int:
+        return len(self.extraction.cells) if self.extraction else 0
+
+    @property
+    def locator_verified(self) -> int:
+        if self.extraction is None:
+            return 0
+        return sum(1 for cell in self.extraction.cells if cell.locator_verified)
+
+    @property
+    def rejected(self) -> int:
+        return len(self.extraction.rejected) if self.extraction else 0
+
+
+async def extract_work_dimensions(
+    context: JobContext,
+    *,
+    work_id: Any,
+) -> WorkDimensionExtraction:
+    """对**已经存在**的证据单元补跑一次结构化抽取，不写库。
+
+    正常流程里抽取发生在 EVIDENCE 阶段，用的是那一轮在内存里的候选。历史项目的
+    证据是在 ``EXPERIMENT_EXTRACTION_MODE=off`` 时抽的，维度全空，于是
+    ``comparability_key`` 退化成按证据单元加盐的唯一值，跨研究比较从来没成立过。
+    这里从已落库的单元重建候选，走同一条抽取路径，避免为了补维度而重跑整条流水线。
+    """
+    sources = await load_persisted_fulltext_sources(context, [work_id])
+    source = sources.get(str(work_id))
+    if source is None or not (source.text or "").strip():
+        return WorkDimensionExtraction(work_id=work_id, skipped="no_fulltext")
+
+    async with context.session() as session:
+        units = list(
+            (
+                await session.scalars(
+                    select(EvidenceUnit)
+                    .where(EvidenceUnit.work_id == work_id)
+                    .where(
+                        or_(
+                            EvidenceUnit.project_id.is_(None),
+                            EvidenceUnit.project_id == context.project_id,
+                        )
+                    )
+                )
+            ).all()
+        )
+        document = await session.get(DocumentFile, source.document_file_id)
+    if not units or document is None:
+        return WorkDimensionExtraction(work_id=work_id, skipped="no_evidence_units")
+
+    candidates = [
+        EvidenceCandidate(
+            text=unit.text,
+            page=unit.page,
+            section_path=unit.section_path,
+            paragraph_index=unit.paragraph_index,
+            object_ref=unit.object_ref,
+            grade=unit.grade,
+        )
+        for unit in units
+    ]
+    extraction = await _llm_structured_extraction(
+        context,
+        document=document,
+        fulltext=source.text,
+        anchors=candidates,
+    )
+    if extraction is None:
+        return WorkDimensionExtraction(work_id=work_id, skipped="extraction_unavailable")
+    return WorkDimensionExtraction(
+        work_id=work_id,
+        extraction=extraction,
+        candidates=candidates,
+        evidence_unit_ids={unit.text: unit.id for unit in units},
+    )
+
+
+async def apply_work_dimensions(
+    context: JobContext,
+    extracted: WorkDimensionExtraction,
+) -> int:
+    """把抽出的维度写进 EvidenceMeasurement（走生产同一条写入路径）。"""
+    if extracted.extraction is None:
+        return 0
+    return await _apply_llm_measurements(
+        context,
+        extraction=extracted.extraction,
+        candidates=extracted.candidates,
+        evidence_unit_ids=extracted.evidence_unit_ids,
+    )
 
 
 def _unit_for_span(
@@ -1347,5 +1461,8 @@ def _clean_text(value: Any) -> str:
 __all__ = [
     "EvidenceCandidate",
     "EvidenceOutcome",
+    "WorkDimensionExtraction",
+    "apply_work_dimensions",
     "extract_evidence_units",
+    "extract_work_dimensions",
 ]

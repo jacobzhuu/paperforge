@@ -203,7 +203,7 @@ def _patch_extractor(monkeypatch, extraction: ExperimentExtraction | None) -> li
     """替换模型调用，并数它被调了几次（预算与档位都靠这个断言）。"""
     calls: list[int] = []
 
-    async def _fake(context, *, document, fulltext):  # noqa: ANN001 - 内部替身
+    async def _fake(context, *, document, fulltext, anchors=None):  # noqa: ANN001 - 内部替身
         calls.append(1)
         return extraction
 
@@ -364,7 +364,7 @@ async def test_different_datasets_stay_incomparable(session_factory, monkeypatch
         str(work_b): _stub_extraction(dataset="OTHER-BENCH"),
     }
 
-    async def _fake(context, *, document, fulltext):  # noqa: ANN001
+    async def _fake(context, *, document, fulltext, anchors=None):  # noqa: ANN001
         return extractions[str(document.work_id)]
 
     monkeypatch.setattr(evidence_module, "_llm_structured_extraction", _fake)
