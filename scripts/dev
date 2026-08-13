@@ -38,6 +38,9 @@ Commands:
            (`up` skips processes that are already running, so it will NOT
            pick up your edits)
   deploy   Force the deployed-stack roll, even with no deployment running
+  reap     Inspect superseded blue/green deployments and report which ones
+           have no queued or in-progress ARQ jobs. Pass --apply to remove
+           only deployments that remain drained across two checks.
   down     Stop PaperForge services (persistent database volumes are kept)
   status   Show service status and local URLs
   logs     Show recent application and Docker service logs
@@ -529,6 +532,152 @@ funnel_target_port() {
     | sed -n 's|.*proxy http://127.0.0.1:\([0-9]\{1,\}\).*|\1|p' | head -n 1
 }
 
+deployment_for_web_port() {
+  local wanted_port="$1" container binding project
+  [ -n "${wanted_port}" ] || return 1
+  for container in $(docker ps -q \
+    --filter 'label=com.docker.compose.project' \
+    --filter 'label=com.docker.compose.service=web' 2>/dev/null); do
+    binding="$(docker port "${container}" 3000/tcp 2>/dev/null \
+      | sed -n 's|.*:\([0-9][0-9]*\)$|\1|p' | head -n 1)"
+    [ "${binding}" = "${wanted_port}" ] || continue
+    project="$(docker inspect -f \
+      '{{index .Config.Labels "com.docker.compose.project"}}' "${container}")"
+    case "${project}" in paperforge-deploy-*) echo "${project}"; return 0 ;; esac
+  done
+  return 1
+}
+
+deployment_drain_state() {
+  # Print "queued in_progress" for one deployment-specific Redis database.  Run the
+  # check inside that deployment's worker so host networking and Redis credentials do
+  # not need to be copied or exposed.  Any inspection failure is a hard "do not reap".
+  local project="$1" workers worker_count
+  workers="$(docker ps -q \
+    --filter "label=com.docker.compose.project=${project}" \
+    --filter 'label=com.docker.compose.service=worker' 2>/dev/null)"
+  worker_count="$(wc -w <<<"${workers}" | tr -d '[:space:]')"
+  [ "${worker_count}" = "1" ] || return 1
+  docker exec "${workers}" python -c '
+import asyncio
+import os
+
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
+async def check():
+    redis = await create_pool(RedisSettings.from_dsn(os.environ["REDIS_URL"]))
+    try:
+        queued = int(await redis.zcard(redis.default_queue_name))
+        cursor = 0
+        in_progress = 0
+        while True:
+            cursor, keys = await redis.scan(
+                cursor=cursor,
+                match="arq:in-progress:*",
+                count=100,
+            )
+            in_progress += len(keys)
+            if cursor == 0:
+                break
+        print(f"{queued} {in_progress}")
+    finally:
+        await redis.aclose()
+
+
+asyncio.run(check())
+'
+}
+
+reap_deployments() {
+  local mode="${1:---dry-run}" state_project="" funnel_project="" funnel_port=""
+  local protected=" " projects project state queued in_progress confirmed containers remaining
+  case "${mode}" in
+    --dry-run|'') mode="--dry-run" ;;
+    --apply) ;;
+    *) echo "Usage: ./scripts/dev reap [--dry-run|--apply]" >&2; return 1 ;;
+  esac
+  ensure_docker
+  prepare_state
+
+  if [ -f "${DEPLOY_STATE}" ]; then
+    # shellcheck disable=SC1090
+    state_project="$(. "${DEPLOY_STATE}" && echo "${PAPERFORGE_DEPLOY_PROJECT:-}")"
+  fi
+  funnel_port="$(funnel_target_port || true)"
+  funnel_project="$(deployment_for_web_port "${funnel_port}" || true)"
+  for project in "${state_project}" "${funnel_project}"; do
+    [ -n "${project}" ] && protected="${protected}${project} "
+  done
+  if [ "${mode}" = "--apply" ] && [ -z "${funnel_project}" ]; then
+    echo "Cannot identify the deployment serving the Funnel; refusing to remove anything." >&2
+    return 1
+  fi
+
+  projects="$(docker ps \
+    --filter 'label=com.docker.compose.project' \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep '^paperforge-deploy-' | sort -u || true)"
+  [ -n "${projects}" ] || { echo "No running blue/green deployments found."; return 0; }
+  echo "Protected live deployment(s):${protected}"
+
+  while IFS= read -r project; do
+    [ -n "${project}" ] || continue
+    case "${protected}" in
+      *" ${project} "*) echo "KEEP  ${project} (live)"; continue ;;
+    esac
+    if ! state="$(deployment_drain_state "${project}" 2>/dev/null)"; then
+      echo "KEEP  ${project} (worker/Redis state could not be verified)"
+      continue
+    fi
+    read -r queued in_progress <<EOF
+${state}
+EOF
+    if ! [[ "${queued}" =~ ^[0-9]+$ && "${in_progress}" =~ ^[0-9]+$ ]]; then
+      echo "KEEP  ${project} (unexpected drain-state response)"
+      continue
+    fi
+    if [ "${queued}" -ne 0 ] || [ "${in_progress}" -ne 0 ]; then
+      echo "KEEP  ${project} (queued=${queued}, in_progress=${in_progress})"
+      continue
+    fi
+    if [ "${mode}" = "--dry-run" ]; then
+      echo "READY ${project} (drained; --apply would remove its containers, networks, and caches)"
+      continue
+    fi
+
+    # Close the enqueue/start race without touching the candidate.  A superseded API has no
+    # Funnel traffic, but two independent observations make that assumption verifiable.
+    sleep 2
+    if ! confirmed="$(deployment_drain_state "${project}" 2>/dev/null)" \
+      || [ "${confirmed}" != "0 0" ]; then
+      echo "KEEP  ${project} (became active or could not be reverified: ${confirmed:-unknown})"
+      continue
+    fi
+    containers="$(docker ps -aq \
+      --filter "label=com.docker.compose.project=${project}" 2>/dev/null)"
+    if [ -n "${containers}" ] && ! docker rm -f ${containers} >/dev/null; then
+      echo "KEEP  ${project} (Docker refused container removal)" >&2
+      continue
+    fi
+    remaining="$(docker ps -aq \
+      --filter "label=com.docker.compose.project=${project}" 2>/dev/null)"
+    if [ -n "${remaining}" ]; then
+      echo "KEEP  ${project} (container removal was incomplete)" >&2
+      continue
+    fi
+    docker network rm "${project}_runtime" "${project}_ingress" >/dev/null 2>&1 || true
+    # Blue/green volumes contain only reconstructible Tectonic/font caches. User data lives in
+    # the external PostgreSQL/MinIO stack and is never targeted by this command.
+    docker volume rm "${project}_texdcache" "${project}_texdfontcache" \
+      >/dev/null 2>&1 || true
+    echo "REAPED ${project} (drained twice; application images retained for recovery)"
+  done <<EOF
+${projects}
+EOF
+}
+
 port_is_free() {
   ! ss -ltn 2>/dev/null | grep -q ":$1[[:space:]]"
 }
@@ -736,10 +885,10 @@ deploy() {
   echo "Deployment is live: ${PUBLIC_URL} (local ${port})"
   if [ -n "${previous}" ]; then
     echo
-    echo "The previous deployment (${previous}) is still running: this host's Snap"
-    echo "Docker refuses to stop containers. It no longer receives traffic and its"
-    echo "worker polls a different Redis database, so it is idle. Remove it with"
-    echo "'docker rm -f' once the AppArmor profile is fixed."
+    echo "The previous deployment (${previous}) remains available for in-flight jobs."
+    echo "After it drains, inspect and safely remove superseded deployments with:"
+    echo "  ./scripts/dev reap          # read-only"
+    echo "  ./scripts/dev reap --apply  # verifies twice before removal"
   fi
 }
 
@@ -809,6 +958,7 @@ case "${1:-}" in
   up) up ;;
   restart) restart "${2:-auto}" ;;
   deploy) deploy ;;
+  reap) reap_deployments "${2:---dry-run}" ;;
   down) down ;;
   status) status ;;
   logs) logs ;;

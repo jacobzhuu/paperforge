@@ -49,6 +49,7 @@ from visuals.errors import CONTENT_REJECTED, INVALID_REQUEST, PROVIDER_NOT_CONFI
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.image_prompt import (
     analyze_image_prompt,
+    build_paper_context,
     rewrite_rejected_image_prompt,
 )
 from paperforge_worker.pipelines.visual_planner import (
@@ -267,7 +268,7 @@ async def suggest_visuals(
             summary.alt_text = analysis.alt_text
         else:
             # 全流程不得绕过 DeepSeek 把模板提示词直接发给 Yunwu。草稿保留，
-            # 用户之后可在工作台重试全文分析。
+            # 用户之后可在工作台重试论文上下文分析。
             deepseek_prompt_ready = False
         planned = [summary]
         generator = "graphical_abstract"
@@ -651,11 +652,11 @@ def _section_excerpt(row: Any) -> str:
 
 
 def _paper_context(project_title: str, sections: list[Any]) -> str:
-    """完整论文上下文；交给 DeepSeek 时不按章节数或字符数截断。"""
-    parts = [f"Paper title: {project_title}"]
-    for row in sections:
-        parts.append(f"[{row.section_key}] {row.title}\n{_section_excerpt(row)}")
-    return "\n\n".join(parts)
+    """Build section-balanced paper context under the shared image-analysis budget."""
+    return build_paper_context(
+        project_title,
+        [(str(row.section_key), str(row.title), _section_excerpt(row)) for row in sections],
+    )
 
 
 def _is_short_review(paper_type: str, sections: list[SectionBrief]) -> bool:

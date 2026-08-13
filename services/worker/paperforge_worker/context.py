@@ -20,6 +20,7 @@ from db import (
     FINISHED_JOB_STATUSES,
     append_job_event,
     get_project,
+    job_event_channel,
     job_resume_spec,
     job_stop_requested,
     record_llm_call,
@@ -78,6 +79,20 @@ async def _committing_session(
 _STOP_POLL_TTL_SECONDS = 2.0
 
 
+async def _publish_job_event(publisher: Any | None, job_id: uuid.UUID | None) -> None:
+    """Best-effort Redis wake-up; the committed database row remains authoritative."""
+    if publisher is None or job_id is None:
+        return
+    try:
+        await publisher.publish(job_event_channel(job_id), "1")
+    except Exception:  # noqa: BLE001 - losing a wake-up must not fail a generation job
+        logger.warning(
+            "job event notification failed",
+            extra={"job_id": str(job_id)},
+            exc_info=True,
+        )
+
+
 class JobStopped(Exception):
     """用户请求停止本次运行。
 
@@ -101,12 +116,20 @@ class JobContext:
     session_factory: async_sessionmaker[AsyncSession]
     http_client: httpx.Client
     scholar_cache: Any
+    event_publisher: Any | None = field(default=None, repr=False)
     owner_id: uuid.UUID | None = None
     llm_calls: list[LLMCallRecord] = field(default_factory=list)
     #: 本次运行开始时 job 已有的 checkpoint（续跑 job 会被播种上一轮的阶段产物），
     #: 加上本次运行陆续写进去的。`_run_stage` 据此判断哪些阶段可以跳过。
     checkpoint: dict[str, Any] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    #: Semantic claim verification can run several times while one quality-repair job converges.
+    #: Cache exact claim/excerpt verdicts for this job so unchanged anchors do not incur repeated
+    #: model calls.  Keys include the verifier version and source text hash (see quality.py).
+    claim_verification_cache: dict[str, dict[str, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
     #: 停止开关的轮询缓存：(读到的时刻, 结果)。
     _stop_cache: tuple[float, str | None] | None = field(default=None, repr=False)
 
@@ -153,6 +176,13 @@ class JobContext:
                 event_type=event_type,
                 payload=payload or {},
             )
+        # Publish only after the transaction commits. Publishing inside the session block lets an
+        # API subscriber wake before the row is visible and then sleep through the real event.
+        await self.notify_event()
+
+    async def notify_event(self) -> None:
+        """Wake SSE subscribers after a committed event or status-only transition."""
+        await _publish_job_event(self.event_publisher, self.job_id)
 
     async def flush_llm_calls(self) -> None:
         """把本次运行的 LLM 调用写入 llm_call_log（成本面板数据源）。"""
@@ -248,6 +278,7 @@ async def job_context(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     http_client: httpx.Client | None = None,
     scholar_cache: Any | None = None,
+    event_publisher: Any | None = None,
 ) -> AsyncIterator[JobContext]:
     owns_engine = session_factory is None
     engine = (
@@ -273,7 +304,12 @@ async def job_context(
         # 进入阶段也会 await（两次数据库往返）。worker 停机时的 task.cancel() 可能
         # 正好落在这里——此前这一段完全没有收尾，任务就永远停在 running，
         # 正是本模块要防的那种僵尸，只是窗口更窄所以更难复现。
-        pending = await _mark_job_interrupted(factory, job_id, type(error).__name__)
+        pending = await _mark_job_interrupted(
+            factory,
+            job_id,
+            type(error).__name__,
+            event_publisher=event_publisher,
+        )
         if owns_client:
             client.close()
         if engine is not None:
@@ -286,6 +322,7 @@ async def job_context(
         session_factory=factory,
         http_client=client,
         scholar_cache=cache,
+        event_publisher=event_publisher,
         owner_id=owner_id,
         checkpoint=seeded,
     )
@@ -394,6 +431,7 @@ async def _write_stopped(context: JobContext, mode: str) -> None:
             },
         )
         await update_job(session, job, status=status)
+    await context.notify_event()
 
 
 async def _mark_interrupted(context: JobContext, error: BaseException) -> None:
@@ -403,6 +441,7 @@ async def _mark_interrupted(context: JobContext, error: BaseException) -> None:
         context.job_id,
         type(error).__name__,
         warnings=context.warnings,
+        event_publisher=context.event_publisher,
     )
 
 
@@ -412,6 +451,7 @@ async def _mark_job_interrupted(
     reason: str,
     *,
     warnings: list[dict[str, Any]] | None = None,
+    event_publisher: Any | None = None,
 ) -> asyncio.Task | None:
     """收尾的落库部分。
 
@@ -421,7 +461,15 @@ async def _mark_job_interrupted(
     if job_id is None:
         return None
     try:
-        return await _shielded_task(_write_interrupted(session_factory, job_id, reason, warnings))
+        return await _shielded_task(
+            _write_interrupted(
+                session_factory,
+                job_id,
+                reason,
+                warnings,
+                event_publisher=event_publisher,
+            )
+        )
     except Exception:  # noqa: BLE001 - 已经在异常路径上，不再制造新的异常
         logger.warning("failed to mark job interrupted", extra={"reason": reason}, exc_info=True)
         return None
@@ -432,6 +480,8 @@ async def _write_interrupted(
     job_id: uuid.UUID,
     reason: str,
     warnings: list[dict[str, Any]] | None = None,
+    *,
+    event_publisher: Any | None = None,
 ) -> None:
     context_warnings = warnings or []
     async with _committing_session(session_factory) as session:
@@ -458,6 +508,7 @@ async def _write_interrupted(
             status="failed",
             error={"reason": "interrupted", "exception": reason, "warnings": context_warnings},
         )
+    await _publish_job_event(event_publisher, job_id)
 
 
 async def _recover_pdf_upload(

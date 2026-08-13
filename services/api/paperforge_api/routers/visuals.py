@@ -290,8 +290,8 @@ async def draft_visual(
             spec=analyzed_spec.model_dump(mode="json"),
             target_section_key=target_key,
             suggested_block_index=suggested_block_index,
-            reason=f"DeepSeek 已结合论文全文分析本次意图；{reason}",
-            context_summary=_full_paper_context_summary(rows),
+            reason=f"DeepSeek 已结合论文分节上下文分析本次意图；{reason}",
+            context_summary=_full_paper_context_summary(project.title, rows),
             warnings=warnings,
             generator=f"llm:{analysis.model or 'deepseek'}",
         )
@@ -645,24 +645,34 @@ def _section_excerpt(row: Any | None) -> str:
 
 
 def _full_paper_context(project_title: str, rows: list[Any]) -> str:
-    """把当前文稿完整交给 DeepSeek；不按章节数或字符数截断。"""
-    parts = [f"Paper title: {project_title}"]
-    if not rows:
-        parts.append("The paper body is currently empty.")
-        return "\n\n".join(parts)
-    for row in rows:
-        key = str(getattr(row, "section_key", "") or "")
-        title = str(getattr(row, "title", "") or key)
-        body = _section_excerpt(row)
-        parts.append(f"[{key}] {title}\n{body}")
-    return "\n\n".join(parts)
+    """Build the same section-balanced context used by background visual planning."""
+    from paperforge_worker.pipelines.image_prompt import build_paper_context
+
+    return build_paper_context(
+        project_title,
+        [
+            (
+                str(getattr(row, "section_key", "") or ""),
+                str(getattr(row, "title", "") or ""),
+                _section_excerpt(row),
+            )
+            for row in rows
+        ],
+    )
 
 
-def _full_paper_context_summary(rows: list[Any]) -> str:
+def _full_paper_context_summary(project_title: str, rows: list[Any]) -> str:
     if not rows:
         return "DeepSeek 已读取当前项目题目；论文正文尚为空。"
-    characters = sum(len(_section_excerpt(row)) for row in rows)
-    return f"DeepSeek 已读取当前论文全部 {len(rows)} 个章节（约 {characters} 字符）。"
+    source_characters = sum(len(_section_excerpt(row)) for row in rows)
+    context = _full_paper_context(project_title, rows)
+    sent_characters = len(context)
+    if "middle content omitted" not in context:
+        return f"DeepSeek 已读取当前论文全部 {len(rows)} 个章节（约 {source_characters} 字符）。"
+    return (
+        f"DeepSeek 已读取全部 {len(rows)} 个章节的均衡上下文"
+        f"（原文约 {source_characters} 字符，本次发送 {sent_characters} 字符）。"
+    )
 
 
 def _image_intent_from_spec(spec: dict[str, Any], fallback: str = "") -> str:
@@ -688,7 +698,7 @@ async def _analyze_ai_spec(
     user_intent: str,
     spec: dict[str, Any],
 ) -> tuple[AIImageSpec, Any]:
-    """强制通过 DeepSeek 全文分析；失败时阻止未润色提示词进入 Yunwu。"""
+    """强制通过 DeepSeek 论文上下文分析；失败时阻止未润色提示词进入 Yunwu。"""
     from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.image_prompt import analyze_image_prompt
 
@@ -705,7 +715,7 @@ async def _analyze_ai_spec(
             detail={
                 "code": "deepseek_image_prompt_failed",
                 "message": (
-                    "DeepSeek 未能完成论文全文分析，请稍后重试；"
+                    "DeepSeek 未能完成论文上下文分析，请稍后重试；"
                     "系统不会把未分析的提示词直接发送给生图服务。"
                 ),
             },
@@ -864,9 +874,9 @@ async def prepare_ai_generation(
     visual_id: str,
     session: SessionDep,
 ) -> VisualResponse:
-    """为旧草稿或正文已变化的草稿补做 DeepSeek 全文分析。
+    """为旧草稿或正文已变化的草稿补做 DeepSeek 论文上下文分析。
 
-    前端在打开付费确认框前调用；这样确认框里展示的已经是 DeepSeek 结合当前全文
+    前端在打开付费确认框前调用；这样确认框里展示的已经是 DeepSeek 结合当前分节上下文
     生成的最终提示词，而不是在用户确认以后再偷偷改写。
     """
     project = await _require_project(session, project_id)

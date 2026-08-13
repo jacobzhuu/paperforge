@@ -38,6 +38,12 @@ JOB_STATUSES = frozenset(
 # 「这一轮运行已经结束」的状态。paused 也在内：任务本身没做完，但这一轮确实停了，
 # SSE 流要关、前端进度条要收，续跑靠新建一个 job（见 JOB_RESUME_KEY）。
 FINISHED_JOB_STATUSES = frozenset({"paused", "succeeded", "failed", "cancelled", "needs_input"})
+JOB_EVENT_CHANNEL_PREFIX = "paperforge:job-events:"
+
+
+def job_event_channel(job_id: uuid.UUID) -> str:
+    """Return the shared Redis wake-up channel for one durable DB event stream."""
+    return f"{JOB_EVENT_CHANNEL_PREFIX}{job_id}"
 
 
 async def create_job(

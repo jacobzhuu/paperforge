@@ -65,7 +65,7 @@ from paperforge_worker.pipelines.quality import (
     build_quality_report,
     repairable_finding_count,
     soft_check_citations,
-    verify_cross_language_claim_evidence,
+    verify_claim_evidence,
     zh_language_mismatches,
 )
 from paperforge_worker.pipelines.readiness import (
@@ -83,8 +83,11 @@ from paperforge_worker.pipelines.visuals import generate_visual, suggest_visuals
 
 logger = get_logger(__name__)
 
-# 一键生成的单任务超时（秒）。默认 job_timeout 管的是单阶段任务。
-FULL_PIPELINE_TIMEOUT_SECONDS = 7200
+# 多章节写作/重写任务的超时（秒）。检索、导出等有自身有界 I/O 的单阶段任务继续用
+# 默认 job_timeout；write/polish/rebuild/quality-repair/full 都会串行调用多次 LLM，必须
+# 按整篇文档规模给预算。保留旧名供已有运维探针兼容。
+LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS = 7200
+FULL_PIPELINE_TIMEOUT_SECONDS = LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS
 
 # 正文写作前的定向补证轮数上限。每一轮都是一次真实检索 + 全文获取 + 证据抽取，
 # 所以有界；但一轮是不够的——「缺第二个独立来源」往往要换一套术语才够得到。
@@ -265,6 +268,7 @@ async def run_library_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -446,6 +450,7 @@ async def run_import_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         payloads: list[dict[str, Any]] = []
@@ -493,6 +498,7 @@ async def run_cards_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -521,6 +527,7 @@ async def run_qdecomp_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -557,6 +564,7 @@ async def run_evidence_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         fulltext_result = await _run_stage(
@@ -591,6 +599,7 @@ async def run_qmatrix_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -620,6 +629,7 @@ async def run_alignment_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -670,6 +680,7 @@ async def run_synthesis_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -709,6 +720,7 @@ async def run_outline_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -753,6 +765,7 @@ async def run_write_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -807,6 +820,7 @@ async def run_draft_rebuild_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -902,6 +916,7 @@ async def run_polish_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -1053,6 +1068,7 @@ async def run_ingest_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -1098,6 +1114,7 @@ async def run_pdf_match_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         # PDF dispatch commits before enqueue. Keep a short visibility wait as
         # defence for cross-session scheduling and independently invoked jobs.
@@ -1142,6 +1159,7 @@ async def run_uploaded_pdf_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         # Confirmation, DocumentFile binding and job creation commit together.
         # This also waits out the previously committed needs_confirmation state.
@@ -1305,6 +1323,7 @@ async def run_snowball_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -1401,6 +1420,7 @@ async def run_quality_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         report = await _run_stage(
@@ -1451,6 +1471,7 @@ async def run_quality_repair_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -1705,14 +1726,17 @@ async def _quality(
             (anchor["claim_hash"], anchor["cite_key"], anchor["evidence_hash"]),
             "unreviewed",
         )
-    cross_language_verification = await verify_cross_language_claim_evidence(
+    claim_entailment_mode = getattr(context.settings, "claim_entailment_mode", "promote_only")
+    claim_verification = await verify_claim_evidence(
         anchors=report.claim_evidence,
         runner=context.llm_runner(),
+        cache=context.claim_verification_cache,
+        mode=claim_entailment_mode,
     )
-    if cross_language_verification["candidate_count"]:
+    if claim_verification["candidate_count"]:
         await context.emit(
-            "quality.cross_language_verification",
-            cross_language_verification,
+            "quality.claim_evidence_verification",
+            claim_verification,
             stage="quality",
         )
     if project is not None:
@@ -1800,23 +1824,31 @@ async def _quality(
         selected_work_count=len(entries),
         questions=questions,
     )
-    if cross_language_verification["candidate_count"]:
-        depth_metrics["cross_language_verification"] = {
-            key: cross_language_verification[key]
+    if claim_verification["candidate_count"]:
+        depth_metrics["claim_evidence_verification"] = {
+            key: claim_verification[key]
             for key in (
+                "mode",
                 "status",
                 "candidate_count",
+                "scheduled_count",
                 "checked_count",
+                "would_promote_count",
+                "would_demote_count",
                 "promoted_count",
+                "demoted_count",
                 "failed_count",
+                "unverified_count",
+                "cache_hit_count",
+                "model_checked_count",
             )
         }
-        if cross_language_verification["failed_count"]:
+        if claim_verification["mode"] == "enforce" and claim_verification["failed_count"]:
             report.warnings.append(
                 {
-                    "code": "cross_language_verification_incomplete",
-                    "message": "部分跨语言论断未完成语义核验，质量门已按未通过处理",
-                    "count": cross_language_verification["failed_count"],
+                    "code": "claim_evidence_verification_incomplete",
+                    "message": "部分核心论断未完成语义证据核验；既有确定性判定保持不变，需复查",
+                    "count": claim_verification["failed_count"],
                 }
             )
     report.depth_metrics = {**depth_metrics, **report.depth_metrics}
@@ -2000,6 +2032,7 @@ async def run_export_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         # Independent exports previously trusted caller-supplied readiness and
@@ -2065,6 +2098,7 @@ async def run_visual_suggest_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         # 单阶段任务：这一阶段跑完任务就结束了，进度就是 1.0。
@@ -2095,6 +2129,7 @@ async def run_visual_generate_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -2728,6 +2763,7 @@ async def run_full_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -3087,6 +3123,9 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
                 status=status,
                 error={"warnings": context.warnings} if context.warnings else None,
             )
+    # ``job.finished`` is committed before this status transition. Wake subscribers again so they
+    # observe the terminal row and close immediately instead of waiting for the safety heartbeat.
+    await context.notify_event()
 
 
 async def _finish_needs_input(context: JobContext, report: Any) -> None:
@@ -3111,6 +3150,7 @@ async def _finish_needs_input(context: JobContext, report: Any) -> None:
         job = await session.get(GenerationJob, context.job_id)
         if job is not None:
             await update_job(session, job, status="needs_input", error=payload)
+    await context.notify_event()
 
 
 async def startup(ctx: dict) -> None:
@@ -3141,23 +3181,24 @@ class WorkerSettings:
         run_alignment_pipeline,
         run_synthesis_pipeline,
         run_outline_pipeline,
-        run_write_pipeline,
-        func(run_draft_rebuild_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
-        run_polish_pipeline,
+        func(run_write_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
+        func(run_draft_rebuild_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
+        func(run_polish_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_export_pipeline,
         run_ingest_pipeline,
         run_pdf_match_pipeline,
         run_uploaded_pdf_pipeline,
         run_snowball_pipeline,
         run_quality_pipeline,
-        func(run_quality_repair_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
+        func(run_quality_repair_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_visual_suggest_pipeline,
         run_visual_generate_pipeline,
-        # 一键生成串起 scope→…→render 十个阶段，是唯一会跑到小时级的任务：
-        # 实测 7 节 / 46 篇约 22 分钟，章节与文献翻倍就顶到默认超时上。
+        # 一键生成串起 scope→…→render 十个阶段；独立写作和润色虽然阶段更少，
+        # 也同样按章节串行调用模型。实测 7 节 / 46 篇约 22 分钟，章节、修复轮次与
+        # 文献规模叠加后会顶到默认超时。
         # 超时不是重试而是直接判失败（arq 用 asyncio.wait_for，抛的是 TimeoutError），
         # 所以宁可给宽，真挂住了还有 LLM 侧的单请求超时兜底。
-        func(run_full_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
+        func(run_full_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
     ]
     on_startup = startup
     on_shutdown = shutdown

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from llm_runtime import LLMConfig, parse_model_prices
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -62,6 +63,10 @@ class WorkerSettings(BaseSettings):
     # answer_status、证据归属、comparison_clusters 一个都不由它改写。
     synthesis_llm_enabled: bool = False
     synthesis_llm_max_questions: int = 8
+
+    # 核心论断语义蕴含核验的分阶段发布开关。默认只允许可靠的正向判定解除词法
+    # 假阴性；只有经过 shadow 人工抽检后才应启用 enforce 的负向降级。
+    claim_entailment_mode: Literal["off", "shadow", "promote_only", "enforce"] = "promote_only"
 
     @property
     def experiment_extraction_enabled(self) -> bool:

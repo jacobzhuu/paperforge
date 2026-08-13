@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from paperforge_worker.pipelines.image_prompt import MAX_PAPER_CONTEXT_CHARS
 from paperforge_worker.pipelines.visual_planner import (
     MAX_AI_IMAGES,
     SectionBrief,
@@ -108,6 +109,25 @@ async def test_planner_records_reason_and_source_sections() -> None:
     # 用的是 planner 角色，调用会进 llm_call_log。
     assert runner.calls[0]["role"] == "planner"
     assert runner.calls[0]["metadata"]["stage"] == "visual_plan"
+
+
+@pytest.mark.asyncio
+async def test_planner_bounds_supplied_paper_context_and_preserves_both_ends() -> None:
+    runner = _Runner({"proposals": [_diagram_proposal()]})
+    paper_context = "PAPER-BEGIN " + ("evidence " * 20_000) + "PAPER-END"
+
+    await plan_visuals(
+        sections=SECTIONS,
+        runner=runner,
+        allow_ai_images=False,
+        paper_context=paper_context,
+    )
+
+    submitted = runner.calls[0]["user_prompt"].split("Sections:\n", 1)[1]
+    assert len(submitted) == MAX_PAPER_CONTEXT_CHARS
+    assert submitted.startswith("PAPER-BEGIN")
+    assert submitted.endswith("PAPER-END")
+    assert "middle content omitted" in submitted
 
 
 @pytest.mark.asyncio

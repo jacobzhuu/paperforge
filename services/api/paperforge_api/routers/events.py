@@ -1,7 +1,7 @@
 """任务进度 SSE（设计 §4.7 `GET /projects/{id}/jobs/{job_id}/events`）。
 
-单向进度流足够，免 WebSocket 复杂度（设计 §4.1）。事件源是 `job_event` 表，
-按 seq 单调递增轮询；客户端断线重连时用 `Last-Event-ID` 续传。
+单向进度流足够，免 WebSocket 复杂度（设计 §4.1）。`job_event` 表是可重放的事实源，
+Redis Pub/Sub 只负责在新行提交后唤醒连接；客户端断线重连时用 `Last-Event-ID` 续传。
 """
 
 from __future__ import annotations
@@ -10,20 +10,31 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Any
 
-from db import FINISHED_JOB_STATUSES, get_job, list_job_events
+from arq.connections import ArqRedis
+from db import FINISHED_JOB_STATUSES, get_job, job_event_channel, list_job_events
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from observability import get_logger
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from paperforge_api.deps import authorize_project_request, get_session_factory
-
-router = APIRouter(
-    prefix="/api/v1", tags=["events"], dependencies=[Depends(authorize_project_request)]
+from paperforge_api.deps import (
+    authorize_stream_project_request,
+    get_queue,
+    get_session_factory,
 )
 
+logger = get_logger(__name__)
+
+router = APIRouter(
+    prefix="/api/v1", tags=["events"], dependencies=[Depends(authorize_stream_project_request)]
+)
+
+# Redis unavailable is a supported degradation path; only that path retains the old fast poll.
 POLL_INTERVAL_SECONDS = 0.5
+PUBSUB_WAIT_SECONDS = 1.0
+EVENT_PAGE_SIZE = 200
 # 空闲心跳：穿透代理的空闲超时，同时让前端知道连接仍然活着。
 HEARTBEAT_SECONDS = 15.0
 # 这一轮运行已结束、事件流可以收口的状态。paused 也在内：任务本身还没做完，
@@ -37,6 +48,7 @@ async def stream_job_events(
     job_id: str,
     request: Request,
     session_factory: Annotated[async_sessionmaker, Depends(get_session_factory)],
+    event_bus: Annotated[ArqRedis | None, Depends(get_queue)],
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     after: int | None = None,
 ) -> StreamingResponse:
@@ -61,7 +73,7 @@ async def stream_job_events(
         after_seq = 0
 
     return StreamingResponse(
-        _event_stream(session_factory, job_uuid, after_seq, request),
+        _event_stream(session_factory, job_uuid, after_seq, request, event_bus),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -76,48 +88,127 @@ async def _event_stream(
     job_id: uuid.UUID,
     after_seq: int,
     request: Request,
+    event_bus: ArqRedis | None = None,
 ) -> AsyncIterator[str]:
-    idle = 0.0
-    while True:
-        if await request.is_disconnected():
-            return
-        async with session_factory() as session:
-            events = await list_job_events(session, job_id, after_seq=after_seq)
-            job = await get_job(session, job_id)
-        if events:
-            idle = 0.0
-            for event in events:
-                after_seq = event.seq
-                yield _format_event(
-                    event_id=event.seq,
-                    data={
-                        "seq": event.seq,
-                        "type": event.event_type,
-                        "payload": event.payload_json or {},
-                        "stage": job.stage if job else None,
-                        "progress": job.progress if job else None,
-                        "status": job.status if job else None,
-                    },
-                )
-        else:
-            idle += POLL_INTERVAL_SECONDS
-            if idle >= HEARTBEAT_SECONDS:
-                idle = 0.0
-                yield ": heartbeat\n\n"
+    channel = job_event_channel(job_id)
+    pubsub = await _subscribe(event_bus, channel)
+    loop = asyncio.get_running_loop()
+    last_activity = loop.time()
+    refresh = True
+    heartbeat_due = False
+    try:
+        while True:
+            if await request.is_disconnected():
+                return
 
-        if job is not None and job.status in TERMINAL_STATUSES and not events:
-            yield _format_event(
-                event_id=after_seq,
-                data={
-                    "type": "job.closed",
-                    "payload": {},
-                    "status": job.status,
-                    "progress": job.progress,
-                    "stage": job.stage,
-                },
-            )
-            return
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            if refresh:
+                async with session_factory() as session:
+                    events = await list_job_events(
+                        session,
+                        job_id,
+                        after_seq=after_seq,
+                        limit=EVENT_PAGE_SIZE,
+                    )
+                    job = await get_job(session, job_id)
+                refresh = False
+                if events:
+                    heartbeat_due = False
+                    last_activity = loop.time()
+                    for event in events:
+                        after_seq = event.seq
+                        yield _format_event(
+                            event_id=event.seq,
+                            data={
+                                "seq": event.seq,
+                                "type": event.event_type,
+                                "payload": event.payload_json or {},
+                                "stage": job.stage if job else None,
+                                "progress": job.progress if job else None,
+                                "status": job.status if job else None,
+                            },
+                        )
+                elif heartbeat_due:
+                    heartbeat_due = False
+                    last_activity = loop.time()
+                    yield ": heartbeat\n\n"
+
+                if job is not None and job.status in TERMINAL_STATUSES and not events:
+                    yield _format_event(
+                        event_id=after_seq,
+                        data={
+                            "type": "job.closed",
+                            "payload": {},
+                            "status": job.status,
+                            "progress": job.progress,
+                            "stage": job.stage,
+                        },
+                    )
+                    return
+                if job is not None and job.status in TERMINAL_STATUSES:
+                    # A reconnect to an already-finished job may replay its final event without a
+                    # future Pub/Sub wake-up. Re-read immediately and emit job.closed after drain.
+                    refresh = True
+                    continue
+                # Drain a long replay without waiting for another transient wake-up message.
+                if len(events) >= EVENT_PAGE_SIZE:
+                    refresh = True
+                    continue
+
+            if pubsub is None:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                refresh = True
+            else:
+                try:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=PUBSUB_WAIT_SECONDS,
+                    )
+                except Exception:  # noqa: BLE001 - transparently degrade to durable DB polling
+                    logger.warning(
+                        "job event subscription failed; falling back to database polling",
+                        extra={"job_id": str(job_id)},
+                        exc_info=True,
+                    )
+                    await _close_pubsub(pubsub, channel)
+                    pubsub = None
+                else:
+                    if message is not None:
+                        refresh = True
+
+            if loop.time() - last_activity >= HEARTBEAT_SECONDS:
+                # This safety refresh also carries progress from an old blue/green worker that was
+                # already running before Pub/Sub notifications were deployed.
+                heartbeat_due = True
+                refresh = True
+    finally:
+        if pubsub is not None:
+            await _close_pubsub(pubsub, channel)
+
+
+async def _subscribe(event_bus: ArqRedis | None, channel: str) -> Any | None:
+    if event_bus is None:
+        return None
+    pubsub = event_bus.pubsub()
+    try:
+        # Subscribe before the first DB replay. An event committed during setup is then visible in
+        # either the replay or a queued wake-up, closing the usual subscribe/backfill race.
+        await pubsub.subscribe(channel)
+    except Exception:  # noqa: BLE001 - API remains usable when Redis is degraded
+        logger.warning("job event subscription unavailable", exc_info=True)
+        await _close_pubsub(pubsub, channel)
+        return None
+    return pubsub
+
+
+async def _close_pubsub(pubsub: Any, channel: str) -> None:
+    try:
+        await pubsub.unsubscribe(channel)
+    except Exception:  # noqa: BLE001 - connection cleanup is best effort
+        pass
+    try:
+        await pubsub.aclose()
+    except Exception:  # noqa: BLE001 - connection cleanup is best effort
+        pass
 
 
 def _format_event(*, event_id: int, data: dict) -> str:

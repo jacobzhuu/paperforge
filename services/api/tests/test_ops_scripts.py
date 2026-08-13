@@ -165,6 +165,18 @@ def test_blue_green_deploy_rebuilds_and_preflights_the_texd_runtime() -> None:
     )
 
 
+def test_blue_green_reaper_protects_live_and_active_deployments() -> None:
+    source = DEV.read_text(encoding="utf-8")
+    funnel_guard = "Cannot identify the deployment serving the Funnel; refusing to remove anything."
+    assert 'reap) reap_deployments "${2:---dry-run}"' in source
+    assert funnel_guard in source
+    assert 'match="arq:in-progress:*"' in source
+    assert "await redis.zcard(redis.default_queue_name)" in source
+    assert source.count('deployment_drain_state "${project}"') >= 2
+    assert source.index("sleep 2") < source.index("docker rm -f ${containers}")
+    assert "application images retained for recovery" in source
+
+
 def test_offline_image_loader_verifies_before_loading() -> None:
     source = IMAGE_LOADER.read_text(encoding="utf-8")
     assert source.index("bundle SHA-256 mismatch") < source.index("docker load")

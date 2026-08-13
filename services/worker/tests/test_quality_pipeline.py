@@ -14,13 +14,16 @@ from typing import Any
 from llm_runtime import LLMConfig, LLMRunner
 from llm_runtime.types import LLMResponse
 from paperforge_worker.pipelines.quality import (
+    CLAIM_DEMOTION_CONFIDENCE,
     CROSS_LANGUAGE_SUPPORT_CONFIDENCE,
+    MAX_CLAIM_EVIDENCE_CHECKS,
     SOFT_CHECK_THRESHOLD,
     SoftCheckFinding,
     build_quality_report,
     count_words,
     coverage_hints,
     soft_check_citations,
+    verify_claim_evidence,
     verify_cross_language_claim_evidence,
     zh_language_mismatches,
 )
@@ -29,18 +32,21 @@ NOW = datetime(2026, 7, 25, tzinfo=UTC)
 
 
 class _Stub:
-    def __init__(self, payload: Any) -> None:
+    def __init__(self, payload: Any, calls: list[Any] | None = None) -> None:
         self.payload = payload
+        self.calls = calls
 
     def generate(self, request):
+        if self.calls is not None:
+            self.calls.append(request)
         text = self.payload if isinstance(self.payload, str) else json.dumps(self.payload)
         return LLMResponse(text=text, model="stub", provider="stub")
 
 
-def _runner(payload: Any) -> LLMRunner:
+def _runner(payload: Any, *, calls: list[Any] | None = None) -> LLMRunner:
     return LLMRunner(
         LLMConfig(provider="openai", base_url="http://stub", api_key="k"),
-        provider=_Stub(payload),
+        provider=_Stub(payload, calls),
     )
 
 
@@ -178,6 +184,257 @@ async def test_cross_language_verifier_promotes_only_confident_direct_support() 
     assert anchors[0]["support_score"] == CROSS_LANGUAGE_SUPPORT_CONFIDENCE
 
 
+async def test_claim_verifier_enforce_rejects_contradiction_and_accepts_paraphrase() -> None:
+    """Shared words select an excerpt; they must never decide scholarly support."""
+    contradiction = _bilingual_anchor(
+        claim_hash="contradiction",
+        claim_text="Treatment A significantly improved survival compared with control.",
+        evidence_excerpt=(
+            "Treatment A did not significantly improve survival compared with control."
+        ),
+        support_status="supported",
+        support_score=0.92,
+    )
+    paraphrase = _bilingual_anchor(
+        claim_hash="paraphrase",
+        claim_text="Treatment A lowered the risk of relapse.",
+        evidence_excerpt="Participants receiving A were less likely to experience recurrence.",
+    )
+    summary = await verify_claim_evidence(
+        anchors=[contradiction, paraphrase],
+        mode="enforce",
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "supported",
+                        "confidence": 0.96,
+                        "reason": (
+                            "Relapse risk and recurrence likelihood express the same outcome."
+                        ),
+                    },
+                    {
+                        "index": 1,
+                        "verdict": "contradicted",
+                        "confidence": 0.99,
+                        "reason": "The excerpt explicitly negates the claimed improvement.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    assert summary["status"] == "completed"
+    assert summary["demoted_count"] == 1
+    assert summary["promoted_count"] == 1
+    assert contradiction["support_status"] == "insufficient_support"
+    assert contradiction["support_score"] is None
+    assert paraphrase["support_status"] == "supported"
+    assert paraphrase["support_score"] == 0.96
+
+
+async def test_claim_verifier_default_records_negative_without_demoting() -> None:
+    """The safe default must not let an unmeasured model newly block a paper."""
+    anchor = _bilingual_anchor(
+        claim_hash="promotion-only-contradiction",
+        support_status="supported",
+        support_score=0.92,
+    )
+
+    summary = await verify_claim_evidence(
+        anchors=[anchor],
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "contradicted",
+                        "confidence": 0.99,
+                        "reason": "The excerpt explicitly states the opposite direction.",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert summary["mode"] == "promote_only"
+    assert summary["would_demote_count"] == 1
+    assert summary["demoted_count"] == 0
+    assert anchor["support_status"] == "supported"
+    assert anchor["support_score"] == 0.92
+
+
+async def test_claim_verifier_shadow_and_off_never_change_support_status() -> None:
+    payload = {
+        "judgements": [
+            {
+                "index": 0,
+                "verdict": "supported",
+                "confidence": 0.99,
+                "reason": "The excerpt directly entails the complete claim.",
+            }
+        ]
+    }
+    shadow = _bilingual_anchor(claim_hash="shadow")
+    shadow_summary = await verify_claim_evidence(
+        anchors=[shadow],
+        mode="shadow",
+        runner=_runner(payload),
+    )
+
+    calls: list[Any] = []
+    disabled = _bilingual_anchor(claim_hash="disabled")
+    off_summary = await verify_claim_evidence(
+        anchors=[disabled],
+        mode="off",
+        runner=_runner(payload, calls=calls),
+    )
+
+    assert shadow_summary["status"] == "completed"
+    assert shadow_summary["would_promote_count"] == 1
+    assert shadow_summary["promoted_count"] == 0
+    assert shadow["support_status"] == "insufficient_support"
+    assert off_summary["status"] == "disabled"
+    assert off_summary["scheduled_count"] == 0
+    assert off_summary["failed_count"] == 0
+    assert disabled["support_status"] == "insufficient_support"
+    assert calls == []
+
+
+async def test_claim_verifier_outage_preserves_provisional_status() -> None:
+    provisional = _bilingual_anchor(
+        claim_text="The treatment increased recovery by 27%.",
+        evidence_excerpt="The treatment increased recovery by 27%.",
+        support_status="supported",
+        support_score=1.0,
+    )
+
+    summary = await verify_claim_evidence(anchors=[provisional], runner=None)
+
+    assert summary["status"] == "unavailable"
+    assert summary["demoted_count"] == 0
+    assert summary["failed_count"] == 1
+    assert provisional["support_status"] == "supported"
+    assert provisional["support_score"] == 1.0
+
+
+async def test_claim_verifier_cap_preserves_unverified_overflow_status() -> None:
+    anchors = [
+        _bilingual_anchor(
+            claim_hash=f"claim-{index}",
+            support_status="supported",
+            support_score=1.0,
+        )
+        for index in range(MAX_CLAIM_EVIDENCE_CHECKS + 1)
+    ]
+    summary = await verify_claim_evidence(
+        anchors=anchors,
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": index,
+                        "verdict": "supported",
+                        "confidence": 0.99,
+                        "reason": "The excerpt directly entails the claim.",
+                    }
+                    for index in range(MAX_CLAIM_EVIDENCE_CHECKS)
+                ]
+            }
+        ),
+    )
+
+    assert summary["status"] == "partial"
+    assert summary["candidate_count"] == MAX_CLAIM_EVIDENCE_CHECKS + 1
+    assert summary["scheduled_count"] == MAX_CLAIM_EVIDENCE_CHECKS
+    assert summary["checked_count"] == MAX_CLAIM_EVIDENCE_CHECKS
+    assert summary["failed_count"] == 1
+    assert anchors[-1]["support_status"] == "supported"
+    assert anchors[-1]["support_score"] == 1.0
+
+
+async def test_claim_verifier_does_not_demote_on_partial_or_low_confidence_negative() -> None:
+    partial = _bilingual_anchor(
+        claim_hash="partial-supported",
+        support_status="supported",
+        support_score=0.8,
+    )
+    uncertain_negative = _bilingual_anchor(
+        claim_hash="low-confidence-negative",
+        support_status="supported",
+        support_score=0.75,
+    )
+
+    summary = await verify_claim_evidence(
+        anchors=[partial, uncertain_negative],
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "partial",
+                        "confidence": 0.99,
+                        "reason": "Only one part of the compound claim is entailed.",
+                    },
+                    {
+                        "index": 1,
+                        "verdict": "contradicted",
+                        "confidence": CLAIM_DEMOTION_CONFIDENCE - 0.01,
+                        "reason": "The direction may differ, but confidence is below the gate.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    assert summary["status"] == "completed"
+    assert summary["demoted_count"] == 0
+    assert partial["support_status"] == "supported"
+    assert partial["support_score"] == 0.8
+    assert uncertain_negative["support_status"] == "supported"
+    assert uncertain_negative["support_score"] == 0.75
+
+
+async def test_claim_verifier_reuses_job_cache_for_an_unchanged_pair() -> None:
+    calls: list[Any] = []
+    runner = _runner(
+        {
+            "judgements": [
+                {
+                    "index": 0,
+                    "verdict": "supported",
+                    "confidence": 0.98,
+                    "reason": "The excerpt directly entails the complete claim.",
+                }
+            ]
+        },
+        calls=calls,
+    )
+    cache: dict[str, dict[str, Any]] = {}
+    first = _bilingual_anchor()
+    second = _bilingual_anchor()
+
+    first_summary = await verify_claim_evidence(
+        anchors=[first],
+        runner=runner,
+        cache=cache,
+    )
+    second_summary = await verify_claim_evidence(
+        anchors=[second],
+        runner=runner,
+        cache=cache,
+    )
+
+    assert len(calls) == 1
+    assert first_summary["model_checked_count"] == 1
+    assert first_summary["cache_hit_count"] == 0
+    assert second_summary["model_checked_count"] == 0
+    assert second_summary["cache_hit_count"] == 1
+    assert second_summary["status"] == "completed"
+    assert second["support_status"] == "supported"
+
+
 async def test_cross_language_verifier_does_not_promote_partial_or_low_confidence_support() -> None:
     partial = _bilingual_anchor(claim_hash="partial")
     uncertain = _bilingual_anchor(claim_hash="uncertain")
@@ -226,12 +483,13 @@ async def test_cross_language_verifier_fails_closed_and_preserves_other_hard_rul
     same_language = _bilingual_anchor(
         claim_text="Dirichlet sampling reduced polluted-node influence.",
     )
-    not_needed = await verify_cross_language_claim_evidence(
+    same_language_summary = await verify_cross_language_claim_evidence(
         anchors=[numeric_without_locator, same_language],
         runner=_runner({"judgements": []}),
     )
-    assert not_needed["status"] == "not_needed"
-    assert not_needed["candidate_count"] == 0
+    assert same_language_summary["status"] == "unavailable"
+    assert same_language_summary["candidate_count"] == 1
+    assert same_language_summary["failed_count"] == 1
 
 
 # ---- 覆盖建议 ----

@@ -501,9 +501,7 @@ def test_delivered_full_job_can_start_or_skip_quality_repair(
         )
 
     seed(clean_pg_database_url, _deliver_with_findings)
-    response = client.post(
-        f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair"
-    )
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair")
     assert response.status_code == 202, response.text
     repair = response.json()
     assert repair["kind"] == "write"
@@ -2199,7 +2197,7 @@ def test_yunwu_ai_draft_requires_deepseek_full_paper_analysis(
         assert body["spec"]["refined_prompt"]
         assert body["spec"]["semantics"]["aspect_ratio"] == "3:2"
         assert calls[0]["role"] == "polisher"
-        assert "COMPLETE PAPER" in calls[0]["user_prompt"]
+        assert "SECTION-BALANCED PAPER CONTEXT" in calls[0]["user_prompt"]
         assert "循证研究自动化" in calls[0]["user_prompt"]
     finally:
         api_config._settings = None

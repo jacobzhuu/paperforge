@@ -2,7 +2,7 @@
 
 守的是两件事：
 
-1. 交互式生图把当前论文全文交给 DeepSeek，不截断末尾章节；
+1. 交互式生图上下文有硬上限，且超长文稿仍保留分节覆盖和末尾结论；
 2. 模型给不出可用结果时返回 None，由调用方阻止未经分析的提示词进入生图服务。
 """
 
@@ -13,8 +13,10 @@ from typing import Any
 
 import pytest
 from paperforge_worker.pipelines.image_prompt import (
+    MAX_PAPER_CONTEXT_CHARS,
     MAX_PROMPT_CHARS,
     analyze_image_prompt,
+    build_paper_context,
     refine_image_prompt,
     rewrite_rejected_image_prompt,
 )
@@ -82,7 +84,7 @@ async def test_brief_carries_semantics_and_supplied_paper_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_paper_analysis_receives_the_entire_untruncated_document() -> None:
+async def test_full_paper_analysis_bounds_context_without_losing_the_conclusion() -> None:
     final_prompt = (
         "Create a wide journal graphical abstract that integrates the paper's taxonomy, "
         "mechanisms, defenses, and open questions. Arrange four connected scientific panels "
@@ -102,7 +104,7 @@ async def test_full_paper_analysis_receives_the_entire_untruncated_document() ->
         }
     )
     sentinel = "结论部分末尾的唯一标记-DO-NOT-TRUNCATE"
-    paper = "引言正文" + ("跨章节证据。" * 1000) + sentinel
+    paper = "引言正文-BEGIN" + ("跨章节证据。" * 10_000) + sentinel
     analysis = await analyze_image_prompt(
         user_intent="生成全文综述图",
         full_paper=paper,
@@ -112,8 +114,32 @@ async def test_full_paper_analysis_receives_the_entire_untruncated_document() ->
 
     assert analysis is not None
     assert analysis.prompt == final_prompt
-    assert sentinel in runner.calls[0]["user_prompt"]
+    submitted = runner.calls[0]["user_prompt"].split("SECTION-BALANCED PAPER CONTEXT:\n", 1)[1]
+    assert len(submitted) == MAX_PAPER_CONTEXT_CHARS
+    assert submitted.startswith("引言正文-BEGIN")
+    assert sentinel in submitted
+    assert "middle content omitted" in submitted
     assert runner.calls[0]["metadata"]["stage"] == "image_prompt_full_paper"
+
+
+def test_structured_paper_context_preserves_balanced_section_head_and_tail_coverage() -> None:
+    sections = [
+        (
+            f"s{index}",
+            f"Section {index}",
+            f"SECTION-{index}-BEGIN " + (character * 30_000) + f" SECTION-{index}-END",
+        )
+        for index, character in enumerate("ABC", start=1)
+    ]
+
+    context = build_paper_context("A very long paper", sections)
+
+    assert len(context) == MAX_PAPER_CONTEXT_CHARS
+    for index in range(1, 4):
+        assert f"[s{index}] Section {index}" in context
+        assert f"SECTION-{index}-BEGIN" in context
+        assert f"SECTION-{index}-END" in context
+    assert context.count("middle content omitted") == 3
 
 
 @pytest.mark.asyncio

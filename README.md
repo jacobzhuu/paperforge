@@ -74,6 +74,7 @@ Tectonic、visuald、API、worker 和 Web。成功后会自动打开并打印：
 ./scripts/dev status
 ./scripts/dev logs
 ./scripts/dev restart   # 改完代码用这个
+./scripts/dev reap      # 只读检查已排空的旧蓝绿部署；确认后加 --apply 清理
 ./scripts/dev down
 ```
 
