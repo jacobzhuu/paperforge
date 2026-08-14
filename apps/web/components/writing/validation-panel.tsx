@@ -1117,6 +1117,37 @@ function EvidenceReviewList({
                   </blockquote>
                 )}
 
+                {anchor.entailment_verdict && (
+                  <div className="space-y-1.5 rounded-md border bg-muted/20 p-3">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Badge
+                        variant={
+                          anchor.entailment_verdict === 'supported'
+                            ? 'success'
+                            : anchor.entailment_verdict === 'partial' ||
+                                anchor.entailment_verdict === 'uncertain'
+                              ? 'warning'
+                              : 'destructive'
+                        }
+                      >
+                        语义核验：{anchor.entailment_verdict}
+                      </Badge>
+                      {anchor.entailment_confidence !== null &&
+                        anchor.entailment_confidence !== undefined && (
+                          <span className="text-muted-foreground">
+                            置信度 {(anchor.entailment_confidence * 100).toFixed(0)}%
+                          </span>
+                        )}
+                      {anchor.entailment_cached && <Badge variant="muted">缓存复用</Badge>}
+                    </div>
+                    {anchor.entailment_reason && (
+                      <p className="leading-relaxed text-muted-foreground">
+                        {anchor.entailment_reason}
+                      </p>
+                    )}
+                  </div>
+                )}
+
                 {errors[anchor.id] && (
                   <p
                     role="alert"

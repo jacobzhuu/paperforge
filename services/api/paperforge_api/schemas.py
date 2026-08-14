@@ -948,6 +948,14 @@ class ClaimEvidenceResponse(BaseModel):
     support_status: str
     support_score: float | None = None
     manual_status: str = "unreviewed"
+    entailment_verdict: str | None = None
+    entailment_confidence: float | None = None
+    entailment_reason: str | None = None
+    entailment_model: str | None = None
+    entailment_verifier_version: str | None = None
+    entailment_cached: bool | None = None
+    entailment_review: dict[str, Any] | None = None
+    entailment_checked_at: datetime | None = None
 
 
 class ReviewClaimEvidenceRequest(BaseModel):

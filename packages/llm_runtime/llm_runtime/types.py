@@ -26,6 +26,10 @@ class LLMResponse:
     usage: dict[str, Any] | None = None
     raw_response_id: str | None = None
     finish_reason: str | None = None
+    # Runner-level retry provenance. Providers leave this at zero; ``LLMRunner`` increments it
+    # when it has already spent the one allowed larger-budget truncation retry. Structured JSON
+    # parsing uses the marker to avoid starting a second, nested retry sequence.
+    truncation_retries: int = 0
 
 
 class LLMError(RuntimeError):

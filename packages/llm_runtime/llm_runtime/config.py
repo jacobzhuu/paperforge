@@ -44,6 +44,13 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
 DEFAULT_ROLE_THINKING: dict[str, str] = {
     "extractor": "disabled",
     "reranker": "disabled",
+    # Claim entailment is a bounded classification task with a closed JSON schema.  Measured by an
+    # out-of-band replay over a 91-pair cohort (not a pipeline run): with thinking disabled all 91
+    # pairs resolved in 9 calls, against 39 for the same cohort with thinking on, which spent most
+    # of the output budget on hidden reasoning.  Note the pipeline itself caps a single pass at
+    # MAX_CLAIM_EVIDENCE_CHECKS (60), so "91/91" is a property of the replay, not an invariant any
+    # quality job can report.
+    "verifier": "disabled",
     # 结构化实验抽取是按封闭 schema 读文本，和卡片抽取同类。开着思考会把输出预算
     # 烧在推理上：生产实测 26 次调用里 15 次 `output_truncated`，13 篇论文有 6 篇
     # 一条结果都没抽出来。

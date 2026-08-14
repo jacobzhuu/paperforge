@@ -131,6 +131,7 @@ from db.repositories.quality import (
     READINESS_STATUSES,
     REVIEW_STYLES,
     create_quality_report,
+    get_claim_entailment_cache,
     get_quality_report,
     invalidate_quality_reports_for_document,
     invalidate_quality_reports_for_project,
@@ -138,6 +139,7 @@ from db.repositories.quality import (
     list_claim_evidence,
     replace_claim_evidence,
     set_claim_manual_status,
+    store_claim_entailment_cache,
 )
 from db.repositories.questions import (
     ANSWER_STATUSES,
@@ -276,6 +278,7 @@ __all__ = [
     "get_quality_report",
     "get_owned_project",
     "get_active_session_by_hash",
+    "get_claim_entailment_cache",
     "get_user",
     "get_user_by_email",
     "get_visual",
@@ -337,6 +340,7 @@ __all__ = [
     "upsert_eligibility_decision",
     "set_question_answer_status",
     "set_claim_manual_status",
+    "store_claim_entailment_cache",
     "purge_project",
     "restore_project",
     "set_project_status",

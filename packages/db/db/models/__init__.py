@@ -30,6 +30,7 @@ from db.models.library import (
 )
 from db.models.paper import (
     CitationUsage,
+    ClaimEntailmentCache,
     ClaimEvidenceAnchor,
     ExportArtifact,
     GenerationJob,
@@ -60,6 +61,7 @@ __all__ = [
     "AppUser",
     "AuthActionToken",
     "CitationUsage",
+    "ClaimEntailmentCache",
     "ClaimEvidenceAnchor",
     "DocumentChunk",
     "DocumentFile",

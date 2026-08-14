@@ -63,6 +63,7 @@ from paperforge_worker.pipelines.quality import (
     build_depth_metrics,
     build_original_claim_grounding,
     build_quality_report,
+    claim_verification_cache_keys,
     repairable_finding_count,
     soft_check_citations,
     verify_claim_evidence,
@@ -1574,6 +1575,7 @@ async def _quality(
     from db import (
         document_snapshot_hash,
         evidence_payload,
+        get_claim_entailment_cache,
         get_project,
         get_writing_whitelist,
         grounded_asset_payloads,
@@ -1587,6 +1589,7 @@ async def _quality(
         list_research_questions,
         list_search_runs,
         list_sections,
+        store_claim_entailment_cache,
     )
 
     async with context.session() as session:
@@ -1726,13 +1729,53 @@ async def _quality(
             (anchor["claim_hash"], anchor["cite_key"], anchor["evidence_hash"]),
             "unreviewed",
         )
-    claim_entailment_mode = getattr(context.settings, "claim_entailment_mode", "promote_only")
+    claim_entailment_mode = getattr(context.settings, "claim_entailment_mode", "shadow")
+    verifier_runner = context.llm_runner()
+    if claim_entailment_mode != "off" and verifier_runner.enabled:
+        verifier_model = verifier_runner.model_for("verifier")
+        cache_keys = claim_verification_cache_keys(
+            report.claim_evidence,
+            model=verifier_model,
+        )
+        missing_cache_keys = cache_keys.difference(context.claim_verification_cache)
+        if missing_cache_keys:
+            try:
+                async with context.session() as session:
+                    context.claim_verification_cache.update(
+                        await get_claim_entailment_cache(session, missing_cache_keys)
+                    )
+            except Exception:  # noqa: BLE001 - cache outages must not fail quality verification
+                logger.warning(
+                    "failed to load claim entailment cache",
+                    extra={"project_id": str(context.project_id)},
+                    exc_info=True,
+                )
     claim_verification = await verify_claim_evidence(
         anchors=report.claim_evidence,
-        runner=context.llm_runner(),
+        runner=verifier_runner,
         cache=context.claim_verification_cache,
         mode=claim_entailment_mode,
     )
+    if (
+        claim_verification["model_checked_count"]
+        or claim_verification["alternative_model_checked_count"]
+    ):
+        try:
+            async with context.session() as session:
+                await store_claim_entailment_cache(
+                    session,
+                    [
+                        entry
+                        for entry in context.claim_verification_cache.values()
+                        if entry.get("cache_key")
+                    ],
+                )
+        except Exception:  # noqa: BLE001 - a cache write failure cannot invalidate verdicts
+            logger.warning(
+                "failed to persist claim entailment cache",
+                extra={"project_id": str(context.project_id)},
+                exc_info=True,
+            )
     if claim_verification["candidate_count"]:
         await context.emit(
             "quality.claim_evidence_verification",
@@ -1834,13 +1877,22 @@ async def _quality(
                 "scheduled_count",
                 "checked_count",
                 "would_promote_count",
+                "raw_would_demote_count",
                 "would_demote_count",
                 "promoted_count",
                 "demoted_count",
                 "failed_count",
                 "unverified_count",
                 "cache_hit_count",
+                "persistent_cache_hit_count",
+                "job_cache_hit_count",
                 "model_checked_count",
+                "alternative_checked_count",
+                "alternative_failed_count",
+                "alternative_cache_hit_count",
+                "alternative_model_checked_count",
+                "unsafe_demotion_avoided_count",
+                "review_incomplete_count",
             )
         }
         if claim_verification["mode"] == "enforce" and claim_verification["failed_count"]:

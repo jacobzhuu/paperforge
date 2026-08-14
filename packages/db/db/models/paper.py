@@ -519,6 +519,54 @@ class ClaimEvidenceAnchor(Base):
     support_status: Mapped[str] = mapped_column(String(48), nullable=False)
     support_score: Mapped[float | None] = mapped_column(Float)
     manual_status: Mapped[str] = mapped_column(String(24), default="unreviewed", nullable=False)
+    # Shadow verdicts are durable review evidence even when they do not change support_status.
+    # Keeping them on the snapshot-bound anchor makes the UI and later audits independent of the
+    # transient job event stream.
+    entailment_verdict: Mapped[str | None] = mapped_column(String(16))
+    entailment_confidence: Mapped[float | None] = mapped_column(Float)
+    entailment_reason: Mapped[str | None] = mapped_column(Text)
+    entailment_model: Mapped[str | None] = mapped_column(String(128))
+    entailment_verifier_version: Mapped[str | None] = mapped_column(String(32))
+    entailment_cached: Mapped[bool | None] = mapped_column(Boolean)
+    entailment_review_json: Mapped[dict | None] = mapped_column(JSONB)
+    entailment_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ClaimEntailmentCache(Base):
+    """Content-addressed semantic verdict cache shared by quality jobs.
+
+    ``cache_key`` hashes verifier version, configured model, claim kind, claim text and exact
+    excerpt, so a model change cannot silently reuse an incompatible verdict.  Bumping
+    ``CLAIM_VERIFIER_VERSION`` is the only invalidation mechanism: rows are immutable
+    (``on_conflict_do_nothing``) and have no TTL.
+
+    Two retention facts this table's shape does not make obvious:
+
+    * ``reason`` is model-authored prose that routinely paraphrases both the claim and the cited
+      excerpt, so this table **does** hold derived manuscript text — the claim/evidence columns are
+      hashes, but the reason is not.
+    * There is no ``project_id`` and no FK, which is what lets one verdict serve every project.
+      The cost is that ``purge_project`` (a plain delete relying on ``ON DELETE CASCADE``) cannot
+      reach these rows, so they outlive the project whose claims produced them.
+    """
+
+    __tablename__ = "claim_entailment_cache"
+    __table_args__ = (
+        Index("ix_claim_entailment_cache_claim_evidence", "claim_hash", "evidence_hash"),
+    )
+
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    claim_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

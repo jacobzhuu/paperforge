@@ -29,7 +29,9 @@ class WorkerSettings(BaseSettings):
     llm_openai_base_url: str = "https://api.openai.com/v1"
     llm_openai_api_key: str = ""
     llm_role_models: str = "{}"
-    llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled"}'
+    llm_role_thinking: str = (
+        '{"extractor":"disabled","reranker":"disabled","verifier":"disabled"}'
+    )
     # 模型 → 单价（每百万 token）。留空则所有调用记为**未定价**，成本面板会
     # 明说金额不完整，而不是显示一个看起来很划算的 $0.00。
     #   {"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}
@@ -64,9 +66,18 @@ class WorkerSettings(BaseSettings):
     synthesis_llm_enabled: bool = False
     synthesis_llm_max_questions: int = 8
 
-    # 核心论断语义蕴含核验的分阶段发布开关。默认只允许可靠的正向判定解除词法
-    # 假阴性；只有经过 shadow 人工抽检后才应启用 enforce 的负向降级。
-    claim_entailment_mode: Literal["off", "shadow", "promote_only", "enforce"] = "promote_only"
+    # 核心论断语义蕴含核验的分阶段发布开关。默认 shadow：只记录判定，不改状态。
+    #
+    # 注意 shadow 并非「promote_only 的更安全版本」，两者的风险方向相反：
+    # promote_only 不可能降级（结构上就没有这条路径），但它能把词法假阴性的
+    # insufficient_support 提升为 supported，从而消掉 core_claim_fulltext_missing
+    # 这一最常见的 blocker。shadow 放弃了这条解阻塞路径，**因此比 promote_only
+    # 更容易把稿子判成 needs_revision**，代价是多跑质量修复轮次。
+    #
+    # 之所以仍然默认 shadow：提升的正确性尚未被标注样本验证过（当前影子样本覆盖率
+    # 约 5.7%，且无人工标注）。覆盖率与人工抽检达标后应先升到 promote_only；
+    # enforce 的负向降级必须最后启用。
+    claim_entailment_mode: Literal["off", "shadow", "promote_only", "enforce"] = "shadow"
 
     @property
     def experiment_extraction_enabled(self) -> bool:

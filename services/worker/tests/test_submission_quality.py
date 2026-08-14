@@ -493,6 +493,49 @@ def test_explicit_evidence_unit_drives_r4_grade_check() -> None:
     assert anchors[0]["support_status"] == "grade_not_permitted"
 
 
+def test_claim_anchor_keeps_located_alternatives_for_safe_negative_review() -> None:
+    selected_id, alternative_id = str(uuid.uuid4()), str(uuid.uuid4())
+    work_id = uuid.uuid4()
+    row = _row("The treatment significantly improved recovery.")
+    row.body_ir_json["blocks"][0]["runs"][1]["evidence_ids"] = [selected_id]
+
+    anchors = build_claim_evidence(
+        rows=[row],
+        evidence_sources={
+            "smith2020": {
+                "work_id": work_id,
+                "fulltext_used": True,
+                "quotable_points": [],
+            }
+        },
+        evidence_units={
+            selected_id: {
+                "id": selected_id,
+                "work_id": str(work_id),
+                "grade": "A_located_structured",
+                "text": "Figure 1. Overview of the treatment and recovery study.",
+                "object_ref": "fig:F1",
+                "measurements": [],
+            },
+            alternative_id: {
+                "id": alternative_id,
+                "work_id": str(work_id),
+                "grade": "B_located_prose",
+                "text": "The treatment significantly improved recovery in the study cohort.",
+                "section_path": "Results",
+                "paragraph_index": 4,
+                "measurements": [],
+            },
+        },
+    )
+
+    assert anchors[0]["evidence_unit_id"] == selected_id
+    alternatives = anchors[0]["_verification_alternatives"]
+    assert len(alternatives) == 1
+    assert alternatives[0]["evidence_unit_id"] == alternative_id
+    assert alternatives[0]["source_section"] == "Results"
+
+
 def test_r6_numeric_claim_requires_page_or_structured_object() -> None:
     evidence_id = str(uuid.uuid4())
     work_id = uuid.uuid4()

@@ -20,6 +20,7 @@ from paperforge_worker.pipelines.quality import (
     SOFT_CHECK_THRESHOLD,
     SoftCheckFinding,
     build_quality_report,
+    claim_verification_cache_key,
     count_words,
     coverage_hints,
     soft_check_citations,
@@ -43,10 +44,29 @@ class _Stub:
         return LLMResponse(text=text, model="stub", provider="stub")
 
 
+class _SequenceStub:
+    def __init__(self, payloads: list[Any], calls: list[Any]) -> None:
+        self.payloads = list(payloads)
+        self.calls = calls
+
+    def generate(self, request):
+        self.calls.append(request)
+        payload = self.payloads.pop(0)
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        return LLMResponse(text=text, model="stub", provider="stub")
+
+
 def _runner(payload: Any, *, calls: list[Any] | None = None) -> LLMRunner:
     return LLMRunner(
         LLMConfig(provider="openai", base_url="http://stub", api_key="k"),
         provider=_Stub(payload, calls),
+    )
+
+
+def _sequence_runner(payloads: list[Any], *, calls: list[Any]) -> LLMRunner:
+    return LLMRunner(
+        LLMConfig(provider="openai", base_url="http://stub", api_key="k"),
+        provider=_SequenceStub(payloads, calls),
     )
 
 
@@ -433,6 +453,148 @@ async def test_claim_verifier_reuses_job_cache_for_an_unchanged_pair() -> None:
     assert second_summary["cache_hit_count"] == 1
     assert second_summary["status"] == "completed"
     assert second["support_status"] == "supported"
+
+
+async def test_claim_verifier_reuses_a_persistent_model_bound_cache_entry() -> None:
+    calls: list[Any] = []
+    runner = _runner({}, calls=calls)
+    anchor = _bilingual_anchor()
+    cache_key = claim_verification_cache_key(anchor, model=runner.model_for("verifier"))
+    cache = {
+        cache_key: {
+            "cache_key": cache_key,
+            "verdict": "supported",
+            "confidence": 0.98,
+            "reason": "The excerpt directly entails the complete claim.",
+            "model": runner.model_for("verifier"),
+            "cache_scope": "persistent",
+        }
+    }
+
+    summary = await verify_claim_evidence(
+        anchors=[anchor],
+        runner=runner,
+        cache=cache,
+        mode="shadow",
+    )
+
+    assert calls == []
+    assert summary["persistent_cache_hit_count"] == 1
+    assert summary["job_cache_hit_count"] == 0
+    assert anchor["entailment_cached"] is True
+    assert anchor["entailment_verdict"] == "supported"
+
+
+def test_claim_verification_cache_key_changes_with_the_configured_model() -> None:
+    anchor = _bilingual_anchor()
+
+    assert claim_verification_cache_key(
+        anchor, model="deepseek-v4-flash"
+    ) != claim_verification_cache_key(anchor, model="deepseek-v4-pro")
+
+
+async def test_negative_primary_does_not_demote_when_an_alternative_is_not_negative() -> None:
+    anchor = _bilingual_anchor(
+        claim_hash="unsafe-selection",
+        support_status="supported",
+        support_score=0.4,
+        evidence_excerpt="A figure overview mentions the treatment.",
+        _verification_alternatives=[
+            {
+                "evidence_excerpt": "The treatment significantly improved recovery.",
+                "evidence_hash": "alternative-evidence",
+                "evidence_unit_id": "result-unit",
+                "source_section": "Results",
+                "source_paragraph": 4,
+            }
+        ],
+    )
+    calls: list[Any] = []
+    runner = _sequence_runner(
+        [
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "unsupported",
+                        "confidence": 0.97,
+                        "reason": "The overview does not report the claimed result.",
+                    }
+                ]
+            },
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "supported",
+                        "confidence": 0.99,
+                        "reason": "The alternative result passage directly states the claim.",
+                    }
+                ]
+            },
+        ],
+        calls=calls,
+    )
+
+    summary = await verify_claim_evidence(
+        anchors=[anchor],
+        runner=runner,
+        cache={},
+        mode="enforce",
+    )
+
+    assert len(calls) == 2
+    assert summary["raw_would_demote_count"] == 1
+    assert summary["would_demote_count"] == 0
+    assert summary["unsafe_demotion_avoided_count"] == 1
+    assert summary["alternative_checked_count"] == 1
+    assert anchor["support_status"] == "supported"
+    assert anchor["entailment_review_json"]["status"] == "alternative_not_negative"
+
+
+async def test_incomplete_alternative_review_fails_safe_without_demotion() -> None:
+    anchor = _bilingual_anchor(
+        claim_hash="incomplete-selection-review",
+        support_status="supported",
+        support_score=0.4,
+        evidence_excerpt="A figure overview mentions the treatment.",
+        _verification_alternatives=[
+            {
+                "evidence_excerpt": "A separate located result passage.",
+                "evidence_hash": "alternative-evidence",
+                "source_section": "Results",
+            }
+        ],
+    )
+    calls: list[Any] = []
+    runner = _sequence_runner(
+        [
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "unsupported",
+                        "confidence": 0.97,
+                        "reason": "The overview does not report the claimed result.",
+                    }
+                ]
+            },
+            "not-json",
+        ],
+        calls=calls,
+    )
+
+    summary = await verify_claim_evidence(
+        anchors=[anchor],
+        runner=runner,
+        cache={},
+        mode="enforce",
+    )
+
+    assert summary["status"] == "partial"
+    assert summary["review_incomplete_count"] == 1
+    assert summary["would_demote_count"] == 0
+    assert anchor["support_status"] == "supported"
 
 
 async def test_cross_language_verifier_does_not_promote_partial_or_low_confidence_support() -> None:

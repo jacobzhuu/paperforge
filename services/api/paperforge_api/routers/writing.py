@@ -873,6 +873,14 @@ def _claim_evidence_response(row: ClaimEvidenceAnchor) -> ClaimEvidenceResponse:
         support_status=row.support_status,
         support_score=row.support_score,
         manual_status=row.manual_status,
+        entailment_verdict=row.entailment_verdict,
+        entailment_confidence=row.entailment_confidence,
+        entailment_reason=row.entailment_reason,
+        entailment_model=row.entailment_model,
+        entailment_verifier_version=row.entailment_verifier_version,
+        entailment_cached=row.entailment_cached,
+        entailment_review=row.entailment_review_json,
+        entailment_checked_at=row.entailment_checked_at,
     )
 
 

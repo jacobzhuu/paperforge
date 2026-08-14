@@ -27,6 +27,7 @@ CLAIM_SUPPORT_CONFIDENCE = 0.9
 CLAIM_DEMOTION_CONFIDENCE = 0.85
 MAX_CLAIM_EVIDENCE_CHECKS = 60
 CLAIM_EVIDENCE_BATCH_SIZE = 12
+MAX_CLAIM_EVIDENCE_ALTERNATIVES = 3
 CLAIM_VERIFIER_VERSION = "claim_evidence_v1"
 ClaimEntailmentMode = Literal["off", "shadow", "promote_only", "enforce"]
 CLAIM_ENTAILMENT_MODES = frozenset({"off", "shadow", "promote_only", "enforce"})
@@ -216,6 +217,11 @@ def build_claim_evidence(
 ) -> list[dict[str, Any]]:
     """从句级 PaperIR 构造论断—EvidenceUnit 矩阵并执行 R4/R5/R6。"""
     units_by_id = evidence_units or {}
+    units_by_work: dict[str, list[dict[str, Any]]] = {}
+    for evidence_unit in units_by_id.values():
+        unit_work_id = str(evidence_unit.get("work_id") or "")
+        if unit_work_id:
+            units_by_work.setdefault(unit_work_id, []).append(evidence_unit)
     anchors: list[dict[str, Any]] = []
     for row in rows:
         body = getattr(row, "body_ir_json", None) or {}
@@ -321,6 +327,15 @@ def build_claim_evidence(
                             source_kind = "fulltext"
                             support_status = "supported" if supported else "insufficient_support"
                         claim_hash = hashlib.sha256(sentence.encode()).hexdigest()
+                        verification_alternatives = _claim_verification_alternatives(
+                            claim=sentence,
+                            claim_kind=claim_kind,
+                            selected_unit=unit,
+                            work_id=source_work_id,
+                            all_units=units_by_work.get(source_work_id, []),
+                            quotable_points=source.get("quotable_points") or [],
+                            selected_excerpt=excerpt,
+                        )
                         anchors.append(
                             {
                                 "section_id": row.id,
@@ -349,6 +364,11 @@ def build_claim_evidence(
                                 "support_status": support_status,
                                 "support_score": score,
                                 "manual_status": "unreviewed",
+                                **(
+                                    {"_verification_alternatives": verification_alternatives}
+                                    if verification_alternatives
+                                    else {}
+                                ),
                             }
                         )
     return anchors
@@ -598,14 +618,133 @@ def _best_evidence_unit(
 ) -> dict[str, Any]:
     if not units:
         return {}
-    return max(
+    return _rank_evidence_units(units, claim=claim)[0]
+
+
+def _rank_evidence_units(
+    units: list[dict[str, Any]],
+    *,
+    claim: str,
+) -> list[dict[str, Any]]:
+    return sorted(
         units,
         key=lambda unit: (
             _support_score(claim, str(unit.get("text") or "")),
             bool(unit.get("page") is not None or unit.get("object_ref")),
             bool(unit.get("section_path") or unit.get("paragraph_index") is not None),
         ),
+        reverse=True,
     )
+
+
+def _claim_verification_alternatives(
+    *,
+    claim: str,
+    claim_kind: str,
+    selected_unit: dict[str, Any],
+    work_id: str,
+    all_units: list[dict[str, Any]],
+    quotable_points: list[Any],
+    selected_excerpt: str | None,
+) -> list[dict[str, Any]]:
+    """Keep a few independently located excerpts for conservative negative confirmation.
+
+    The primary anchor still follows the manuscript's explicit evidence binding.  Alternatives
+    are consulted only when that primary excerpt would cause a high-confidence demotion, avoiding
+    the unsafe inference that one lexical-best caption is the strongest passage in the cited work.
+    """
+    selected_id = str(selected_unit.get("id") or "")
+    candidates: list[dict[str, Any]] = []
+    seen_texts = {selected_excerpt} if selected_excerpt else set()
+    if work_id:
+        ranked_units = _rank_evidence_units(all_units, claim=claim)
+        # The unsafe production cases selected a terse A-grade figure caption because it shared
+        # more tokens than the actual result prose. Always inspect located prose first, while
+        # retaining one structured alternative for numeric/table evidence.
+        prose_units = [item for item in ranked_units if item.get("grade") == "B_located_prose"]
+        structured_units = [
+            item for item in ranked_units if item.get("grade") == "A_located_structured"
+        ]
+        ordered_units = [
+            *(prose_units[:1]),
+            *(structured_units[:1]),
+            *ranked_units,
+        ]
+        seen_units: set[int] = set()
+        for unit in ordered_units:
+            unit_identity = id(unit)
+            if unit_identity in seen_units:
+                continue
+            seen_units.add(unit_identity)
+            text = str(unit.get("text") or "").strip()
+            grade = str(unit.get("grade") or "")
+            located = bool(
+                unit.get("page") is not None
+                or unit.get("section_path")
+                or unit.get("paragraph_index") is not None
+                or unit.get("object_ref")
+            )
+            if (
+                not text
+                or str(unit.get("id") or "") == selected_id
+                or text in seen_texts
+                or grade == "D_abstract_only"
+                or not located
+                or not _evidence_grade_ok(claim_kind, claim, grade)
+                or (
+                    claim_kind == "numeric"
+                    and unit.get("page") is None
+                    and not unit.get("object_ref")
+                )
+            ):
+                continue
+            seen_texts.add(text)
+            candidates.append(
+                {
+                    "evidence_excerpt": text,
+                    "evidence_hash": hashlib.sha256(text.encode()).hexdigest(),
+                    "evidence_unit_id": str(unit.get("id") or "") or None,
+                    "source_page": unit.get("page"),
+                    "source_section": unit.get("section_path"),
+                    "source_paragraph": unit.get("paragraph_index"),
+                }
+            )
+            if len(candidates) >= MAX_CLAIM_EVIDENCE_ALTERNATIVES:
+                return candidates
+
+    ranked_points = sorted(
+        [
+            point
+            for point in quotable_points
+            if isinstance(point, dict)
+            and point.get("text")
+            and (
+                point.get("page") is not None
+                or point.get("section")
+                or point.get("paragraph") is not None
+            )
+        ],
+        key=lambda point: _support_score(claim, str(point.get("text") or "")),
+        reverse=True,
+    )
+    for point in ranked_points:
+        text = str(point.get("text") or "").strip()
+        if not text or text in seen_texts:
+            continue
+        seen_texts.add(text)
+        candidates.append(
+            {
+                "evidence_excerpt": text,
+                "evidence_hash": hashlib.sha256(text.encode()).hexdigest(),
+                "evidence_unit_id": None,
+                "source_page": point.get("page"),
+                "source_section": point.get("section"),
+                "source_paragraph": point.get("paragraph"),
+            }
+        )
+        if len(candidates) >= MAX_CLAIM_EVIDENCE_ALTERNATIVES:
+            break
+    return candidates
 
 
 def _evidence_grade_ok(claim_kind: str, text: str, grade: str) -> bool:
@@ -1252,16 +1391,37 @@ def _claim_evidence_candidates(
     return candidates
 
 
-def _claim_verification_cache_key(anchor: dict[str, Any]) -> str:
+def claim_verification_cache_key(anchor: dict[str, Any], *, model: str) -> str:
     material = "\0".join(
         (
             CLAIM_VERIFIER_VERSION,
+            model,
             str(anchor.get("claim_kind") or ""),
             str(anchor.get("claim_text") or ""),
             str(anchor.get("evidence_excerpt") or ""),
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def claim_verification_cache_keys(
+    anchors: list[dict[str, Any]],
+    *,
+    model: str,
+) -> set[str]:
+    """Return primary and possible negative-confirmation keys for one quality pass."""
+    keys: set[str] = set()
+    for _anchor_index, anchor in _claim_evidence_candidates(anchors):
+        keys.add(claim_verification_cache_key(anchor, model=model))
+        for alternative in anchor.get("_verification_alternatives") or []:
+            if isinstance(alternative, dict) and alternative.get("evidence_excerpt"):
+                keys.add(
+                    claim_verification_cache_key(
+                        {**anchor, **alternative},
+                        model=model,
+                    )
+                )
+    return keys
 
 
 def _normalize_claim_judgement(item: Any) -> dict[str, Any] | None:
@@ -1282,11 +1442,24 @@ def _normalize_claim_judgement(item: Any) -> dict[str, Any] | None:
     reason = str(item.get("reason") or "").strip()[:300]
     if not reason:
         return None
-    return {
+    normalized = {
         "verdict": verdict,
         "confidence": min(1.0, max(0.0, float(raw_confidence))),
         "reason": reason,
     }
+    for key in (
+        "model",
+        "claim_hash",
+        "evidence_hash",
+        "claim_kind",
+        "verifier_version",
+        "cache_scope",
+        "cache_key",
+    ):
+        value = item.get(key)
+        if value is not None:
+            normalized[key] = str(value)
+    return normalized
 
 
 def _apply_claim_judgement(
@@ -1294,6 +1467,10 @@ def _apply_claim_judgement(
     judgement: dict[str, Any],
     *,
     mode: ClaimEntailmentMode,
+    model: str,
+    cached: bool,
+    demotion_confirmed: bool | None = None,
+    evidence_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     verdict = str(judgement["verdict"])
     confidence = float(judgement["confidence"])
@@ -1303,7 +1480,8 @@ def _apply_claim_judgement(
         verdict in {"unsupported", "contradicted"} and confidence >= CLAIM_DEMOTION_CONFIDENCE
     )
     would_promote = supported and not was_supported
-    would_demote = contradicted and was_supported
+    raw_would_demote = contradicted and was_supported
+    would_demote = raw_would_demote and demotion_confirmed is not False
     promoted = would_promote and mode in {"promote_only", "enforce"}
     demoted = would_demote and mode == "enforce"
     if promoted:
@@ -1312,16 +1490,32 @@ def _apply_claim_judgement(
     if demoted:
         anchor["support_status"] = "insufficient_support"
         anchor["support_score"] = None
+    anchor.update(
+        {
+            "entailment_verdict": verdict,
+            "entailment_confidence": confidence,
+            "entailment_reason": str(judgement["reason"]),
+            "entailment_model": str(judgement.get("model") or model),
+            "entailment_verifier_version": CLAIM_VERIFIER_VERSION,
+            "entailment_cached": cached,
+            "entailment_review_json": evidence_review,
+            "entailment_checked_at": datetime.now(UTC),
+        }
+    )
     return {
         "claim_hash": str(anchor.get("claim_hash") or ""),
         "cite_key": str(anchor.get("cite_key") or ""),
         "verdict": verdict,
         "confidence": round(confidence, 3),
         "reason": str(judgement["reason"]),
+        "model": str(judgement.get("model") or model),
         "would_promote": would_promote,
         "would_demote": would_demote,
+        "raw_would_demote": raw_would_demote,
         "promoted": promoted,
         "demoted": demoted,
+        "cached": cached,
+        **({"evidence_review": evidence_review} if evidence_review else {}),
     }
 
 
@@ -1368,101 +1562,259 @@ async def verify_claim_evidence(
         "scheduled_count": 0 if resolved_mode == "off" else len(candidates),
         "checked_count": 0,
         "would_promote_count": 0,
+        "raw_would_demote_count": 0,
         "would_demote_count": 0,
         "promoted_count": 0,
         "demoted_count": 0,
         "failed_count": 0 if resolved_mode == "off" else len(all_candidates),
         "unverified_count": len(all_candidates),
         "cache_hit_count": 0,
+        "persistent_cache_hit_count": 0,
+        "job_cache_hit_count": 0,
         "model_checked_count": 0,
+        "alternative_checked_count": 0,
+        "alternative_failed_count": 0,
+        "alternative_cache_hit_count": 0,
+        "alternative_model_checked_count": 0,
+        "unsafe_demotion_avoided_count": 0,
+        "review_incomplete_count": 0,
         "judgements": [],
     }
     if not all_candidates or resolved_mode == "off":
         return summary
 
-    checked_indexes: set[int] = set()
-    pending: list[tuple[int, tuple[int, dict[str, Any]]]] = []
-    for candidate_index, candidate in enumerate(candidates):
-        _anchor_index, anchor = candidate
-        cached = (
-            _normalize_claim_judgement(cache.get(_claim_verification_cache_key(anchor)))
-            if cache is not None
-            else None
-        )
-        if cached is None:
-            pending.append((candidate_index, candidate))
-            continue
-        checked_indexes.add(candidate_index)
-        applied = _apply_claim_judgement(anchor, cached, mode=resolved_mode)
-        applied["cached"] = True
-        summary["judgements"].append(applied)
-        summary["would_promote_count"] += int(applied["would_promote"])
-        summary["would_demote_count"] += int(applied["would_demote"])
-        summary["promoted_count"] += int(applied["promoted"])
-        summary["demoted_count"] += int(applied["demoted"])
-        summary["cache_hit_count"] += 1
+    verifier_model = (
+        str(runner.model_for("verifier"))
+        if runner is not None and callable(getattr(runner, "model_for", None))
+        else "unknown-verifier"
+    )
 
-    if runner is not None and runner.enabled:
+    def pair_payload(pair_index: int, anchor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "index": pair_index,
+            "claim_kind": str(anchor.get("claim_kind") or ""),
+            "claim": str(anchor.get("claim_text") or "")[:600],
+            "evidence": str(anchor.get("evidence_excerpt") or "")[:1600],
+            "locator": {
+                "page": anchor.get("source_page"),
+                "section": anchor.get("source_section"),
+                "paragraph": anchor.get("source_paragraph"),
+            },
+        }
+
+    def enriched_cache_entry(
+        anchor: dict[str, Any],
+        judgement: dict[str, Any],
+        cache_key: str,
+    ) -> dict[str, Any]:
+        claim_text = str(anchor.get("claim_text") or "")
+        evidence = str(anchor.get("evidence_excerpt") or "")
+        return {
+            **judgement,
+            "cache_key": cache_key,
+            "claim_hash": str(
+                anchor.get("claim_hash") or hashlib.sha256(claim_text.encode()).hexdigest()
+            ),
+            "evidence_hash": str(
+                anchor.get("evidence_hash") or hashlib.sha256(evidence.encode()).hexdigest()
+            ),
+            "claim_kind": str(anchor.get("claim_kind") or ""),
+            "verifier_version": CLAIM_VERIFIER_VERSION,
+            "model": verifier_model,
+            "cache_scope": "job",
+        }
+
+    async def resolve_pairs(
+        pairs_to_resolve: list[tuple[int, dict[str, Any]]],
+        *,
+        alternative: bool,
+    ) -> dict[int, tuple[dict[str, Any], bool]]:
+        resolved: dict[int, tuple[dict[str, Any], bool]] = {}
+        pending: list[tuple[int, dict[str, Any], str]] = []
+        for pair_index, anchor in pairs_to_resolve:
+            key = claim_verification_cache_key(anchor, model=verifier_model)
+            cached_judgement = (
+                _normalize_claim_judgement(cache.get(key)) if cache is not None else None
+            )
+            if cached_judgement is None:
+                pending.append((pair_index, anchor, key))
+                continue
+            resolved[pair_index] = (cached_judgement, True)
+            summary["cache_hit_count"] += 1
+            if cached_judgement.get("cache_scope") == "persistent":
+                summary["persistent_cache_hit_count"] += 1
+            else:
+                summary["job_cache_hit_count"] += 1
+            if alternative:
+                summary["alternative_cache_hit_count"] += 1
+
+        if runner is None or not runner.enabled:
+            return resolved
         for batch_start in range(0, len(pending), CLAIM_EVIDENCE_BATCH_SIZE):
             batch = pending[batch_start : batch_start + CLAIM_EVIDENCE_BATCH_SIZE]
-            batch_by_index = {candidate_index: candidate for candidate_index, candidate in batch}
-            pairs = [
-                {
-                    "index": candidate_index,
-                    "claim_kind": str(anchor.get("claim_kind") or ""),
-                    "claim": str(anchor.get("claim_text") or "")[:600],
-                    "evidence": str(anchor.get("evidence_excerpt") or "")[:1600],
-                    "locator": {
-                        "page": anchor.get("source_page"),
-                        "section": anchor.get("source_section"),
-                        "paragraph": anchor.get("source_paragraph"),
-                    },
-                }
-                for candidate_index, (_anchor_index, anchor) in batch
-            ]
+            batch_by_index = {pair_index: (anchor, key) for pair_index, anchor, key in batch}
             try:
                 result = await runner.agenerate_json(
                     "verifier",
                     system_prompt=_CLAIM_EVIDENCE_PROMPT,
-                    user_prompt=json.dumps({"pairs": pairs}, ensure_ascii=False),
+                    user_prompt=json.dumps(
+                        {
+                            "pairs": [
+                                pair_payload(pair_index, anchor)
+                                for pair_index, anchor, _key in batch
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
                     max_output_tokens=2400,
                     temperature=0.0,
-                    metadata={"stage": "claim_evidence_gate"},
+                    metadata={
+                        "stage": "claim_evidence_gate",
+                        "evidence_pass": "alternative" if alternative else "primary",
+                    },
                 )
-            except Exception:  # noqa: BLE001 - verification failure must not fail the complete job
+            except Exception:  # noqa: BLE001 - verifier failure must not fail the quality job
                 continue
             if not result.ok or not isinstance(result.value, dict):
                 continue
             for item in result.value.get("judgements") or []:
                 if not isinstance(item, dict):
                     continue
-                candidate_index = item.get("index")
+                pair_index = item.get("index")
                 if (
-                    not isinstance(candidate_index, int)
-                    or candidate_index not in batch_by_index
-                    or candidate_index in checked_indexes
+                    not isinstance(pair_index, int)
+                    or pair_index not in batch_by_index
+                    or pair_index in resolved
                 ):
                     continue
                 judgement = _normalize_claim_judgement(item)
                 if judgement is None:
                     continue
-                checked_indexes.add(candidate_index)
-                _anchor_index, anchor = batch_by_index[candidate_index]
+                anchor, key = batch_by_index[pair_index]
+                entry = enriched_cache_entry(anchor, judgement, key)
                 if cache is not None:
-                    cache[_claim_verification_cache_key(anchor)] = judgement
-                applied = _apply_claim_judgement(anchor, judgement, mode=resolved_mode)
-                applied["cached"] = False
-                summary["judgements"].append(applied)
-                summary["would_promote_count"] += int(applied["would_promote"])
-                summary["would_demote_count"] += int(applied["would_demote"])
-                summary["promoted_count"] += int(applied["promoted"])
-                summary["demoted_count"] += int(applied["demoted"])
-                summary["model_checked_count"] += 1
+                    cache[key] = entry
+                resolved[pair_index] = (entry, False)
+                if alternative:
+                    summary["alternative_model_checked_count"] += 1
+                else:
+                    summary["model_checked_count"] += 1
+        return resolved
 
+    primary_pairs = [
+        (candidate_index, anchor)
+        for candidate_index, (_anchor_index, anchor) in enumerate(candidates)
+    ]
+    primary_results = await resolve_pairs(primary_pairs, alternative=False)
+
+    review_targets: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    alternative_pairs: list[tuple[int, dict[str, Any]]] = []
+    alternative_index = 0
+    for candidate_index, (_anchor_index, anchor) in enumerate(candidates):
+        result = primary_results.get(candidate_index)
+        if result is None:
+            continue
+        judgement, _cached = result
+        negative = (
+            anchor.get("support_status") == "supported"
+            and judgement["verdict"] in {"unsupported", "contradicted"}
+            and float(judgement["confidence"]) >= CLAIM_DEMOTION_CONFIDENCE
+        )
+        alternatives = [
+            {**anchor, **alternative}
+            for alternative in anchor.get("_verification_alternatives") or []
+            if isinstance(alternative, dict) and alternative.get("evidence_excerpt")
+        ]
+        if not negative or not alternatives:
+            continue
+        target_pairs: list[tuple[int, dict[str, Any]]] = []
+        for alternative in alternatives:
+            target_pairs.append((alternative_index, alternative))
+            alternative_pairs.append((alternative_index, alternative))
+            alternative_index += 1
+        review_targets[candidate_index] = target_pairs
+
+    alternative_results = await resolve_pairs(alternative_pairs, alternative=True)
+    summary["alternative_checked_count"] = len(alternative_results)
+    summary["alternative_failed_count"] = len(alternative_pairs) - len(alternative_results)
+
+    for candidate_index, (_anchor_index, anchor) in enumerate(candidates):
+        primary = primary_results.get(candidate_index)
+        if primary is None:
+            continue
+        judgement, cached = primary
+        demotion_confirmed: bool | None = None
+        evidence_review: dict[str, Any] | None = None
+        target_pairs = review_targets.get(candidate_index)
+        if target_pairs:
+            reviewed = [
+                (alternative, alternative_results.get(pair_index))
+                for pair_index, alternative in target_pairs
+            ]
+            complete = all(result is not None for _alternative, result in reviewed)
+            all_negative = complete and all(
+                result is not None
+                and result[0]["verdict"] in {"unsupported", "contradicted"}
+                and float(result[0]["confidence"]) >= CLAIM_DEMOTION_CONFIDENCE
+                for _alternative, result in reviewed
+            )
+            demotion_confirmed = bool(all_negative)
+            if not complete:
+                summary["review_incomplete_count"] += 1
+            if not demotion_confirmed:
+                summary["unsafe_demotion_avoided_count"] += 1
+            evidence_review = {
+                "status": (
+                    "confirmed_negative"
+                    if demotion_confirmed
+                    else "incomplete"
+                    if not complete
+                    else "alternative_not_negative"
+                ),
+                "alternative_count": len(reviewed),
+                "checked_count": sum(result is not None for _alternative, result in reviewed),
+                "alternatives": [
+                    {
+                        "evidence_hash": str(alternative.get("evidence_hash") or ""),
+                        "evidence_unit_id": alternative.get("evidence_unit_id"),
+                        "source_page": alternative.get("source_page"),
+                        "source_section": alternative.get("source_section"),
+                        "source_paragraph": alternative.get("source_paragraph"),
+                        **(
+                            {
+                                "verdict": result[0]["verdict"],
+                                "confidence": round(float(result[0]["confidence"]), 3),
+                                "reason": result[0]["reason"],
+                                "cached": result[1],
+                            }
+                            if result is not None
+                            else {"verdict": "unverified"}
+                        ),
+                    }
+                    for alternative, result in reviewed
+                ],
+            }
+        applied = _apply_claim_judgement(
+            anchor,
+            judgement,
+            mode=resolved_mode,
+            model=verifier_model,
+            cached=cached,
+            demotion_confirmed=demotion_confirmed,
+            evidence_review=evidence_review,
+        )
+        summary["judgements"].append(applied)
+        summary["would_promote_count"] += int(applied["would_promote"])
+        summary["raw_would_demote_count"] += int(applied["raw_would_demote"])
+        summary["would_demote_count"] += int(applied["would_demote"])
+        summary["promoted_count"] += int(applied["promoted"])
+        summary["demoted_count"] += int(applied["demoted"])
+
+    checked_indexes = set(primary_results)
     summary["checked_count"] = len(checked_indexes)
     summary["failed_count"] = len(all_candidates) - len(checked_indexes)
     summary["unverified_count"] = summary["failed_count"]
-    if len(checked_indexes) == len(all_candidates):
+    if len(checked_indexes) == len(all_candidates) and not summary["review_incomplete_count"]:
         summary["status"] = "completed"
     elif checked_indexes:
         summary["status"] = "partial"
@@ -1687,6 +2039,8 @@ __all__ = [
     "build_depth_metrics",
     "build_original_claim_grounding",
     "build_quality_report",
+    "claim_verification_cache_key",
+    "claim_verification_cache_keys",
     "asset_text_support_score",
     "asset_numeric_support_score",
     "classify_claim",

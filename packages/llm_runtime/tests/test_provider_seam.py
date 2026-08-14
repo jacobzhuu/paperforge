@@ -344,6 +344,71 @@ def test_runner_does_not_retry_forever_on_truncation():
     assert len(attempts) == 2
 
 
+@pytest.mark.asyncio
+async def test_json_truncation_recovery_has_one_shared_retry_budget():
+    """JSON parsing must not start a second retry sequence after ``generate`` already retried."""
+    import httpx
+    from llm_runtime import LLMConfig, LLMRunner
+    from llm_runtime.providers import OpenAICompatibleLLMProvider
+
+    budgets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        budgets.append(payload["max_tokens"])
+        if len(budgets) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": "…",
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": '{"items": ['},
+                    }
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="http://stub/v1",
+        api_key="k",
+        model="deepseek-v4-pro",
+        timeout_seconds=5.0,
+        max_retries=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    runner = LLMRunner(
+        LLMConfig(provider="openai", base_url="http://stub/v1", api_key="k"),
+        provider=provider,
+    )
+
+    result = await runner.agenerate_json(
+        "planner",
+        system_prompt="s",
+        user_prompt="u",
+        max_output_tokens=1000,
+    )
+
+    assert result.ok is False
+    assert result.error == "invalid_json: JSONDecodeError"
+    assert budgets == [1000, 2000]
+
+
 def test_a_new_role_inherits_the_built_in_thinking_policy():
     """部署的 LLM_ROLE_THINKING 是写死的全量映射，不会因为代码新增角色而更新。
 

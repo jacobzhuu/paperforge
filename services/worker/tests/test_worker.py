@@ -30,10 +30,11 @@ def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
     settings = worker_config.WorkerSettings(_env_file=None)
     assert settings.card_concurrency == 6
     assert settings.qmatrix_concurrency == 4
-    assert settings.claim_entailment_mode == "promote_only"
+    assert settings.claim_entailment_mode == "shadow"
     llm = settings.llm_config()
     assert llm.thinking_for_role("extractor") == "disabled"
     assert llm.thinking_for_role("reranker") == "disabled"
+    assert llm.thinking_for_role("verifier") == "disabled"
     assert llm.thinking_for_role("writer") is None
 
 

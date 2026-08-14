@@ -1013,6 +1013,14 @@ export interface ClaimEvidence {
   support_status: string;
   support_score?: number | null;
   manual_status: 'unreviewed' | 'confirmed' | 'rejected';
+  entailment_verdict?: 'supported' | 'partial' | 'unsupported' | 'contradicted' | 'uncertain' | null;
+  entailment_confidence?: number | null;
+  entailment_reason?: string | null;
+  entailment_model?: string | null;
+  entailment_verifier_version?: string | null;
+  entailment_cached?: boolean | null;
+  entailment_review?: Record<string, unknown> | null;
+  entailment_checked_at?: string | null;
 }
 
 export type RefineAction = 'polish' | 'expand' | 'shorten' | 'academic_tone';

@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -137,7 +137,7 @@ class LLMRunner:
                 and _retry_on_truncation
                 and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
             ):
-                return self.generate(
+                retried = self.generate(
                     role,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
@@ -146,6 +146,14 @@ class LLMRunner:
                     json_output=json_output,
                     metadata={**(metadata or {}), "retry": "output_truncated"},
                     _retry_on_truncation=False,
+                )
+                return (
+                    replace(
+                        retried,
+                        truncation_retries=retried.truncation_retries + 1,
+                    )
+                    if retried is not None
+                    else None
                 )
             return None
         except Exception as error:  # noqa: BLE001 - 任何 provider 崩溃都降级
@@ -182,6 +190,7 @@ class LLMRunner:
         temperature: float = 0.0,
         json_output: bool = False,
         metadata: dict[str, Any] | None = None,
+        _retry_on_truncation: bool = True,
     ) -> LLMResponse | None:
         """异步包装：provider 是同步 httpx 实现，放线程池执行以免阻塞事件循环。"""
         return await asyncio.to_thread(
@@ -193,6 +202,7 @@ class LLMRunner:
             temperature=temperature,
             json_output=json_output,
             metadata=metadata,
+            _retry_on_truncation=_retry_on_truncation,
         )
 
     async def agenerate_json(
@@ -223,6 +233,7 @@ class LLMRunner:
             temperature=temperature,
             json_output=True,
             metadata=metadata,
+            _retry_on_truncation=_retry_on_truncation,
         )
         if response is None:
             return JsonResult(value=None, error="llm_call_failed")
@@ -240,6 +251,7 @@ class LLMRunner:
             if (
                 _retry_on_truncation
                 and response.finish_reason == "length"
+                and response.truncation_retries == 0
                 and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
             ):
                 return await self.agenerate_json(
