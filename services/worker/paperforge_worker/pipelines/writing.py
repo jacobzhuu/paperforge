@@ -1277,14 +1277,13 @@ def enforce_sentence_evidence_rules(
             if units and grade_ok and comparable and located:
                 continue
             if claim_kind == "comparison" and units and not comparable:
-                sentence["text"] = (
-                    "这些证据采用不同的任务、数据集、指标或划分，结果应分别陈述。"
-                    if language == "zh"
-                    else (
-                        "These evidence units use different tasks, datasets, metrics, "
-                        "or splits; their results must be reported separately."
-                    )
-                )
+                # 不可比的跨研究比较必须从正文里拿掉，而不是换成一句「结果应分别陈述」。
+                # 那句话是写给系统看的判定说明，不是作者的论述：它出现在成稿里读起来
+                # 就是一行模板（实测出现在项目 6a6bbf18 的 s4 正文中段）。下面
+                # R6/R4 分支早就确立了正确做法——句子留在审计记录里，正文里删掉。
+                sentence["text"] = ""
+                sentence["cite_keys"] = []
+                sentence["evidence_ids"] = []
                 sentence["downgraded_reason"] = "R5_not_comparable"
             elif units and all(unit.get("grade") == "D_abstract_only" for unit in units):
                 original = str(sentence.get("text") or "")
@@ -1488,6 +1487,15 @@ def inspect_section_draft(
                 detail=draft.failure_reason or "no model output",
             )
         ]
+    if draft.generator == "deterministic_search_log":
+        # 检索方法节是**故意**确定性生成的：它是一份检索日志，不是论证。拿正文的
+        # 篇幅线去量它，会把一节正确的产物判成没写成，然后反复重写——而重写只会
+        # 再确定性地生成同一段文字。
+        return (
+            []
+            if any(str(p.get("text") or "").strip() for p in draft.paragraphs)
+            else [SectionDefect(code="not_generated", detail="empty search log")]
+        )
 
     defects: list[SectionDefect] = []
     minimum = (

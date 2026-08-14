@@ -465,6 +465,29 @@ async def test_a_manuscript_with_an_unrecoverable_section_is_not_complete(
     assert outcome.to_payload()["complete"] is False
 
 
+def test_a_deterministic_search_log_is_not_judged_by_prose_length() -> None:
+    """检索方法节是**故意**确定性生成的检索日志，不是论证。
+
+    拿正文的篇幅线去量它，会把一节正确的产物判成没写成，然后反复重写——而重写只会
+    再确定性地生成同一段文字，稿子还会被判定为不完整、卡住交付。
+    """
+    draft = SectionDraft(section_key="search_methods", title="检索方法")
+    draft.generator = "deterministic_search_log"
+    draft.paragraphs = [
+        {"text": "检索式：natural product AND signalling；共 3 个来源。", "cite_keys": []}
+    ]
+
+    assert draft.has_body
+    assert inspect_section_draft(draft, language="zh") == []
+
+    empty = SectionDraft(section_key="search_methods", title="检索方法")
+    empty.generator = "deterministic_search_log"
+    empty.paragraphs = [{"text": "   ", "cite_keys": []}]
+    assert [defect.code for defect in inspect_section_draft(empty, language="zh")] == [
+        "not_generated"
+    ]
+
+
 def test_write_outcome_is_only_complete_when_every_section_has_prose() -> None:
     outcome = WriteOutcome()
     outcome.section_count = 7

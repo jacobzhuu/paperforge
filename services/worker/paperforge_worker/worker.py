@@ -3043,8 +3043,10 @@ async def run_full_pipeline(
             and quality_outcome.readiness_status not in RENDERABLE_READINESS
         ):
             await _finish_needs_input(context, quality_outcome)
-        elif not _stage_scalar(context, "write", "complete", write_outcome):
+        elif _stage_scalar(context, "write", "complete", write_outcome) is False:
             # 修复轮跑完仍然有章节没有正文。产物保留可查，但这不是一篇交付稿。
+            # 只认显式的 False：``None`` 是「这条 checkpoint 早于完整性判据」，
+            # 不是「不完整」。
             await _finish_incomplete(context, write_outcome, quality_outcome)
         else:
             delivered = export_outcome is not None or bool(context.stage_payload("render"))
@@ -3224,13 +3226,19 @@ async def _finish_write_outcome(context: JobContext, outcome: Any) -> None:
     ``section_count`` 曾经是唯一判据，于是「11 节里 5 节只有一句占位」也记成成功。
     产物照旧留在库里可看可改，但任务状态不再声称这是一篇写完的稿子。
     """
-    if outcome is None or not outcome.section_count:
+    # 续跑时 write 阶段会被跳过，outcome 为 None 而正文确实在库里——此时判据只能
+    # 从 checkpoint 取，否则一次「继续」会把一篇写好的稿子标成失败。
+    section_count = _stage_scalar(context, "write", "section_count", outcome)
+    if not section_count:
         await _finish(context, delivered=False)
         return
-    if outcome.complete:
-        await _finish(context, delivered=True)
+    complete = _stage_scalar(context, "write", "complete", outcome)
+    if complete is False:
+        await _finish_incomplete(context, outcome, None)
         return
-    await _finish_incomplete(context, outcome, None)
+    # ``None`` 表示这条 checkpoint 早于完整性判据存在（旧任务续跑），无从判断，
+    # 不能凭空指控它不完整。
+    await _finish(context, delivered=True)
 
 
 async def _finish_incomplete(context: JobContext, write_outcome: Any, quality_report: Any) -> None:

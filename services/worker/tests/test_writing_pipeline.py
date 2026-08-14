@@ -98,6 +98,56 @@ def test_evidence_downgrade_keeps_audit_reason_out_of_body_prose() -> None:
     assert result[0]["text"] == ""
 
 
+def test_a_non_comparable_comparison_is_dropped_not_replaced_with_boilerplate() -> None:
+    """R5 也不许把判定说明写进正文。
+
+    此前不可比的比较句会被替换成「这些证据采用不同的任务、数据集、指标或划分，
+    结果应分别陈述。」——那是写给系统看的判词，出现在成稿里就是一行模板。实测它
+    出现在项目 6a6bbf18 的 s4 正文中段，夹在两段正常论述之间。
+    """
+    paragraphs = [
+        {
+            "sentences": [
+                {
+                    "text": "方法 A 在准确率上优于方法 B。",
+                    "cite_keys": ["lewis2020retrieval"],
+                    "evidence_ids": ["e-1", "e-2"],
+                }
+            ]
+        }
+    ]
+    evidence_by_id = {
+        "e-1": {
+            "grade": "A_located_structured",
+            "page": 3,
+            "measurements": [{"comparability_key": "task=qa|dataset=nq"}],
+        },
+        "e-2": {
+            "grade": "A_located_structured",
+            "page": 7,
+            "measurements": [{"comparability_key": "task=summarisation|dataset=cnn"}],
+        },
+    }
+    result = enforce_sentence_evidence_rules(
+        paragraphs,
+        evidence_by_id=evidence_by_id,
+        language="zh",
+    )
+
+    body = " ".join(paragraph.get("text", "") for paragraph in result)
+    assert "结果应分别陈述" not in body
+    assert "不同的任务、数据集" not in body
+    # 整段被删空时会被移出返回值，审计记录留在原段落对象上（原地改写）。
+    downgraded = [
+        sentence
+        for paragraph in paragraphs
+        for sentence in paragraph.get("downgraded_sentences") or []
+    ]
+    assert [item["downgraded_reason"] for item in downgraded] == ["R5_not_comparable"]
+    # 判定理由必须留在审计记录里——删掉正文不等于删掉证据。
+    assert downgraded[0]["text"] == ""
+
+
 def _context() -> WritingContext:
     return WritingContext(
         outline={"topic": "RAG", "research_question": "How does RAG work?", "sections": [SECTION]},
