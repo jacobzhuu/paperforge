@@ -11,7 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.paper import CitationUsage, Outline, PaperDocument, PaperSection
 
-SECTION_STATUSES = frozenset({"generated", "edited", "approved"})
+# ``needs_rewrite`` 是「这一节没有正文」——写作降级留下的缺口，不是一份粗糙的初稿。
+# 质量门据此产出阻断项，编辑器据此打徽标；两边都必须能和 ``generated`` 区分开。
+SECTION_STATUSES = frozenset({"generated", "edited", "approved", "needs_rewrite"})
 OUTLINE_STATUSES = frozenset({"draft", "confirmed"})
 
 

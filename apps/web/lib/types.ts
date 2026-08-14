@@ -580,7 +580,8 @@ export interface PaperSection {
   section_key: string;
   title: string;
   order_no: number;
-  status: 'generated' | 'edited' | 'approved';
+  /** `needs_rewrite`：写作降级留下的缺口，这一节没有正文，只有一句说明。 */
+  status: 'generated' | 'edited' | 'approved' | 'needs_rewrite';
   model?: string | null;
   cite_keys: string[];
   body_ir: SectionIR | Record<string, never>;

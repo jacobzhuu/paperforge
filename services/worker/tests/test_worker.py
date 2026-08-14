@@ -35,7 +35,9 @@ def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
     assert llm.thinking_for_role("extractor") == "disabled"
     assert llm.thinking_for_role("reranker") == "disabled"
     assert llm.thinking_for_role("verifier") == "disabled"
-    assert llm.thinking_for_role("writer") is None
+    # 写作角色的输出（一节正文 + 逐句 evidence_ids）和推理抢同一份 max_output_tokens，
+    # 而 deepseek 系被 clamp 在 8192：开着思考就会零内容返回并降级。
+    assert llm.thinking_for_role("writer") == "disabled"
 
 
 def test_worker_rejects_unknown_claim_entailment_mode():

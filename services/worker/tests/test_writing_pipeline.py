@@ -252,6 +252,58 @@ async def test_llm_failure_falls_back_to_deterministic_section() -> None:
     assert set(draft.paragraphs[-1]["cite_keys"]) <= WHITELIST
 
 
+async def test_write_failure_never_pastes_evidence_text_into_the_body() -> None:
+    """降级不得把证据原文当正文交出去。
+
+    回归自项目 6a6bbf18（2026-08-14）：writer 两次都 `output_truncated`，降级路径
+    把大纲提示语和一整段英文 PDF 原文（连原文献自己的 (Zipfel, 2014) 标注一起）
+    写成了中文综述的正文段落。这是逐字复制他人正文，不只是质量差。
+    """
+    verbatim = (
+        "Given that P. polymyxa could favorably alter the soil microbiome ( 34 ), "
+        "we investigated whether the AIP QS autoinducers could shape the rhizosphere "
+        "microbiome as reported by Zipfel, 2014."
+    )
+    section = {
+        **SECTION,
+        "question_id": "q-1",
+        "summary": "回答该子问题；当前证据状态：一致。",
+    }
+    outline = {
+        "sections": [section],
+        "sub_question_bundles": [
+            {
+                "question_id": "q-1",
+                "evidence": [
+                    {
+                        "evidence_id": "e-1",
+                        "cite_key": "lewis2020retrieval",
+                        "text": verbatim,
+                        "grade": "B_located_prose",
+                    }
+                ],
+            }
+        ],
+    }
+    runner, _provider = _runner(["not json"])
+    draft = await write_section(
+        section=section,
+        cards=CARDS,
+        whitelist=WHITELIST,
+        context=WritingContext(outline=outline, language="zh"),
+        runner=runner,
+    )
+
+    assert draft.generator == "deterministic_fallback"
+    body = " ".join(paragraph["text"] for paragraph in draft.paragraphs)
+    assert verbatim not in body
+    assert "P. polymyxa" not in body
+    assert "Zipfel" not in body
+    # 大纲 summary 是写给模型的指令，同样不是正文。
+    assert section["summary"] not in body
+    assert draft.paragraphs[0]["needs_rewrite"] is True
+
+
 async def test_without_runner_uses_deterministic_paragraphs() -> None:
     draft = await write_section(
         section=SECTION,
@@ -261,7 +313,10 @@ async def test_without_runner_uses_deterministic_paragraphs() -> None:
         runner=None,
     )
     assert draft.generator == "deterministic"
-    assert len(draft.paragraphs) >= 2
+    # 没有写作模型就没有正文——留一句「待重写」，而不是拿大纲提示语和素材凑一段。
+    assert len(draft.paragraphs) == 1
+    assert draft.paragraphs[0]["needs_rewrite"] is True
+    assert SECTION["summary"] not in draft.paragraphs[0]["text"]
 
 
 # ---- 连贯性 pass ----
@@ -786,7 +841,7 @@ def test_summarize_paragraphs_takes_first_sentences() -> None:
 
 
 def test_deterministic_paragraphs_without_evidence_never_reuses_unscoped_cards() -> None:
-    paragraphs = deterministic_paragraphs(SECTION, CARDS, {"lewis2020retrieval"})
+    paragraphs = deterministic_paragraphs(SECTION)
     texts = " ".join(p["text"] for p in paragraphs)
     assert "no evidence meeting" in texts
     assert "Introduces RAG combining a retriever with a generator." not in texts
@@ -794,13 +849,7 @@ def test_deterministic_paragraphs_without_evidence_never_reuses_unscoped_cards()
 
 
 def test_deterministic_paragraphs_without_evidence_exposes_a_gap_not_library_cards() -> None:
-    paragraphs = deterministic_paragraphs(
-        {"title": "跨研究比较"},
-        CARDS,
-        {"lewis2020retrieval", "gao2023survey"},
-        evidence=[],
-        language="zh",
-    )
+    paragraphs = deterministic_paragraphs({"title": "跨研究比较"}, language="zh")
     texts = " ".join(p["text"] for p in paragraphs)
     assert "尚无满足定位与可比性要求的证据" in texts
     assert "Introduces RAG" not in texts

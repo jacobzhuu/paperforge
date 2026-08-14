@@ -663,6 +663,13 @@ async def _persist_draft(
         )
 
 
+# 这几个 generator 的含义是「这一节没有正文」：模型没给出可用输出，降级只留下一句说明。
+# 必须和 `generated` 区分开落库，质量门才报得出 section_not_generated，编辑器才标得出来。
+# `evidence_gap_skeleton` 不在此列——那是证据不足，已由 placeholders_present 覆盖，
+# 作者要做的是补来源而不是重跑这一节。
+_NOT_GENERATED_GENERATORS = frozenset({"deterministic", "deterministic_fallback", "failed"})
+
+
 async def _upsert_draft(
     session,
     *,
@@ -690,6 +697,7 @@ async def _upsert_draft(
         body_ir=body_ir,
         cite_keys=cite_keys,
         asset_refs=asset_refs,
+        status=("needs_rewrite" if draft.generator in _NOT_GENERATED_GENERATORS else "generated"),
         model=draft.model,
     )
     usages = [

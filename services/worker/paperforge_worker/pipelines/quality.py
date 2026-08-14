@@ -505,22 +505,23 @@ def _asset_excerpt(asset: dict[str, Any]) -> str:
     return str(asset.get("text") or asset.get("_asset_description") or "")[:4000]
 
 
+def _support_tokens(value: str) -> set[str]:
+    """英文词 + 中文字符二元组：词汇支撑度与逐字复制检测共用同一套词元。"""
+    lowered = value.casefold()
+    result = set(re.findall(r"[a-z][a-z0-9_-]{2,}", lowered))
+    cjk = "".join(re.findall(r"[\u3400-\u9fff]", lowered))
+    result.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
+    return result
+
+
 def asset_text_support_score(claim: str, source: str) -> float:
     """Deterministic lexical floor for method-note/code provenance.
 
     English words and Chinese character bigrams are both represented so a Chinese method
     sentence does not require verbatim equality with a long source paragraph.
     """
-
-    def tokens(value: str) -> set[str]:
-        lowered = value.casefold()
-        result = set(re.findall(r"[a-z][a-z0-9_-]{2,}", lowered))
-        cjk = "".join(re.findall(r"[\u3400-\u9fff]", lowered))
-        result.update(cjk[index : index + 2] for index in range(max(0, len(cjk) - 1)))
-        return result
-
-    claim_tokens = tokens(claim)
-    source_tokens = tokens(source)
+    claim_tokens = _support_tokens(claim)
+    source_tokens = _support_tokens(source)
     return len(claim_tokens & source_tokens) / max(1, len(claim_tokens))
 
 
@@ -806,19 +807,31 @@ SCHOLARLY_BLOCKER_CODES = frozenset(
         "numeric_locator_missing",
         "evidence_binding_missing",
         "citation_resolution_failed",
+        # 这两条都由收敛器重写对应章节来修，所以必须留在这个集合里，
+        # 否则概览页会显示「0 处可修复」，而正文里明明有几节是空的。
+        "section_not_generated",
+        "verbatim_evidence_copy",
     }
 )
+
+# draft 档的规则是「不设门槛，成稿优先」——前提是确实有一份稿子。
+# 「这一节没有正文」和「这一节写得糙」不是一回事：前者没有任何东西可读、可改，
+# 把它降级成一条提示，用户就会拿着一份中间是洞的稿子当初稿看。
+ALWAYS_BLOCKER_CODES = frozenset({"section_not_generated"})
 
 
 def repairable_finding_count(report: QualityReport) -> int:
     """这份报告里有多少处「跑一轮质量修复有可能推进」的发现项。
 
-    对 draft 报告读 warnings（阻断项在那一档被降级过去），对 scholarly /
-    submission 读 blockers。两边都只认 SCHOLARLY_BLOCKER_CODES，因为收敛器
-    能做的就是重写这些码对应的章节；把「文献偏近五年」这类提示也算进去，
-    只会让用户点下修复后发现什么都没变。
+    对 draft 报告读 warnings（阻断项在那一档被降级过去）**加上** blockers——
+    ALWAYS_BLOCKER_CODES 里的码不参与降级，只读 warnings 会把「有几节没有正文」
+    恰好漏掉，而那正是最该修的一类。对 scholarly / submission 读 blockers。
+    两边都只认 SCHOLARLY_BLOCKER_CODES，因为收敛器能做的就是重写这些码对应的章节；
+    把「文献偏近五年」这类提示也算进去，只会让用户点下修复后发现什么都没变。
     """
-    pool = report.warnings if report.quality_profile == "draft" else report.blockers
+    pool = (
+        report.warnings + report.blockers if report.quality_profile == "draft" else report.blockers
+    )
     return sum(1 for item in pool if str(item.get("code")) in SCHOLARLY_BLOCKER_CODES)
 
 
@@ -829,6 +842,7 @@ def apply_readiness_gate(
     project: Any,
     whitelist: set[str],
     search_runs: list[Any],
+    evidence_units: dict[str, dict[str, Any]] | None = None,
 ) -> QualityReport:
     """应用双模式质量门；分项评分不参与“堆数量过线”。"""
     all_text = " ".join(_body_text(getattr(row, "body_ir_json", None) or {}) for row in rows)
@@ -1012,6 +1026,30 @@ def apply_readiness_gate(
                     sections=sorted({item["section_key"] for item in language_mismatches}),
                 )
             )
+    # 写作降级留下的缺口：这一节根本没有正文。和「初稿粗糙」不是一回事，
+    # 所以它不随 draft 档一起被降级成提示（见 ALWAYS_BLOCKER_CODES）。
+    not_generated = [
+        row.section_key for row in rows if getattr(row, "status", "") == "needs_rewrite"
+    ]
+    if not_generated:
+        blockers.append(
+            _issue(
+                "section_not_generated",
+                f"{len(not_generated)} 个章节没有正文（写作降级），需重写",
+                count=len(not_generated),
+                section_keys=not_generated,
+            )
+        )
+    verbatim_copies = verbatim_evidence_copies(rows, evidence_units or {})
+    if verbatim_copies:
+        blockers.append(
+            _issue(
+                "verbatim_evidence_copy",
+                f"{len(verbatim_copies)} 处正文与所引证据原文几乎逐字相同，未经改写",
+                count=len(verbatim_copies),
+                sections=sorted({item["section_key"] for item in verbatim_copies}),
+            )
+        )
     unapproved = [row.section_key for row in rows if getattr(row, "status", "") != "approved"]
     if unapproved:
         blockers.append(
@@ -1125,8 +1163,10 @@ def apply_readiness_gate(
             item for item in blockers if item["code"] not in SCHOLARLY_BLOCKER_CODES
         ]
     else:
-        profile_blockers = []
-        profile_warnings = warnings + blockers
+        profile_blockers = [item for item in blockers if item["code"] in ALWAYS_BLOCKER_CODES]
+        profile_warnings = warnings + [
+            item for item in blockers if item["code"] not in ALWAYS_BLOCKER_CODES
+        ]
     report.blockers = profile_blockers
     report.warnings = profile_warnings
     report.readiness_status = (
@@ -1167,6 +1207,72 @@ def zh_language_mismatches(rows: list[Any]) -> list[dict[str, Any]]:
                     }
                 )
     return mismatches
+
+
+def verbatim_evidence_copies(
+    rows: list[Any],
+    evidence_units: dict[str, dict[str, Any]],
+    *,
+    threshold: float = 0.9,
+    min_tokens: int = 12,
+) -> list[dict[str, Any]]:
+    """找出**没有改写**、直接照抄绑定证据原文的段落。
+
+    降级路径曾经把 ``evidence_unit.text`` 逐字当成正文段落输出（项目 6a6bbf18）。
+    那一次是靠 ``language_mismatch`` 撞见的——因为原文恰好是英文；证据本来就是中文时
+    同样的照抄完全静默。这条检查按词元包含率判定，与语种无关。
+
+    判据是「这一段的词元几乎全部来自它自己引的证据」，不是「两段相似」：改写过的段落
+    会引入连接词和自己的论证措辞，包含率掉得很快；整段搬运则接近 1。
+
+    **按段落而不是按句子判定**：照抄进来的是一整块原文，句子切分会把它切成碎片，而
+    局部引用只挂在紧邻 cite 的那一小段上——那次事故里 s3 的九个照抄段落有八个因此
+    在句级检查下完全无声。同理，比对的是该段绑定证据的**并集**：一段可能是从好几条
+    证据拼起来的，逐条比每一条都不过阈值。
+
+    在真实数据上量过（同一篇稿子）：照抄段落 9/9 命中且包含率均为 1.00，模型真写的
+    段落 10/10 落在 0.00–0.01。这个间隔就是 0.9 这个阈值的依据。
+    """
+    findings: list[dict[str, Any]] = []
+    for row in rows:
+        for index, block in enumerate((getattr(row, "body_ir_json", None) or {}).get("blocks", [])):
+            if not isinstance(block, dict) or block.get("type") != "paragraph":
+                continue
+            runs = block.get("runs")
+            if not isinstance(runs, list):
+                continue
+            text = "".join(
+                str(run.get("v") or "")
+                for run in runs
+                if isinstance(run, dict) and run.get("t") == "text"
+            ).strip()
+            # 太短的段落（术语定义、过渡句）本来就和原文高度重合，不足以判定照抄。
+            if len(_support_tokens(text)) < min_tokens:
+                continue
+            evidence_ids = [
+                str(evidence_id)
+                for run in runs
+                if isinstance(run, dict) and run.get("t") == "cite"
+                for evidence_id in (run.get("evidence_ids") or [])
+            ]
+            source = " ".join(
+                str((evidence_units.get(evidence_id) or {}).get("text") or "")
+                for evidence_id in evidence_ids
+            ).strip()
+            if not source:
+                continue
+            score = asset_text_support_score(text, source)
+            if score >= threshold:
+                findings.append(
+                    {
+                        "section_key": row.section_key,
+                        "block_index": index,
+                        "evidence_ids": sorted(set(evidence_ids)),
+                        "overlap": round(score, 3),
+                        "excerpt": text[:160],
+                    }
+                )
+    return findings
 
 
 def build_depth_metrics(
@@ -2052,6 +2158,7 @@ def count_words(text: str) -> int:
 
 
 __all__ = [
+    "ALWAYS_BLOCKER_CODES",
     "CLAIM_DEMOTION_CONFIDENCE",
     "CLAIM_SUPPORT_CONFIDENCE",
     "CLAIM_VERIFIER_VERSION",
@@ -2076,6 +2183,7 @@ __all__ = [
     "coverage_hints",
     "repairable_finding_count",
     "soft_check_citations",
+    "verbatim_evidence_copies",
     "verify_claim_evidence",
     "verify_cross_language_claim_evidence",
 ]

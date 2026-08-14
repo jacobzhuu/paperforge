@@ -37,10 +37,11 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
     "synthesizer": "planner",
 }
 
-# DeepSeek V4 defaults to high-effort thinking.  That is useful for planning and
-# long-form writing, but it wastes latency/output budget on bounded extraction and
-# reranking tasks whose prompts already define a closed JSON schema.  Keep the
-# quality-critical roles on the provider default unless a deployment opts in.
+# DeepSeek V4 defaults to high-effort thinking.  That is useful for planning, but it
+# wastes latency/output budget on tasks whose prompts already define a closed JSON
+# schema — and on any task whose own output is large enough to compete with the
+# reasoning for the same `max_output_tokens`.  Keep the remaining roles on the
+# provider default unless a deployment opts in.
 DEFAULT_ROLE_THINKING: dict[str, str] = {
     "extractor": "disabled",
     "reranker": "disabled",
@@ -55,6 +56,12 @@ DEFAULT_ROLE_THINKING: dict[str, str] = {
     # 烧在推理上：生产实测 26 次调用里 15 次 `output_truncated`，13 篇论文有 6 篇
     # 一条结果都没抽出来。
     "experiment_extractor": "disabled",
+    # 写作是本管线输出最大的一步（目标 1200 字，外加每句回抄 evidence_ids），它和
+    # 推理抢的是同一份 max_output_tokens，而 deepseek 系被 clamp_max_output_tokens()
+    # 压在 8192——加预算这条路没有余量。生产实测（项目 6a6bbf18，2026-08-14）：21 次
+    # writer 调用 11 次零内容返回，截断调用平均 79s 且产出 0 token，11 节里 5 节因此
+    # 从未经过模型，降级路径把证据原文当正文交了出去。
+    "writer": "disabled",
 }
 
 
@@ -77,8 +84,7 @@ class ModelPrice:
         if input_tokens is None and output_tokens is None:
             return None
         return (
-            (input_tokens or 0) * self.input_per_mtok
-            + (output_tokens or 0) * self.output_per_mtok
+            (input_tokens or 0) * self.input_per_mtok + (output_tokens or 0) * self.output_per_mtok
         ) / 1_000_000
 
 

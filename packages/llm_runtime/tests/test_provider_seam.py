@@ -29,7 +29,7 @@ def test_role_routing_prefers_override_then_default():
     assert config.model_for_role("unknown-role") == "fallback"
     assert config.thinking_for_role("extractor") == "disabled"
     assert config.thinking_for_role("reranker") == "disabled"
-    assert config.thinking_for_role("writer") is None
+    assert config.thinking_for_role("writer") == "disabled"
 
 
 def test_evidence_classifier_inherits_deployed_deepseek_tiers() -> None:
@@ -421,6 +421,9 @@ def test_a_new_role_inherits_the_built_in_thinking_policy():
     )
 
     assert deployed.thinking_for_role("experiment_extractor") == "disabled"
+    # 写作同理：线上那份映射只列了 extractor/reranker/verifier，writer 于是一直
+    # 开着思考跑，21 次调用 11 次零内容返回，5 节正文因此从未经过模型。
+    assert deployed.thinking_for_role("writer") == "disabled"
     # 综合是推理，不该被顺手关掉。
     assert deployed.thinking_for_role("synthesizer") is None
     # qmatrix 分类与卡片抽取共用模型档位但思考策略分开，这一条不能被回退改掉。

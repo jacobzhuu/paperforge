@@ -127,6 +127,9 @@ const SECTION_STATUS: Record<PaperSection['status'], { label: string; variant: '
   generated: { label: '已生成', variant: 'muted' },
   edited: { label: '已编辑', variant: 'secondary' },
   approved: { label: '已定稿', variant: 'success' },
+  // 写作降级留下的缺口：这一节没有正文，只有一句说明。必须和「已生成」看得出区别，
+  // 否则用户要读完整节才发现它是空的。
+  needs_rewrite: { label: '待重写', variant: 'secondary' },
 };
 
 /** 本地草稿键：崩溃或误关标签页后能恢复。 */

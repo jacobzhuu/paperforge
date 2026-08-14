@@ -35,6 +35,11 @@ from paper_ir import (
 
 MAX_PARAGRAPHS_PER_SECTION = 8
 MAX_ROLLING_SUMMARY_CHARS = 600
+# 一节正文（目标 ~1200 字）外加逐句回抄的 evidence_ids，实测要 4000–8000 输出 token。
+# 从 4000 起步等于先买一次必然截断的调用：截断后 runner 只加倍重试一次，而
+# `clamp_max_output_tokens()` 把 deepseek 系压在 8192，加倍之后也没有第三次机会。
+# max_tokens 是上限不是计费量（按实际生成计费），所以直接按模型上限要。
+SECTION_MAX_OUTPUT_TOKENS = 8000
 TARGET_WORDS_PER_SECTION_ZH = 1200
 TARGET_WORDS_PER_SECTION_EN = 800
 WRITING_CARD_CONTEXT_CHAR_BUDGET = 36_000
@@ -317,15 +322,9 @@ async def write_section(
         else:
             draft.paragraphs = deterministic_paragraphs(
                 section,
-                cards,
-                allowed,
-                evidence=section_evidence,
                 language=context.language,
-            )
-            draft.paragraphs = enforce_sentence_evidence_rules(
-                draft.paragraphs,
-                evidence_by_id=evidence_by_id,
-                language=context.language,
+                # 没有引用契约是「证据不够」；runner 关着是「没人写」。
+                reason="evidence_gap" if body_without_cites else "write_failed",
             )
         draft.generator = "evidence_gap_skeleton" if body_without_cites else "deterministic"
         return draft
@@ -352,7 +351,7 @@ async def write_section(
         "writer",
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        max_output_tokens=4000,
+        max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
         temperature=0.4,
         allowed_cite_keys=allowed,
         mode="report",
@@ -379,7 +378,7 @@ async def write_section(
             "writer",
             system_prompt=system_prompt,
             user_prompt=retry_prompt,
-            max_output_tokens=4000,
+            max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
             temperature=0.2,
             # 第三道：二次违规直接 strip，并把告警留给编辑器显示。
             allowed_cite_keys=allowed,
@@ -405,15 +404,8 @@ async def write_section(
         else:
             draft.paragraphs = deterministic_paragraphs(
                 section,
-                cards,
-                allowed,
-                evidence=section_evidence,
                 language=context.language,
-            )
-            draft.paragraphs = enforce_sentence_evidence_rules(
-                draft.paragraphs,
-                evidence_by_id=evidence_by_id,
-                language=context.language,
+                reason="write_failed",
             )
         draft.generator = "deterministic_fallback"
         return draft
@@ -448,17 +440,11 @@ async def write_section(
                 language=context.language,
             )
         else:
+            # 模型答了，但每一句都被证据规则剥掉了——留下的不是正文，同样按未生成处理。
             draft.paragraphs = deterministic_paragraphs(
                 section,
-                cards,
-                allowed,
-                evidence=section_evidence,
                 language=context.language,
-            )
-            draft.paragraphs = enforce_sentence_evidence_rules(
-                draft.paragraphs,
-                evidence_by_id=evidence_by_id,
-                language=context.language,
+                reason="write_failed",
             )
         draft.generator = "deterministic_fallback"
     return draft
@@ -488,7 +474,7 @@ async def coherence_pass(
             f"Allowed cite keys: {', '.join(sorted(allowed)) or '(none)'}\n\n"
             f"Current paragraphs JSON:\n{_paragraphs_json(draft.paragraphs)}"
         ),
-        max_output_tokens=4000,
+        max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
         temperature=0.2,
         allowed_cite_keys=allowed,
         mode="strip",
@@ -1320,48 +1306,41 @@ def normalize_terms(raw: Any) -> dict[str, str]:
 
 def deterministic_paragraphs(
     section: dict[str, Any],
-    cards: dict[str, dict[str, Any]],
-    allowed: set[str],
     *,
-    evidence: list[dict[str, Any]] | None = None,
     language: str = "en",
+    reason: str = "evidence_gap",
 ) -> list[dict[str, Any]]:
-    """确定性回退：用卡片摘要拼出可读的占位正文，绝不产生卡片之外的断言。"""
-    paragraphs: list[dict[str, Any]] = []
-    summary = str(section.get("summary") or "").strip()
-    if summary:
-        paragraphs.append({"text": summary, "cite_keys": []})
-    if evidence:
-        for item in evidence[: MAX_PARAGRAPHS_PER_SECTION - len(paragraphs)]:
-            text = str(item.get("text") or "").strip()
-            cite_key = str(item.get("cite_key") or "")
-            evidence_id = str(item.get("evidence_id") or "")
-            if not text or cite_key not in allowed or not evidence_id:
-                continue
-            if item.get("grade") == "D_abstract_only":
-                text = (
-                    f"相关文献仅在摘要中报告：{text.rstrip('。')}。"
-                    if language == "zh"
-                    else f"The cited work reports in its abstract that {text.rstrip('.')}."
-                )
-            sentence = {
-                "text": text,
-                "cite_keys": [cite_key],
-                "evidence_ids": [evidence_id],
-            }
-            paragraphs.append(
-                {
-                    "text": text,
-                    "cite_keys": [cite_key],
-                    "sentences": [sentence],
-                    "stance_summary": section.get("stance_summary") or "partial",
-                }
+    """确定性回退：说明这一节为什么还没有正文，**绝不**替模型写正文。
+
+    此前这里做的是「用现成材料拼出可读的占位」，实际拼出来的东西不能交付：
+
+    - ``section["summary"]`` 是大纲写给**写作模型**的指令（「回答该子问题；当前证据
+      状态：一致。」），当成正文段落输出，读者看到的是一句工单；
+    - 证据段落是 ``evidence_unit.text`` **逐字**照搬——那是第三方论文的原文，带着
+      它自己的 ``(Zipfel, 2014)``、``[ 94 , 95 ]`` 标注和双栏 PDF 抽取的粘连乱码，
+      而且不会翻译（中文综述里整段英文）。生产实测（项目 6a6bbf18，2026-08-14）
+      11 节中 5 节走了这条路，s3/s4/s6 就是这样把别人的正文原样交了出去。
+
+    降级的正确含义是「这一节没写出来」，不是「用原文顶上」。所以这里只留一句诚实的
+    说明并交给 ``needs_rewrite`` 流程，正文缺口对作者始终可见。
+
+    ``reason="evidence_gap"`` 是「证据不够，写不了」；``"write_failed"`` 是「有证据，
+    但没拿到模型输出」。两者对作者的下一步动作完全不同——补来源，还是重跑这一节。
+    """
+    title = str(section.get("title") or "").strip()
+    if reason == "write_failed":
+        text = (
+            f"本节“{title}”尚未生成：没有可用的写作模型输出，待重写。"
+            if language == "zh"
+            else (
+                f"This section ({title}) was not generated: no usable writer-model output. "
+                "It needs to be rewritten."
             )
-        return paragraphs[:MAX_PARAGRAPHS_PER_SECTION]
+        )
+        return [{"text": text, "cite_keys": [], "needs_rewrite": True}]
     # Never turn an empty evidence contract into an alphabetical dump of every
     # library card.  That looks like a review while silently admitting papers
     # outside the section's scope.  Keep the gap visible for the author instead.
-    title = str(section.get("title") or "").strip()
     gap = (
         f"本节“{title}”尚无满足定位与可比性要求的证据；待补充可核验来源后再展开论述。"
         if language == "zh"
@@ -1370,8 +1349,7 @@ def deterministic_paragraphs(
             "and comparability criteria; add verifiable sources before drafting the discussion."
         )
     )
-    paragraphs.append({"text": gap, "cite_keys": [], "evidence_gap": True})
-    return paragraphs[:MAX_PARAGRAPHS_PER_SECTION]
+    return [{"text": gap, "cite_keys": [], "evidence_gap": True}]
 
 
 def summarize_paragraphs(paragraphs: list[dict[str, Any]]) -> str:
