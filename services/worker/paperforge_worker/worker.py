@@ -3167,6 +3167,17 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
         return
     from db.models.paper import GenerationJob
 
+    # A failed job must explain itself on its own row.  ``update_job`` skips a ``None`` error, so
+    # passing warnings-or-nothing left 20 of 23 production failures with an empty ``error_json``
+    # while the actual cause (e.g. ``error_code: "network_timeout"``) sat in the event stream --
+    # visible only to someone who already knew to go looking for it.
+    error_payload: dict[str, Any] | None
+    if delivered:
+        error_payload = {"warnings": context.warnings} if context.warnings else None
+    else:
+        error_payload = {"reason": "not_delivered", "warnings": context.warnings}
+        if context.last_failure:
+            error_payload["failure"] = context.last_failure
     async with context.session() as session:
         job = await session.get(GenerationJob, context.job_id)
         if job is not None:
@@ -3174,7 +3185,7 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
                 session,
                 job,
                 status=status,
-                error={"warnings": context.warnings} if context.warnings else None,
+                error=error_payload,
             )
     # ``job.finished`` is committed before this status transition. Wake subscribers again so they
     # observe the terminal row and close immediately instead of waiting for the safety heartbeat.

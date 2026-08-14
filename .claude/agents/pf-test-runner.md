@@ -75,7 +75,8 @@ Install `ruff` with a plain `pip install` as root (`docker exec -u root`), **not
 
 # Known-good baselines (judge results against these)
 
-- packages + worker: 434 passed (2026-07-29)
+- `services/worker` alone: 422 collected, 421 passed + 1 known Pillow failure (2026-08-14). The
+  older combined "packages + worker: 434" figure is stale — do not compare a single suite to it.
 - visuald + visuals: 59 passed
 - web: 75 passed (129 in the wider audit run)
 - `services/api` minus `test_ops_scripts.py`: 122 passed on a clean DB (3 long-standing failures

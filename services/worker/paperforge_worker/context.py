@@ -79,6 +79,33 @@ async def _committing_session(
 _STOP_POLL_TTL_SECONDS = 2.0
 
 
+def _failure_signal(
+    event_type: str,
+    payload: dict[str, Any],
+    stage: str | None,
+) -> dict[str, Any] | None:
+    """Extract a compact, persistable reason from a stage event that reports a failure.
+
+    Stages signal trouble in two shapes: an explicit ``status: "failed"`` or an ``error_code`` /
+    ``error`` field.  Both are kept small on purpose — this ends up in ``generation_job.error_json``
+    and is meant to name the cause, not to duplicate the event stream.
+    """
+    error_code = payload.get("error_code") or payload.get("error")
+    if str(payload.get("status") or "") != "failed" and not error_code:
+        return None
+    signal: dict[str, Any] = {"event_type": event_type}
+    if stage:
+        signal["stage"] = stage
+    if error_code:
+        signal["error_code"] = str(error_code)[:200]
+    for key in ("message", "detail", "reason"):
+        value = payload.get(key)
+        if value:
+            signal[key] = str(value)[:300]
+            break
+    return signal
+
+
 async def _publish_job_event(publisher: Any | None, job_id: uuid.UUID | None) -> None:
     """Best-effort Redis wake-up; the committed database row remains authoritative."""
     if publisher is None or job_id is None:
@@ -130,6 +157,9 @@ class JobContext:
         default_factory=dict,
         repr=False,
     )
+    #: The most recent failure a stage reported through ``emit``.  ``_finish`` persists it so a
+    #: failed job explains itself on its own row instead of only in the event stream.
+    last_failure: dict[str, Any] | None = field(default=None, repr=False)
     #: 停止开关的轮询缓存：(读到的时刻, 结果)。
     _stop_cache: tuple[float, str | None] | None = field(default=None, repr=False)
 
@@ -157,6 +187,14 @@ class JobContext:
         """写 job_event（SSE 源）并顺带更新任务阶段/进度/checkpoint。"""
         if checkpoint:
             self.checkpoint.update(checkpoint)
+        # Stages already report *why* they failed, but only into the event stream; the terminal
+        # job row kept none of it.  Remember the last such signal so `_finish` can persist it.
+        # ``job.finished`` is skipped deliberately: it is the generic terminal event and would
+        # otherwise overwrite the specific stage failure with "failed, no detail".
+        if payload and event_type != "job.finished":
+            signal = _failure_signal(event_type, payload, stage)
+            if signal is not None:
+                self.last_failure = signal
         if self.job_id is None:
             logger.info("job_event", extra={"event_type": event_type, "payload": payload})
             return

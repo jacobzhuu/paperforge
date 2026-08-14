@@ -184,3 +184,62 @@ async def test_normal_exit_does_not_touch_job_status(session_factory) -> None:
     job = await _job_status(session_factory, job_id)
     assert job.status == "running"
     assert job.error_json is None
+
+
+async def test_a_failed_job_records_the_stage_failure_it_already_reported(session_factory) -> None:
+    """20 of 23 production failures had an empty ``error_json`` while the cause sat in the event
+    stream: ``update_job`` skips a ``None`` error, and ``_finish`` passed None whenever the job
+    had no warnings. The diagnosis existed and was dropped."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await context.emit(
+            "visual_generate.completed",
+            {"status": "failed", "error_code": "network_timeout"},
+            stage="visual",
+        )
+        await _finish(context, delivered=False)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.status == "failed"
+    assert job.error_json is not None
+    assert job.error_json["reason"] == "not_delivered"
+    assert job.error_json["failure"]["error_code"] == "network_timeout"
+    assert job.error_json["failure"]["event_type"] == "visual_generate.completed"
+    assert job.error_json["failure"]["stage"] == "visual"
+
+
+async def test_the_generic_terminal_event_does_not_overwrite_the_stage_failure(
+    session_factory,
+) -> None:
+    """``job.finished`` also carries status="failed" but no cause; it must not win."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await context.emit(
+            "search.completed",
+            {"status": "failed", "error_code": "provider_unavailable"},
+            stage="search",
+        )
+        await _finish(context, delivered=False)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.error_json["failure"]["error_code"] == "provider_unavailable"
+
+
+async def test_a_delivered_job_without_warnings_still_records_no_error(session_factory) -> None:
+    """Success must stay clean: only non-delivery gets an explanatory payload."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await _finish(context, delivered=True)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.status == "succeeded"
+    assert job.error_json is None
