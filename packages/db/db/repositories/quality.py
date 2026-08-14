@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from typing import Any
 
@@ -13,6 +14,22 @@ from db.models.paper import ClaimEntailmentCache, ClaimEvidenceAnchor, QualityRe
 
 QUALITY_PROFILES = frozenset({"draft", "scholarly", "submission"})
 REVIEW_STYLES = frozenset({"narrative", "systematic"})
+# The closed verdict set the semantic verifier may emit. Declared here rather than imported from
+# the worker so the persistence layer can reject a malformed verdict on its own authority.
+CLAIM_ENTAILMENT_VERDICTS = frozenset(
+    {"supported", "partial", "unsupported", "contradicted", "uncertain"}
+)
+# String column widths on ``claim_entailment_cache``. A value wider than its column raises
+# DataError for the entire batch, so oversized rows are dropped before the INSERT is built.
+_CACHE_COLUMN_WIDTHS = {
+    "cache_key": 64,
+    "claim_hash": 64,
+    "evidence_hash": 64,
+    "claim_kind": 24,
+    "verifier_version": 32,
+    "model": 128,
+    "verdict": 16,
+}
 READINESS_STATUSES = frozenset(
     {"draft", "needs_revision", "preflight_ready", "submission_ready", "unassessed"}
 )
@@ -231,27 +248,52 @@ async def store_claim_entailment_cache(
     session: AsyncSession,
     entries: list[dict[str, Any]],
 ) -> int:
-    """Insert immutable verdicts; a verifier-version bump is the invalidation mechanism."""
+    """Insert immutable verdicts; a verifier-version bump is the invalidation mechanism.
+
+    Rows here are permanent: ``on_conflict_do_nothing`` means a key can never be corrected and
+    there is no TTL.  So every row is validated individually and a bad one is dropped rather than
+    sent — one oversized ``model`` reaching the DB would fail the whole multi-row INSERT and lose
+    every verdict the job just paid for.
+    """
     values: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in entries:
         cache_key = str(entry.get("cache_key") or "")
         if not cache_key or cache_key in seen:
             continue
-        seen.add(cache_key)
+        verdict = str(entry.get("verdict") or "")
+        if verdict not in CLAIM_ENTAILMENT_VERDICTS:
+            continue
+        try:
+            confidence = float(entry.get("confidence"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        # A verdict is only reusable if its confidence is comparable to a threshold; NaN silently
+        # fails every comparison, so it must not become a permanent row.
+        if math.isnan(confidence):
+            continue
         row = {
             "cache_key": cache_key,
             "claim_hash": str(entry.get("claim_hash") or ""),
             "evidence_hash": str(entry.get("evidence_hash") or ""),
             "claim_kind": str(entry.get("claim_kind") or ""),
             "verifier_version": str(entry.get("verifier_version") or ""),
-            "model": str(entry.get("model") or ""),
-            "verdict": str(entry.get("verdict") or ""),
-            "confidence": float(entry.get("confidence") or 0.0),
+            # Identity is carried by cache_key, which already hashes the full model string, so
+            # clipping the human-readable copy to its column width cannot make a row ambiguous.
+            "model": str(entry.get("model") or "")[:128],
+            "verdict": verdict,
+            "confidence": min(1.0, max(0.0, confidence)),
             "reason": str(entry.get("reason") or "")[:300],
         }
-        if all(value != "" for value in row.values() if isinstance(value, str)):
-            values.append(row)
+        if any(
+            not row[field] or len(str(row[field])) > _CACHE_COLUMN_WIDTHS[field]
+            for field in _CACHE_COLUMN_WIDTHS
+        ):
+            continue
+        if not row["reason"]:
+            continue
+        seen.add(cache_key)
+        values.append(row)
     if not values:
         return 0
     result = await session.execute(

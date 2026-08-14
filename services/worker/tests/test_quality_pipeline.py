@@ -493,6 +493,68 @@ def test_claim_verification_cache_key_changes_with_the_configured_model() -> Non
     ) != claim_verification_cache_key(anchor, model="deepseek-v4-pro")
 
 
+def test_claim_entailment_verdicts_match_the_persistence_layer() -> None:
+    """Drift between the two copies is silent: the cache would just stop storing that verdict."""
+    from db.repositories.quality import CLAIM_ENTAILMENT_VERDICTS as PERSISTED_VERDICTS
+    from paperforge_worker.pipelines.quality import CLAIM_ENTAILMENT_VERDICTS
+
+    assert CLAIM_ENTAILMENT_VERDICTS == PERSISTED_VERDICTS
+
+
+def test_claim_verification_cache_key_is_invalidated_by_a_prompt_edit(monkeypatch) -> None:
+    """Cached verdicts are permanent, so editing the prompt must not silently reuse them."""
+    import hashlib
+
+    from paperforge_worker.pipelines import quality
+
+    # The fingerprint must actually derive from the prompt, or editing the prompt changes nothing.
+    assert (
+        quality._CLAIM_EVIDENCE_PROMPT_FINGERPRINT
+        == hashlib.sha256(quality._CLAIM_EVIDENCE_PROMPT.encode("utf-8")).hexdigest()[:16]
+    )
+
+    anchor = _bilingual_anchor()
+    before = claim_verification_cache_key(anchor, model="deepseek-v4-flash")
+    monkeypatch.setattr(quality, "_CLAIM_EVIDENCE_PROMPT_FINGERPRINT", "0" * 16)
+
+    assert claim_verification_cache_key(anchor, model="deepseek-v4-flash") != before
+
+
+async def test_demotion_without_any_alternative_is_recorded_as_unconfirmed() -> None:
+    """Absence of an alternative excerpt still demotes, but must not read as a reviewed demotion."""
+    anchor = _bilingual_anchor(
+        claim_hash="no-alternative-available",
+        support_status="supported",
+        support_score=0.4,
+        evidence_excerpt="A figure overview mentions the treatment.",
+    )
+
+    summary = await verify_claim_evidence(
+        anchors=[anchor],
+        runner=_runner(
+            {
+                "judgements": [
+                    {
+                        "index": 0,
+                        "verdict": "unsupported",
+                        "confidence": 0.97,
+                        "reason": "The overview does not report the claimed result.",
+                    }
+                ]
+            }
+        ),
+        cache={},
+        mode="enforce",
+    )
+
+    assert summary["demotion_unconfirmed_count"] == 1
+    assert summary["unsafe_demotion_avoided_count"] == 0
+    # Behaviour is deliberately unchanged: no alternative is not evidence of support.
+    assert summary["demoted_count"] == 1
+    assert anchor["support_status"] == "insufficient_support"
+    assert anchor["entailment_review_json"]["status"] == "no_alternative_available"
+
+
 async def test_negative_primary_does_not_demote_when_an_alternative_is_not_negative() -> None:
     anchor = _bilingual_anchor(
         claim_hash="unsafe-selection",

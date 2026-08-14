@@ -1892,6 +1892,7 @@ async def _quality(
                 "alternative_cache_hit_count",
                 "alternative_model_checked_count",
                 "unsafe_demotion_avoided_count",
+                "demotion_unconfirmed_count",
                 "review_incomplete_count",
             )
         }

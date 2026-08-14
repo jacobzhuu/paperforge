@@ -31,6 +31,13 @@ MAX_CLAIM_EVIDENCE_ALTERNATIVES = 3
 CLAIM_VERIFIER_VERSION = "claim_evidence_v1"
 ClaimEntailmentMode = Literal["off", "shadow", "promote_only", "enforce"]
 CLAIM_ENTAILMENT_MODES = frozenset({"off", "shadow", "promote_only", "enforce"})
+# The closed verdict vocabulary this pipeline may emit.  ``db`` deliberately keeps its own copy so
+# the persistence layer can reject a malformed verdict on its own authority; the two are held in
+# agreement by test_claim_entailment_verdicts_match_the_persistence_layer.  Drift would not raise —
+# it would silently stop caching a verdict and re-spend on it forever.
+CLAIM_ENTAILMENT_VERDICTS = frozenset(
+    {"supported", "partial", "unsupported", "contradicted", "uncertain"}
+)
 # Compatibility names for callers that predate the verifier's expansion from bilingual
 # failures to every otherwise-valid core claim/evidence pair.
 CROSS_LANGUAGE_SUPPORT_CONFIDENCE = CLAIM_SUPPORT_CONFIDENCE
@@ -58,6 +65,14 @@ Return JSON only:
 {"judgements": [{"index": 0, "verdict": "supported|partial|unsupported|contradicted|uncertain",
 "confidence": 0.0, "reason": "brief evidence-bound explanation"}]}
 confidence is confidence in the verdict, not topical similarity."""
+
+# Verdicts are cached in a durable, immutable table, so a prompt edit must invalidate them the way
+# a model change does.  CLAIM_VERIFIER_VERSION alone cannot: it is hand-maintained and nothing
+# couples it to this string.  Deriving a fingerprint means editing the prompt is self-invalidating
+# and no one has to remember to bump anything.
+_CLAIM_EVIDENCE_PROMPT_FINGERPRINT = hashlib.sha256(
+    _CLAIM_EVIDENCE_PROMPT.encode("utf-8")
+).hexdigest()[:16]
 
 
 @dataclass
@@ -1395,6 +1410,7 @@ def claim_verification_cache_key(anchor: dict[str, Any], *, model: str) -> str:
     material = "\0".join(
         (
             CLAIM_VERIFIER_VERSION,
+            _CLAIM_EVIDENCE_PROMPT_FINGERPRINT,
             model,
             str(anchor.get("claim_kind") or ""),
             str(anchor.get("claim_text") or ""),
@@ -1431,13 +1447,7 @@ def _normalize_claim_judgement(item: Any) -> dict[str, Any] | None:
     if isinstance(raw_confidence, bool) or not isinstance(raw_confidence, int | float):
         return None
     verdict = str(item.get("verdict") or "").strip().lower()
-    if verdict not in {
-        "supported",
-        "partial",
-        "unsupported",
-        "contradicted",
-        "uncertain",
-    }:
+    if verdict not in CLAIM_ENTAILMENT_VERDICTS:
         return None
     reason = str(item.get("reason") or "").strip()[:300]
     if not reason:
@@ -1577,6 +1587,7 @@ async def verify_claim_evidence(
         "alternative_cache_hit_count": 0,
         "alternative_model_checked_count": 0,
         "unsafe_demotion_avoided_count": 0,
+        "demotion_unconfirmed_count": 0,
         "review_incomplete_count": 0,
         "judgements": [],
     }
@@ -1793,6 +1804,23 @@ async def verify_claim_evidence(
                     }
                     for alternative, result in reviewed
                 ],
+            }
+        elif (
+            anchor.get("support_status") == "supported"
+            and judgement["verdict"] in {"unsupported", "contradicted"}
+            and float(judgement["confidence"]) >= CLAIM_DEMOTION_CONFIDENCE
+        ):
+            # The safeguard cannot apply here: the cited work offered no second located,
+            # grade-permitted excerpt to cross-check against.  Demotion still proceeds on the
+            # single bound excerpt — absence of an alternative is not evidence of support — but
+            # it is unconfirmed, and a rollout decision that cannot separate these from confirmed
+            # demotions is reading a number that overstates how much review actually happened.
+            summary["demotion_unconfirmed_count"] += 1
+            evidence_review = {
+                "status": "no_alternative_available",
+                "alternative_count": 0,
+                "checked_count": 0,
+                "alternatives": [],
             }
         applied = _apply_claim_judgement(
             anchor,
