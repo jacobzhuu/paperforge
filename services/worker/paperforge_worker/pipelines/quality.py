@@ -819,6 +819,28 @@ SCHOLARLY_BLOCKER_CODES = frozenset(
 # 把它降级成一条提示，用户就会拿着一份中间是洞的稿子当初稿看。
 ALWAYS_BLOCKER_CODES = frozenset({"section_not_generated"})
 
+# 「重写这一节就有可能修好」的问题码。发现它们不该只是报给用户——**任何档位**都要
+# 先自动跑一轮定向重写，修不掉才算结论。这几条的共同点是问题出在正文本身，
+# 而不是证据基础：证据不足那类缺口重写多少次都一样，不在此列。
+RECOVERABLE_BLOCKER_CODES = frozenset(
+    {
+        "section_not_generated",
+        "verbatim_evidence_copy",
+        "language_mismatch",
+        "placeholders_present",
+    }
+)
+
+
+def recoverable_findings(report: QualityReport) -> list[dict[str, Any]]:
+    """这份报告里值得先自动修一轮的发现项。
+
+    阻断项与提示一起看：draft 档把大部分码降级成了提示，只读 blockers 会让
+    「正文里有整段英文」在草稿模式下永远等不到修复。
+    """
+    pool = list(report.blockers) + list(report.warnings)
+    return [item for item in pool if str(item.get("code")) in RECOVERABLE_BLOCKER_CODES]
+
 
 def repairable_finding_count(report: QualityReport) -> int:
     """这份报告里有多少处「跑一轮质量修复有可能推进」的发现项。
@@ -2165,6 +2187,7 @@ __all__ = [
     "CROSS_LANGUAGE_SUPPORT_CONFIDENCE",
     "MAX_CLAIM_EVIDENCE_CHECKS",
     "MAX_SOFT_CHECKS",
+    "RECOVERABLE_BLOCKER_CODES",
     "SCHOLARLY_BLOCKER_CODES",
     "SOFT_CHECK_THRESHOLD",
     "QualityReport",
@@ -2181,6 +2204,7 @@ __all__ = [
     "classify_claim",
     "count_words",
     "coverage_hints",
+    "recoverable_findings",
     "repairable_finding_count",
     "soft_check_citations",
     "verbatim_evidence_copies",

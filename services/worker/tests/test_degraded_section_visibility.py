@@ -14,9 +14,11 @@ from typing import Any
 
 from paperforge_worker.pipelines.quality import (
     ALWAYS_BLOCKER_CODES,
+    RECOVERABLE_BLOCKER_CODES,
     SCHOLARLY_BLOCKER_CODES,
     apply_readiness_gate,
     build_quality_report,
+    recoverable_findings,
     repairable_finding_count,
     verbatim_evidence_copies,
 )
@@ -123,6 +125,43 @@ def test_a_missing_section_counts_as_repairable_in_draft() -> None:
     """概览页的修复卡读的是这个计数；读不到就等于「0 处可修复」而正文有洞。"""
     rows = [_row(section_key="s3", status="needs_rewrite")]
     assert repairable_finding_count(_gate(rows, profile="draft")) >= 1
+
+
+def test_draft_findings_are_offered_to_the_repair_loop_not_just_reported() -> None:
+    """草稿档也要先自动修一轮。
+
+    检测到问题却只写进报告，等于把一份自己知道有洞的稿子交出去。修复轮的触发条件
+    读的是 ``recoverable_findings``，它必须同时看阻断项和被降级的提示——draft 档
+    把大部分码降级成了提示，只读 blockers 会让这一档永远等不到修复。
+    """
+    rows = [
+        _row(section_key="s3", status="needs_rewrite"),
+        _row(
+            section_key="s4",
+            status="generated",
+            text=EVIDENCE_TEXT,
+            evidence_ids=["e-1"],
+        ),
+    ]
+    report = _gate(rows, profile="draft", evidence_units={"e-1": {"text": EVIDENCE_TEXT}})
+
+    codes = {str(item.get("code")) for item in recoverable_findings(report)}
+    assert "section_not_generated" in codes, "阻断项要被修复轮看到"
+    assert "verbatim_evidence_copy" in codes, "被降级成提示的码同样要被看到"
+    assert codes <= RECOVERABLE_BLOCKER_CODES
+
+    # 修复轮据此挑章节：两条发现项各自点名的章节都要进去。
+    targets: set[str] = set()
+    for finding in recoverable_findings(report):
+        targets.update(str(key) for key in finding.get("section_keys") or [])
+        targets.update(str(key) for key in finding.get("sections") or [])
+    assert targets == {"s3", "s4"}
+
+
+def test_a_clean_draft_asks_for_no_repair_round() -> None:
+    """没有可恢复缺陷时不能凭空触发修复——那是白花两轮改写的钱。"""
+    report = _gate([_row(section_key="s5", status="generated")], profile="draft")
+    assert recoverable_findings(report) == []
 
 
 def test_verbatim_evidence_copy_is_caught_regardless_of_language() -> None:

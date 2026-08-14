@@ -47,10 +47,13 @@ from paper_ir.schema import Section as IRSection
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.publication_metadata import generate_publication_metadata
 from paperforge_worker.pipelines.writing import (
+    SectionDefect,
     SectionDraft,
     WritingContext,
     coherence_pass,
     count_words,
+    inspect_section_draft,
+    section_evidence_for,
     write_section,
 )
 
@@ -69,6 +72,13 @@ _WRITE_PROGRESS_END = 0.90
 WRITE_STAGE = "write"
 POLISH_STAGE = "polish"
 
+# 一节最多写几次（含首轮）。三次覆盖了实测的全部可恢复失败：截断、整段照抄、
+# 中途切语种。再往上加只是让一个真正写不出来的章节多烧两次钱。
+MAX_SECTION_ATTEMPTS = 3
+# 交付前的补写扫描最多再救几节。这是兜底不是主力：主力是 _write_one 里的阶梯，
+# 到这一步还没成的通常是证据本身有问题，重试收益递减。
+MAX_RECOVERY_SECTIONS = 4
+
 
 @dataclass
 class WriteOutcome:
@@ -86,6 +96,19 @@ class WriteOutcome:
     polish_pending_count: int = 0
     polish_skipped: bool = False
     publication_metadata_generator: str | None = None
+    #: 重试之后才写成的章节——这些是恢复回路真正救回来的，成本上也应看得见。
+    recovered_sections: list[dict[str, Any]] = field(default_factory=list)
+    #: 用尽重试仍然没有成熟正文的章节。非空就意味着这篇稿子**不完整**。
+    incomplete_sections: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """这篇稿子能不能算写完了。
+
+        以前的判据是 ``section_count > 0``——只要有章节行就算交付，哪怕每一节都是
+        降级占位。完整性必须看正文本身。
+        """
+        return self.section_count > 0 and not self.incomplete_sections
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -105,6 +128,9 @@ class WriteOutcome:
             "polish_pending_count": self.polish_pending_count,
             "polish_skipped": self.polish_skipped,
             "publication_metadata_generator": self.publication_metadata_generator,
+            "recovered_sections": self.recovered_sections,
+            "incomplete_sections": self.incomplete_sections,
+            "complete": self.complete,
         }
 
 
@@ -278,6 +304,23 @@ async def write_document(
         # 框架章节此前不发事件：摘要/引言/结论那几分钟前端完全没有进度可看。
         await _emit_section(draft)
         await context.raise_if_stopped()
+
+    # 交付前的补写：润色之前先把没写成的章节救回来。放在润色之前是因为润色只
+    # 处理已有正文，先润后补等于新补的那几节永远没被打磨过。
+    await _recover_incomplete_sections(
+        context,
+        sections=sections,
+        drafts=drafts,
+        document_id=document_id,
+        order_by_key=order_by_key,
+        cards=cards,
+        whitelist=whitelist,
+        language=language,
+        writing_context=writing_context,
+        runner=runner,
+        outcome=outcome,
+        assets=assets,
+    )
 
     if coherence:
         await _polish_all(
@@ -917,6 +960,109 @@ def _document_model():
     return PaperDocument
 
 
+async def _recover_incomplete_sections(
+    context: JobContext,
+    *,
+    sections: list[dict[str, Any]],
+    drafts: dict[str, SectionDraft],
+    document_id: uuid.UUID,
+    order_by_key: dict[str, int],
+    cards: dict[str, dict[str, Any]],
+    whitelist: dict[str, uuid.UUID],
+    language: str,
+    writing_context: WritingContext,
+    runner,
+    outcome: WriteOutcome,
+    assets: list[dict[str, Any]] | None,
+) -> None:
+    """交付前把还没写成的章节再救一轮，并记录最终仍然缺的是哪几节。
+
+    到这里时全篇的滚动摘要已经建好，重写一节能看到完整的上下文——这是首轮写作
+    时没有的信息，所以这一轮**不是**把同一次调用原样再发一遍。
+
+    这一步同时是完整性的唯一判据来源：跑完之后 ``outcome.incomplete_sections``
+    要么是空的（稿子完整），要么明确列出哪几节缺、缺什么，由上层决定还能不能算交付。
+    """
+    by_key = {str(section.get("key") or ""): section for section in sections}
+    pending = [
+        key
+        for key, draft in drafts.items()
+        if inspect_section_draft(
+            draft,
+            language=language,
+            evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
+            is_frame=(by_key.get(key) or {}).get("kind") == "frame",
+        )
+    ]
+    if not pending:
+        return
+
+    await context.emit(
+        "write.recovery_started",
+        {"sections": sorted(pending), "total": len(pending)},
+        stage=WRITE_STAGE,
+    )
+    for key in sorted(pending)[:MAX_RECOVERY_SECTIONS]:
+        section = by_key.get(key)
+        if section is None or runner is None or not runner.enabled:
+            continue
+        await context.raise_if_stopped()
+        previous = drafts[key]
+        retried = await _write_one(
+            section=(
+                section
+                if section.get("kind") != "frame"
+                else {**section, "summary": _frame_goal(section, writing_context.outline, language)}
+            ),
+            cards=cards,
+            whitelist=set(whitelist),
+            writing_context=writing_context,
+            runner=runner,
+            context=context,
+            outcome=outcome,
+            assets=assets,
+            # 这一轮只补一次：主力阶梯已经在首轮用掉了，这里再堆重试收益递减。
+            max_attempts=1,
+        )
+        if not retried.has_body and previous.has_body:
+            continue
+        drafts[key] = retried
+        writing_context.register(key, retried)
+        await _persist_draft(
+            context,
+            document_id=document_id,
+            draft=retried,
+            order_no=order_by_key.get(key, 0),
+            whitelist=whitelist,
+            language=language,
+        )
+
+    outcome.incomplete_sections = [
+        {
+            "section": key,
+            "defects": [defect.code for defect in defects],
+            "generator": drafts[key].generator,
+        }
+        for key in sorted(drafts)
+        if (
+            defects := inspect_section_draft(
+                drafts[key],
+                language=language,
+                evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
+                is_frame=(by_key.get(key) or {}).get("kind") == "frame",
+            )
+        )
+    ]
+    await context.emit(
+        "write.recovery_completed",
+        {
+            "recovered": [item["section"] for item in outcome.recovered_sections],
+            "incomplete": outcome.incomplete_sections,
+        },
+        stage=WRITE_STAGE,
+    )
+
+
 async def _write_one(
     *,
     section: dict[str, Any],
@@ -927,33 +1073,134 @@ async def _write_one(
     context: JobContext,
     outcome: WriteOutcome,
     assets: list[dict[str, Any]] | None = None,
+    max_attempts: int = MAX_SECTION_ATTEMPTS,
 ) -> SectionDraft:
+    """写一节，并在这一节内部完成恢复。
+
+    单节失败以前是终点：一次调用不成就落降级占位，整篇带着窟窿继续走。实际发生的
+    失败绝大多数是**这一次调用**的问题（推理吃光预算、整段照抄证据、写着写着切到
+    英文），换一种要法再问一次就能拿到正常正文。所以恢复必须发生在这里——此时
+    prompt、证据、白名单都还在手上，而不是等到几十分钟后由一个全篇修复任务重来。
+
+    升级阶梯，每一级都针对上一级暴露的具体问题：
+      1. 正常写；
+      2. 带纠正指令重写（照抄/语种/过短各有各的说法）；截断则改走紧凑档降低需求；
+      3. 紧凑档 + 纠正指令一起上。
+    仍然不成才落 needs_rewrite，交给交付前的补写扫描与质量修复闭环。
+    """
     section_key = str(section.get("key") or "section")
-    try:
-        return await write_section(
-            section=section,
-            cards=cards,
-            whitelist=whitelist,
-            context=writing_context,
-            runner=runner,
-            assets=assets,
+    is_frame = section.get("kind") == "frame"
+    section_evidence = section_evidence_for(section, writing_context.outline)
+    best: SectionDraft | None = None
+    best_defects: list[SectionDefect] = []
+    compact = False
+    corrections: list[str] = []
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            draft = await write_section(
+                section=section,
+                cards=cards,
+                whitelist=whitelist,
+                context=writing_context,
+                runner=runner,
+                assets=assets,
+                compact=compact,
+                corrections=corrections or None,
+            )
+        except Exception as error:  # noqa: BLE001 - 单章失败不阻断整篇（draft-first）
+            logger.warning(
+                "section writing failed",
+                extra={"section": section_key, "error": type(error).__name__, "attempt": attempt},
+            )
+            context.warn("write", type(error).__name__, {"section": section_key})
+            outcome.warnings.append(
+                {"stage": "write", "section": section_key, "reason": type(error).__name__}
+            )
+            draft = SectionDraft(
+                section_key=section_key,
+                title=str(section.get("title") or section_key),
+            )
+            draft.paragraphs = [{"text": "", "cite_keys": []}]
+            draft.generator = "failed"
+            draft.failure_reason = type(error).__name__
+
+        draft.attempts = attempt
+        defects = inspect_section_draft(
+            draft,
+            language=writing_context.language,
+            evidence=section_evidence,
+            is_frame=is_frame,
         )
-    except Exception as error:  # noqa: BLE001 - 单章失败不阻断整篇（draft-first）
-        logger.warning(
-            "section writing failed",
-            extra={"section": section_key, "error": type(error).__name__},
+        if not defects:
+            if attempt > 1:
+                outcome.recovered_sections.append(
+                    {"section": section_key, "attempts": attempt, "recovered_from": corrections[:1]}
+                )
+                await context.emit(
+                    "write.section_recovered",
+                    {"section": section_key, "attempts": attempt},
+                    stage=WRITE_STAGE,
+                )
+            return draft
+
+        # 「有正文但有瑕疵」严格好于「只有占位」：留住目前最好的一版，
+        # 全部重试都失败时至少不会把一段真正文换成一句占位。
+        if best is None or _draft_rank(draft, defects) > _draft_rank(best, best_defects):
+            best, best_defects = draft, defects
+
+        if attempt >= max_attempts or all(not defect.recoverable for defect in defects):
+            break
+
+        corrections = [
+            text
+            for defect in defects
+            if (text := defect.correction(language=writing_context.language))
+        ]
+        # 截断/空返回不是「写得不对」，加纠正指令没有意义——要减少要写的量。
+        if any(defect.code == "not_generated" for defect in defects) or not corrections:
+            compact = True
+        logger.info(
+            "retrying section",
+            extra={
+                "section": section_key,
+                "attempt": attempt + 1,
+                "defects": [defect.code for defect in defects],
+                "compact": compact,
+            },
         )
-        context.warn("write", type(error).__name__, {"section": section_key})
-        outcome.warnings.append(
-            {"stage": "write", "section": section_key, "reason": type(error).__name__}
+        await context.emit(
+            "write.section_retry",
+            {
+                "section": section_key,
+                "attempt": attempt + 1,
+                "defects": [defect.code for defect in defects],
+                "compact": compact,
+            },
+            stage=WRITE_STAGE,
         )
-        draft = SectionDraft(
-            section_key=section_key,
-            title=str(section.get("title") or section_key),
-        )
-        draft.paragraphs = [{"text": "", "cite_keys": []}]
-        draft.generator = "failed"
-        return draft
+
+    assert best is not None  # 循环至少跑一轮
+    outcome.warnings.append(
+        {
+            "stage": "write",
+            "section": section_key,
+            "reason": "section_not_matured",
+            "defects": [defect.code for defect in best_defects],
+            "attempts": best.attempts,
+        }
+    )
+    context.warn(
+        "write",
+        "section_not_matured",
+        {"section": section_key, "defects": [defect.code for defect in best_defects]},
+    )
+    return best
+
+
+def _draft_rank(draft: SectionDraft, defects: list[SectionDefect]) -> tuple[int, int, int]:
+    """比较两版草稿哪一版更接近成稿：有正文 > 缺陷少 > 篇幅足。"""
+    return (int(draft.has_body), -len(defects), draft.word_count)
 
 
 async def _card_context(session, project_id: uuid.UUID) -> dict[str, dict[str, Any]]:

@@ -64,6 +64,7 @@ from paperforge_worker.pipelines.quality import (
     build_original_claim_grounding,
     build_quality_report,
     claim_verification_cache_keys,
+    recoverable_findings,
     repairable_finding_count,
     soft_check_citations,
     verify_claim_evidence,
@@ -800,7 +801,9 @@ async def run_write_pipeline(
             ),
             critical=True,
         )
-        await _finish(context, delivered=bool(outcome and outcome.section_count))
+        # 完整性是交付的前提：``section_count`` 只说明有章节行，不说明每一节都有正文。
+        # 补写扫描已经尽过力，到这里还缺的章节必须体现在任务状态上。
+        await _finish_write_outcome(context, outcome)
         return {"project_id": project_id, "write": outcome.to_payload() if outcome else None}
 
 
@@ -886,7 +889,7 @@ async def run_draft_rebuild_pipeline(
         ):
             await _finish_needs_input(context, quality)
         else:
-            await _finish(context, delivered=bool(write and write.section_count))
+            await _finish_write_outcome(context, write)
         return {
             "project_id": project_id,
             "outline": outline.to_payload() if outline else None,
@@ -953,10 +956,14 @@ async def run_polish_pipeline(
                 ),
                 kind="write",
             )
-            if (
-                quality_profile != "draft"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status != "preflight_ready"
+            # 可恢复的缺陷（整节没写出来、整段照抄证据、语种不一致）在**任何档位**
+            # 都先自动修一轮：只报不修等于把一份自己知道有洞的稿子交出去。
+            if quality_outcome is not None and (
+                (
+                    quality_profile != "draft"
+                    and quality_outcome.readiness_status != "preflight_ready"
+                )
+                or recoverable_findings(quality_outcome)
             ):
                 quality_outcome, repair_history = await _converge_scholarly_quality(
                     context,
@@ -964,6 +971,7 @@ async def run_polish_pipeline(
                     language=language,
                     paper_type=paper_type,
                     review_style=review_style,
+                    quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
             if (
                 quality_profile == "submission"
@@ -1493,10 +1501,9 @@ async def run_quality_repair_pipeline(
             kind="write",
         )
         repair_history: list[dict[str, Any]] = []
-        if (
-            quality_profile != "draft"
-            and report is not None
-            and report.readiness_status != "preflight_ready"
+        if report is not None and (
+            (quality_profile != "draft" and report.readiness_status != "preflight_ready")
+            or recoverable_findings(report)
         ):
             report, repair_history = await _converge_scholarly_quality(
                 context,
@@ -1504,6 +1511,7 @@ async def run_quality_repair_pipeline(
                 language=language,
                 paper_type=paper_type,
                 review_style=review_style,
+                quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
             )
         if (
             quality_profile == "submission"
@@ -2263,9 +2271,12 @@ async def _quality_failing_sections(context: JobContext, report: Any) -> set[str
         section_keys.update(
             anchor.section_key for anchor in anchors if _claim_anchor_requires_repair(anchor)
         )
-    for blocker in report.blockers or []:
-        section_keys.update(str(key) for key in blocker.get("section_keys") or [])
-        section_keys.update(str(key) for key in blocker.get("sections") or [])
+    # 提示也要读：draft 档把大部分阻断项降级成了提示，只读 blockers 会让这一档的
+    # 修复轮拿到一个空的章节集合，然后回落到「重写除框架章节外的所有章节」——
+    # 既贵又不对症。
+    for finding in list(report.blockers or []) + recoverable_findings(report):
+        section_keys.update(str(key) for key in finding.get("section_keys") or [])
+        section_keys.update(str(key) for key in finding.get("sections") or [])
     if section_keys:
         return section_keys
     async with context.session() as session:
@@ -2697,8 +2708,14 @@ async def _converge_scholarly_quality(
     language: str,
     paper_type: str,
     review_style: str,
+    quality_profile: str = "scholarly",
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """At most two monotonic local rewrite rounds after the pre-write evidence gate."""
+    """At most two monotonic local rewrite rounds after the pre-write evidence gate.
+
+    ``quality_profile`` 必须跟着调用方走。此前这里写死 scholarly，于是 draft 档的
+    任务一旦进来，重新评估出的是一份 scholarly 报告，和用户选的档位对不上；更实际的
+    后果是 draft 根本没被允许进来过——可恢复的缺陷因此永远只是提示。
+    """
     current = initial_report
     history: list[dict[str, Any]] = []
     for attempt in range(1, 3):
@@ -2720,7 +2737,7 @@ async def _converge_scholarly_quality(
             )
             candidate = await _quality(
                 context,
-                quality_profile="scholarly",
+                quality_profile=quality_profile,
                 review_style=review_style,
             )
         except Exception as error:  # noqa: BLE001 - restore the last known-good manuscript
@@ -2750,13 +2767,13 @@ async def _converge_scholarly_quality(
             candidate = await _republish_after_rollback(
                 context,
                 current,
-                quality_profile="scholarly",
+                quality_profile=quality_profile,
                 review_style=review_style,
             )
             if candidate is None:
                 candidate = await _quality(
                     context,
-                    quality_profile="scholarly",
+                    quality_profile=quality_profile,
                     review_style=review_style,
                 )
             after = _blocker_instances(candidate)
@@ -2891,10 +2908,14 @@ async def run_full_pipeline(
                 ),
                 kind="write",
             )
-            if (
-                quality_profile != "draft"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status != "preflight_ready"
+            # 可恢复的缺陷（整节没写出来、整段照抄证据、语种不一致）在**任何档位**
+            # 都先自动修一轮：只报不修等于把一份自己知道有洞的稿子交出去。
+            if quality_outcome is not None and (
+                (
+                    quality_profile != "draft"
+                    and quality_outcome.readiness_status != "preflight_ready"
+                )
+                or recoverable_findings(quality_outcome)
             ):
                 quality_outcome, repair_history = await _converge_scholarly_quality(
                     context,
@@ -2902,6 +2923,7 @@ async def run_full_pipeline(
                     language=language,
                     paper_type=paper_type,
                     review_style=review_style,
+                    quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
             if (
                 quality_profile == "submission"
@@ -3021,6 +3043,9 @@ async def run_full_pipeline(
             and quality_outcome.readiness_status not in RENDERABLE_READINESS
         ):
             await _finish_needs_input(context, quality_outcome)
+        elif not _stage_scalar(context, "write", "complete", write_outcome):
+            # 修复轮跑完仍然有章节没有正文。产物保留可查，但这不是一篇交付稿。
+            await _finish_incomplete(context, write_outcome, quality_outcome)
         else:
             delivered = export_outcome is not None or bool(context.stage_payload("render"))
             await _finish(context, delivered=delivered)
@@ -3190,6 +3215,62 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
             )
     # ``job.finished`` is committed before this status transition. Wake subscribers again so they
     # observe the terminal row and close immediately instead of waiting for the safety heartbeat.
+    await context.notify_event()
+
+
+async def _finish_write_outcome(context: JobContext, outcome: Any) -> None:
+    """写作类任务的收尾：完整才算交付，不完整报 needs_input 而不是 succeeded。
+
+    ``section_count`` 曾经是唯一判据，于是「11 节里 5 节只有一句占位」也记成成功。
+    产物照旧留在库里可看可改，但任务状态不再声称这是一篇写完的稿子。
+    """
+    if outcome is None or not outcome.section_count:
+        await _finish(context, delivered=False)
+        return
+    if outcome.complete:
+        await _finish(context, delivered=True)
+        return
+    await _finish_incomplete(context, outcome, None)
+
+
+async def _finish_incomplete(context: JobContext, write_outcome: Any, quality_report: Any) -> None:
+    """稿子不完整：保留产物，但明说缺哪几节、缺什么。"""
+    incomplete = (
+        list(getattr(write_outcome, "incomplete_sections", None) or [])
+        if write_outcome is not None
+        else list(context.stage_payload("write").get("incomplete_sections") or [])
+    )
+    payload = {
+        "status": "needs_input",
+        "readiness_status": "incomplete_manuscript",
+        "blockers": [
+            {
+                "code": "section_not_generated",
+                "message": f"{len(incomplete)} 个章节在重试与自动修复之后仍然没有正文",
+                "count": len(incomplete),
+                "section_keys": [str(item.get("section")) for item in incomplete],
+                "defects": sorted(
+                    {code for item in incomplete for code in item.get("defects") or []}
+                ),
+            }
+        ],
+        "quality_report_id": getattr(quality_report, "report_id", None),
+    }
+    await context.emit(
+        "job.needs_input",
+        payload,
+        stage="done",
+        progress=1.0,
+        checkpoint={"quality_blocked": payload},
+    )
+    if context.job_id is None:
+        return
+    from db.models.paper import GenerationJob
+
+    async with context.session() as session:
+        job = await session.get(GenerationJob, context.job_id)
+        if job is not None:
+            await update_job(session, job, status="needs_input", error=payload)
     await context.notify_event()
 
 

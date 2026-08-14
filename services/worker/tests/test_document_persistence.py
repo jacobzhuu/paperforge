@@ -120,18 +120,30 @@ def _context(project_id: uuid.UUID, session_factory) -> JobContext:
     )
 
 
+def section_body(key: str) -> str:
+    """一节替身正文。
+
+    长度必须过得了 ``inspect_section_draft`` 的最低篇幅线：写作循环会把过短的章节
+    判成没写成并重试，而这些用例考的是落库时机、暂停与润色，不是重试阶梯。
+    """
+    lead = "Poisoning attacks in sequential recommenders." if key == "abstract" else f"{key} body."
+    filler = (
+        "Poisoning studies differ in threat model, attacker budget, and the recommender "
+        "architecture under attack, so their reported degradations are only comparable "
+        "once those conditions are stated together. "
+    )
+    return lead + " " + filler * 8
+
+
 def _draft_writer(cite_key: str, *, cancel_at: str | None = None):
     """替身写手：按需在某一节抛 CancelledError，模拟 arq 超时掐断。"""
 
-    async def _write(*, section, cards, whitelist, context, runner, assets=None):
+    async def _write(*, section, cards, whitelist, context, runner, assets=None, **_kwargs):
         key = str(section.get("key") or "")
         if key == cancel_at:
             raise asyncio.CancelledError
         draft = SectionDraft(section_key=key, title=str(section.get("title") or key))
-        text = (
-            "Poisoning attacks in sequential recommenders." if key == "abstract" else f"{key} body."
-        )
-        draft.paragraphs = [{"text": text, "cite_keys": [cite_key]}]
+        draft.paragraphs = [{"text": section_body(key), "cite_keys": [cite_key]}]
         draft.generator = "llm:test-model"
         draft.model = "test-model"
         return draft

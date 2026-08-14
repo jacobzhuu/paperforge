@@ -42,6 +42,17 @@ MAX_ROLLING_SUMMARY_CHARS = 600
 SECTION_MAX_OUTPUT_TOKENS = 8000
 TARGET_WORDS_PER_SECTION_ZH = 1200
 TARGET_WORDS_PER_SECTION_EN = 800
+# 截断之后**降低需求**，而不是加预算：deepseek 系被 clamp 在 8192，供给侧已经到顶。
+# 紧凑档砍掉目标长度与段落数，让同一节的输出结构性地装得进同一个上限。
+COMPACT_TARGET_WORDS_ZH = 700
+COMPACT_TARGET_WORDS_EN = 450
+COMPACT_MAX_PARAGRAPHS = 4
+# 一节正文低于这个字数就不算写出来了——模型偶尔会返回一两句话就收尾。
+MIN_BODY_WORDS_ZH = 180
+MIN_BODY_WORDS_EN = 120
+# 框架章节（摘要/引言/结论）本来就短，用更低的下限，否则会把正常摘要判成失败。
+MIN_FRAME_WORDS_ZH = 80
+MIN_FRAME_WORDS_EN = 60
 WRITING_CARD_CONTEXT_CHAR_BUDGET = 36_000
 MAX_CARD_FIELD_ITEMS = 8
 MAX_CARD_EVIDENCE_POINTS = 12
@@ -148,10 +159,23 @@ class SectionDraft:
     model: str | None = None
     rewrite_count: int = 0
     generator: str = "deterministic"
+    #: 为什么这一节没有正文。编排层据此决定下一次用哪种重试策略，而不是
+    #: 把所有失败都当成同一件事重试同一遍。
+    failure_reason: str | None = None
+    #: 这一节实际经历了几次写作调用（含重试），落进 outcome 供成本核对。
+    attempts: int = 0
 
     @property
     def word_count(self) -> int:
         return sum(count_words(p.get("text", "")) for p in self.paragraphs)
+
+    @property
+    def has_body(self) -> bool:
+        """这一节是不是真的有正文——降级占位不算。"""
+        return self.generator.startswith("llm") or self.generator in {
+            "resumed",
+            "deterministic_search_log",
+        }
 
     def to_ir_section(self, *, level: int = 1) -> Section:
         """转成 PaperIR Section：cite 是原子节点，不是正文里的字符串。"""
@@ -272,12 +296,20 @@ async def write_section(
     context: WritingContext,
     runner: LLMRunner | None = None,
     assets: list[dict[str, Any]] | None = None,
+    compact: bool = False,
+    corrections: list[str] | None = None,
 ) -> SectionDraft:
-    """生成单个章节。R2 违规先重写一次，再违规则 strip 并留告警。"""
+    """生成单个章节。R2 违规先重写一次，再违规则 strip 并留告警。
+
+    ``compact`` 走紧凑档：目标长度与段落数都压下来。这是截断之后唯一有效的方向——
+    deepseek 系的输出上限被 ``clamp_max_output_tokens()`` 压在 8192，供给侧没有余量，
+    只能让需求装进去。``corrections`` 是上一版的具体问题（照抄原文、语种不对、太短），
+    直接回灌给模型，重试才有理由产生不同的结果。
+    """
     section_key = str(section.get("key") or "section")
     title = str(section.get("title") or section_key)
     allowed = {key for key in section.get("cite_keys", []) if key in whitelist}
-    section_evidence = _section_evidence(section, context.outline)
+    section_evidence = section_evidence_for(section, context.outline)
     evidence_by_id = {
         str(item.get("evidence_id")): item for item in section_evidence if item.get("evidence_id")
     }
@@ -327,6 +359,7 @@ async def write_section(
                 reason="evidence_gap" if body_without_cites else "write_failed",
             )
         draft.generator = "evidence_gap_skeleton" if body_without_cites else "deterministic"
+        draft.failure_reason = "no_evidence_contract" if body_without_cites else "writer_disabled"
         return draft
 
     user_prompt = _build_prompt(
@@ -335,6 +368,8 @@ async def write_section(
         allowed=allowed,
         context=context,
         assets=assets or [],
+        compact=compact,
+        corrections=corrections,
     )
     system_prompt = (
         _ORIGINAL_SYSTEM_PROMPT_ZH
@@ -408,6 +443,7 @@ async def write_section(
                 reason="write_failed",
             )
         draft.generator = "deterministic_fallback"
+        draft.failure_reason = result.error or "no_model_output"
         return draft
 
     draft.paragraphs = normalize_paragraphs(
@@ -447,6 +483,7 @@ async def write_section(
                 reason="write_failed",
             )
         draft.generator = "deterministic_fallback"
+        draft.failure_reason = "evidence_rules_stripped_all_sentences"
     return draft
 
 
@@ -534,9 +571,14 @@ def _build_prompt(
     allowed: set[str],
     context: WritingContext,
     assets: list[dict[str, Any]] | None = None,
+    compact: bool = False,
+    corrections: list[str] | None = None,
 ) -> str:
     zh = context.language == "zh"
-    target = TARGET_WORDS_PER_SECTION_ZH if zh else TARGET_WORDS_PER_SECTION_EN
+    if compact:
+        target = COMPACT_TARGET_WORDS_ZH if zh else COMPACT_TARGET_WORDS_EN
+    else:
+        target = TARGET_WORDS_PER_SECTION_ZH if zh else TARGET_WORDS_PER_SECTION_EN
     outline_titles = [
         str(s.get("title")) for s in (context.outline.get("sections") or []) if s.get("title")
     ]
@@ -581,14 +623,45 @@ def _build_prompt(
         remaining_context = max(0, remaining_context - len(rendered))
 
     points = section.get("argument_points") or []
-    section_evidence = _section_evidence(section, context.outline)
+    section_evidence = section_evidence_for(section, context.outline)
     evidence_block = _evidence_context_block(
         section=section,
         evidence=section_evidence,
         language=context.language,
     )
+    # 纠正指令放在最前面：这是重试与首轮唯一的差别，埋在两千行上下文中间等于没写。
+    correction_block = (
+        "\n".join(
+            [
+                (
+                    "必须修正上一版的以下问题："
+                    if zh
+                    else "You MUST fix these problems from your last attempt:"
+                ),
+                *(f"- {item}" for item in corrections),
+                "",
+            ]
+        )
+        if corrections
+        else ""
+    )
+    compact_block = (
+        (
+            f"输出预算有限：最多写 {COMPACT_MAX_PARAGRAPHS} 段，terms 可以留空数组。"
+            "宁可少写一个论点，也要把写下的部分写完整——截断的半句话没有任何价值。"
+            if zh
+            else (
+                f"Output budget is tight: at most {COMPACT_MAX_PARAGRAPHS} paragraphs, and `terms` "
+                "may be an empty array. Drop an argument rather than getting cut off mid-sentence."
+            )
+        )
+        if compact
+        else ""
+    )
     return "\n".join(
         [
+            correction_block,
+            compact_block,
             f"Paper topic: {context.outline.get('topic', '')}",
             f"Research question: {context.outline.get('research_question', '')}",
             f"Full outline: {' | '.join(outline_titles)}",
@@ -660,7 +733,7 @@ def _truncate_card_context(parts: list[str], char_budget: int) -> str:
     return "\n".join(kept)
 
 
-def _section_evidence(
+def section_evidence_for(
     section: dict[str, Any],
     outline: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -1350,6 +1423,123 @@ def deterministic_paragraphs(
         )
     )
     return [{"text": gap, "cite_keys": [], "evidence_gap": True}]
+
+
+@dataclass(frozen=True)
+class SectionDefect:
+    """一节稿子没达到「成熟正文」的一个具体原因。"""
+
+    code: str
+    detail: str
+    #: 这条缺陷能不能靠重写这一节修好。不可恢复的（证据不足）重写多少次都一样。
+    recoverable: bool = True
+
+    def correction(self, *, language: str) -> str:
+        """回灌给模型的纠正指令。空串表示这条缺陷没法靠改提示词修。"""
+        table = _SECTION_CORRECTIONS.get(self.code, {})
+        return table.get("zh" if language == "zh" else "en", "")
+
+
+_SECTION_CORRECTIONS: dict[str, dict[str, str]] = {
+    "verbatim_evidence_copy": {
+        "zh": (
+            "上一版把证据原文整段照抄进了正文。必须用你自己的话重写：先给出论断，"
+            "再说明证据支持它的哪一部分；可以引用具体数值和结论，但不得成段复制原文措辞。"
+        ),
+        "en": (
+            "The previous draft copied evidence text verbatim. Rewrite it in your own words: "
+            "state the claim first, then say what the evidence supports. Cite specific values "
+            "and findings, but never reproduce whole passages of the source wording."
+        ),
+    },
+    "language_mismatch": {
+        "zh": (
+            "上一版有整段英文。正文必须全部用中文写作，"
+            "英文只允许出现在术语、缩写、模型或数据集名里。"
+        ),
+        "en": "The previous draft contained non-English paragraphs. Write all prose in English.",
+    },
+    "too_short": {
+        "zh": "上一版篇幅明显不足，只写了个开头。请按目标长度完整展开本节论证。",
+        "en": (
+            "The previous draft was far too short. Develop the full argument to the target length."
+        ),
+    },
+}
+
+
+def inspect_section_draft(
+    draft: SectionDraft,
+    *,
+    language: str,
+    evidence: list[dict[str, Any]] | None = None,
+    is_frame: bool = False,
+) -> list[SectionDefect]:
+    """判定一节稿子是否够格进入成稿——写作循环与交付门用的是同一个判据。
+
+    这是**写作时**的验收，不是事后体检：同一组判据在生成回路里驱动重写，在交付
+    门里决定能不能算完整。两处若各写一套，最终必然出现「质量门说有问题、写作层
+    却认为已经写完」的稳定分歧。
+    """
+    if not draft.has_body:
+        return [
+            SectionDefect(
+                code="not_generated",
+                detail=draft.failure_reason or "no model output",
+            )
+        ]
+
+    defects: list[SectionDefect] = []
+    minimum = (
+        (MIN_FRAME_WORDS_ZH if language == "zh" else MIN_FRAME_WORDS_EN)
+        if is_frame
+        else (MIN_BODY_WORDS_ZH if language == "zh" else MIN_BODY_WORDS_EN)
+    )
+    if draft.word_count < minimum:
+        defects.append(
+            SectionDefect(
+                code="too_short",
+                detail=f"{draft.word_count} words < {minimum}",
+            )
+        )
+
+    from paperforge_worker.pipelines.quality import (
+        verbatim_evidence_copies,
+        zh_language_mismatches,
+    )
+
+    row = _draft_as_section_row(draft)
+    if language == "zh" and zh_language_mismatches([row]):
+        defects.append(SectionDefect(code="language_mismatch", detail="latin-script paragraphs"))
+
+    evidence_units = {
+        str(item.get("evidence_id")): {"text": str(item.get("text") or "")}
+        for item in evidence or []
+        if item.get("evidence_id")
+    }
+    copies = verbatim_evidence_copies([row], evidence_units)
+    if copies:
+        defects.append(
+            SectionDefect(
+                code="verbatim_evidence_copy",
+                detail=f"{len(copies)} paragraph(s) overlap >= {copies[0]['overlap']}",
+            )
+        )
+    return defects
+
+
+def _draft_as_section_row(draft: SectionDraft) -> Any:
+    """把草稿包成质量检查认得的行对象，复用同一批检测函数而不是另写一遍。"""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        id=None,
+        section_key=draft.section_key,
+        title=draft.title,
+        status="generated",
+        cite_keys_json=sorted({key for p in draft.paragraphs for key in p.get("cite_keys", [])}),
+        body_ir_json=draft.to_ir_section().model_dump(mode="json"),
+    )
 
 
 def summarize_paragraphs(paragraphs: list[dict[str, Any]]) -> str:
