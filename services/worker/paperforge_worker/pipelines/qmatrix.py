@@ -320,6 +320,7 @@ async def _classify_question(
 
     classified: list[dict[str, Any]] = []
     classifier_returned_valid_payload = False
+    fallback_returned_valid_payload = False
     if runner.enabled:
         llm_result = await runner.agenerate_json(
             "evidence_classifier",
@@ -343,11 +344,27 @@ async def _classify_question(
                 llm_result.value.get("links"),
                 allowed_ids={str(unit.id) for unit, _score in candidates},
             )
-        # A syntactically valid empty array is not trustworthy when lexical
-        # retrieval found a strong eligible pool.  Retry only this anomaly on
-        # the quality tier with a smaller prompt; legitimate non-matches remain
-        # empty if the second independent judgement agrees.
-        if classifier_returned_valid_payload and not classified and candidates:
+        # Retry on the quality tier with a smaller prompt whenever the first pass yielded no
+        # usable links.  Two distinct causes, both answered by the same smaller ask:
+        #
+        # 1. A syntactically valid empty array is not trustworthy when lexical retrieval found a
+        #    strong eligible pool.  Legitimate non-matches stay empty if the second independent
+        #    judgement agrees.
+        # 2. A truncated or malformed response yields no links at all.  This is the *common* case
+        #    -- 31 of 65 production classifier calls truncated -- and it previously skipped the
+        #    retry entirely (the gate required a valid payload), falling straight through to the
+        #    deterministic fallback below.  That fallback can only ever emit stance="supports";
+        #    157 of 367 production links sit at exactly its min(0.85, score) cap, so it is a large
+        #    minority of all linkage.  Since synthesis detects conflict only through stance
+        #    disagreement, every truncated call permanently removed any chance of a dissenting
+        #    stance for that question -- production holds zero `contradicts` links.  Halving the
+        #    candidate count is the targeted fix: the output budget, not the model's judgement,
+        #    was the binding limit.
+        #
+        # If the retry itself returns a valid but empty array, that is an explicit decision by the
+        # quality tier and the deterministic fallback stays off -- the same rule already applied to
+        # the first pass, now applied consistently to whichever pass produced a valid payload.
+        if not classified and candidates:
             focused = candidates[:12]
             retry = await runner.agenerate_json(
                 "evidence_classifier_fallback",
@@ -369,17 +386,22 @@ async def _classify_question(
                 and isinstance(retry.value, dict)
                 and isinstance(retry.value.get("links"), list)
             ):
+                fallback_returned_valid_payload = True
                 classified = _normalize_links(
                     retry.value.get("links"),
                     allowed_ids={str(unit.id) for unit, _score in focused},
                 )
                 diagnostic["fallback_classifier_used"] = True
-    llm_classified = len(classified) if classifier_returned_valid_payload else 0
+    # Either pass returning a valid payload means a model judged these candidates.  The retry now
+    # also runs after a truncated first pass, so this must not stay keyed on the first pass alone:
+    # that would let the deterministic fallback below overwrite links the retry just recovered.
+    semantic_payload = classifier_returned_valid_payload or fallback_returned_valid_payload
+    llm_classified = len(classified) if semantic_payload else 0
     fallback_classified = 0
     # A valid empty list is an explicit decision.  Deterministic fallback is
     # only for an unavailable/invalid classifier and never promotes a
     # topic-blind degraded pool.
-    if not classifier_returned_valid_payload and routing_mode != "degraded_lexical_bypass":
+    if not semantic_payload and routing_mode != "degraded_lexical_bypass":
         classified = _deterministic_links(candidates, measurements=measurements)
         fallback_classified = len(classified)
     diagnostic["classified_count"] = len(classified)
@@ -394,7 +416,7 @@ async def _classify_question(
     if not classified:
         diagnostic["no_link_reason"] = (
             "classifier_rejected_all"
-            if classifier_returned_valid_payload
+            if semantic_payload
             else (
                 "degraded_classifier_unavailable"
                 if routing_mode == "degraded_lexical_bypass"

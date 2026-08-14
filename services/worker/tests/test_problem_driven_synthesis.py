@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from uuid import uuid4
 
+from llm_runtime.runner import JsonResult
 from paperforge_worker.pipelines.qmatrix import (
     MAX_COMPARABILITY_BRIDGE,
+    _classify_question,
     _deterministic_links,
     _diverse_ranked_candidates,
     _link_set_score,
@@ -284,3 +286,94 @@ def test_the_bridge_is_bounded_and_respects_the_per_work_cap():
     bridged = [item for item in selected if any(item[0] is unit for unit in siblings)]
     assert len(bridged) <= MAX_COMPARABILITY_BRIDGE
     assert len({id(item[0].work_id) for item in bridged}) == len(bridged)
+
+
+class _ScriptedRunner:
+    """Returns a queued JsonResult per call and records which role was asked."""
+
+    enabled = True
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.roles: list[str] = []
+
+    def model_for(self, role: str) -> str:
+        return "stub-model"
+
+    async def agenerate_json(self, role, **_kwargs):
+        self.roles.append(role)
+        return self._results.pop(0)
+
+
+def _question(text: str):
+    return SimpleNamespace(
+        id=uuid4(),
+        text=text,
+        expected_evidence_kinds_json=["experimental_fact"],
+        task_id=None,
+    )
+
+
+async def test_a_truncated_classifier_is_retried_instead_of_degrading_to_lexical_links():
+    """The common failure was skipping the retry: `ok` is False on truncation, and the old gate
+    required a valid payload, so 31 of 65 production calls fell straight to `_deterministic_links`
+    — which stamps stance="supports" on everything and leaves synthesis nothing to disagree with.
+    """
+    unit = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [
+            # First pass truncated: value is None, so `ok` is False.
+            JsonResult(value=None, error="output_truncated"),
+            JsonResult(
+                value={
+                    "links": [
+                        {"evidence_id": str(unit.id), "stance": "contradicts", "confidence": 0.72}
+                    ]
+                }
+            ),
+        ]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[unit],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+    )
+
+    assert runner.roles == ["evidence_classifier", "evidence_classifier_fallback"]
+    # The recovered semantic judgement must survive: `_deterministic_links` would have
+    # overwritten it with stance="supports" if the fallback flag were not consulted.
+    assert [link["stance"] for link in result.classified] == ["contradicts"]
+    assert result.llm_classified == 1
+    assert result.fallback_classified == 0
+    assert result.diagnostic["fallback_classifier_used"] is True
+
+
+async def test_a_truncated_classifier_still_degrades_to_lexical_when_the_retry_also_fails():
+    """Degrade-never-block: two failed passes must still produce the deterministic links."""
+    unit = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [
+            JsonResult(value=None, error="output_truncated"),
+            JsonResult(value=None, error="output_truncated"),
+        ]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[unit],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+    )
+
+    assert runner.roles == ["evidence_classifier", "evidence_classifier_fallback"]
+    assert [link["stance"] for link in result.classified] == ["supports"]
+    assert result.llm_classified == 0
+    assert result.fallback_classified == 1
