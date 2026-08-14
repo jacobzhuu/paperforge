@@ -81,7 +81,8 @@ Install `ruff` with a plain `pip install` as root (`docker exec -u root`), **not
 - web: 75 passed (129 in the wider audit run)
 - `services/api` minus `test_ops_scripts.py`: 122 passed on a clean DB (3 long-standing failures
   were fixed 2026-08-05 — if one reappears it is a **real regression**, not a known issue)
-- `packages/db`: 43 passed
+- `packages/db`: 71 passed (2026-08-14; the older "43 passed" figure predates the entailment
+  cache tests)
 
 `services/worker/tests/test_visual_export.py::test_docx_converts_uploaded_pdf_figure_to_embedded_png`
 fails in `paperforge-worker:local` because Pillow lives only in visuald — that one is environmental.
