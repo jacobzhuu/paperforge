@@ -195,11 +195,13 @@ services:
     <<: *app-security
     tmpfs:
       - /tmp
+    # depends_on 只门住启动那一刻；共享服务在运行期退出（snap 刷新就干过）之后，
+    # 仍然要有人发现。同一个检查也覆盖对象存储，见 healthcheck 模块的注释。
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('redis', 6379), timeout=2).close()"]
-      interval: 10s
-      timeout: 3s
-      retries: 20
+      test: ["CMD", "python", "-m", "paperforge_worker.healthcheck"]
+      interval: 15s
+      timeout: 12s
+      retries: 8
       start_period: 20s
     mem_limit: 2g
     cpus: 2.0

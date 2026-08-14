@@ -165,6 +165,24 @@ def test_blue_green_deploy_rebuilds_and_preflights_the_texd_runtime() -> None:
     )
 
 
+def test_blue_green_deploy_preflights_the_shared_object_store() -> None:
+    """共享 MinIO 不在蓝绿 compose 里；没人断言它，它停了 11 天也照样滚部署。"""
+    source = DEV.read_text(encoding="utf-8")
+    assert 'verify_object_store "${compose_project}"' in source
+    assert "Object storage is unusable from the new worker; refusing to switch Funnel." in source
+    assert source.index('verify_object_store "${compose_project}"') < source.index(
+        'tailscale_cli funnel --bg "${port}"'
+    )
+
+
+def test_worker_healthcheck_covers_the_object_store_not_only_the_queue() -> None:
+    """只探队列的 worker 在对象存储停摆时仍报 healthy，故障就此隐身。"""
+    for compose in ("docker-compose.bluegreen.yml", "docker-compose.prod.yml"):
+        source = (ROOT / "infra" / compose).read_text(encoding="utf-8")
+        assert '"CMD", "python", "-m", "paperforge_worker.healthcheck"' in source, compose
+        assert "socket.create_connection(('redis', 6379)" not in source, compose
+
+
 def test_blue_green_reaper_protects_live_and_active_deployments() -> None:
     source = DEV.read_text(encoding="utf-8")
     funnel_guard = "Cannot identify the deployment serving the Funnel; refusing to remove anything."

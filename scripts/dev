@@ -308,6 +308,35 @@ print("✓ texd offline longtable preflight passed")
 '
 }
 
+verify_object_store() {
+  local project="$1"
+  # 对象存储是蓝绿栈外部的共享服务，compose 门不住它。健康检查只证明桶还在，
+  # 这里再走一次真实写—读—删：凭据失效或桶策略变成只读同样会让每条生成在
+  # INGEST 崩掉，而那时 SEARCH/SCREEN 的钱已经花掉了。
+  # 2026-08-03 起 MinIO 停了 11 天，中间照常滚了 5 次部署，没有一次发现。
+  docker exec "${project}-worker-1" python -c '
+import os
+
+from paperforge_worker.config import get_settings
+from paperforge_worker.healthcheck import enforce_deadline
+from storage import make_object_store
+
+settings = get_settings()
+# 黑洞掉的端点会让 MinIO 客户端挂十几分钟；部署不能停在那里等。
+enforce_deadline(30)
+store = make_object_store(settings)
+key = "healthcheck/deploy-preflight-%s" % os.urandom(8).hex()
+payload = os.urandom(32)
+store.put(key, payload)
+try:
+    if store.get(key) != payload:
+        raise SystemExit("object store round trip returned different bytes")
+finally:
+    store.delete(key)
+print("✓ object store round trip passed (%s)" % settings.storage_backend)
+'
+}
+
 wait_postgres() {
   local attempt=0
   for attempt in $(seq 1 60); do
@@ -847,6 +876,10 @@ deploy() {
 
   wait_http "new deployment" "http://127.0.0.1:${port}/login"
   verify_texd_runtime "${compose_project}"
+  if ! verify_object_store "${compose_project}"; then
+    echo "Object storage is unusable from the new worker; refusing to switch Funnel." >&2
+    return 1
+  fi
 
   # The public UI must not be switched to a worker that still cannot reach the
   # image provider.  Any HTTP response proves DNS/TLS/proxy connectivity; only
@@ -929,6 +962,16 @@ status() {
     echo "Deployment: ${project}"
     funnel_port="$(funnel_target_port || true)"
     echo "Funnel:     ${PUBLIC_URL} → 127.0.0.1:${funnel_port:-unknown}"
+    # 共享的 PostgreSQL/Redis/MinIO 不属于这个 compose project，`ps` 看不到它们停了。
+    local dependencies
+    if dependencies="$(docker exec "${project}-worker-1" python -m paperforge_worker.healthcheck 2>&1)"; then
+      echo "✓ shared dependencies: queue and object store reachable"
+    elif [ "${dependencies#*No module named}" != "${dependencies}" ]; then
+      echo "· shared dependencies: not checked (this deployment predates the probe)"
+    else
+      echo "✗ shared dependencies unavailable; generations will fail at INGEST:" >&2
+      echo "  ${dependencies}" >&2
+    fi
     docker compose -p "${project}" ps 2>/dev/null || true
     echo
   fi

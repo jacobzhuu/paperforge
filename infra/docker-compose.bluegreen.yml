@@ -156,11 +156,16 @@ services:
       - /tmp
     cap_drop:
       - ALL
+    # PostgreSQL/Redis/MinIO 是这套蓝绿栈**外部**的共享服务，compose 无法用
+    # depends_on 门住它们。健康检查因此必须自己断言依赖：只探队列的话，对象
+    # 存储停摆会一直显示为「healthy」，直到用户的项目页上冒出 INGEST 传输错误。
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,socket; from urllib.parse import urlparse; u=urlparse(os.environ['REDIS_URL']); socket.create_connection((u.hostname, u.port or 6379), timeout=2).close()"]
-      interval: 10s
-      timeout: 3s
-      retries: 20
+      # timeout 要留在探测自己的封顶（8s）加上配置导入（~2s）之上，否则失败原因
+      # 会被容器运行时 kill 掉，只剩一个没有解释的 unhealthy。
+      test: ["CMD", "python", "-m", "paperforge_worker.healthcheck"]
+      interval: 15s
+      timeout: 12s
+      retries: 8
       start_period: 20s
     mem_limit: 2g
     cpus: 2.0
