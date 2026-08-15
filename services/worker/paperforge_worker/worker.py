@@ -2433,6 +2433,7 @@ async def _converge_section_semantics(
     runner = context.llm_runner()
     history: list[dict[str, Any]] = []
     attempted: dict[str, set[str]] = {}
+    last_note: dict[str, str] = {}
     verdict_payloads: dict[str, dict[str, Any]] = {}
 
     for attempt in range(1, MAX_SEMANTIC_ROUNDS + 1):
@@ -2473,6 +2474,15 @@ async def _converge_section_semantics(
         for verdict in failing:
             tried = attempted.setdefault(verdict.section_key, set())
             item = shelf.get(verdict.section_key, {})
+            # 重写的指令是随判定走的，这一轮点名的句子和上一轮不一样，就还值得再写一次:
+            # 实测 s2 第一轮被点名「微生物 VOCs 使植物进入防御准备状态」，重写之后那句话
+            # 的主语确实换成了「有益微生物」，但同一段里「VOCs 激活 ISR/SAR」还留着，
+            # 第二轮点的是这句新的。补检索和重跑综合不吃这一条——它们的输入是项目级的，
+            # 判定变了输入也不变，再跑一遍就是重复付钱。
+            note = _repair_note(verdict, item)
+            if note and note != last_note.get(verdict.section_key):
+                tried.discard("rewrite")
+            last_note[verdict.section_key] = note
             route = repair_route(
                 verdict,
                 attempted=frozenset(tried),
@@ -2517,11 +2527,7 @@ async def _converge_section_semantics(
                 section_keys=rewrite_sections,
                 language=language,
                 paper_type=paper_type,
-                notes={
-                    verdict.section_key: _repair_note(verdict, shelf.get(verdict.section_key, {}))
-                    for verdict in failing
-                    if verdict.section_key in rewrite_sections
-                },
+                notes={key: note for key, note in last_note.items() if key in rewrite_sections},
             )
 
     # 最后一轮的修复必须再评一次，否则 ``unresolved`` 报的是**修之前**的判定——

@@ -269,6 +269,52 @@ async def test_evidence_already_on_the_shelf_is_not_repaired_by_retrieving_more(
     assert "没用" not in note and "用起来" not in note
 
 
+async def test_a_rewrite_repeats_when_it_has_new_sentences_to_fix(monkeypatch, harness) -> None:
+    """重写指令随判定走：这一轮点名的句子换了，就还值得再写一次。
+
+    实测 s2：第一轮点名「微生物 VOCs 使植物进入防御准备状态」，重写之后那句的主语
+    确实改成了「有益微生物」，但同段里「VOCs 激活 ISR/SAR」还留着，第二轮点的是新的
+    那句。按「一条路只走一次」，s2 第二轮拿不到任何修复——不是修不动，是没人再修。
+    """
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s2")))
+    seen: list[int] = []
+
+    async def _review(**kwargs):
+        seen.append(1)
+        return _verdict(
+            "s2",
+            synthesis_mode="mixed",
+            unsupported_claims=(f"第 {len(seen)} 轮点名的句子",),
+        )
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    payload = await worker._converge_section_semantics(
+        _context(), language="zh", paper_type="review"
+    )
+
+    assert harness["rewrite"] == [["s2"], ["s2"]], "点名的句子变了就该再写一次"
+    assert harness["notes"][0]["s2"] != harness["notes"][1]["s2"], "两轮指令必须不同"
+    assert payload["unresolved"] == ["s2"]
+
+
+async def test_a_rewrite_is_not_repeated_when_the_verdict_is_unchanged(
+    monkeypatch, harness
+) -> None:
+    """反向保护：判定一字未变就别再花一次钱重写，换下一条路或停。"""
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s6")))
+
+    async def _review(**kwargs):
+        return _verdict("s6", synthesis_mode="mixed", unsupported_claims=("同一句永远不变的话",))
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    payload = await worker._converge_section_semantics(
+        _context(), language="zh", paper_type="review"
+    )
+
+    assert harness["rewrite"] == [["s6"]], "判定没变，不该重复重写"
+    assert payload["unresolved"] == ["s6"]
+
+
 async def test_a_small_evidence_pool_still_routes_to_retrieval(monkeypatch, harness) -> None:
     """反向保护：池子本来就小、又确实答不上，那就是真缺证据，闸不能误伤。"""
     monkeypatch.setattr(
