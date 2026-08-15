@@ -19,6 +19,7 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
     "evidence_classifier": "gpt-4o-mini",
     "evidence_classifier_fallback": "gpt-4o",
     "experiment_extractor": "gpt-4o-mini",
+    "section_reviewer": "gpt-4o",
     "synthesizer": "gpt-4o-mini",
 }
 
@@ -43,6 +44,8 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
     # 跨研究综合是推理，不是按 schema 读文本：判断"同一可比条件下这些结果说明了
     # 什么"需要规划档位的模型，因此回退到 planner 而不是 extractor。
     "synthesizer": "planner",
+    # 语义评审（这一节答没答上、这些研究是什么关系）同样是判断题，走 planner 档。
+    "section_reviewer": "planner",
 }
 
 # DeepSeek V4 defaults to high-effort thinking.  That is useful for planning, but it
@@ -77,6 +80,9 @@ DEFAULT_ROLE_THINKING: dict[str, str] = {
     # flash 关掉思考会直接退化成不判断。关思考的前提是同时换到 planner 档。
     "evidence_classifier": "disabled",
     "evidence_classifier_fallback": "disabled",
+    # 语义评审输出的是一份闭集 JSON 判定，不需要长推理；而按 evidence_classifier
+    # 那一轮的实测，判断力来自档位（planner）而不是思考开关。
+    "section_reviewer": "disabled",
 }
 
 

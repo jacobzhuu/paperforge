@@ -53,6 +53,7 @@ ROLES = (
     "writer",
     "polisher",
     "verifier",
+    "section_reviewer",
 )
 ROLE_DESCRIPTION = {
     "planner": "SCOPE / 大纲 / 主题聚类（中档，严格 JSON 校验 + 确定性回退）",
@@ -63,6 +64,7 @@ ROLE_DESCRIPTION = {
     "writer": "章节写作与连贯性 pass（最强档，结构化输出）",
     "polisher": "编辑器内润色 / 改写 / 学术语气（强档）",
     "verifier": "引用语义软校验、数字 lint 辅助（便宜，仅出提示）",
+    "section_reviewer": "语义评审：章节答没答上子问题、证据之间是什么关系（强档，关思考）",
 }
 
 

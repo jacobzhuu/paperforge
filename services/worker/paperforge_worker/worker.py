@@ -78,6 +78,11 @@ from paperforge_worker.pipelines.readiness import (
 from paperforge_worker.pipelines.scope import generate_scope
 from paperforge_worker.pipelines.screen import screen_eligibility
 from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
+from paperforge_worker.pipelines.semantic_review import (
+    ReviewOutcome,
+    repair_route,
+    review_section,
+)
 from paperforge_worker.pipelines.synthesis import (
     load_synthesis_bundles,
     synthesize_questions,
@@ -974,6 +979,13 @@ async def run_polish_pipeline(
                     review_style=review_style,
                     quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
+            # 语义评审放在确定性质量门之后：先修可判定的红线，再问「答没答上」。
+            # 反过来会让评审对着一份还带着引用/数字问题的稿子做判断。
+            semantic_review = await _converge_section_semantics(
+                context,
+                language=language,
+                paper_type=paper_type,
+            )
             if (
                 quality_profile == "submission"
                 and quality_outcome is not None
@@ -992,6 +1004,7 @@ async def run_polish_pipeline(
                     checkpoint={
                         "quality": quality_outcome.to_payload(),
                         "quality_repair_history": repair_history,
+                        "section_review": semantic_review,
                     },
                 )
             readiness = (
@@ -1514,6 +1527,13 @@ async def run_quality_repair_pipeline(
                 review_style=review_style,
                 quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
             )
+        # 用户点「质量修复」时同样跑语义评审：这条路径正是「帮我把稿子修好」，
+        # 只修可判定的红线而不问「答没答上」是把最重要的一半留在门外。
+        semantic_review = await _converge_section_semantics(
+            context,
+            language=language,
+            paper_type=paper_type,
+        )
         if (
             quality_profile == "submission"
             and report is not None
@@ -1532,6 +1552,7 @@ async def run_quality_repair_pipeline(
                 checkpoint={
                     "quality": report.to_payload(),
                     "quality_repair_history": repair_history,
+                    "section_review": semantic_review,
                 },
             )
         # 收敛器接受了改写就意味着正文变了，此前那份导出件已经对不上稿子。
@@ -2275,6 +2296,198 @@ def _claim_anchor_requires_repair(anchor: Any) -> bool:
     return not resolved
 
 
+#: 语义评审的收敛轮数。一轮走一条修复路，两轮足以让「先补证据、再收回论断」这条
+#: 最常见的组合走完；再多就是对着同一个病因反复付钱。
+MAX_SEMANTIC_ROUNDS = 2
+
+
+async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
+    """凑齐评审要看的三样东西：子问题、这一节的正文、这一节能用的证据。"""
+    from db import (
+        get_outline,
+        latest_document,
+        list_evidence_units,
+        list_question_evidence_links,
+        list_research_questions,
+        list_sections,
+    )
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        if document is None:
+            return []
+        rows = await list_sections(session, document.id)
+        outline = await get_outline(session, document.outline_id) if document.outline_id else None
+        questions = {
+            str(item.id): item
+            for item in await list_research_questions(session, context.project_id, kind="sub")
+        }
+        links = await list_question_evidence_links(session, context.project_id)
+        units = {unit.id: unit for unit in await list_evidence_units(session, context.project_id)}
+
+    evidence_by_question: dict[str, list[dict[str, Any]]] = {}
+    for link in links:
+        unit = units.get(link.evidence_unit_id)
+        if unit is None:
+            continue
+        evidence_by_question.setdefault(str(link.research_question_id), []).append(
+            {
+                "evidence_id": str(unit.id),
+                "work_id": str(unit.work_id),
+                "grade": unit.grade,
+                "text": unit.text,
+                "page": unit.page,
+                "section_path": unit.section_path,
+            }
+        )
+    outline_sections = ((outline.tree_json or {}).get("sections") or []) if outline else []
+    question_by_section = {
+        str(item.get("key")): str(item.get("question_id"))
+        for item in outline_sections
+        if isinstance(item, dict) and item.get("question_id")
+    }
+
+    inputs: list[dict[str, Any]] = []
+    for row in rows:
+        question_id = question_by_section.get(row.section_key)
+        question = questions.get(question_id or "")
+        if question is None:
+            continue
+        inputs.append(
+            {
+                "section_key": row.section_key,
+                "question_id": question_id,
+                "question": question.text,
+                "prose": _body_text_for_quality(row.body_ir_json or {}),
+                "evidence": evidence_by_question.get(question_id or "", []),
+            }
+        )
+    return inputs
+
+
+async def _converge_section_semantics(
+    context: JobContext,
+    *,
+    language: str,
+    paper_type: str,
+) -> dict[str, Any]:
+    """语义评审 → 按病因分流修复 → 重评。有明确验收判据、有轮数上限。
+
+    与既有的质量收敛互补而不重叠：那一条看的是引用、数字、可比性这些**可判定**的
+    红线；这一条问的是「这一节到底答没答上它的子问题」。后者写不成词表，只能让
+    模型判——但修复动作由确定性规则分流，模型的病因只是输入之一。
+    """
+    runner = context.llm_runner()
+    history: list[dict[str, Any]] = []
+    attempted: dict[str, set[str]] = {}
+    verdict_payloads: dict[str, dict[str, Any]] = {}
+
+    for attempt in range(1, MAX_SEMANTIC_ROUNDS + 1):
+        inputs = await _section_review_inputs(context)
+        if not inputs:
+            break
+        outcome = ReviewOutcome()
+        for item in inputs:
+            await context.raise_if_stopped()
+            verdict = await review_section(
+                section_key=item["section_key"],
+                question=item["question"],
+                prose=item["prose"],
+                evidence=item["evidence"],
+                runner=runner,
+                language=language,
+            )
+            outcome.calls += 1
+            if verdict is None:
+                # 评审器不可用不能变成「不合格」：保持既有交付判断。
+                outcome.failed_calls += 1
+                continue
+            outcome.verdicts.append(verdict)
+            verdict_payloads[verdict.section_key] = verdict.to_payload()
+
+        failing = [item for item in outcome.verdicts if not item.acceptable]
+        await context.emit(
+            "section_review.completed",
+            {"attempt": attempt, **outcome.to_payload()},
+            stage="quality",
+        )
+        if not failing:
+            history.append({"attempt": attempt, "failing": [], "routes": {}})
+            break
+
+        routes: dict[str, str] = {}
+        for verdict in failing:
+            tried = attempted.setdefault(verdict.section_key, set())
+            route = repair_route(verdict, attempted=frozenset(tried))
+            if route == "none":
+                continue
+            tried.add(route)
+            routes[verdict.section_key] = route
+        history.append(
+            {
+                "attempt": attempt,
+                "failing": [item.section_key for item in failing],
+                "diagnoses": {item.section_key: item.diagnosis for item in failing},
+                "routes": routes,
+            }
+        )
+        if not routes:
+            break
+
+        await context.emit(
+            "section_review.repairing",
+            {"attempt": attempt, "routes": routes},
+            stage="quality_repair",
+        )
+        # 一条路只跑一次，即使多节共用：补检索与重跑综合都是项目级动作。
+        if "retrieve" in routes.values():
+            await _supplement_review_evidence(context, language=language, round_index=attempt)
+            await _rebuild_question_matrix(context, language=language)
+        if "resynthesize" in routes.values():
+            await _resynthesize_questions(context)
+        rewrite_sections = {key for key, route in routes.items() if route == "rewrite"}
+        # 补证据与重跑综合之后，正文必须重写才能把新东西写进去。
+        rewrite_sections |= {key for key, route in routes.items() if route in {"retrieve"}}
+        if rewrite_sections:
+            await repair_document_sections(
+                context,
+                section_keys=rewrite_sections,
+                language=language,
+                paper_type=paper_type,
+            )
+
+    payload = {
+        "rounds": history,
+        "verdicts": list(verdict_payloads.values()),
+        "unresolved": [key for key, item in verdict_payloads.items() if not item.get("acceptable")],
+    }
+    await context.emit("section_review.converged", payload, stage="quality")
+    return payload
+
+
+async def _rebuild_question_matrix(context: JobContext, *, language: str) -> None:
+    """补检索之后重建问题—证据矩阵，否则新文献永远进不了任何一节。"""
+    try:
+        await build_question_evidence_matrix(context, language=language)
+    except Exception as error:  # noqa: BLE001 - 补证据失败不该毁掉已有稿子
+        context.warn("section_review", type(error).__name__, {"stage": "qmatrix_rebuild"})
+
+
+async def _resynthesize_questions(context: JobContext) -> None:
+    """丢掉旧的综合缓存并重跑：``bundle_hash`` 没变时 enrich 会直接跳过。"""
+    from db.models.paper import QuestionSynthesis
+    from sqlalchemy import delete
+
+    async with context.session() as session:
+        await session.execute(
+            delete(QuestionSynthesis).where(QuestionSynthesis.project_id == context.project_id)
+        )
+    try:
+        await synthesize_questions(context)
+    except Exception as error:  # noqa: BLE001
+        context.warn("section_review", type(error).__name__, {"stage": "resynthesize"})
+
+
 async def _quality_failing_sections(context: JobContext, report: Any) -> set[str]:
     from db import latest_document, list_claim_evidence, list_sections
 
@@ -2944,6 +3157,13 @@ async def run_full_pipeline(
                     review_style=review_style,
                     quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
+            # 语义评审放在确定性质量门之后：先修可判定的红线，再问「答没答上」。
+            # 反过来会让评审对着一份还带着引用/数字问题的稿子做判断。
+            semantic_review = await _converge_section_semantics(
+                context,
+                language=language,
+                paper_type=paper_type,
+            )
             if (
                 quality_profile == "submission"
                 and quality_outcome is not None
@@ -2962,6 +3182,7 @@ async def run_full_pipeline(
                     checkpoint={
                         "quality": quality_outcome.to_payload(),
                         "quality_repair_history": repair_history,
+                        "section_review": semantic_review,
                     },
                 )
             readiness = (
