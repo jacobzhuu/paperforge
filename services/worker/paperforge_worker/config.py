@@ -29,9 +29,7 @@ class WorkerSettings(BaseSettings):
     llm_openai_base_url: str = "https://api.openai.com/v1"
     llm_openai_api_key: str = ""
     llm_role_models: str = "{}"
-    llm_role_thinking: str = (
-        '{"extractor":"disabled","reranker":"disabled","verifier":"disabled"}'
-    )
+    llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled","verifier":"disabled"}'
     # 模型 → 单价（每百万 token）。留空则所有调用记为**未定价**，成本面板会
     # 明说金额不完整，而不是显示一个看起来很划算的 $0.00。
     #   {"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}
@@ -63,7 +61,15 @@ class WorkerSettings(BaseSettings):
     # 叙述性跨研究综合（P0-4 / Phase 4）。关闭时 SYNTH bundle 与引入前逐字节相同：
     # 不加 `synthesis` 键、不读表、不调用。开启后综合只是**增补**——
     # answer_status、证据归属、comparison_clusters 一个都不由它改写。
-    synthesis_llm_enabled: bool = False
+    #
+    # 2026-08-15 开启。此前它自落地起一直是 False：整个生产库 `question_synthesis`
+    # **零行**，`synthesizer` 角色一次都没被调用过，于是每一节只能罗列文献——正文里
+    # 「这些研究在什么条件下一致、缺口在哪」那一层根本没有人写。
+    # 开启前在真实 bundle 上离线重放过（项目 6a6bbf18，6 个子问题）：6/6 出结果、
+    # 0 截断、五道准入过滤 **0 拒绝**，产出 5 条 claim / 24 条 agreement /
+    # 2 条 conditional / 9 条 gap，且 gap 全部是可核验的方法学缺口。
+    # 代价是每个子问题约 75s（推理档位），一次全流程 ≈ +8 分钟。
+    synthesis_llm_enabled: bool = True
     synthesis_llm_max_questions: int = 8
 
     # 核心论断语义蕴含核验的分阶段发布开关。默认 shadow：只记录判定，不改状态。

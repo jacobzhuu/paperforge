@@ -53,6 +53,7 @@ from paperforge_worker.pipelines.writing import (
     coherence_pass,
     count_words,
     inspect_section_draft,
+    repair_unsourced_numbers,
     section_evidence_for,
     write_section,
 )
@@ -422,30 +423,8 @@ async def write_document(
     outcome.rewrite_count = sum(draft.rewrite_count for _key, draft in ordered)
 
     # NUMLINT：正文数值 vs 素材解析值（设计 §4.4.2 红线的 lint 层）。
-    report = lint_sections(
-        [
-            {
-                "section_key": key,
-                "text": " ".join(p.get("text", "") for p in draft.paragraphs),
-            }
-            for key, draft in ordered
-        ],
-        parsed_assets=assets,
-        paper_type=paper_type,
-        literature_evidence=[
-            {
-                "cite_key": key,
-                "text": point.get("text") if isinstance(point, dict) else point,
-                "located": bool(
-                    isinstance(point, dict)
-                    and (point.get("page") or point.get("section") or point.get("paragraph"))
-                ),
-            }
-            for key, card in cards.items()
-            if card.get("fulltext_used")
-            for point in card.get("quotable_points") or []
-        ],
-    )
+    report = _numlint(ordered, assets=assets, paper_type=paper_type, cards=cards)
+
     outcome.numlint_consistent = report.consistent
     outcome.unsourced_number_count = len(report.unsourced)
     if not report.consistent:
@@ -958,6 +937,107 @@ def _document_model():
     from db.models.paper import PaperDocument
 
     return PaperDocument
+
+
+def _numlint(
+    ordered: list[tuple[str, SectionDraft]],
+    *,
+    assets: list[dict[str, Any]],
+    paper_type: str,
+    cards: dict[str, dict[str, Any]],
+):
+    """全篇数值溯源检查。修复轮跑完要用同一把尺子复检，所以抽成一个函数。"""
+    return lint_sections(
+        [
+            {
+                "section_key": key,
+                "text": " ".join(p.get("text", "") for p in draft.paragraphs),
+            }
+            for key, draft in ordered
+        ],
+        parsed_assets=assets,
+        paper_type=paper_type,
+        literature_evidence=[
+            {
+                "cite_key": key,
+                "text": point.get("text") if isinstance(point, dict) else point,
+                "located": bool(
+                    isinstance(point, dict)
+                    and (point.get("page") or point.get("section") or point.get("paragraph"))
+                ),
+            }
+            for key, card in cards.items()
+            if card.get("fulltext_used")
+            for point in card.get("quotable_points") or []
+        ],
+    )
+
+
+async def _repair_unsourced_numbers(
+    context: JobContext,
+    *,
+    report,
+    ordered: list[tuple[str, SectionDraft]],
+    document_id: uuid.UUID,
+    order_by_key: dict[str, int],
+    whitelist: dict[str, uuid.UUID],
+    language: str,
+    runner,
+    outcome: WriteOutcome,
+    relint,
+):
+    """把没有出处的数字从正文里清掉，然后用同一把尺子复检。
+
+    NUMLINT 以前只报数：一个查不到出处的「超过 200 种」照样进交付稿，而它读起来
+    和有出处的数据毫无区别。这里按章节把受影响的句子交回模型改写成定性表述，
+    改不动的直接删句；引用绑定全程不动。
+    """
+    by_section: dict[str, set[str]] = {}
+    for finding in report.unsourced:
+        by_section.setdefault(finding.section_key, set()).add(finding.value)
+    drafts_by_key = dict(ordered)
+    repaired = {"rewritten": 0, "removed": 0, "sections": []}
+
+    for section_key, values in by_section.items():
+        draft = drafts_by_key.get(section_key)
+        if draft is None:
+            continue
+        draft, stats = await repair_unsourced_numbers(
+            draft=draft,
+            values=values,
+            language=language,
+            runner=runner,
+        )
+        if not (stats["rewritten"] or stats["removed"]):
+            continue
+        repaired["rewritten"] += stats["rewritten"]
+        repaired["removed"] += stats["removed"]
+        repaired["sections"].append(section_key)
+        await _persist_draft(
+            context,
+            document_id=document_id,
+            draft=draft,
+            order_no=order_by_key.get(section_key, 0),
+            whitelist=whitelist,
+            language=language,
+        )
+
+    if repaired["sections"]:
+        outcome.warnings.append(
+            {
+                "stage": "numlint",
+                "reason": "unsourced_numbers_repaired",
+                "rewritten": repaired["rewritten"],
+                "removed": repaired["removed"],
+                "sections": sorted(repaired["sections"]),
+            }
+        )
+        await context.emit(
+            "numlint.repaired",
+            repaired,
+            stage="numlint",
+        )
+    return relint()
 
 
 async def _recover_incomplete_sections(

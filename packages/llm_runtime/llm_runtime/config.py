@@ -27,7 +27,15 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
 # while allowing qmatrix classification to use a different thinking policy
 # from mechanical card extraction.
 ROLE_MODEL_FALLBACKS: dict[str, str] = {
-    "evidence_classifier": "extractor",
+    # 问题—证据判定要的是判断力，不是按 schema 读文本。实测（项目 6a6bbf18 的
+    # 真实候选集，每臂 4 个子问题）：
+    #   flash + 思考开（原配置）：1/4 截断，17 条链接，中位 76.4s
+    #   flash + 思考关：0 截断但**退化**——4 个问题里 3 个返回 0 条，第 4 个把 24 个
+    #                   候选全连上（半数标 not_comparable）。这不是判断，是放弃判断。
+    #   pro   + 思考关：0 截断，34 条链接，中位 6.8s，且**完全覆盖** flash+思考开
+    #                   找到的那 17 条。
+    # 所以这里换档位而不是照搬写作角色的「关思考」——那条路会悄悄毁掉证据链接。
+    "evidence_classifier": "planner",
     "evidence_classifier_fallback": "planner",
     # 结构化实验抽取和卡片抽取一样是「按封闭 schema 读文本」，不是规划或写作，
     # 因此沿用部署已有的 extractor 档位，旧 env 文件无需改动。
@@ -62,6 +70,13 @@ DEFAULT_ROLE_THINKING: dict[str, str] = {
     # writer 调用 11 次零内容返回，截断调用平均 79s 且产出 0 token，11 节里 5 节因此
     # 从未经过模型，降级路径把证据原文当正文交了出去。
     "writer": "disabled",
+    # 证据分类同样被推理吃预算：生产历史 77 次调用 39 次 `output_truncated`（51%），
+    # 而截断之后只能回落到词汇匹配——那条路只会输出 stance="supports"，于是整个
+    # 生产库 429 条链接里 **一条 contradicts 都没有**，综述的「冲突识别」形同虚设。
+    # 但这里**不能**照搬写作角色的做法：见 ROLE_MODEL_FALLBACKS 上方的实测，
+    # flash 关掉思考会直接退化成不判断。关思考的前提是同时换到 planner 档。
+    "evidence_classifier": "disabled",
+    "evidence_classifier_fallback": "disabled",
 }
 
 

@@ -40,9 +40,12 @@ def test_evidence_classifier_inherits_deployed_deepseek_tiers() -> None:
             "planner": "deepseek-v4-pro",
         },
     )
-    assert config.model_for_role("evidence_classifier") == "deepseek-v4-flash"
+    # 2026-08-15：证据判定从 flash 档换到 planner 档，并关掉思考。依据是真实候选集上的
+    # 三臂对比——flash+思考开 25% 截断；flash+思考关会退化成「4 个问题 3 个返回 0 条」；
+    # pro+思考关 0 截断、链接数翻倍且完全覆盖前者。
+    assert config.model_for_role("evidence_classifier") == "deepseek-v4-pro"
     assert config.model_for_role("evidence_classifier_fallback") == "deepseek-v4-pro"
-    assert config.thinking_for_role("evidence_classifier") is None
+    assert config.thinking_for_role("evidence_classifier") == "disabled"
 
 
 def _request() -> LLMRequest:
@@ -426,8 +429,9 @@ def test_a_new_role_inherits_the_built_in_thinking_policy():
     assert deployed.thinking_for_role("writer") == "disabled"
     # 综合是推理，不该被顺手关掉。
     assert deployed.thinking_for_role("synthesizer") is None
-    # qmatrix 分类与卡片抽取共用模型档位但思考策略分开，这一条不能被回退改掉。
-    assert deployed.thinking_for_role("evidence_classifier") is None
+    # 证据判定同样吃掉了预算：生产 77 次调用 39 次 output_truncated，截断后只能回落到
+    # 词汇匹配，而那条路只输出 supports——全库 429 条链接零条 contradicts。
+    assert deployed.thinking_for_role("evidence_classifier") == "disabled"
 
 
 def test_an_explicit_deployment_override_still_wins():

@@ -1424,6 +1424,33 @@ def deterministic_paragraphs(
     return [{"text": gap, "cite_keys": [], "evidence_gap": True}]
 
 
+_NUMBER_REPAIR_PROMPT_ZH = """你是学术论文的事实校订编辑。给定一节正文与一份「无法溯源的数值」清单，
+逐句改写**只含这些数值的句子**，让论断不再依赖查不到出处的具体数字。
+
+只输出 JSON，结构与输入相同：
+{"sentences": [{"index": 0, "text": "改写后的句子"}]}
+
+硬性要求：
+- 优先保留论断本身，只把无出处的数字改成定性表述（如「显著增加」「多数研究报告」）；
+- 改写后的句子里**不得出现任何新的数字**，也不得保留清单里的那些数值；
+- 不得新增、删除或调换引用；不在正文里写 [1]、(Smith 2020) 之类的标记；
+- 如果去掉数字后这句话就没有内容了，把 text 设为空字符串——删掉好过留一句空话。"""
+
+_NUMBER_REPAIR_PROMPT_EN = """You are a fact-checking editor. Given one section and a list of
+figures that cannot be traced to any evidence, rewrite only the sentences containing them so the
+claim no longer rests on an unverifiable number.
+
+Output JSON only, same shape as the input:
+{"sentences": [{"index": 0, "text": "rewritten sentence"}]}
+
+Requirements:
+- keep the claim, restate the untraceable figure qualitatively (e.g. "substantially increased");
+- the rewritten sentence must contain NO digits at all, and must not keep the listed values;
+- never add, drop, or swap citations; never write inline markers like [1] or (Smith 2020);
+- if the sentence has nothing left once the number goes, return an empty string — deleting it
+  beats leaving an empty assertion."""
+
+
 @dataclass(frozen=True)
 class SectionDefect:
     """一节稿子没达到「成熟正文」的一个具体原因。"""
@@ -1534,6 +1561,111 @@ def inspect_section_draft(
             )
         )
     return defects
+
+
+async def repair_unsourced_numbers(
+    *,
+    draft: SectionDraft,
+    values: set[str],
+    language: str,
+    runner: LLMRunner | None = None,
+) -> tuple[SectionDraft, dict[str, int]]:
+    """把查不到出处的数值从正文里清掉：先改写，改不动就删句。
+
+    此前 NUMLINT 只报数（``unsourced_number_count``），稿子照常交付——一个没有出处的
+    「超过 200 种化合物」读起来和有出处的一模一样，而审稿人只会当它是编的。
+
+    阶梯与写作恢复同构：先让模型把论断改成定性表述（保留论点、去掉数字），改写要过
+    三道校验——数值真的没了、没引入新数字、引用绑定逐字未变；过不了就删掉那一句，
+    审计信息留在段落上。绝不「保留原句只加个警告」。
+    """
+    stats = {"rewritten": 0, "removed": 0, "kept": 0}
+    if not values:
+        return draft, stats
+
+    from ingest.assets import normalize_number
+    from ingest.numlint import numbers_in
+
+    wanted = {normalize_number(value) for value in values}
+    targets: list[dict[str, Any]] = []
+    for paragraph in draft.paragraphs:
+        for sentence in paragraph.get("sentences") or []:
+            found = {normalize_number(item) for item in numbers_in(str(sentence.get("text") or ""))}
+            if found & wanted:
+                targets.append(sentence)
+    if not targets:
+        return draft, stats
+
+    rewritten: dict[int, str] = {}
+    if runner is not None and runner.enabled:
+        listing = "\n".join(
+            f"{index}. {str(sentence.get('text') or '')}" for index, sentence in enumerate(targets)
+        )
+        result = await runner.agenerate_json(
+            "writer",
+            system_prompt=(
+                _NUMBER_REPAIR_PROMPT_ZH if language == "zh" else _NUMBER_REPAIR_PROMPT_EN
+            ),
+            user_prompt=(
+                f"无法溯源的数值：{', '.join(sorted(values))}\n\n需要改写的句子：\n{listing}"
+                if language == "zh"
+                else (
+                    f"Untraceable figures: {', '.join(sorted(values))}\n\n"
+                    f"Sentences to rewrite:\n{listing}"
+                )
+            ),
+            max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
+            temperature=0.0,
+            metadata={"stage": "numlint_repair", "section": draft.section_key},
+        )
+        if result.ok and isinstance(result.value, dict):
+            for item in result.value.get("sentences") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(targets):
+                    rewritten[index] = _clean_paragraph(item.get("text"))
+
+    for index, sentence in enumerate(targets):
+        candidate = rewritten.get(index)
+        # 校验：改写后一个数字都不许剩（既清掉了目标值，也堵住「换一个数字」）。
+        # 引用绑定不动——这里只改 text，cite_keys/evidence_ids 逐字保留。
+        if candidate and not numbers_in(candidate):
+            sentence["text"] = candidate
+            sentence["repaired_reason"] = "numlint_unsourced_number"
+            stats["rewritten"] += 1
+            continue
+        sentence["text"] = ""
+        sentence["downgraded_reason"] = "numlint_unsourced_number"
+        stats["removed"] += 1
+
+    draft.paragraphs = _drop_blanked_sentences(draft.paragraphs)
+    return draft, stats
+
+
+def _drop_blanked_sentences(paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """删掉被清空的句子并重算段落文本；审计条目留在段落上。"""
+    for paragraph in paragraphs:
+        sentences = paragraph.get("sentences") or []
+        if not sentences:
+            continue
+        kept = [item for item in sentences if str(item.get("text") or "").strip()]
+        dropped = [item for item in sentences if not str(item.get("text") or "").strip()]
+        paragraph["sentences"] = kept
+        if dropped:
+            paragraph["downgraded_sentences"] = (
+                list(paragraph.get("downgraded_sentences") or []) + dropped
+            )
+        paragraph["text"] = " ".join(str(item.get("text") or "").strip() for item in kept)
+    return [
+        paragraph
+        for paragraph in paragraphs
+        if str(paragraph.get("text") or "").strip()
+        or any(str(item.get("text") or "").strip() for item in paragraph.get("sentences") or [])
+    ]
 
 
 def _draft_as_section_row(draft: SectionDraft) -> Any:
