@@ -74,10 +74,18 @@ class SectionVerdict:
 
         允许 ``partial``——前提是正文自己承认了缺口。评审器判定证据不足而正文却
         写得像回答完整，那才是问题。
+
+        评审器**点名**的超证据论断一律不放行，即使它同时把 calibration 判成 matched。
+        实测 s2 就卡在这个缝里：整体语气不算过强，所以 calibration=matched，但它同时
+        列出三条超出证据的论断，其中一条把「微生物 VOCs 激活茉莉酸/乙烯/水杨酸通路
+        使植物进入防御准备状态」当成已知事实，而证据里说的是细胞壁多糖（LPS/EPS）
+        这类激发子诱导 ISR/SAR——换了机制的主语。这种话读起来最顺，也最该拦。
         """
         if self.answers_question == "no":
             return False
         if self.answers_question == "partial" and not self.gap_declared:
+            return False
+        if self.unsupported_claims:
             return False
         return (
             self.support != "unsupported"

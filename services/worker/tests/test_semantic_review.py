@@ -96,6 +96,23 @@ def test_each_failure_mode_is_rejected(overrides: dict[str, Any]) -> None:
     assert not _verdict(**overrides).acceptable
 
 
+def test_named_unsupported_claims_block_even_when_the_tone_is_calibrated() -> None:
+    """整体语气不过强，不代表里面没有超证据的句子。
+
+    实测 s2 卡在这个缝里：calibration=matched、mode=mixed、缺口也声明了，于是判为合格，
+    可评审器同时点名三条超出证据的论断——其中一条把「微生物 VOCs 激活茉莉酸/乙烯/
+    水杨酸通路」写成已知事实，而证据讲的是细胞壁多糖激发子诱导 ISR/SAR。
+    """
+    verdict = _verdict(
+        answers_question="partial",
+        gap_declared=True,
+        synthesis_mode="mixed",
+        unsupported_claims=("微生物VOCs通过激活茉莉酸/乙烯通路使植物进入防御准备状态",),
+    )
+    assert not verdict.acceptable
+    assert repair_route(verdict) == "rewrite"
+
+
 def test_a_declared_gap_is_an_acceptable_partial_answer() -> None:
     """证据真的不够时，明说缺口是合格行为——目标明确禁止为了凑长度灌水。"""
     assert _verdict(answers_question="partial", gap_declared=True).acceptable
