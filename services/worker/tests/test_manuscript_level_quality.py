@@ -107,3 +107,32 @@ def test_both_codes_are_repairable_rather_than_terminal() -> None:
     """检测到就该驱动重写——只报不修正是上一轮修掉的毛病。"""
     assert "cross_section_repetition" in RECOVERABLE_BLOCKER_CODES
     assert "conclusion_overreach" in RECOVERABLE_BLOCKER_CODES
+
+
+def test_the_repair_loop_can_see_findings_that_draft_demoted_to_warnings() -> None:
+    """改善判据必须和触发条件看同一批发现项。
+
+    只数 blockers 在 draft 档是瞎的：那一档把可恢复的码降级成 warning，于是修复前后
+    都是 0，``0 < 0`` 永远为假，每一轮重写都被判为「没有改善」并回滚。生产实测里
+    conclusion_overreach 就是这样被检出、触发了两轮重写、又被整个回滚的。
+    """
+    from paperforge_worker.worker import _blocker_instances
+
+    before = SimpleNamespace(
+        blockers=[],
+        warnings=[{"code": "conclusion_overreach"}, {"code": "year_imbalance"}],
+    )
+    after = SimpleNamespace(blockers=[], warnings=[{"code": "year_imbalance"}])
+    assert _blocker_instances(before) == 1, "被降级的可恢复发现项要计入"
+    assert _blocker_instances(after) == 0, "无关提示不计入"
+    assert _blocker_instances(after) < _blocker_instances(before), "修好了就要判为改善"
+
+
+def test_the_metric_does_not_double_count_a_code_in_both_pools() -> None:
+    report = SimpleNamespace(
+        blockers=[{"code": "section_not_generated", "count": 2}],
+        warnings=[{"code": "section_not_generated"}],
+    )
+    from paperforge_worker.worker import _blocker_instances
+
+    assert _blocker_instances(report) == 2

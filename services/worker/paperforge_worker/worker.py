@@ -58,6 +58,7 @@ from paperforge_worker.pipelines.pdf_upload import (
 from paperforge_worker.pipelines.qdecomp import persist_question_decomposition
 from paperforge_worker.pipelines.qmatrix import build_question_evidence_matrix
 from paperforge_worker.pipelines.quality import (
+    RECOVERABLE_BLOCKER_CODES,
     apply_readiness_gate,
     build_claim_evidence,
     build_depth_metrics,
@@ -2212,7 +2213,25 @@ def _object_store(settings: Settings):
 
 
 def _blocker_instances(report: Any) -> int:
-    return sum(max(1, int(item.get("count") or 1)) for item in (report.blockers or []))
+    """修复轮的改善判据：它必须看得见触发修复的那些发现项。
+
+    只数 blockers 在 draft 档是瞎的——那一档把几乎所有码降级成了 warning，于是
+    「修复前 0 条、修复后 0 条」，``0 < 0`` 永远为假，每一次重写都被判为没有改善并
+    回滚。生产实测（项目 6a6bbf18）：conclusion_overreach 被正确检出并触发了两轮
+    重写，两轮全部 accepted=false，稿子原样退回——花了钱，什么都没修。
+
+    所以计数覆盖 blockers ∪ 可恢复的 warning：scholarly/submission 下这些码本来就是
+    blocker，取并集不改变那两档的行为。
+    """
+    counted = list(getattr(report, "blockers", None) or [])
+    blocker_codes = {str(item.get("code")) for item in counted}
+    counted.extend(
+        item
+        for item in (getattr(report, "warnings", None) or [])
+        if str(item.get("code")) in RECOVERABLE_BLOCKER_CODES
+        and str(item.get("code")) not in blocker_codes
+    )
+    return sum(max(1, int(item.get("count") or 1)) for item in counted)
 
 
 _NON_DEGENERATION_CODES = frozenset(
