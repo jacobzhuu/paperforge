@@ -262,10 +262,11 @@ async def test_evidence_already_on_the_shelf_is_not_repaired_by_retrieving_more(
 
     assert harness["retrieve"] == [], "证据池里还有没用上的，不该再去检索"
     assert payload["rounds"][0]["routes"]["s5"] == "resynthesize"
-    # 那一批没用上的证据必须被点名带进重写指令，否则写作器还是会挑同样的 6 条。
     note = harness["notes"][0]["s5"]
-    assert "COVERAGE" in note and "18" in note
-    assert "SYNTHESIS" in note, "罗列的病因也要说给写作器听"
+    assert "SYNTHESIS" in note, "罗列的病因要说给写作器听"
+    # 但**不许**把「还有 N 条没用上，请用起来」写进指令。实测那 18 条里是生长素生理、
+    # 玉米年产量、图题和测序建库流程，对这个子问题不可用——催着用等于让它灌水。
+    assert "没用" not in note and "用起来" not in note
 
 
 async def test_a_small_evidence_pool_still_routes_to_retrieval(monkeypatch, harness) -> None:

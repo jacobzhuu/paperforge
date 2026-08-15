@@ -784,7 +784,9 @@ def _evidence_context_block(
         "D_abstract_only": 3,
     }
     used = len("\n".join(lines))
-    for item in sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9)):
+    for item in dedupe_evidence_by_text(
+        sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9))
+    ):
         grade = str(item.get("grade") or "")
         locator = (
             ", ".join(
@@ -826,6 +828,26 @@ def _evidence_context_block(
     if section.get("evidence_gap"):
         lines.append(f"[EVIDENCE GAP] {section['evidence_gap']}")
     return "\n".join(lines)
+
+
+def dedupe_evidence_by_text(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一段文字只让写作器看一遍。
+
+    同一篇文献被切出的证据条目会有完全相同的正文（实测项目 6a6bbf18：s3/s5/s6 每节的
+    证据池里各有 3 条是重复文本，s1/s2 各 2 条）。重复条目既白占上下文预算，又让
+    「这一节有多少证据没用上」这个统计虚高。保留先出现的那条——上游已按证据等级排过序，
+    先出现的等级不低于后面的。
+    """
+    seen: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for item in evidence:
+        fingerprint = "".join(str(item.get("text") or "").split())
+        if fingerprint and fingerprint in seen:
+            continue
+        if fingerprint:
+            seen.add(fingerprint)
+        kept.append(item)
+    return kept
 
 
 def _synthesis_block(synthesis: Any) -> list[str]:

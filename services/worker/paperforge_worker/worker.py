@@ -79,7 +79,6 @@ from paperforge_worker.pipelines.scope import generate_scope
 from paperforge_worker.pipelines.screen import screen_eligibility
 from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
 from paperforge_worker.pipelines.semantic_review import (
-    UNUSED_EVIDENCE_FLOOR,
     ReviewOutcome,
     SectionVerdict,
     repair_route,
@@ -90,6 +89,7 @@ from paperforge_worker.pipelines.synthesis import (
     synthesize_questions,
 )
 from paperforge_worker.pipelines.visuals import generate_visual, suggest_visuals
+from paperforge_worker.pipelines.writing import dedupe_evidence_by_text
 
 logger = get_logger(__name__)
 
@@ -2370,7 +2370,9 @@ async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
         question = questions.get(question_id or "")
         if question is None:
             continue
-        pool = evidence_by_question.get(question_id or "", [])
+        # 评审器看到的证据要和写作器看到的一致：重复文本只算一条，否则「有多少证据
+        # 没用上」会虚高，那道不再检索的闸就会因为重复条目误触发。
+        pool = dedupe_evidence_by_text(evidence_by_question.get(question_id or "", []))
         cited = _cited_evidence_ids(row.body_ir_json or {})
         inputs.append(
             {
@@ -2399,12 +2401,11 @@ def _repair_note(verdict: SectionVerdict, item: dict[str, Any]) -> str:
             "同一条论断下比较——指出它们一致、互补还是受条件调节，并说明条件差异；"
             "不要为每条证据单写一句。"
         )
-    unused = int(item.get("unused_evidence", 0))
-    if unused >= UNUSED_EVIDENCE_FLOOR:
-        notes.append(
-            f"COVERAGE: 本节可用证据里有 {unused} 条上一稿一次都没引用。请把它们用起来，"
-            "或明确说明为什么不适用；不要靠重复已引证据来充篇幅。"
-        )
+    # 这里**不要**加一条「还有 N 条证据没用上，请用起来」。试过，实测有害：s5 那 18 条
+    # 没被引用的证据里，是生长素生理、AMF 耐盐、玉米年产量、两条图题、以及扩增子测序的
+    # 建库/测序流程——对「天然产物信号的方法学」这个子问题基本不可用，还有 3 条是重复条目。
+    # 写作器跳过它们是对的；催它「用起来」等于让它灌水，而灌水正是要防的东西。
+    # 证据池里有没用上的条目，只用来决定**不要再去检索**（见 repair_route），不进指令。
     if verdict.unanswered_aspects:
         notes.append(
             "UNANSWERED: 子问题里这些方面还没答上：" + "；".join(verdict.unanswered_aspects)

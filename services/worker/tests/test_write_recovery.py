@@ -505,3 +505,26 @@ def test_placeholder_generators_never_count_as_body(generator: str) -> None:
     assert [defect.code for defect in inspect_section_draft(draft, language="zh")] == [
         "not_generated"
     ]
+
+
+def test_the_same_evidence_text_is_shown_to_the_writer_only_once() -> None:
+    """同一篇文献切出的重复条目会挤占上下文预算，也让「有多少证据没用上」虚高。
+
+    实测项目 6a6bbf18：s3/s5/s6 的证据池里各有 3 条是完全相同的正文，s1/s2 各 2 条。
+    去重要按正文而不是按 ID——重复的正是不同 ID、同一段字。
+    """
+    from paperforge_worker.pipelines.writing import dedupe_evidence_by_text
+
+    repeated = "Auxins are pivotal hormones that significantly influence root exudation."
+    kept = dedupe_evidence_by_text(
+        [
+            {"evidence_id": "e-1", "grade": "A_located_structured", "text": repeated},
+            {"evidence_id": "e-2", "grade": "B_located_prose", "text": "另一段证据。"},
+            {"evidence_id": "e-3", "grade": "B_located_prose", "text": f"  {repeated}\n"},
+            {"evidence_id": "e-4", "grade": "B_located_prose", "text": ""},
+            {"evidence_id": "e-5", "grade": "B_located_prose", "text": ""},
+        ]
+    )
+
+    # 先出现的那条留下（上游已按等级排过序），后面重复的丢掉。
+    assert [item["evidence_id"] for item in kept] == ["e-1", "e-2", "e-4", "e-5"]
