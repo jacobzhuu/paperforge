@@ -144,6 +144,25 @@ def test_an_acceptable_section_is_never_repaired() -> None:
     assert repair_route(_verdict()) == "none"
 
 
+def test_retrieval_is_skipped_when_the_section_never_used_what_it_already_has() -> None:
+    """「证据薄」有两种：没检索到，和检索到了没写进去。后者补检索只会垒得更高。
+
+    线上实测的分界（项目 6a6bbf18 第 6 版）：合格章节用掉证据池的 77–86%、
+    只剩 2–3 条没用；不合格的三节只用掉 25–46%、各剩 13–18 条。
+    """
+    verdict = _verdict(
+        answers_question="partial",
+        support="thin",
+        unanswered_aspects=("低丰度检测的挑战",),
+        gap_declared=False,
+    )
+    assert repair_route(verdict, pool_size=24, unused_evidence=18) != "retrieve"
+    # 池子小或者用得足的照旧走补检索——闸只挡「手上还有一堆没用」这一种。
+    assert repair_route(verdict, pool_size=3, unused_evidence=3) == "retrieve"
+    assert repair_route(verdict, pool_size=14, unused_evidence=2) == "retrieve"
+    assert repair_route(verdict) == "retrieve"
+
+
 # ---- 判定收口 ------------------------------------------------------------------
 
 

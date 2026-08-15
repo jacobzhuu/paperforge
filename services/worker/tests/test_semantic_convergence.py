@@ -30,7 +30,7 @@ def _context() -> JobContext:
     )
 
 
-def _inputs(*section_keys: str) -> list[dict[str, Any]]:
+def _inputs(*section_keys: str, pool_size: int = 1, unused: int = 0) -> list[dict[str, Any]]:
     return [
         {
             "section_key": key,
@@ -38,6 +38,8 @@ def _inputs(*section_keys: str) -> list[dict[str, Any]]:
             "question": f"{key} 的子问题？",
             "prose": "正文",
             "evidence": [{"evidence_id": "e-1", "work_id": "w-1", "text": "证据"}],
+            "pool_size": pool_size,
+            "unused_evidence": unused,
         }
         for key in section_keys
     ]
@@ -59,7 +61,13 @@ def _verdict(section_key: str, **overrides: Any) -> SectionVerdict:
 @pytest.fixture
 def harness(monkeypatch):
     """把三条修复路都换成记录器，只观察编排决策。"""
-    calls: dict[str, list[Any]] = {"retrieve": [], "resynthesize": [], "rewrite": [], "qmatrix": []}
+    calls: dict[str, list[Any]] = {
+        "retrieve": [],
+        "resynthesize": [],
+        "rewrite": [],
+        "qmatrix": [],
+        "notes": [],
+    }
 
     async def _retrieve(context, **kwargs):
         calls["retrieve"].append(kwargs)
@@ -71,8 +79,9 @@ def harness(monkeypatch):
     async def _resynth(context):
         calls["resynthesize"].append(True)
 
-    async def _rewrite(context, *, section_keys, language, paper_type):
+    async def _rewrite(context, *, section_keys, language, paper_type, notes=None):
         calls["rewrite"].append(sorted(section_keys))
+        calls["notes"].append(notes or {})
 
     monkeypatch.setattr(worker, "_supplement_review_evidence", _retrieve)
     monkeypatch.setattr(worker, "_rebuild_question_matrix", _qmatrix)
@@ -93,7 +102,13 @@ async def test_a_clean_manuscript_triggers_no_repair(monkeypatch, harness) -> No
     )
 
     assert payload["unresolved"] == []
-    assert harness == {"retrieve": [], "resynthesize": [], "rewrite": [], "qmatrix": []}
+    assert harness == {
+        "retrieve": [],
+        "resynthesize": [],
+        "rewrite": [],
+        "qmatrix": [],
+        "notes": [],
+    }
     assert len(payload["rounds"]) == 1
 
 
@@ -215,6 +230,71 @@ async def test_overclaiming_goes_straight_to_rewriting(monkeypatch, harness) -> 
     assert payload["unresolved"] == []
 
 
+async def test_evidence_already_on_the_shelf_is_not_repaired_by_retrieving_more(
+    monkeypatch, harness
+) -> None:
+    """判定说「证据薄」，但这一节的证据池里还压着 18 条一次没引用的——补检索是白花钱。
+
+    实测原型：s5 有 24 条链接证据、正文只用了 6 条，两轮里第一轮被送去补检索，
+    结果判定一字未变。证据不在手上和证据没用上是两回事。
+    """
+    monkeypatch.setattr(
+        worker,
+        "_section_review_inputs",
+        lambda ctx: _ok(_inputs("s5", pool_size=24, unused=18)),
+    )
+
+    async def _review(**kwargs):
+        return _verdict(
+            "s5",
+            answers_question="partial",
+            support="thin",
+            synthesis_mode="listed",
+            unanswered_aspects=("低丰度检测",),
+            gap_declared=False,
+            diagnosis="evidence_gap",
+        )
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    payload = await worker._converge_section_semantics(
+        _context(), language="zh", paper_type="review"
+    )
+
+    assert harness["retrieve"] == [], "证据池里还有没用上的，不该再去检索"
+    assert payload["rounds"][0]["routes"]["s5"] == "resynthesize"
+    # 那一批没用上的证据必须被点名带进重写指令，否则写作器还是会挑同样的 6 条。
+    note = harness["notes"][0]["s5"]
+    assert "COVERAGE" in note and "18" in note
+    assert "SYNTHESIS" in note, "罗列的病因也要说给写作器听"
+
+
+async def test_a_small_evidence_pool_still_routes_to_retrieval(monkeypatch, harness) -> None:
+    """反向保护：池子本来就小、又确实答不上，那就是真缺证据，闸不能误伤。"""
+    monkeypatch.setattr(
+        worker,
+        "_section_review_inputs",
+        lambda ctx: _ok(_inputs("s7", pool_size=3, unused=3)),
+    )
+
+    async def _review(**kwargs):
+        return _verdict(
+            "s7",
+            answers_question="partial",
+            support="thin",
+            unanswered_aspects=("田间验证",),
+            gap_declared=False,
+            diagnosis="evidence_gap",
+        )
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    payload = await worker._converge_section_semantics(
+        _context(), language="zh", paper_type="review"
+    )
+
+    assert payload["rounds"][0]["routes"]["s7"] == "retrieve"
+    assert len(harness["retrieve"]) == 1
+
+
 async def test_a_reviewer_outage_never_marks_the_manuscript_unacceptable(
     monkeypatch, harness
 ) -> None:
@@ -230,7 +310,13 @@ async def test_a_reviewer_outage_never_marks_the_manuscript_unacceptable(
     )
 
     assert payload["unresolved"] == []
-    assert harness == {"retrieve": [], "resynthesize": [], "rewrite": [], "qmatrix": []}
+    assert harness == {
+        "retrieve": [],
+        "resynthesize": [],
+        "rewrite": [],
+        "qmatrix": [],
+        "notes": [],
+    }
 
 
 def _ok(value):

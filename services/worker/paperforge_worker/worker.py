@@ -79,7 +79,9 @@ from paperforge_worker.pipelines.scope import generate_scope
 from paperforge_worker.pipelines.screen import screen_eligibility
 from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
 from paperforge_worker.pipelines.semantic_review import (
+    UNUSED_EVIDENCE_FLOOR,
     ReviewOutcome,
+    SectionVerdict,
     repair_route,
     review_section,
 )
@@ -2301,6 +2303,21 @@ def _claim_anchor_requires_repair(anchor: Any) -> bool:
 MAX_SEMANTIC_ROUNDS = 2
 
 
+def _cited_evidence_ids(body: dict[str, Any]) -> set[str]:
+    """正文里真正引到的证据 ID——用来区分「没检索到」和「检索到了没用上」。"""
+    found: set[str] = set()
+    for block in body.get("blocks") or []:
+        for runs in (
+            [block.get("runs") or []]
+            if block.get("type") == "paragraph"
+            else [item.get("runs") or [] for item in block.get("items") or []]
+        ):
+            for run in runs:
+                if isinstance(run, dict):
+                    found.update(str(value) for value in run.get("evidence_ids") or [])
+    return found
+
+
 async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
     """凑齐评审要看的三样东西：子问题、这一节的正文、这一节能用的证据。"""
     from db import (
@@ -2353,16 +2370,51 @@ async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
         question = questions.get(question_id or "")
         if question is None:
             continue
+        pool = evidence_by_question.get(question_id or "", [])
+        cited = _cited_evidence_ids(row.body_ir_json or {})
         inputs.append(
             {
                 "section_key": row.section_key,
                 "question_id": question_id,
                 "question": question.text,
                 "prose": _body_text_for_quality(row.body_ir_json or {}),
-                "evidence": evidence_by_question.get(question_id or "", []),
+                "evidence": pool,
+                "pool_size": len(pool),
+                "unused_evidence": sum(1 for item in pool if item["evidence_id"] not in cited),
             }
         )
     return inputs
+
+
+def _repair_note(verdict: SectionVerdict, item: dict[str, Any]) -> str:
+    """把这一节**具体哪里不合格**说给写作器听。
+
+    没有这段话，三条修复路最后都落到同一句泛泛的「去掉没证据的论断」上——罗列型的
+    章节被重写之后还是罗列。实测 s5 就是这样连续两轮判定一字未变。
+    """
+    notes: list[str] = []
+    if verdict.synthesis_mode == "listed":
+        notes.append(
+            "SYNTHESIS: 本节上一稿是逐条罗列（一条证据一句话）。这次要把多篇证据归到"
+            "同一条论断下比较——指出它们一致、互补还是受条件调节，并说明条件差异；"
+            "不要为每条证据单写一句。"
+        )
+    unused = int(item.get("unused_evidence", 0))
+    if unused >= UNUSED_EVIDENCE_FLOOR:
+        notes.append(
+            f"COVERAGE: 本节可用证据里有 {unused} 条上一稿一次都没引用。请把它们用起来，"
+            "或明确说明为什么不适用；不要靠重复已引证据来充篇幅。"
+        )
+    if verdict.unanswered_aspects:
+        notes.append(
+            "UNANSWERED: 子问题里这些方面还没答上：" + "；".join(verdict.unanswered_aspects)
+        )
+    if verdict.unsupported_claims:
+        notes.append(
+            "UNSUPPORTED: 这些论断超出了证据，改写到证据能支撑的范围或删掉："
+            + "；".join(verdict.unsupported_claims)
+        )
+    return "\n".join(notes)
 
 
 async def _converge_section_semantics(
@@ -2415,10 +2467,17 @@ async def _converge_section_semantics(
             history.append({"attempt": attempt, "failing": [], "routes": {}})
             break
 
+        shelf = {item["section_key"]: item for item in inputs}
         routes: dict[str, str] = {}
         for verdict in failing:
             tried = attempted.setdefault(verdict.section_key, set())
-            route = repair_route(verdict, attempted=frozenset(tried))
+            item = shelf.get(verdict.section_key, {})
+            route = repair_route(
+                verdict,
+                attempted=frozenset(tried),
+                pool_size=int(item.get("pool_size", 0)),
+                unused_evidence=int(item.get("unused_evidence", 0)),
+            )
             if route == "none":
                 continue
             tried.add(route)
@@ -2457,6 +2516,11 @@ async def _converge_section_semantics(
                 section_keys=rewrite_sections,
                 language=language,
                 paper_type=paper_type,
+                notes={
+                    verdict.section_key: _repair_note(verdict, shelf.get(verdict.section_key, {}))
+                    for verdict in failing
+                    if verdict.section_key in rewrite_sections
+                },
             )
 
     # 最后一轮的修复必须再评一次，否则 ``unresolved`` 报的是**修之前**的判定——

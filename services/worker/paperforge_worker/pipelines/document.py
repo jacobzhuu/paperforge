@@ -745,8 +745,15 @@ async def repair_document_sections(
     section_keys: set[str],
     language: str,
     paper_type: str,
+    notes: dict[str, str] | None = None,
 ) -> WriteOutcome:
-    """Rewrite only quality-failing sections against the latest evidence/outline."""
+    """Rewrite only quality-failing sections against the latest evidence/outline.
+
+    ``notes`` carries a per-section instruction describing *what specifically* was
+    wrong with that section. Without it every repair is the same generic "drop
+    unsupported claims" nudge, and a section that failed for listing its evidence
+    one-sentence-at-a-time gets rewritten into the same list.
+    """
     outcome = WriteOutcome()
     async with context.session() as session:
         outline_row = await latest_outline(session, context.project_id)
@@ -781,6 +788,7 @@ async def repair_document_sections(
                 + "\nQUALITY REPAIR: omit every claim that is not directly supported by the "
                 "provided evidence/source refs; split non-comparable results and copy no "
                 "number without an exact locator."
+                + (f"\n{(notes or {}).get(key, '')}" if (notes or {}).get(key) else "")
             ),
         }
         draft = await _write_one(

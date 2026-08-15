@@ -299,7 +299,28 @@ def build_section_verdict(
 REPAIR_ROUTES = ("none", "retrieve", "resynthesize", "rewrite")
 
 
-def repair_route(verdict: SectionVerdict, *, attempted: frozenset[str] = frozenset()) -> str:
+#: 判定说证据「薄」，但这一节的证据池里还有这么多条一次都没被引用——那就不是没检索到，
+#: 是检索到了没用上。实测（项目 6a6bbf18 第 6 版）：合格的 s1/s3/s4 分别只剩 2/3/2 条没用，
+#: 用掉了池子的 86%/77%/83%；不合格的 s2/s5/s6 各剩 17/18/13 条，只用掉 29%/25%/46%。
+#: 两组之间没有重叠，取 6 条 + 六成这两道线把它们分开，且证据池本来就小的章节不会被误伤。
+UNUSED_EVIDENCE_FLOOR = 6
+LOW_UTILISATION = 0.6
+
+
+def _shelf_is_stocked(pool_size: int, unused_evidence: int) -> bool:
+    """这一节手上是不是还压着一批没写进去的证据。"""
+    if pool_size <= 0 or unused_evidence < UNUSED_EVIDENCE_FLOOR:
+        return False
+    return (pool_size - unused_evidence) / pool_size < LOW_UTILISATION
+
+
+def repair_route(
+    verdict: SectionVerdict,
+    *,
+    attempted: frozenset[str] = frozenset(),
+    pool_size: int = 0,
+    unused_evidence: int = 0,
+) -> str:
     """按病因决定修哪里，并在同一条路走不通时升级。
 
     顺序不是随意的，它对应「哪一步坏了就修哪一步」：
@@ -312,9 +333,14 @@ def repair_route(verdict: SectionVerdict, *, attempted: frozenset[str] = frozens
 
     ``attempted`` 让循环升级：同一条路走过一次而判定没变，就换下一条，而不是
     对着同一个病因重复付钱。
+
+    ``pool_size`` / ``unused_evidence`` 是一道不花钱的闸：判定说「证据薄」有两种可能，
+    真的没检索到，和检索到了没写进去。后者再补检索只会把没人用的那堆垒得更高，
+    该做的是让写作器把手上的证据用起来。实测 s5 就是这一种——24 条证据用了 6 条。
     """
     if verdict.acceptable:
         return "none"
+    stocked = _shelf_is_stocked(pool_size, unused_evidence)
     routes: list[str] = []
     if verdict.unanswered_aspects and verdict.support in {"thin", "unsupported"}:
         routes.append("retrieve")
@@ -334,6 +360,8 @@ def repair_route(verdict: SectionVerdict, *, attempted: frozenset[str] = frozens
     )
     routes.append("rewrite")
     for route in routes:
+        if route == "retrieve" and stocked:
+            continue
         if route not in attempted:
             return route
     return "none"
