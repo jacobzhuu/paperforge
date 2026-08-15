@@ -2445,9 +2445,12 @@ async def _converge_section_semantics(
             await _rebuild_question_matrix(context, language=language)
         if "resynthesize" in routes.values():
             await _resynthesize_questions(context)
-        rewrite_sections = {key for key, route in routes.items() if route == "rewrite"}
-        # 补证据与重跑综合之后，正文必须重写才能把新东西写进去。
-        rewrite_sections |= {key for key, route in routes.items() if route in {"retrieve"}}
+        # 补证据与重跑综合之后，正文必须**跟着重写**才能把新东西写进去。漏掉
+        # resynthesize 那一半的后果是隐蔽的：综合确实重跑了、库里也更新了，但正文
+        # 一个字没变，于是下一轮复评看到的还是同一段话，判定当然也不会变。
+        rewrite_sections = {
+            key for key, route in routes.items() if route in {"rewrite", "retrieve", "resynthesize"}
+        }
         if rewrite_sections:
             await repair_document_sections(
                 context,
@@ -2455,6 +2458,24 @@ async def _converge_section_semantics(
                 language=language,
                 paper_type=paper_type,
             )
+
+    # 最后一轮的修复必须再评一次，否则 ``unresolved`` 报的是**修之前**的判定——
+    # 一个刚被修好的章节会被永远记成未解决，而验收判据也就不再是判据。
+    repaired = {key for round_ in history for key in (round_.get("routes") or {})}
+    if repaired:
+        for item in await _section_review_inputs(context):
+            if item["section_key"] not in repaired:
+                continue
+            verdict = await review_section(
+                section_key=item["section_key"],
+                question=item["question"],
+                prose=item["prose"],
+                evidence=item["evidence"],
+                runner=runner,
+                language=language,
+            )
+            if verdict is not None:
+                verdict_payloads[verdict.section_key] = verdict.to_payload()
 
     payload = {
         "rounds": history,

@@ -118,7 +118,9 @@ async def test_listing_is_repaired_by_regenerating_synthesis_not_by_rewriting_bl
 
     assert harness["resynthesize"] == [True]
     assert harness["retrieve"] == []
-    assert harness["rewrite"] == []
+    # 重跑综合之后正文必须跟着重写，否则新的综合永远进不了稿子——实测里 s5 就是
+    # 这样「综合重跑了、正文一个字没变、下一轮判定当然也没变」。
+    assert harness["rewrite"] == [["s2"]]
     assert payload["rounds"][0]["routes"] == {"s2": "resynthesize"}
     assert payload["unresolved"] == []
 
@@ -153,6 +155,39 @@ async def test_missing_evidence_retrieves_and_then_rewrites_the_section(
     assert payload["rounds"][0]["routes"]["s5"] == "retrieve"
     assert payload["rounds"][1]["routes"]["s5"] != "retrieve"
     assert payload["unresolved"] == ["s5"]
+
+
+async def test_the_last_repair_is_verified_before_reporting_the_result(
+    monkeypatch, harness
+) -> None:
+    """最后一轮修完要再评一次。
+
+    否则 ``unresolved`` 报的是**修之前**的判定：一个刚刚被修好的章节会被永远记成
+    未解决，验收判据也就不再是判据。这里让最后那次评审返回合格，断言它进了结果。
+    """
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s5")))
+    seen: list[int] = []
+
+    async def _review(**kwargs):
+        seen.append(1)
+        # 两轮都判不合格；只有收尾那次复评合格。
+        if len(seen) <= worker.MAX_SEMANTIC_ROUNDS:
+            return _verdict(
+                "s5",
+                answers_question="partial",
+                support="thin",
+                unanswered_aspects=("田间验证",),
+                gap_declared=False,
+            )
+        return _verdict("s5")
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    payload = await worker._converge_section_semantics(
+        _context(), language="zh", paper_type="review"
+    )
+
+    assert len(seen) == worker.MAX_SEMANTIC_ROUNDS + 1, "收尾复评必须真的跑"
+    assert payload["unresolved"] == []
 
 
 async def test_overclaiming_goes_straight_to_rewriting(monkeypatch, harness) -> None:
