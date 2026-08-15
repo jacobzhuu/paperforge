@@ -1623,7 +1623,7 @@ async def repair_unsourced_numbers(
                 if not isinstance(item, dict):
                     continue
                 try:
-                    index = int(item.get("index"))
+                    index = int(str(item.get("index")))
                 except (TypeError, ValueError):
                     continue
                 if 0 <= index < len(targets):

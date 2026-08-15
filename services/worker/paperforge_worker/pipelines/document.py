@@ -996,7 +996,9 @@ async def _repair_unsourced_numbers(
     for finding in report.unsourced:
         by_section.setdefault(finding.section_key, set()).add(finding.value)
     drafts_by_key = dict(ordered)
-    repaired = {"rewritten": 0, "removed": 0, "sections": []}
+    rewritten_count = 0
+    removed_count = 0
+    repaired_sections: list[str] = []
 
     for section_key, values in by_section.items():
         draft = drafts_by_key.get(section_key)
@@ -1010,9 +1012,9 @@ async def _repair_unsourced_numbers(
         )
         if not (stats["rewritten"] or stats["removed"]):
             continue
-        repaired["rewritten"] += stats["rewritten"]
-        repaired["removed"] += stats["removed"]
-        repaired["sections"].append(section_key)
+        rewritten_count += stats["rewritten"]
+        removed_count += stats["removed"]
+        repaired_sections.append(section_key)
         await _persist_draft(
             context,
             document_id=document_id,
@@ -1022,21 +1024,16 @@ async def _repair_unsourced_numbers(
             language=language,
         )
 
-    if repaired["sections"]:
+    if repaired_sections:
+        repaired = {
+            "rewritten": rewritten_count,
+            "removed": removed_count,
+            "sections": sorted(repaired_sections),
+        }
         outcome.warnings.append(
-            {
-                "stage": "numlint",
-                "reason": "unsourced_numbers_repaired",
-                "rewritten": repaired["rewritten"],
-                "removed": repaired["removed"],
-                "sections": sorted(repaired["sections"]),
-            }
+            {"stage": "numlint", "reason": "unsourced_numbers_repaired", **repaired}
         )
-        await context.emit(
-            "numlint.repaired",
-            repaired,
-            stage="numlint",
-        )
+        await context.emit("numlint.repaired", repaired, stage="numlint")
     return relint()
 
 

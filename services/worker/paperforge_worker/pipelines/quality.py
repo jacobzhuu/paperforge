@@ -811,6 +811,8 @@ SCHOLARLY_BLOCKER_CODES = frozenset(
         # 否则概览页会显示「0 处可修复」，而正文里明明有几节是空的。
         "section_not_generated",
         "verbatim_evidence_copy",
+        "cross_section_repetition",
+        "conclusion_overreach",
     }
 )
 
@@ -828,6 +830,10 @@ RECOVERABLE_BLOCKER_CODES = frozenset(
         "verbatim_evidence_copy",
         "language_mismatch",
         "placeholders_present",
+        # 全篇级问题同样靠重写点名的章节来修：重复的那两节合并论述，
+        # 越界的结论按正文的限定条件重写。
+        "cross_section_repetition",
+        "conclusion_overreach",
     }
 )
 
@@ -1062,6 +1068,27 @@ def apply_readiness_gate(
                 section_keys=not_generated,
             )
         )
+    # 全篇级问题：逐节看都成立，合起来才暴露。
+    repetition = cross_section_repetition(rows)
+    if repetition:
+        blockers.append(
+            _issue(
+                "cross_section_repetition",
+                f"{len(repetition)} 处正文在不同小节里重复了同一论述",
+                count=len(repetition),
+                sections=sorted({key for item in repetition for key in item["sections"]}),
+            )
+        )
+    overreach = conclusion_overreach(rows)
+    if overreach:
+        blockers.append(
+            _issue(
+                "conclusion_overreach",
+                "结论的确定性高于它所总结的正文",
+                section_keys=["conclusion"],
+                **overreach,
+            )
+        )
     verbatim_copies = verbatim_evidence_copies(rows, evidence_units or {})
     if verbatim_copies:
         blockers.append(
@@ -1197,6 +1224,112 @@ def apply_readiness_gate(
         else ("preflight_ready" if not profile_blockers else "needs_revision")
     )
     return report
+
+
+# 框架章节与证据台账**本来就该**复述正文：摘要、引言、结论各自概括全篇，
+# 台账是证据的逐条索引。把它们纳入重复检测只会产出永远修不掉的告警。
+_RESTATING_SECTIONS = frozenset({"abstract", "introduction", "conclusion", "evidence_ledger"})
+# 「这份证据只支持到这里」的措辞。综述的结论段落如果一个都不用，通常不是因为
+# 证据变强了，而是因为收尾时把限定条件丢了。
+_HEDGE_MARKERS = (
+    "可能",
+    "提示",
+    "尚需",
+    "有待",
+    "尚未",
+    "初步",
+    "倾向于",
+    "不一致",
+    "证据有限",
+    "may ",
+    "suggest",
+    "remains unclear",
+    "limited evidence",
+    "further work",
+)
+_OVERREACH_MARKERS = ("证明了", "确证", "毫无疑问", "必然", "总是", "所有研究均", "首次证实")
+
+
+def _section_sentences(row: Any) -> list[str]:
+    text = _body_text(getattr(row, "body_ir_json", None) or {})
+    return [
+        item.strip() for item in re.split(r"(?<=[。！？.!?])\s*", text) if len(item.strip()) > 12
+    ]
+
+
+def cross_section_repetition(
+    rows: list[Any],
+    *,
+    threshold: float = 0.75,
+    min_tokens: int = 10,
+) -> list[dict[str, Any]]:
+    """两个正文小节说了同一句话。
+
+    章节级检查看不见这种问题：每一节单独读都成立，合起来才是同一段论述写了两遍。
+    只比正文小节——摘要/引言/结论/证据台账复述全篇是它们的职责。
+    """
+    indexed: list[tuple[str, str, set[str]]] = []
+    for row in rows:
+        key = str(getattr(row, "section_key", ""))
+        if key in _RESTATING_SECTIONS:
+            continue
+        for sentence in _section_sentences(row):
+            tokens = _support_tokens(sentence)
+            if len(tokens) >= min_tokens:
+                indexed.append((key, sentence, tokens))
+
+    findings: list[dict[str, Any]] = []
+    for index, (key_a, sentence_a, tokens_a) in enumerate(indexed):
+        for key_b, _sentence_b, tokens_b in indexed[index + 1 :]:
+            if key_a == key_b:
+                continue
+            overlap = len(tokens_a & tokens_b) / max(1, min(len(tokens_a), len(tokens_b)))
+            if overlap >= threshold:
+                findings.append(
+                    {
+                        "sections": sorted({key_a, key_b}),
+                        "overlap": round(overlap, 3),
+                        "excerpt": sentence_a[:160],
+                    }
+                )
+                break
+    return findings
+
+
+def conclusion_overreach(rows: list[Any]) -> dict[str, Any] | None:
+    """结论比它总结的正文更有把握。
+
+    实测（项目 6a6bbf18 的 v4 稿）：正文每千字有 2.6 处限定措辞，结论段落 **0 处**——
+    正文老老实实写「证据尚不统一」，收尾却一句限定都没有。读者只会记住结论。
+    """
+    conclusion = next(
+        (row for row in rows if str(getattr(row, "section_key", "")) == "conclusion"),
+        None,
+    )
+    if conclusion is None:
+        return None
+    conclusion_text = _body_text(getattr(conclusion, "body_ir_json", None) or {})
+    body_text = " ".join(
+        _body_text(getattr(row, "body_ir_json", None) or {})
+        for row in rows
+        if str(getattr(row, "section_key", "")) not in {"conclusion", "abstract"}
+    )
+    if len(conclusion_text) < 120 or len(body_text) < 600:
+        return None
+
+    absolutes = [marker for marker in _OVERREACH_MARKERS if marker in conclusion_text]
+    conclusion_hedges = sum(conclusion_text.count(marker) for marker in _HEDGE_MARKERS)
+    body_density = sum(body_text.count(marker) for marker in _HEDGE_MARKERS) / len(body_text)
+    # 正文明显在限定（每千字 ≥1 处）而结论一处都没有，才算越界；两边都不限定说明
+    # 这篇本来就是强证据综述，不该被这条规则罚。
+    hedge_gap = conclusion_hedges == 0 and body_density * 1000 >= 1.0
+    if not absolutes and not hedge_gap:
+        return None
+    return {
+        "absolutes": absolutes,
+        "conclusion_hedges": conclusion_hedges,
+        "body_hedges_per_1k": round(body_density * 1000, 2),
+    }
 
 
 def zh_language_mismatches(rows: list[Any]) -> list[dict[str, Any]]:
@@ -2204,6 +2337,8 @@ __all__ = [
     "classify_claim",
     "count_words",
     "coverage_hints",
+    "conclusion_overreach",
+    "cross_section_repetition",
     "recoverable_findings",
     "repairable_finding_count",
     "soft_check_citations",
