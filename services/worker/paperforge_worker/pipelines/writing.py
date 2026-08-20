@@ -1518,6 +1518,19 @@ _SECTION_CORRECTIONS: dict[str, dict[str, str]] = {
             "The previous draft was far too short. Develop the full argument to the target length."
         ),
     },
+    "below_target": {
+        "zh": (
+            "上一版没写够本节的目标篇幅。用手上已有的证据把论证展开：把同一条论断下的"
+            "多篇证据放到一起比较，说明条件差异，并把还没答上的方面明说出来。"
+            "**不要**为了凑长度重复已经说过的话或加空泛的过渡句。"
+        ),
+        "en": (
+            "The previous draft fell short of this section's target length. Develop the argument "
+            "with the evidence already provided: group multiple sources under one claim and "
+            "compare them, state the conditions that differ, and name the aspects still "
+            "unanswered. Do NOT pad with restatement or filler transitions."
+        ),
+    },
 }
 
 
@@ -1526,6 +1539,14 @@ _SECTION_CORRECTIONS: dict[str, dict[str, str]] = {
 #: 1200 / 350–800——一节只写到目标的四分之一也算合格。实测（项目 ff6b9983 第 3 版）
 #: 十节里有五节首稿在 264–583 字之间，全部一次通过，没有任何一次 too_short 重写。
 MIN_TARGET_RATIO = 0.5
+
+
+def section_absolute_minimum(*, language: str, is_frame: bool) -> int:
+    """低于这个字数就不是「写薄了」，是没写出来。与篇幅目标无关。"""
+    zh = language == "zh"
+    if is_frame:
+        return MIN_FRAME_WORDS_ZH if zh else MIN_FRAME_WORDS_EN
+    return MIN_BODY_WORDS_ZH if zh else MIN_BODY_WORDS_EN
 
 
 def section_minimum_words(
@@ -1588,12 +1609,27 @@ def inspect_section_draft(
         )
 
     defects: list[SectionDefect] = []
-    minimum = section_minimum_words(section, language=language, is_frame=is_frame)
-    if draft.word_count < minimum:
+    # 「没写出来」和「写薄了」是两件事，必须分开报。
+    #
+    # ``too_short`` 是完整性缺陷：低于绝对下限的东西是个残句，交付时该拦。
+    # ``below_target`` 只是没写够本节的篇幅目标——它有正文、有引用，只是短。把它也
+    # 算成完整性缺陷，交付判定就会说出「6 个章节在重试与自动修复之后仍然没有正文」
+    # 这种与事实相反的话（实测：那 6 节里引言 515 字、s6 649 字）。两者都驱动写作
+    # 回路里的重写，但只有前者能否决交付。
+    absolute_floor = section_absolute_minimum(language=language, is_frame=is_frame)
+    target_floor = section_minimum_words(section, language=language, is_frame=is_frame)
+    if draft.word_count < absolute_floor:
         defects.append(
             SectionDefect(
                 code="too_short",
-                detail=f"{draft.word_count} words < {minimum}",
+                detail=f"{draft.word_count} words < {absolute_floor}",
+            )
+        )
+    elif draft.word_count < target_floor:
+        defects.append(
+            SectionDefect(
+                code="below_target",
+                detail=f"{draft.word_count} words < {target_floor}",
             )
         )
 

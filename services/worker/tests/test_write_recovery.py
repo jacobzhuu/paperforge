@@ -556,3 +556,50 @@ def test_a_section_whose_evidence_is_narrow_is_not_pushed_to_write_longer() -> N
 
     thin = {"key": "s4", "evidence_limited": True, "distinct_source_count": 1}
     assert section_minimum_words(thin, language="zh", is_frame=False) == MIN_BODY_WORDS_ZH
+
+
+def test_a_thin_section_is_rewritten_but_never_reported_as_missing_prose() -> None:
+    """「写薄了」和「没写出来」是两件事。
+
+    抬高验收线之后交付判定一度说出「6 个章节在重试与自动修复之后仍然没有正文」——
+    而那 6 节里引言有 515 字、s6 有 649 字（项目 ff6b9983 第 4 版实测）。短要驱动
+    重写，但不能否决交付，否则系统会用一句与事实相反的话拒绝自己的产物。
+    """
+    from paperforge_worker.pipelines.document import NON_BLOCKING_SECTION_DEFECTS
+    from paperforge_worker.pipelines.writing import (
+        SectionDraft,
+        inspect_section_draft,
+        section_absolute_minimum,
+    )
+
+    section = {"key": "introduction", "kind": "frame", "target_words": 800}
+    thin = SectionDraft(
+        section_key="introduction",
+        title="引言",
+        paragraphs=[{"text": "引" * 300, "cite_keys": []}],
+        generator="llm:stub",
+    )
+    codes = [
+        defect.code
+        for defect in inspect_section_draft(
+            thin, language="zh", is_frame=True, section=section
+        )
+    ]
+    assert codes == ["below_target"]
+    assert set(codes) <= NON_BLOCKING_SECTION_DEFECTS
+
+    stub = SectionDraft(
+        section_key="introduction",
+        title="引言",
+        paragraphs=[{"text": "引" * 10, "cite_keys": []}],
+        generator="llm:stub",
+    )
+    stub_codes = [
+        defect.code
+        for defect in inspect_section_draft(
+            stub, language="zh", is_frame=True, section=section
+        )
+    ]
+    assert stub_codes == ["too_short"]
+    assert not set(stub_codes) <= NON_BLOCKING_SECTION_DEFECTS
+    assert section_absolute_minimum(language="zh", is_frame=True) < 300

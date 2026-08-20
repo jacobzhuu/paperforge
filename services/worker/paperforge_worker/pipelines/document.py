@@ -1093,6 +1093,10 @@ async def _repair_unsourced_numbers(
     return relint()
 
 
+#: 会驱动重写、但不否决交付的缺陷码。
+NON_BLOCKING_SECTION_DEFECTS = frozenset({"below_target"})
+
+
 async def _recover_incomplete_sections(
     context: JobContext,
     *,
@@ -1171,21 +1175,28 @@ async def _recover_incomplete_sections(
             language=language,
         )
 
+    # 完整性只看「有没有写出来」。``below_target`` 是「写薄了」——它有正文、有引用，
+    # 只是没够着本节的篇幅目标；它已经在写作回路里驱动过一次重写，不该再让交付判定
+    # 说出「这一节仍然没有正文」这种与事实相反的话。
     outcome.incomplete_sections = [
         {
             "section": key,
-            "defects": [defect.code for defect in defects],
+            "defects": blocking,
             "generator": drafts[key].generator,
         }
         for key in sorted(drafts)
         if (
-            defects := inspect_section_draft(
-                drafts[key],
-                language=language,
-                evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
-                is_frame=(by_key.get(key) or {}).get("kind") == "frame",
-                section=by_key.get(key),
-            )
+            blocking := [
+                defect.code
+                for defect in inspect_section_draft(
+                    drafts[key],
+                    language=language,
+                    evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
+                    is_frame=(by_key.get(key) or {}).get("kind") == "frame",
+                    section=by_key.get(key),
+                )
+                if defect.code not in NON_BLOCKING_SECTION_DEFECTS
+            ]
         )
     ]
     await context.emit(
