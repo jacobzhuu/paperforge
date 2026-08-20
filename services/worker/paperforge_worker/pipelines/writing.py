@@ -1616,22 +1616,28 @@ def inspect_section_draft(
     # 算成完整性缺陷，交付判定就会说出「6 个章节在重试与自动修复之后仍然没有正文」
     # 这种与事实相反的话（实测：那 6 节里引言 515 字、s6 649 字）。两者都驱动写作
     # 回路里的重写，但只有前者能否决交付。
-    absolute_floor = section_absolute_minimum(language=language, is_frame=is_frame)
-    target_floor = section_minimum_words(section, language=language, is_frame=is_frame)
-    if draft.word_count < absolute_floor:
-        defects.append(
-            SectionDefect(
-                code="too_short",
-                detail=f"{draft.word_count} words < {absolute_floor}",
+    #
+    # 附录（证据台账）不量篇幅：它的正文是一张表加两句说明，不是论证。拿正文的篇幅线
+    # 去量它，会把一节**正确的**产物判成没写成——和上面检索方法节那条豁免同理。实测
+    # 台账 192 字被报成「1 个章节仍然没有正文」，而它的 block 是 paragraph、paragraph、
+    # table，表就是它的内容。语种、逐字照抄这些检查照旧对附录生效。
+    if not (draft.appendix or (section or {}).get("appendix")):
+        absolute_floor = section_absolute_minimum(language=language, is_frame=is_frame)
+        target_floor = section_minimum_words(section, language=language, is_frame=is_frame)
+        if draft.word_count < absolute_floor:
+            defects.append(
+                SectionDefect(
+                    code="too_short",
+                    detail=f"{draft.word_count} words < {absolute_floor}",
+                )
             )
-        )
-    elif draft.word_count < target_floor:
-        defects.append(
-            SectionDefect(
-                code="below_target",
-                detail=f"{draft.word_count} words < {target_floor}",
+        elif draft.word_count < target_floor:
+            defects.append(
+                SectionDefect(
+                    code="below_target",
+                    detail=f"{draft.word_count} words < {target_floor}",
+                )
             )
-        )
 
     from paperforge_worker.pipelines.quality import (
         verbatim_evidence_copies,

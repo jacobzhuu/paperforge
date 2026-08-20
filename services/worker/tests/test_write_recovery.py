@@ -603,3 +603,19 @@ def test_a_thin_section_is_rewritten_but_never_reported_as_missing_prose() -> No
     assert stub_codes == ["too_short"]
     assert not set(stub_codes) <= NON_BLOCKING_SECTION_DEFECTS
     assert section_absolute_minimum(language="zh", is_frame=True) < 300
+
+
+def test_an_appendix_table_is_not_measured_against_a_prose_length() -> None:
+    """证据台账的正文是一张表加两句说明。拿正文的篇幅线去量它，会把一节正确的产物
+    判成没写成——实测台账 192 字被报成「1 个章节仍然没有正文」。语种和逐字照抄这些
+    检查照旧生效，只是不量篇幅。"""
+    from paperforge_worker.pipelines.writing import SectionDraft, inspect_section_draft
+
+    ledger = SectionDraft(
+        section_key="evidence_ledger",
+        title="附录：证据台账",
+        appendix=True,
+        paragraphs=[{"text": "下表按证据单元逐条列出出处与定位。", "cite_keys": []}],
+        generator="llm:stub",
+    )
+    assert inspect_section_draft(ledger, language="zh", section={"appendix": True}) == []
