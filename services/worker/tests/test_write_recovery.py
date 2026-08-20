@@ -528,3 +528,31 @@ def test_the_same_evidence_text_is_shown_to_the_writer_only_once() -> None:
 
     # 先出现的那条留下（上游已按等级排过序），后面重复的丢掉。
     assert [item["evidence_id"] for item in kept] == ["e-1", "e-2", "e-4", "e-5"]
+
+
+def test_a_section_at_a_quarter_of_its_target_is_not_accepted() -> None:
+    """验收线此前与篇幅目标完全脱钩：正文 180 字、框架 80 字，而目标是 1200 / 350–800。
+
+    实测（项目 ff6b9983 第 3 版）十节里五节首稿只有 264–583 字，一次 too_short 重写
+    都没触发。现在验收线跟着本节自己的目标走。
+    """
+    from paperforge_worker.pipelines.writing import section_minimum_words
+
+    body = {"key": "s1", "target_words": None}
+    assert section_minimum_words(body, language="zh", is_frame=False) == 600
+    intro = {"key": "introduction", "target_words": 800}
+    assert section_minimum_words(intro, language="zh", is_frame=True) == 400
+    # 没有声明目标的框架章节（旧大纲）沿用绝对下限，而不是拿正文的 1200 字去量摘要。
+    from paperforge_worker.pipelines.writing import MIN_FRAME_WORDS_ZH
+
+    assert section_minimum_words({}, language="zh", is_frame=True) == MIN_FRAME_WORDS_ZH
+    abstract = {"key": "abstract", "target_words": 350}
+    assert section_minimum_words(abstract, language="zh", is_frame=True) == 175
+
+
+def test_a_section_whose_evidence_is_narrow_is_not_pushed_to_write_longer() -> None:
+    """证据只有一个来源时抬验收线就是逼灌水，而灌水正是要防的东西。"""
+    from paperforge_worker.pipelines.writing import MIN_BODY_WORDS_ZH, section_minimum_words
+
+    thin = {"key": "s4", "evidence_limited": True, "distinct_source_count": 1}
+    assert section_minimum_words(thin, language="zh", is_frame=False) == MIN_BODY_WORDS_ZH

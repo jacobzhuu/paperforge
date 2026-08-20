@@ -808,6 +808,25 @@ async def repair_document_sections(
             outcome=outcome,
             assets=assets,
         )
+        previous = existing.get(key)
+        if _is_thinner_refresh(section, previous, draft):
+            # 框架章节不是因为自己有问题才被重写的——它们每一轮都跟着正文刷新一遍，
+            # 为的是不停留在已经被删掉的论断上。既然不是在修缺陷，那么「刷完之后
+            # 短了一大截」就只是这一次采样偏短，不是修复。实测（项目 ff6b9983 第 3 版）
+            # 四轮修复下来引言 264→364→361→315→235、结论 207→240→174→214→284：
+            # 每一轮都是一次全新生成，长度上下摆动 ±50%，最后交付的是**最后一次**
+            # 而不是最好的一次。这里给刷新加一道棘轮，正文小节不受影响（它们的重写
+            # 是冲着具体缺陷去的，变短可能正是修复本身）。
+            await context.emit(
+                "quality_repair.refresh_rejected",
+                {
+                    "section": key,
+                    "kept_words": previous.word_count if previous else 0,
+                    "rejected_words": draft.word_count,
+                },
+                stage="quality_repair",
+            )
+            continue
         await _persist_draft(
             context,
             document_id=document.id,
@@ -828,6 +847,28 @@ async def repair_document_sections(
         await context.raise_if_stopped()
     outcome.document_id = str(document.id)
     return outcome
+
+
+#: 框架章节刷新后短于原来的这个比例就不采用。0.8 是「明显更短」而不是「措辞变了」：
+#: 实测四轮刷新的长度波动在 ±50%，而真正因为删掉超证据论断而变短的幅度要小得多。
+FRAME_REFRESH_MIN_RATIO = 0.8
+
+
+def _is_thinner_refresh(
+    section: dict[str, Any],
+    previous: SectionDraft | None,
+    draft: SectionDraft,
+) -> bool:
+    """这次刷新是不是把框架章节写薄了。
+
+    只对框架章节生效，且只在**已经有上一稿**时生效。新稿完全没写出来（0 字）时也算，
+    否则一次失败的生成会把整节清空。
+    """
+    if section.get("kind") != "frame" or previous is None:
+        return False
+    if previous.word_count <= 0:
+        return False
+    return draft.word_count < previous.word_count * FRAME_REFRESH_MIN_RATIO
 
 
 async def snapshot_document_sections(context: JobContext) -> dict[str, dict[str, Any]]:
@@ -1084,6 +1125,7 @@ async def _recover_incomplete_sections(
             language=language,
             evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
             is_frame=(by_key.get(key) or {}).get("kind") == "frame",
+            section=by_key.get(key),
         )
     ]
     if not pending:
@@ -1142,6 +1184,7 @@ async def _recover_incomplete_sections(
                 language=language,
                 evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
                 is_frame=(by_key.get(key) or {}).get("kind") == "frame",
+                section=by_key.get(key),
             )
         )
     ]
@@ -1223,6 +1266,7 @@ async def _write_one(
             language=writing_context.language,
             evidence=section_evidence,
             is_frame=is_frame,
+            section=section,
         )
         if not defects:
             if attempt > 1:

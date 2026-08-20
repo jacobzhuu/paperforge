@@ -1521,12 +1521,48 @@ _SECTION_CORRECTIONS: dict[str, dict[str, str]] = {
 }
 
 
+#: 一节至少要写到自己篇幅目标的这个比例，否则退回重写一次。
+#: 此前的验收线是与目标完全脱钩的绝对值（正文 180 字 / 框架 80 字），而目标是
+#: 1200 / 350–800——一节只写到目标的四分之一也算合格。实测（项目 ff6b9983 第 3 版）
+#: 十节里有五节首稿在 264–583 字之间，全部一次通过，没有任何一次 too_short 重写。
+MIN_TARGET_RATIO = 0.5
+
+
+def section_minimum_words(
+    section: dict[str, Any] | None,
+    *,
+    language: str,
+    is_frame: bool,
+) -> int:
+    """这一节至少要写多少字才算写完。
+
+    与本节自己的篇幅目标挂钩，但**证据本来就窄的小节不抬线**：那种情况下逼长度
+    就是逼灌水，而灌水正是要防的东西（``evidence_limited`` 的小节另有「说清证据
+    有多窄」的写作要求，见 ``_evidence_limitation_line``）。
+    """
+    zh = language == "zh"
+    floor = (MIN_FRAME_WORDS_ZH if zh else MIN_FRAME_WORDS_EN) if is_frame else (
+        MIN_BODY_WORDS_ZH if zh else MIN_BODY_WORDS_EN
+    )
+    section = section or {}
+    if section.get("evidence_limited"):
+        return floor
+    declared = section.get("target_words")
+    if is_frame and not declared:
+        # 没有声明目标的框架章节（早于框架写作交代的旧大纲）沿用绝对下限：拿正文小节
+        # 的 1200 字目标去量一篇摘要，会把一份正常的摘要判成没写完。
+        return floor
+    target = int(declared or (TARGET_WORDS_PER_SECTION_ZH if zh else TARGET_WORDS_PER_SECTION_EN))
+    return max(floor, int(target * MIN_TARGET_RATIO))
+
+
 def inspect_section_draft(
     draft: SectionDraft,
     *,
     language: str,
     evidence: list[dict[str, Any]] | None = None,
     is_frame: bool = False,
+    section: dict[str, Any] | None = None,
 ) -> list[SectionDefect]:
     """判定一节稿子是否够格进入成稿——写作循环与交付门用的是同一个判据。
 
@@ -1552,11 +1588,7 @@ def inspect_section_draft(
         )
 
     defects: list[SectionDefect] = []
-    minimum = (
-        (MIN_FRAME_WORDS_ZH if language == "zh" else MIN_FRAME_WORDS_EN)
-        if is_frame
-        else (MIN_BODY_WORDS_ZH if language == "zh" else MIN_BODY_WORDS_EN)
-    )
+    minimum = section_minimum_words(section, language=language, is_frame=is_frame)
     if draft.word_count < minimum:
         defects.append(
             SectionDefect(
