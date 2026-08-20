@@ -377,3 +377,33 @@ async def test_a_truncated_classifier_still_degrades_to_lexical_when_the_retry_a
     assert [link["stance"] for link in result.classified] == ["supports"]
     assert result.llm_classified == 0
     assert result.fallback_classified == 1
+
+
+async def test_deepening_shows_the_classifier_evidence_it_has_never_seen():
+    """「证据薄」不等于「没检索到」。
+
+    实测（项目 ff6b9983，2026-08-19 首轮全流程）：库里抽出 848 条证据单元，每个子问题
+    只看排名前 24 条（MAX_CANDIDATES_PER_QUESTION），5 个问题合计 120 条进分类器、最终
+    挂上 26 条——97% 的证据从没被任何问题看过一眼。这种情况下补检索买回来的新文献照样
+    挤不进那 24 个位置。加挂模式把已经挂上的单元从池子里拿掉，第二梯队才有机会被看见。
+    """
+    linked = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    unseen = _unit(text="A second MovieLens poisoning study reports HR@20 recovery after defence.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [JsonResult(value={"links": [{"evidence_id": str(unseen.id), "stance": "supports"}]})]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[linked, unseen],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+        exclude_unit_ids={linked.id},
+    )
+
+    assert [str(link["evidence_id"]) for link in result.classified] == [str(unseen.id)]
+    # 已挂的那条必须彻底离开候选池：留着它只会再占一个名额，加挂就白做了。
+    assert result.candidate_count == 1

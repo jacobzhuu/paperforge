@@ -119,7 +119,19 @@ async def build_question_evidence_matrix(
     context: JobContext,
     *,
     language: str,
+    deepen_question_ids: set[Any] | None = None,
 ) -> QuestionMatrixOutcome:
+    """把证据挂到子问题上。
+
+    ``deepen_question_ids`` 打开**加挂**模式：只处理这些问题，候选池排除已经挂上的
+    证据单元，分类结果与现有链接合并而不是替换。
+
+    这条路存在的原因来自实测：一次真实全流程抽出 848 条证据单元，而每个问题只看
+    排名前 24 条（``MAX_CANDIDATES_PER_QUESTION``），5 个问题合计 120 条进了分类器、
+    最终挂上 26 条。也就是说 97% 的证据从没被任何问题看过一眼。语义评审判「证据薄」
+    的那些章节，缺的不是检索——库里躺着的东西它们根本没机会看到。补检索买回来的
+    新文献只会让 848 变成更大的数，仍然挤不进那 24 个位置。
+    """
     outcome = QuestionMatrixOutcome()
     async with context.session() as session:
         questions = await list_research_questions(session, context.project_id, kind="sub")
@@ -145,6 +157,13 @@ async def build_question_evidence_matrix(
             previous_automatic.setdefault(existing_link.research_question_id, []).append(
                 existing_link
             )
+    already_linked: dict[Any, set[Any]] = {}
+    for existing_link in existing_links:
+        already_linked.setdefault(existing_link.research_question_id, set()).add(
+            existing_link.evidence_unit_id
+        )
+    if deepen_question_ids is not None:
+        questions = [question for question in questions if question.id in deepen_question_ids]
     concurrency = max(1, min(int(context.settings.qmatrix_concurrency), 8))
     for batch_start in range(0, len(questions), concurrency):
         batch = questions[batch_start : batch_start + concurrency]
@@ -157,6 +176,11 @@ async def build_question_evidence_matrix(
                     work_context=work_context,
                     runner=runner,
                     language=language,
+                    exclude_unit_ids=(
+                        already_linked.get(question.id, set())
+                        if deepen_question_ids is not None
+                        else None
+                    ),
                 )
                 for question in batch
             )
@@ -203,6 +227,12 @@ async def build_question_evidence_matrix(
         # empty stochastic rerun must never erase a previously useful matrix.
         accepted: list[_QuestionClassification] = []
         for result in results:
+            if deepen_question_ids is not None:
+                # 加挂模式没有「上一轮的同一批」可比：候选池本来就排除了已挂的单元，
+                # 拿它和现有链接比强弱，等于用新增的几条去否决全部旧链接。
+                result.diagnostic["update_decision"] = "deepened"
+                accepted.append(result)
+                continue
             previous = previous_automatic.get(result.question.id, [])
             previous_ids = [link.evidence_unit_id for link in previous]
             new_ids = [link["evidence_id"] for link in result.classified]
@@ -220,12 +250,14 @@ async def build_question_evidence_matrix(
 
         if accepted:
             async with context.session() as session:
-                await clear_automatic_question_evidence_links(
-                    session,
-                    [result.question.id for result in accepted],
-                )
+                if deepen_question_ids is None:
+                    await clear_automatic_question_evidence_links(
+                        session,
+                        [result.question.id for result in accepted],
+                    )
                 for result in accepted:
-                    previous_automatic[result.question.id] = []
+                    if deepen_question_ids is None:
+                        previous_automatic[result.question.id] = []
                     for link_payload in result.classified:
                         stored = await upsert_question_evidence_link(
                             session,
@@ -252,7 +284,11 @@ async def _classify_question(
     work_context: dict[Any, dict[str, Any]],
     runner: Any,
     language: str,
+    exclude_unit_ids: set[Any] | None = None,
 ) -> _QuestionClassification:
+    if exclude_unit_ids:
+        # 加挂时把已经挂上的单元从池子里拿掉，前 24 名于是让给了从没被看过的那一批。
+        evidence = [unit for unit in evidence if unit.id not in exclude_unit_ids]
     ranked, rejected_by_task, rejected_by_lexical, bridge_source = cast(
         tuple[list[tuple[Any, float]], int, int, str | None],
         _rank_candidates(

@@ -67,11 +67,16 @@ def harness(monkeypatch):
         "rewrite": [],
         "qmatrix": [],
         "notes": [],
+        "deepen": [],
     }
 
     async def _retrieve(context, **kwargs):
         calls["retrieve"].append(kwargs)
         return {}
+
+    async def _deepen(context, **kwargs):
+        calls["deepen"].append(kwargs)
+        return {"added": 0}
 
     async def _qmatrix(context, **kwargs):
         calls["qmatrix"].append(kwargs)
@@ -84,6 +89,7 @@ def harness(monkeypatch):
         calls["notes"].append(notes or {})
 
     monkeypatch.setattr(worker, "_supplement_review_evidence", _retrieve)
+    monkeypatch.setattr(worker, "_deepen_question_evidence", _deepen)
     monkeypatch.setattr(worker, "_rebuild_question_matrix", _qmatrix)
     monkeypatch.setattr(worker, "_resynthesize_questions", _resynth)
     monkeypatch.setattr(worker, "repair_document_sections", _rewrite)
@@ -108,6 +114,7 @@ async def test_a_clean_manuscript_triggers_no_repair(monkeypatch, harness) -> No
         "rewrite": [],
         "qmatrix": [],
         "notes": [],
+        "deepen": [],
     }
     assert len(payload["rounds"]) == 1
 
@@ -363,6 +370,7 @@ async def test_a_reviewer_outage_never_marks_the_manuscript_unacceptable(
         "rewrite": [],
         "qmatrix": [],
         "notes": [],
+        "deepen": [],
     }
 
 
@@ -373,3 +381,57 @@ def _ok(value):
         return value
 
     return _coro()
+
+
+async def test_thin_evidence_first_uses_what_the_library_already_holds(
+    monkeypatch, harness
+) -> None:
+    """「证据薄」的第一反应不该是再买一批文献。
+
+    实测（项目 ff6b9983 首轮全流程）：库里抽出 848 条证据单元，每个子问题只看排名
+    前 24 条，5 个问题合计 120 条进分类器、最终挂上 26 条——97% 的证据从没被任何
+    问题看过。这种情况下补检索买回来的新文献照样挤不进那 24 个位置。所以先加挂
+    （候选池排除已挂单元，让第二梯队有一次被看见的机会），再谈补检索。
+    """
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s5")))
+
+    async def _review(**kwargs):
+        return _verdict(
+            "s5",
+            answers_question="partial",
+            support="thin",
+            unanswered_aspects=("递送效率",),
+            gap_declared=False,
+            diagnosis="evidence_gap",
+        )
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    await worker._converge_section_semantics(_context(), language="zh", paper_type="review")
+
+    assert len(harness["deepen"]) == 1
+    assert harness["deepen"][0]["question_ids"] == {"q-s5"}
+
+
+async def test_retrieval_is_told_which_questions_failed(monkeypatch, harness) -> None:
+    """评审器刚刚判完哪一节缺证，那份判断不能在路上被丢掉。
+
+    此前补检索不接收问题清单，改从 ``answer_status`` 重新推一遍缺口；实测 s4/s5 的
+    问题都是 ``partial`` 而不是 ``insufficient_evidence``，于是缺口列表为空、一个检索
+    请求都没发——事件流里只留下 ``routes: retrieve``，看起来按病因修了，实际只重写。
+    """
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s4", "s5")))
+
+    async def _review(**kwargs):
+        return _verdict(
+            kwargs["section_key"],
+            answers_question="partial",
+            support="thin",
+            unanswered_aspects=("监管条款",),
+            gap_declared=False,
+            diagnosis="evidence_gap",
+        )
+
+    monkeypatch.setattr(worker, "review_section", _review)
+    await worker._converge_section_semantics(_context(), language="zh", paper_type="review")
+
+    assert harness["retrieve"][0]["question_ids"] == {"q-s4", "q-s5"}

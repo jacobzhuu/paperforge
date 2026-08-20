@@ -2511,7 +2511,24 @@ async def _converge_section_semantics(
         )
         # 一条路只跑一次，即使多节共用：补检索与重跑综合都是项目级动作。
         if "retrieve" in routes.values():
-            await _supplement_review_evidence(context, language=language, round_index=attempt)
+            gap_question_ids = {
+                shelf[key].get("question_id")
+                for key, route in routes.items()
+                if route == "retrieve" and shelf.get(key)
+            }
+            gap_question_ids.discard(None)
+            await _deepen_question_evidence(
+                context,
+                question_ids=gap_question_ids,
+                language=language,
+                attempt=attempt,
+            )
+            await _supplement_review_evidence(
+                context,
+                language=language,
+                round_index=attempt,
+                question_ids=gap_question_ids,
+            )
             await _rebuild_question_matrix(context, language=language)
         if "resynthesize" in routes.values():
             await _resynthesize_questions(context)
@@ -2563,6 +2580,83 @@ async def _rebuild_question_matrix(context: JobContext, *, language: str) -> Non
         await build_question_evidence_matrix(context, language=language)
     except Exception as error:  # noqa: BLE001 - 补证据失败不该毁掉已有稿子
         context.warn("section_review", type(error).__name__, {"stage": "qmatrix_rebuild"})
+
+
+async def _deepen_question_evidence(
+    context: JobContext,
+    *,
+    question_ids: set[Any],
+    language: str,
+    attempt: int,
+) -> dict[str, Any]:
+    """先把**已经在库里、却从没被这个问题看过**的证据挂上去，再谈补检索。
+
+    「证据薄」在这条管线里有两种截然不同的成因，此前被同一个词盖住了：
+
+    * 真的没检索到——补检索是对的；
+    * 检索到了、也抽成了证据单元，但从没进过这个问题的候选池。
+
+    实测（项目 ff6b9983 首轮全流程）：库里 848 条证据单元，每个子问题只看排名前 24
+    条，5 个问题合计 120 条进分类器、挂上 26 条——97% 的证据没有任何问题看过。
+    这种情况下补检索买回来的新文献照样挤不进那 24 个位置，等于白花钱。所以先加挂：
+    候选池排除已挂单元，让第二梯队的证据有一次被看见的机会。一个问题一次分类调用，
+    实测约 6 秒。
+    """
+    targets: set[uuid.UUID] = set()
+    for raw in question_ids:
+        try:
+            targets.add(raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not targets:
+        return {"deepened": 0}
+    before = await _question_link_counts(context, targets)
+    try:
+        await build_question_evidence_matrix(
+            context,
+            language=language,
+            deepen_question_ids=targets,
+        )
+    except Exception as error:  # noqa: BLE001 - 加挂失败不该毁掉已有稿子
+        context.warn("section_review", type(error).__name__, {"stage": "qmatrix_deepen"})
+        return {"deepened": 0, "error": type(error).__name__}
+    after = await _question_link_counts(context, targets)
+    payload = {
+        "attempt": attempt,
+        "questions": {
+            str(qid): {"before": before.get(qid, 0), "after": after.get(qid, 0)}
+            for qid in targets
+        },
+        "added": sum(after.get(qid, 0) - before.get(qid, 0) for qid in targets),
+    }
+    # 修复动作有没有真的改变输入，必须留在事件流里。此前「补检索」这一路在
+    # 没有可补的缺口时静默返回，事件流里只看得到 routes: retrieve，看不到它
+    # 什么都没做——于是一轮修复看起来是按病因分流的，实际退化成了纯重写。
+    await context.emit("section_review.evidence_deepened", payload, stage="quality_repair")
+    return payload
+
+
+async def _question_link_counts(
+    context: JobContext, question_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    from db.models.paper import QuestionEvidenceLink
+    from sqlalchemy import func as sql_func
+    from sqlalchemy import select as sql_select
+
+    if not question_ids:
+        return {}
+    async with context.session() as session:
+        rows = (
+            await session.execute(
+                sql_select(
+                    QuestionEvidenceLink.research_question_id,
+                    sql_func.count(),
+                )
+                .where(QuestionEvidenceLink.research_question_id.in_(list(question_ids)))
+                .group_by(QuestionEvidenceLink.research_question_id)
+            )
+        ).all()
+    return {row[0]: int(row[1]) for row in rows}
 
 
 async def _resynthesize_questions(context: JobContext) -> None:
@@ -2619,6 +2713,7 @@ async def _supplement_review_evidence(
     language: str,
     report: EvidenceReadinessReport | None = None,
     round_index: int = 1,
+    question_ids: set[Any] | None = None,
 ) -> dict[str, Any]:
     """One bounded, gap-typed retrieval pass for under-evidenced sub-questions.
 
@@ -2652,10 +2747,15 @@ async def _supplement_review_evidence(
         scope = dict(project.scope_json or {}) if project else {}
         linked_work_ids = await _question_linked_work_ids(session, context.project_id)
 
-    gaps = _classify_evidence_gaps(questions, report)
+    gaps = _classify_evidence_gaps(questions, report, question_ids=question_ids)
     if not gaps:
         # 没有可定向补的缺口（例如唯一的降级项是分类器异常）。再检索一轮只会
         # 把同一批文献重新买一遍。
+        await context.emit(
+            "repair_search.skipped",
+            {"round": round_index, "reason": "no_targetable_gap"},
+            stage="quality_repair",
+        )
         return {"round": round_index, "gaps": [], "skipped": "no_targetable_gap"}
     repair_questions = [
         {
@@ -2808,13 +2908,36 @@ async def _question_linked_work_ids(
 def _classify_evidence_gaps(
     questions: list[Any],
     report: EvidenceReadinessReport | None,
+    *,
+    question_ids: set[Any] | None = None,
 ) -> list[tuple[Any, str]]:
     """把「哪些问题缺证」翻译成「缺的是哪一种证」。
 
-    没有 readiness 报告时（独立管线的首轮）退回按 ``answer_status`` 判断。
+    ``question_ids`` 是调用方**已经知道**哪些问题缺证时的直接入口——语义评审就是
+    这种情况：它刚刚判完这一节答没答上，缺口就在它手里。此前这个入口不存在，
+    评审器的判断被丢掉、改用 ``answer_status`` 重新推一遍，而那个字段是问题级的、
+    上一次矩阵重建时写的。实测（项目 ff6b9983）：评审判 s4/s5 证据不足并分流到
+    ``retrieve``，两个问题的 ``answer_status`` 都是 ``partial`` 而不是
+    ``insufficient_evidence``，于是缺口列表为空、补检索一个请求都没发——事件流里
+    只留下一条 ``routes: retrieve``，看起来是按病因修的，实际只跑了重写。
+
+    没有 readiness 报告、也没有指定问题时（独立管线的首轮）退回按
+    ``answer_status`` 判断。
     """
     by_id = {str(question.id): question for question in questions if question.search_query}
     gaps: list[tuple[Any, str]] = []
+    if question_ids:
+        wanted = {str(item) for item in question_ids}
+        return [
+            (
+                question,
+                "no_candidates"
+                if question.answer_status == "insufficient_evidence"
+                else "needs_second_source",
+            )
+            for key, question in by_id.items()
+            if key in wanted
+        ]
     if report is not None and report.question_details:
         for detail in report.question_details:
             question = by_id.get(str(detail.get("question_id") or ""))
