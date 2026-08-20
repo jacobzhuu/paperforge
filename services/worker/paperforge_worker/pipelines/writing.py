@@ -578,7 +578,12 @@ def _build_prompt(
     if compact:
         target = COMPACT_TARGET_WORDS_ZH if zh else COMPACT_TARGET_WORDS_EN
     else:
-        target = TARGET_WORDS_PER_SECTION_ZH if zh else TARGET_WORDS_PER_SECTION_EN
+        # 大纲可以给某一节指定自己的篇幅：摘要不该按正文小节的目标写，引言和结论也
+        # 各有各的量。没有指定就沿用正文小节的目标。
+        target = int(
+            section.get("target_words")
+            or (TARGET_WORDS_PER_SECTION_ZH if zh else TARGET_WORDS_PER_SECTION_EN)
+        )
     outline_titles = [
         str(s.get("title")) for s in (context.outline.get("sections") or []) if s.get("title")
     ]

@@ -64,6 +64,63 @@ Rules:
 FRONT_SECTION_KEYS = ("abstract", "introduction")
 BACK_SECTION_KEYS = ("conclusion",)
 
+# 框架章节此前的 summary 是空字符串，于是写作提示词里那一行就是「Section goal:」后面
+# 什么都没有，argument_points 也是空的。模型没有任何交代，写出来的引言只有 200 字左右；
+# 更糟的是质量修复每一轮都会重写这三节，而修复指令是纯减法（「删掉没有证据支撑的论断」），
+# 于是每修一轮就短一截——实测（项目 ff6b9983 第 2 版）结论 351 → 136 → 137 字，
+# 引言 274 → 179 → 171 字。给它们一份正经的写作交代和各自的篇幅目标，这两件事一起解决。
+FRAME_SECTION_BRIEFS: dict[str, dict[str, Any]] = {
+    "abstract": {
+        "zh": (
+            "写这篇综述的摘要：一句话交代研究背景与为什么现在值得综述；"
+            "说明综述覆盖的范围与取证方式；概括正文各节得出的主要结论（要具体到机制、"
+            "对象或结果，不要只说「进行了讨论」）；点出证据仍然不足之处；最后给出展望。"
+            "不分段，不使用引用标记。"
+        ),
+        "en": (
+            "Write the abstract of this review: one sentence of background and why the topic "
+            "warrants a review now; the scope covered and how evidence was gathered; the "
+            "substantive conclusions of the body sections (name mechanisms, organisms or "
+            "results — never just 'is discussed'); where evidence remains insufficient; and a "
+            "closing outlook. One paragraph, no citation markers."
+        ),
+        "target_zh": 350,
+        "target_en": 220,
+    },
+    "introduction": {
+        "zh": (
+            "写这篇综述的引言，至少三段：第一段交代研究领域的背景与重要性；"
+            "第二段说明目前的研究现状与尚未解决的问题——这里要引用正文用到的文献；"
+            "第三段说明本综述要回答哪些子问题、如何组织各节。"
+            "不要罗列各节标题，要写成连贯的论证。"
+        ),
+        "en": (
+            "Write the introduction of this review in at least three paragraphs: the field and "
+            "why it matters; the current state of the art and what remains unresolved, citing "
+            "the works used in the body; and the sub-questions this review answers together "
+            "with how the sections are organised. Argue in prose; do not list section titles."
+        ),
+        "target_zh": 800,
+        "target_en": 500,
+    },
+    "conclusion": {
+        "zh": (
+            "写这篇综述的结论，至少两段：第一段综合正文各节的发现，给出跨节的判断"
+            "（哪些结论证据充分、哪些仍是初步的、不同研究之间在哪里不一致）；"
+            "第二段说明本领域下一步最需要什么样的证据或方法。"
+            "不要逐节复述，要给出综合判断。"
+        ),
+        "en": (
+            "Write the conclusion of this review in at least two paragraphs: a cross-section "
+            "judgement (which conclusions are well supported, which remain preliminary, where "
+            "studies disagree), then what evidence or methods the field most needs next. "
+            "Synthesise; do not restate the sections one by one."
+        ),
+        "target_zh": 600,
+        "target_en": 380,
+    },
+}
+
 
 @dataclass
 class OutlineOutcome:
@@ -125,6 +182,9 @@ async def generate_outline(
             sub_question_bundles,
             language=language,
             allowed=allowed,
+        )
+        body = await _headline_sections(
+            body, topic=topic, language=language, runner=runner
         )
         generator = "question_evidence_matrix"
     else:
@@ -339,6 +399,7 @@ def question_driven_sections(
     zh = language == "zh"
     sections: list[dict[str, Any]] = []
     for index, bundle in enumerate(bundles[:MAX_SECTIONS]):
+        question_text = str(bundle.get("question") or ("子问题" if zh else "Sub-question"))
         evidence = bundle.get("evidence") or []
         cite_keys = list(
             dict.fromkeys(
@@ -355,12 +416,19 @@ def question_driven_sections(
             {
                 "key": f"q{index + 1}",
                 "level": 1,
-                "title": str(bundle.get("question") or ("子问题" if zh else "Sub-question")),
+                # 小标题不是子问题原文。子问题是**给写作器和评审器的输入**，写成标题
+                # 就成了「CRISPR-Cas 在作物抗病性改良中面临哪些技术挑战（如脱靶效应、
+                # 递送方法、多基因编辑）？」这样一行——带问号、带举例括号，导出的 PDF
+                # 一眼看去不像论文。问题原文移进 summary，写作器照样知道要答什么。
+                "title": _section_heading(question_text, language=language),
+                "question": question_text,
                 "summary": (
-                    f"回答该子问题；当前证据状态：{_stance_label(stance, language)}。"
+                    f"回答这个子问题：{question_text}\n"
+                    f"当前证据状态：{_stance_label(stance, language)}。"
                     if zh
                     else (
-                        "Answer this sub-question; current evidence status: "
+                        f"Answer this sub-question: {question_text}\n"
+                        "Current evidence status: "
                         f"{_stance_label(stance, language)}."
                     )
                 ),
@@ -421,6 +489,129 @@ def _synthesis_argument_points(bundle: dict[str, Any], *, language: str) -> list
         if zh
         else ["State current findings and boundaries according to evidence grade"]
     )
+
+
+#: 中文疑问式小标题里，把句子拉成问题的那些词。去掉它们剩下的就是主题短语。
+_ZH_INTERROGATIVES = (
+    "有哪些",
+    "哪些",
+    "如何",
+    "怎样",
+    "是什么",
+    "为什么",
+    "能否",
+    "是否",
+    "多大程度上",
+)
+_EN_INTERROGATIVES = (
+    "what are the",
+    "what is the",
+    "what are",
+    "what is",
+    "how do",
+    "how does",
+    "how has",
+    "how can",
+    "which",
+    "why do",
+    "why does",
+    "to what extent",
+)
+
+
+_HEADING_SYSTEM_ZH = """你在给一篇综述论文拟正文小标题。
+输入是若干研究子问题，按顺序给每个子问题拟一个小标题。
+只输出 JSON：{"headings": ["小标题1", "小标题2", ...]}
+要求：
+- 数量与顺序必须与输入的子问题一一对应；
+- 每条是**名词性短语**，不是问句：不带问号、不带「哪些/如何/是否」这类疑问词；
+- 不超过 18 个汉字，不加编号、不加括号举例；
+- 各条之间风格一致、彼此可区分，读起来像一篇论文的目录。"""
+
+_HEADING_SYSTEM_EN = """You are naming the body sections of a review paper.
+Given a list of research sub-questions, produce one heading per sub-question, in order.
+Output JSON only: {"headings": ["heading 1", "heading 2", ...]}
+Rules:
+- exactly one heading per input question, same order;
+- each heading is a NOUN PHRASE, never a question: no question mark, no "what/how/which";
+- at most 8 words, no numbering, no parenthetical examples;
+- headings must be parallel in style and mutually distinguishable."""
+
+
+async def _headline_sections(
+    sections: list[dict[str, Any]],
+    *,
+    topic: str,
+    language: str,
+    runner: LLMRunner | None,
+) -> list[dict[str, Any]]:
+    """把问题驱动小节的标题换成像论文目录的短语。
+
+    ``_section_heading`` 的确定性结果准确但读着仍像半截句子（「CRISPR-Cas 编辑作物在
+    抗病性改良方面取得了具体成果」）。这里花一次 planner 调用把整组标题一起拟出来，
+    整组一起拟才能保证风格一致、彼此可区分。模型不可用或返回不合规就沿用确定性结果——
+    标题拟不好是遗憾，拟错或者数量对不上是事故。
+    """
+    targets = [item for item in sections if item.get("question")]
+    if not targets or runner is None:
+        return sections
+    questions = [str(item.get("question") or "") for item in targets]
+    result = await runner.agenerate_json(
+        "planner",
+        system_prompt=(_HEADING_SYSTEM_ZH if language == "zh" else _HEADING_SYSTEM_EN),
+        user_prompt="\n".join(
+            [f"论文主题：{topic}" if language == "zh" else f"Paper topic: {topic}", "", *(
+                f"{index + 1}. {text}" for index, text in enumerate(questions)
+            )]
+        ),
+        max_output_tokens=1200,
+        temperature=0.2,
+        metadata={"stage": "outline_headings"},
+    )
+    headings = (result.value or {}).get("headings") if result.ok else None
+    if not isinstance(headings, list) or len(headings) != len(targets):
+        return sections
+    cleaned = [" ".join(str(item).split()).strip("：: ") for item in headings]
+    if any(not item or "？" in item or "?" in item for item in cleaned):
+        return sections
+    if len({item for item in cleaned}) != len(cleaned):
+        return sections
+    for section, heading in zip(targets, cleaned, strict=True):
+        section["title"] = heading
+    return sections
+
+
+def _section_heading(question: str, *, language: str) -> str:
+    """把一句子问题改写成能印在论文上的小标题。
+
+    确定性做法，不额外调模型：删掉举例括号（「（如脱靶效应、递送方法）」这种在标题里
+    只会把一行撑到三十多字）、删掉问号、删掉疑问词。剩下的是主题短语。
+
+    实测（项目 ff6b9983 第 2 版）导出的 PDF 里，五个正文小标题全是子问题原文，最长的
+    一条 44 个字并且带着括号和问号。这个函数把它变成「CRISPR-Cas 在作物抗病性改良中
+    面临的技术挑战」。删不动时**保留原文**——一个啰嗦但准确的标题，好过一个被截断到
+    看不懂的标题。
+    """
+    text = " ".join(str(question or "").split())
+    if not text:
+        return "子问题" if language == "zh" else "Sub-question"
+    # 举例括号（中英文两种）只在标题里碍事，问题原文仍完整留在 summary 里。
+    text = re.sub(r"[（(](?:如|e\.g\.|例如|包括)[^）)]*[）)]", "", text)
+    text = text.strip().rstrip("?？.。").strip()
+    if language == "zh":
+        for word in _ZH_INTERROGATIVES:
+            text = text.replace(word, "")
+        text = text.replace("  ", " ").strip("，,、 ")
+    else:
+        lowered = text.lower()
+        for word in _EN_INTERROGATIVES:
+            if lowered.startswith(word):
+                text = text[len(word) :].strip()
+                break
+    text = " ".join(text.split())
+    if not text:
+        return " ".join(str(question).split()).rstrip("?？")
+    return text
 
 
 def _stance_label(value: str, language: str) -> str:
@@ -737,7 +928,8 @@ def _with_frame_sections(
                 "key": key,
                 "level": 1,
                 "title": frame_titles[key],
-                "summary": "",
+                "summary": FRAME_SECTION_BRIEFS[key]["zh" if zh else "en"],
+                "target_words": FRAME_SECTION_BRIEFS[key]["target_zh" if zh else "target_en"],
                 "argument_points": [],
                 "cite_keys": [],
                 "kind": "frame",
@@ -757,7 +949,8 @@ def _with_frame_sections(
                 "key": key,
                 "level": 1,
                 "title": frame_titles[key],
-                "summary": "",
+                "summary": FRAME_SECTION_BRIEFS[key]["zh" if zh else "en"],
+                "target_words": FRAME_SECTION_BRIEFS[key]["target_zh" if zh else "target_en"],
                 "argument_points": [],
                 "cite_keys": [],
                 "kind": "frame",

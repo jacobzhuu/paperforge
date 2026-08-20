@@ -14,10 +14,13 @@ from llm_runtime import LLMConfig, LLMRunner
 from llm_runtime.types import LLMResponse
 from paper_ir import PaperIR, PaperMeta
 from paperforge_worker.pipelines.outline import (
+    FRAME_SECTION_BRIEFS,
     CardBrief,
+    _section_heading,
     deterministic_body_sections,
     generate_outline,
     imrad_body_sections,
+    question_driven_sections,
 )
 from paperforge_worker.pipelines.writing import (
     SectionDraft,
@@ -579,7 +582,11 @@ async def test_question_driven_outline_uses_subquestions_not_publication_years()
     body = [section for section in outcome.tree["sections"] if section.get("question_id") == "q-1"][
         0
     ]
-    assert body["title"] == bundles[0]["question"]
+    # 小节由子问题驱动这一点没变；变的是**标题不再是问题原文**——那会把问号和举例
+    # 括号印到 PDF 的目录里。问题原文改挂在 question / summary 上。
+    assert body["question"] == bundles[0]["question"]
+    assert bundles[0]["question"] in body["summary"]
+    assert body["title"] == _section_heading(bundles[0]["question"], language="en")
     assert body["stance_summary"] == "consistent"
     assert body["evidence_ids"] == ["e-1", "e-2"]
     assert outcome.generator == "question_evidence_matrix"
@@ -1015,3 +1022,100 @@ def test_the_prompt_is_unchanged_when_no_synthesis_is_attached():
     assert "SYNTHESIS" not in _evidence_context_block(
         section=section, evidence=evidence, language="en"
     )
+
+
+# ---- 小标题：印在论文上的东西不能是子问题原文 -------------------------------------
+
+BUNDLES = [
+    {
+        "question_id": "q-1",
+        "question": "CRISPR-Cas 在作物抗病性改良中面临哪些技术挑战（如脱靶效应、递送方法）？",
+        "evidence": [
+            {"cite_key": "lewis2020retrieval", "work_id": "w-1", "evidence_id": "e-1"},
+            {"cite_key": "gao2023survey", "work_id": "w-2", "evidence_id": "e-2"},
+        ],
+        "stance_summary": "consistent",
+    }
+]
+
+
+def test_a_section_heading_is_not_the_sub_question_verbatim() -> None:
+    """实测（项目 ff6b9983 第 2 版）导出的 PDF 里五个正文小标题全是子问题原文，
+    带问号、带举例括号，最长一条 44 个字。印在论文上的东西不能长这样。"""
+    sections = question_driven_sections(BUNDLES, language="zh", allowed=set(WHITELIST))
+    title = sections[0]["title"]
+    assert "？" not in title
+    assert "（如" not in title
+    assert "哪些" not in title
+    # 问题原文不能丢：写作器要靠它知道该答什么，语义评审也要拿它做判据。
+    assert sections[0]["question"] == BUNDLES[0]["question"]
+    assert BUNDLES[0]["question"] in sections[0]["summary"]
+
+
+def test_a_heading_that_cannot_be_shortened_keeps_the_original_words() -> None:
+    """删不动时保留原文：啰嗦但准确，好过截断到看不懂。"""
+    assert _section_heading("光合作用", language="zh") == "光合作用"
+    assert _section_heading("", language="zh") == "子问题"
+    assert _section_heading("What are the limits of RAG?", language="en") == "limits of RAG"
+
+
+async def test_generated_headings_replace_the_deterministic_ones() -> None:
+    runner, _provider = _runner([{"headings": ["抗病改良的技术挑战"]}])
+    outcome = await generate_outline(
+        topic="CRISPR",
+        research_question="How?",
+        cards=[CardBrief(cite_key="lewis2020retrieval", title="RAG", year=2020)],
+        whitelist=WHITELIST,
+        language="zh",
+        runner=runner,
+        sub_question_bundles=BUNDLES,
+    )
+    body = [s for s in outcome.tree["sections"] if s.get("question")]
+    assert [s["title"] for s in body] == ["抗病改良的技术挑战"]
+
+
+async def test_a_bad_heading_response_leaves_the_deterministic_titles_alone() -> None:
+    """标题拟不好是遗憾，数量对不上是事故——数量/问号不合规就整组不采用。"""
+    payloads: list[dict[str, Any]] = [
+        {"headings": ["一", "二"]},
+        {"headings": ["这是什么？"]},
+        {"headings": []},
+    ]
+    for payload in payloads:
+        runner, _provider = _runner([payload])
+        outcome = await generate_outline(
+            topic="CRISPR",
+            research_question="How?",
+            cards=[CardBrief(cite_key="lewis2020retrieval", title="RAG", year=2020)],
+            whitelist=WHITELIST,
+            language="zh",
+            runner=runner,
+            sub_question_bundles=BUNDLES,
+        )
+        body = [s for s in outcome.tree["sections"] if s.get("question")]
+        assert body[0]["title"] == _section_heading(BUNDLES[0]["question"], language="zh")
+
+
+# ---- 框架章节：没有交代就写不出东西 -----------------------------------------------
+
+
+async def test_frame_sections_carry_a_brief_and_their_own_length() -> None:
+    """此前 abstract/introduction/conclusion 的 summary 是空字符串，写作提示词里
+    「Section goal:」后面什么都没有。实测引言只有 171–274 字，而质量修复每轮重写
+    这三节、指令又是纯减法，于是结论 351 → 136 → 137 字。"""
+    outcome = await generate_outline(
+        topic="RAG",
+        research_question="How?",
+        cards=[CardBrief(cite_key="lewis2020retrieval", title="RAG", year=2020)],
+        whitelist=WHITELIST,
+        language="zh",
+        runner=None,
+    )
+    frames = {s["key"]: s for s in outcome.tree["sections"] if s.get("kind") == "frame"}
+    assert set(frames) == {"abstract", "introduction", "conclusion"}
+    for key, section in frames.items():
+        assert section["summary"].strip(), key
+        assert section["target_words"] == FRAME_SECTION_BRIEFS[key]["target_zh"]
+    # 摘要不该按正文小节的篇幅写，引言和结论也各有各的量。
+    assert frames["abstract"]["target_words"] < frames["conclusion"]["target_words"]
+    assert frames["conclusion"]["target_words"] < frames["introduction"]["target_words"]

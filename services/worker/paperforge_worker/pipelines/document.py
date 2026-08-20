@@ -788,6 +788,13 @@ async def repair_document_sections(
                 + "\nQUALITY REPAIR: omit every claim that is not directly supported by the "
                 "provided evidence/source refs; split non-comparable results and copy no "
                 "number without an exact locator."
+                # 只说「删掉」会让每一轮修复都把这一节削短一点。实测（项目 ff6b9983
+                # 第 2 版）结论 351 → 136 → 137 字、引言 274 → 179 → 171 字：三轮下来
+                # 框架章节被削掉六成。修复是**重写**，不是删除——删掉超证据的说法之后，
+                # 还要把这一节该覆盖的内容用站得住的证据重新写完整。
+                + "\nThis is a rewrite, not a deletion: after removing the unsupported "
+                "claims, still cover this section's stated goal in full using the evidence "
+                "that does hold, and keep the section's target length."
                 + (f"\n{(notes or {}).get(key, '')}" if (notes or {}).get(key) else "")
             ),
         }

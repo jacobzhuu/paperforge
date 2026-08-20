@@ -381,7 +381,7 @@ async def run_library_pipeline(
             qmatrix_outcome = await _run_stage(
                 context,
                 "qmatrix",
-                lambda: build_question_evidence_matrix(context, language=language),
+                lambda: _build_and_deepen_matrix(context, language=language),
                 critical=strict_dependencies,
             )
             synthesis_outcome = await _run_stage(
@@ -2582,12 +2582,44 @@ async def _rebuild_question_matrix(context: JobContext, *, language: str) -> Non
         context.warn("section_review", type(error).__name__, {"stage": "qmatrix_rebuild"})
 
 
+async def _build_and_deepen_matrix(context: JobContext, *, language: str):
+    """建矩阵，然后立刻把第二梯队的证据也挂一遍。
+
+    每个子问题只看排名前 24 条候选（``MAX_CANDIDATES_PER_QUESTION``）。实测
+    （项目 ff6b9983，2026-08-19 真实全流程）：库里 848 条证据单元，5 个问题合计 120 条
+    进分类器、最终挂上 26 条——97% 的证据从没被任何问题看过。正文薄不是因为写作器
+    惜字如金（它引用了给它的 23 条里的 22 条），是因为它手上只有那么多。加挂一轮实测
+    多挂 18 条（+37%），代价是每个子问题一次分类调用（约 6 秒）。
+
+    **必须在 synth 之前**：叙述性综合按 bundle 指纹缓存，链接集变了指纹就变，
+    综合挂不回去，写作器会连 ``[SYNTHESIS]`` 块一起丢掉。
+    """
+    outcome = await build_question_evidence_matrix(context, language=language)
+    await _deepen_question_evidence(
+        context,
+        question_ids=await _sub_question_ids(context),
+        language=language,
+        attempt=0,
+        stage="qmatrix",
+    )
+    return outcome
+
+
+async def _sub_question_ids(context: JobContext) -> set[uuid.UUID]:
+    from db import list_research_questions
+
+    async with context.session() as session:
+        questions = await list_research_questions(session, context.project_id, kind="sub")
+    return {question.id for question in questions}
+
+
 async def _deepen_question_evidence(
     context: JobContext,
     *,
     question_ids: set[Any],
     language: str,
     attempt: int,
+    stage: str = "quality_repair",
 ) -> dict[str, Any]:
     """先把**已经在库里、却从没被这个问题看过**的证据挂上去，再谈补检索。
 
@@ -2632,7 +2664,7 @@ async def _deepen_question_evidence(
     # 修复动作有没有真的改变输入，必须留在事件流里。此前「补检索」这一路在
     # 没有可补的缺口时静默返回，事件流里只看得到 routes: retrieve，看不到它
     # 什么都没做——于是一轮修复看起来是按病因分流的，实际退化成了纯重写。
-    await context.emit("section_review.evidence_deepened", payload, stage="quality_repair")
+    await context.emit("section_review.evidence_deepened", payload, stage=stage)
     return payload
 
 
