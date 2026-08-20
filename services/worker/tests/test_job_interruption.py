@@ -243,3 +243,28 @@ async def test_a_delivered_job_without_warnings_still_records_no_error(session_f
     job = await _job_status(session_factory, job_id)
     assert job.status == "succeeded"
     assert job.error_json is None
+
+
+async def test_a_running_job_keeps_stamping_that_its_process_is_alive(session_factory) -> None:
+    """上面三条路都要求进程还能执行代码。硬杀不给这个机会。
+
+    蓝绿发布把 worker 容器整个换掉、OOM、SIGKILL——收尾代码一行都不会跑，行就永远
+    停在 running。心跳是那种情况下唯一还留下的证据：**跑着的时候**一直盖章，于是
+    「盖章停了」才能被读到的人当成「没人在跑了」。
+    """
+    project_id, job_id = await _project_and_job(session_factory)
+
+    before = await _job_status(session_factory, job_id)
+    assert before.heartbeat_at is None
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)):
+        for _ in range(100):
+            stamped = await _job_status(session_factory, job_id)
+            if stamped.heartbeat_at is not None:
+                break
+            await asyncio.sleep(0.02)
+
+    assert stamped.heartbeat_at is not None
+    # 心跳只写它自己那一列：阶段和进度是别的写路径在管的，不能被顺手覆盖。
+    assert stamped.stage == "write"
+    assert stamped.progress == pytest.approx(0.65)

@@ -18,12 +18,14 @@ from typing import Any
 import httpx
 from db import (
     FINISHED_JOB_STATUSES,
+    JOB_HEARTBEAT_INTERVAL_SECONDS,
     append_job_event,
     get_project,
     job_event_channel,
     job_resume_spec,
     job_stop_requested,
     record_llm_call,
+    touch_job_heartbeat,
     update_job,
 )
 from db.session import make_engine, make_session_factory
@@ -299,6 +301,32 @@ async def _load_job(session: AsyncSession, job_id: uuid.UUID):
     return await session.get(GenerationJob, job_id)
 
 
+async def _heartbeat(
+    factory: async_sessionmaker[AsyncSession],
+    job_id: uuid.UUID,
+    *,
+    interval: float = JOB_HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """在任务运行期间持续证明「这个进程还拿着它」。
+
+    收尾路径已经被 `_mark_stopped` / `_mark_interrupted` 覆盖，但它们都要求进程还能
+    执行代码。容器被换掉或被 OOM 杀掉时不会有任何代码运行，行就永远停在 running；
+    心跳是那种情况下唯一还留下的证据。写失败只记日志不抛：心跳是观测信号，不该有
+    能力把一次正常的运行搞失败。
+    """
+    while True:
+        # 先盖一次再睡：任务被领走的那一刻就该留下证据，否则「入队后一直没人管」
+        # 和「已经开跑了」在头一个间隔里长得一模一样。
+        try:
+            async with _committing_session(factory) as session:
+                await touch_job_heartbeat(session, job_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - 观测信号不该淹没任务本身
+            logger.warning("job heartbeat failed", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 async def _lock_job(session: AsyncSession, job_id: uuid.UUID):
     from db.models.paper import GenerationJob
 
@@ -364,6 +392,7 @@ async def job_context(
         owner_id=owner_id,
         checkpoint=seeded,
     )
+    heartbeat = asyncio.create_task(_heartbeat(factory, job_id)) if job_id else None
     try:
         # 这里**不能**先查停止开关再 yield：@asynccontextmanager 的生成器一旦在
         # yield 之前抛异常，__aenter__ 会变成 RuntimeError("generator didn't yield")。
@@ -385,6 +414,10 @@ async def job_context(
         await _mark_interrupted(context, error)
         raise
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
         # 取消只投递一次，被取消后继续 await 通常还能跑完；但再来一次取消
         # （worker 连收两个停机信号就是这样）会把收尾打断。收尾动作因此都放进
         # 独立 task 并 shield，免得这一轮的 LLM 记账——成本面板的数据源——跟着丢。

@@ -235,6 +235,10 @@ class GenerationJob(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 跑这条任务的进程还活着的最后证明。worker 领走任务后按 JOB_HEARTBEAT_INTERVAL_SECONDS
+    #: 定期回写；被硬杀掉（容器被换掉、OOM、SIGKILL）时没有任何收尾代码会运行，
+    #: 这个时间戳是唯一还能分辨「跑得慢」和「已经没人在跑」的信号。
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class JobEvent(Base):

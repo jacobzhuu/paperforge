@@ -905,7 +905,17 @@ function RecentJobs({
                 </button>
                 {open && (
                   <div className="space-y-3 pb-2 text-meta text-muted-foreground sm:pl-28">
-                    {job.status === 'needs_input' ? (
+                    {(job.error?.code as string | undefined) === 'job_abandoned' ? (
+                      <div className="space-y-2">
+                        {/* 被硬杀掉的任务（部署换掉了 worker 容器、进程被 OOM）没有任何
+                            收尾代码会运行。此前这种行永远停在「进行中」，进度条一直走，
+                            而且把项目锁着——用户点什么都是「已有任务正在运行」。 */}
+                        <p className="font-medium text-warning-foreground">
+                          这次运行被中断了：执行它的进程已经不存在（通常是服务更新或重启）。
+                          已保留到中断前的产物，可以重新发起。
+                        </p>
+                      </div>
+                    ) : job.status === 'needs_input' ? (
                       <div className="space-y-2">
                         <p className="font-medium text-warning-foreground">
                           {evidenceBlocked

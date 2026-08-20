@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -41,8 +42,8 @@ def test_api_settings_resolve_yunwu_specific_image_credentials() -> None:
 
 
 class _Queue:
-    async def enqueue_job(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    async def enqueue_job(self, *_args: Any, **_kwargs: Any) -> Any:
+        return SimpleNamespace(job_id=_kwargs.get("_job_id"))
 
 
 class _CountingQueue(_Queue):

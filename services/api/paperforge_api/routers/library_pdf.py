@@ -67,7 +67,7 @@ async def upload_literature_pdf(
     """Persist a PDF privately, then asynchronously identify its scholarly work."""
     project = await _require_project(session, project_id)
     await require_queue(queue)
-    await ensure_project_job_slot(session, project.id)
+    await ensure_project_job_slot(session, project.id, queue)
     content = await file.read(MAX_LITERATURE_PDF_BYTES + 1)
     if not content:
         raise HTTPException(status_code=422, detail="uploaded PDF is empty")
@@ -477,7 +477,7 @@ async def _commit_and_enqueue_pdf_job(
     if an HTTP intermediary retries the enqueue request.
     """
     ready = await require_queue(queue)
-    await ensure_project_job_slot(session, project_id)
+    await ensure_project_job_slot(session, project_id, ready)
     kwargs = {"upload_id": upload_id}
     job = await create_job(
         session,

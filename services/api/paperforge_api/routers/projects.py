@@ -82,7 +82,7 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.jobs import start_job
+from paperforge_api.jobs import reconcile_abandoned_jobs, start_job
 from paperforge_api.schemas import (
     CostResponse,
     CreateProjectRequest,
@@ -382,6 +382,7 @@ async def create_project_endpoint(
 async def list_projects_endpoint(
     session: SessionDep,
     user: CurrentUserDep,
+    queue: QueueDep,
     deleted: bool = Query(default=False, description="取回收站（只列已删除的项目）"),
 ) -> list[ProjectResponse]:
     projects = await list_projects(session, owner_id=user.id, deleted=deleted)
@@ -390,7 +391,7 @@ async def list_projects_endpoint(
             _project_response(project, {"library_count": 0, "section_count": 0})
             for project in projects
         ]
-    rollups = await _project_attention_rollups(session, projects)
+    rollups = await _project_attention_rollups(session, projects, queue)
     return [
         _project_response(project, rollups[project.id][0], rollups[project.id][1])
         for project in projects
@@ -398,9 +399,11 @@ async def list_projects_endpoint(
 
 
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
-async def get_project_endpoint(project_id: str, session: SessionDep) -> ProjectResponse:
+async def get_project_endpoint(
+    project_id: str, session: SessionDep, queue: QueueDep
+) -> ProjectResponse:
     project = await _require_project(session, project_id)
-    counters, summary = (await _project_attention_rollups(session, [project]))[project.id]
+    counters, summary = (await _project_attention_rollups(session, [project], queue))[project.id]
     return _project_response(project, counters, summary)
 
 
@@ -912,15 +915,22 @@ async def get_whitelist(project_id: str, session: SessionDep) -> WhitelistRespon
 
 
 @router.get("/projects/{project_id}/jobs", response_model=list[JobResponse])
-async def get_jobs(project_id: str, session: SessionDep) -> list[JobResponse]:
+async def get_jobs(project_id: str, session: SessionDep, queue: QueueDep) -> list[JobResponse]:
     project = await _require_project(session, project_id)
-    return [_job_response(job) for job in await list_jobs(session, project.id)]
+    jobs = await list_jobs(session, project.id)
+    # 读一次就顺手收一次尸：被硬杀掉的任务没有任何代码能替它收尾，只有来看它的人
+    # 才有机会发现「这条已经没人在跑了」。
+    await reconcile_abandoned_jobs(session, queue, jobs)
+    return [_job_response(job) for job in jobs]
 
 
 @router.get("/projects/{project_id}/jobs/{job_id}", response_model=JobResponse)
-async def get_job_endpoint(project_id: str, job_id: str, session: SessionDep) -> JobResponse:
+async def get_job_endpoint(
+    project_id: str, job_id: str, session: SessionDep, queue: QueueDep
+) -> JobResponse:
     await _require_project(session, project_id)
     job = await _require_job(session, job_id)
+    await reconcile_abandoned_jobs(session, queue, [job])
     return _job_response(job)
 
 
@@ -1260,6 +1270,7 @@ async def _assign_keys_for_selected(session: AsyncSession, project_id: uuid.UUID
 async def _project_attention_rollups(
     session: AsyncSession,
     projects: list[PaperProject],
+    queue: ArqRedis | None = None,
 ) -> dict[uuid.UUID, tuple[dict[str, int], dict[str, Any]]]:
     """固定数量批量查询，项目数增加时不产生逐卡 N+1。"""
     ids = [project.id for project in projects]
@@ -1303,6 +1314,9 @@ async def _project_attention_rollups(
             )
         ).all()
     )
+    # 概览卡上的「进行中」就是从这批行里挑的：不先收尸，一条被硬杀掉的任务会在
+    # 项目列表上一直转圈。
+    await reconcile_abandoned_jobs(session, queue, job_rows)
     quality_rows = list(
         (
             await session.scalars(
