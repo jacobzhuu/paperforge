@@ -83,6 +83,12 @@ DEFAULT_ROLE_THINKING: dict[str, str] = {
     # 语义评审输出的是一份闭集 JSON 判定，不需要长推理；而按 evidence_classifier
     # 那一轮的实测，判断力来自档位（planner）而不是思考开关。
     "section_reviewer": "disabled",
+    # SCOPE / QDECOMP 也是按封闭 schema 产出一份问题清单，同样和推理抢
+    # max_output_tokens。生产实测（项目 ff6b9983，2026-08-19 首轮全流程）：两次
+    # planner 调用里第一次 `output_truncated`，白烧 44.7 秒零 token，靠加倍预算重试
+    # 才拿到结果——那一次重试本身又花了 44.4 秒。这是整条管线的第一个阶段，它退化
+    # 会把一份糊掉的子问题清单传给后面每一步。
+    "planner": "disabled",
 }
 
 

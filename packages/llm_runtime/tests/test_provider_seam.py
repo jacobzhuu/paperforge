@@ -30,6 +30,25 @@ def test_role_routing_prefers_override_then_default():
     assert config.thinking_for_role("extractor") == "disabled"
     assert config.thinking_for_role("reranker") == "disabled"
     assert config.thinking_for_role("writer") == "disabled"
+    # 2026-08-19：SCOPE 是管线的第一步，它退化会把糊掉的子问题清单传给后面每一步。
+    # 生产实测两次 planner 调用第一次零 token 截断，重试才成功，白烧 44.7 秒。
+    assert config.thinking_for_role("planner") == "disabled"
+
+
+def test_a_deployment_that_omits_a_role_still_gets_its_default_policy() -> None:
+    """线上的 ``LLM_ROLE_THINKING`` 是一份写死的映射，不会因为代码里多了角色而更新。
+
+    2026-08-19 实测生产配置就是 ``{"extractor","reranker","verifier"}`` 三项，
+    其余角色全靠这里的默认档位兜住——所以「默认能不能穿过部署配置」必须有用例锁。
+    """
+    config = LLMConfig(
+        provider="openai",
+        role_thinking={"extractor": "disabled", "reranker": "disabled", "verifier": "disabled"},
+    )
+    assert config.thinking_for_role("writer") == "disabled"
+    assert config.thinking_for_role("planner") == "disabled"
+    assert config.thinking_for_role("evidence_classifier") == "disabled"
+    assert config.thinking_for_role("section_reviewer") == "disabled"
 
 
 def test_evidence_classifier_inherits_deployed_deepseek_tiers() -> None:
