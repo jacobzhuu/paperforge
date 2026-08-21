@@ -20,12 +20,32 @@ from typing import Any, Literal
 from llm_runtime.client import create_llm_provider
 from llm_runtime.config import LLMConfig, Role
 from llm_runtime.json_utils import CiteKeyViolation, purify_llm_json
-from llm_runtime.providers import LLMProvider
+from llm_runtime.providers import LLMProvider, clamp_max_output_tokens
+from llm_runtime.retry_policy import TruncationRetryPolicy
 from llm_runtime.types import LLMError, LLMRequest, LLMResponse
 
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
-# 重试上限：与 providers.clamp_max_output_tokens 的保守上限一致。
-MAX_OUTPUT_TOKENS_CEILING = 8192
+#: 截断重试被跳过时记的错误码。它和 ``output_truncated`` 是两件事：前者说「模型
+#: 的上限就在这儿，再问一遍也是同一个请求」，后者说「预算不够，加了还有救」。
+#: 混成一个码，台账里就分不出「补救失败」和「压根没补救」。
+TRUNCATED_AT_CEILING = "output_truncated_at_ceiling"
+
+
+def _retry_budget(budget: int, *, model: str, policy: TruncationRetryPolicy) -> int:
+    """提高之后**经模型上限 clamp** 的预算。"""
+    return clamp_max_output_tokens(int(budget * policy.multiplier), model=model)
+
+
+def _retry_can_help(budget: int, *, model: str, policy: TruncationRetryPolicy) -> bool:
+    """重试预算经模型上限 clamp 之后，是否真的涨得够多。
+
+    模型上限是硬的：预算被 clamp 回原值时，重试发出的是逐字相同的请求；只涨了
+    零头时，一个写不完的输出也不会因为多这点 token 就写得完。两种情况都要花掉
+    一整轮 40-80 秒的调用换同一个结果，所以两种都不发。
+    """
+    return _retry_budget(budget, model=model, policy=policy) >= clamp_max_output_tokens(
+        budget, model=model
+    ) * policy.min_growth_ratio
 
 
 @dataclass(frozen=True)
@@ -102,14 +122,16 @@ class LLMRunner:
         temperature: float = 0.0,
         json_output: bool = False,
         metadata: dict[str, Any] | None = None,
-        _retry_on_truncation: bool = True,
+        _truncation_attempt: int = 0,
     ) -> LLMResponse | None:
         """同步调用。失败返回 None 并记录一条带 error_code 的记账（draft-first）。
 
-        推理型模型把思维链计入 max_tokens，预算不足会「零 content」返回；
-        这种情况加倍预算重试一次（上限 MAX_OUTPUT_TOKENS_CEILING），再失败才降级。
+        推理型模型把思维链计入 max_tokens，预算不足会「零 content」返回；这种情况
+        按角色策略提高预算重试，再失败才降级。**加倍之后被模型上限 clamp 回原值
+        时不重试**：那是逐字相同的请求，只会再花一轮调用换同一个结果。
         """
         model = self.model_for(role)
+        policy = self._config.retry_for_role(role)
         request = LLMRequest(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -124,28 +146,36 @@ class LLMRunner:
         try:
             response = self._resolve_provider().generate(request)
         except LLMError as error:
+            can_retry = _truncation_attempt < policy.max_attempts and _retry_can_help(
+                max_output_tokens, model=model, policy=policy
+            )
+            truncated = error.error_code == "output_truncated"
+            # 记账要先算出最终的 code：一次**没有发生**的重试，不该在台账里和一次
+            # 发生了又失败的重试长得一样。
             self._record(
                 role=role,
                 model=model,
                 provider=self._config.provider,
                 latency_ms=_elapsed_ms(started),
-                error_code=error.error_code,
+                error_code=(
+                    TRUNCATED_AT_CEILING
+                    if truncated and not can_retry
+                    else error.error_code
+                ),
                 metadata=request.metadata,
             )
-            if (
-                error.error_code == "output_truncated"
-                and _retry_on_truncation
-                and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
-            ):
+            if truncated and can_retry:
                 retried = self.generate(
                     role,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    max_output_tokens=min(max_output_tokens * 2, MAX_OUTPUT_TOKENS_CEILING),
+                    max_output_tokens=_retry_budget(
+                        max_output_tokens, model=model, policy=policy
+                    ),
                     temperature=temperature,
                     json_output=json_output,
                     metadata={**(metadata or {}), "retry": "output_truncated"},
-                    _retry_on_truncation=False,
+                    _truncation_attempt=_truncation_attempt + 1,
                 )
                 return (
                     replace(
@@ -190,7 +220,7 @@ class LLMRunner:
         temperature: float = 0.0,
         json_output: bool = False,
         metadata: dict[str, Any] | None = None,
-        _retry_on_truncation: bool = True,
+        _truncation_attempt: int = 0,
     ) -> LLMResponse | None:
         """异步包装：provider 是同步 httpx 实现，放线程池执行以免阻塞事件循环。"""
         return await asyncio.to_thread(
@@ -202,7 +232,7 @@ class LLMRunner:
             temperature=temperature,
             json_output=json_output,
             metadata=metadata,
-            _retry_on_truncation=_retry_on_truncation,
+            _truncation_attempt=_truncation_attempt,
         )
 
     async def agenerate_json(
@@ -216,7 +246,7 @@ class LLMRunner:
         allowed_cite_keys: set[str] | None = None,
         mode: Literal["report", "strip"] = "report",
         metadata: dict[str, Any] | None = None,
-        _retry_on_truncation: bool = True,
+        _truncation_attempt: int = 0,
     ) -> JsonResult:
         """结构化输出调用：净化 JSON 并做 R2 cite-key 审计。
 
@@ -233,7 +263,7 @@ class LLMRunner:
             temperature=temperature,
             json_output=True,
             metadata=metadata,
-            _retry_on_truncation=_retry_on_truncation,
+            _truncation_attempt=_truncation_attempt,
         )
         if response is None:
             return JsonResult(value=None, error="llm_call_failed")
@@ -247,23 +277,28 @@ class LLMRunner:
             # 推理型模型把思维链计入 max_tokens。预算刚好够开口、不够写完时，
             # content 非空但 JSON 在中途断掉：provider 层的「零 content」判定救不到
             # 这一档，截断的 JSON 只会解析失败，然后整条管线静默降级到确定性回退。
-            # finish_reason='length' 是这里唯一可靠的信号，据此加倍预算重试一次。
+            # finish_reason='length' 是这里唯一可靠的信号。加不动预算时同样不重试
+            # ——理由与 `generate()` 那一处相同。
+            model = self.model_for(role)
+            policy = self._config.retry_for_role(role)
             if (
-                _retry_on_truncation
+                _truncation_attempt < policy.max_attempts
                 and response.finish_reason == "length"
                 and response.truncation_retries == 0
-                and max_output_tokens < MAX_OUTPUT_TOKENS_CEILING
+                and _retry_can_help(max_output_tokens, model=model, policy=policy)
             ):
                 return await self.agenerate_json(
                     role,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    max_output_tokens=min(max_output_tokens * 2, MAX_OUTPUT_TOKENS_CEILING),
+                    max_output_tokens=_retry_budget(
+                        max_output_tokens, model=model, policy=policy
+                    ),
                     temperature=temperature,
                     allowed_cite_keys=allowed_cite_keys,
                     mode=mode,
                     metadata={**(metadata or {}), "retry": "json_truncated"},
-                    _retry_on_truncation=False,
+                    _truncation_attempt=_truncation_attempt + 1,
                 )
             return JsonResult(
                 value=None,

@@ -322,16 +322,22 @@ class OpenAICompatibleLLMProvider:
                         "(reasoning models spend the same budget on thinking)."
                     ),
                     # Repeating the same max_tokens budget deterministically
-                    # truncates again.  Let LLMRunner double the budget once
-                    # instead of spending provider retries on identical calls.
+                    # truncates again, so provider-level retries are pure waste.
+                    # LLMRunner owns the only useful response — raising the
+                    # budget — and skips even that when the model ceiling is
+                    # already reached.
                     retryable=False,
                 )
+            # 结构合法、正常终止、却一个 content 块都没有：这是服务商偶发的退化
+            # 完成，不是「响应结构非法」。这次尝试没有产生任何持久副作用，重复它
+            # 是安全的，所以标 retryable——`_parse_response` 在下面的重试循环内部，
+            # 翻转这个 flag 就直接拿到已有的指数退避 + 抖动。
             raise LLMError(
                 provider=self.name,
-                error_code="invalid_response",
+                error_code="empty_response",
                 status_code=response.status_code,
-                message="LLM response did not include message content.",
-                retryable=False,
+                message="LLM completed normally but returned no content.",
+                retryable=True,
             )
 
         usage = payload.get("usage")

@@ -457,3 +457,262 @@ def test_an_explicit_deployment_override_still_wins():
     config = LLMConfig(provider="openai", role_thinking={"experiment_extractor": "enabled"})
 
     assert config.thinking_for_role("experiment_extractor") == "enabled"
+
+
+# ---------------------------------------------------------------------------
+# 截断重试：一次「注定无效」的重试不该被发出去
+# ---------------------------------------------------------------------------
+
+
+def _truncated_response() -> httpx.Response:
+    """推理型模型烧光预算后的返回：正常 HTTP，零 content。"""
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "…"},
+                }
+            ]
+        },
+    )
+
+
+def _truncating_runner(model: str):
+    """把某个角色路由到 ``model``，并让它每次都截断。返回 (runner, budgets, calls)。"""
+    from llm_runtime import LLMRunner
+    from llm_runtime.providers import OpenAICompatibleLLMProvider
+
+    budgets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        budgets.append(json.loads(request.content)["max_tokens"])
+        return _truncated_response()
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="http://stub/v1",
+        api_key="k",
+        model=model,
+        timeout_seconds=5.0,
+        max_retries=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    calls: list = []
+    runner = LLMRunner(
+        LLMConfig(
+            provider="openai",
+            base_url="http://stub/v1",
+            api_key="k",
+            role_models={"writer": model},
+        ),
+        provider=provider,
+        on_call=calls.append,
+    )
+    return runner, budgets, calls
+
+
+def test_a_retry_that_cannot_grow_the_budget_is_never_sent():
+    """8000 上的 deepseek 加倍后被 clamp 到 8192——多 192 token，写不完的还是写不完。
+
+    生产实测：writer 60 次这样的重试里 21 次再次截断，每次白烧一整轮 40-80 秒
+    的调用。判定是按模型算的，所以这里断言的是**请求根本没发出去**。
+    """
+    runner, budgets, calls = _truncating_runner("deepseek-v4-pro")
+
+    result = runner.generate(
+        "writer", system_prompt="s", user_prompt="u", max_output_tokens=8000
+    )
+
+    assert result is None
+    assert budgets == [8000], "重试不可能改变结果时，第二次请求不该发出"
+    assert [c.error_code for c in calls] == ["output_truncated_at_ceiling"]
+
+
+def test_the_same_budget_does_retry_on_a_model_with_real_headroom():
+    """同样的 8000，换到上限 32768 的模型就该重试——上限来自模型，不是常量。"""
+    runner, budgets, _ = _truncating_runner("gpt-4.1")
+
+    runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=8000)
+
+    assert budgets == [8000, 16000]
+
+
+def test_a_budget_with_headroom_still_retries():
+    """verifier 请求 2400，加倍到 4800（2.0 倍）——这类重试救回过 17 次，必须保留。"""
+    runner, budgets, calls = _truncating_runner("deepseek-v4-flash")
+
+    runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=2400)
+
+    assert budgets == [2400, 4800]
+    # 两次都截断：第一次是真截断，第二次 4800→8192 只涨 1.71 倍…仍在阈值之上，
+    # 但 max_attempts 已经用完，所以停在这里而不是继续加。
+    assert [c.error_code for c in calls] == ["output_truncated", "output_truncated_at_ceiling"]
+
+
+def test_a_role_can_switch_the_retry_off_from_configuration():
+    from llm_runtime import LLMRunner, TruncationRetryPolicy
+    from llm_runtime.providers import OpenAICompatibleLLMProvider
+
+    budgets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        budgets.append(json.loads(request.content)["max_tokens"])
+        return _truncated_response()
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="http://stub/v1",
+        api_key="k",
+        model="gpt-4.1",
+        timeout_seconds=5.0,
+        max_retries=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    runner = LLMRunner(
+        LLMConfig(
+            provider="openai",
+            base_url="http://stub/v1",
+            api_key="k",
+            role_models={"writer": "gpt-4.1"},
+            role_retry={"writer": TruncationRetryPolicy(max_attempts=0)},
+        ),
+        provider=provider,
+    )
+
+    runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=8000)
+
+    # 预算明明有余量，但部署说了不重试。
+    assert budgets == [8000]
+
+
+def test_a_degenerate_empty_completion_is_retried_by_the_provider():
+    """正常终止、零 content、没有 reasoning：服务商的退化完成，重复它是安全的。
+
+    这次尝试没有产生任何持久副作用，所以走 provider 自己的退避重试，而不是像
+    ``invalid_response`` 那样一次性放弃。
+    """
+    from llm_runtime.providers import OpenAICompatibleLLMProvider
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="http://stub/v1",
+        api_key="k",
+        model="deepseek-v4-pro",
+        timeout_seconds=5.0,
+        max_retries=2,
+        retry_backoff_seconds=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    response = provider.generate(
+        LLMRequest(
+            system_prompt="s", user_prompt="u", model="deepseek-v4-pro", max_output_tokens=100
+        )
+    )
+
+    assert response.text == "ok"
+    assert calls == 2
+
+
+def test_an_empty_completion_that_never_recovers_reports_its_own_code():
+    from llm_runtime.providers import OpenAICompatibleLLMProvider
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"role": "assistant", "content": ""}}
+                ]
+            },
+        )
+
+    provider = OpenAICompatibleLLMProvider(
+        base_url="http://stub/v1",
+        api_key="k",
+        model="deepseek-v4-pro",
+        timeout_seconds=5.0,
+        max_retries=1,
+        retry_backoff_seconds=0,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(LLMError) as excinfo:
+        provider.generate(
+            LLMRequest(
+                system_prompt="s", user_prompt="u", model="deepseek-v4-pro", max_output_tokens=100
+            )
+        )
+    # 与 `invalid_response`（响应结构坏了）区分开：这一条说的是「结构没问题，
+    # 就是什么都没生成」。
+    assert excinfo.value.error_code == "empty_response"
+    assert excinfo.value.retryable is True
+
+
+# ---------------------------------------------------------------------------
+# 策略解析：配错要吵
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"multiplier": 0.5},
+        {"multiplier": 99},
+        {"multiplier": "2"},
+        {"max_attempts": -1},
+        {"max_attempts": 99},
+        {"max_attempts": 1.5},
+        {"min_growth_ratio": 0.5},
+        {"min_growth_ratio": 99},
+        {"attempts": 1},
+        [],
+    ],
+)
+def test_a_bad_retry_policy_is_rejected_at_parse_time(raw):
+    """静默退回默认策略会让部署以为自己调过参数，而生产行为一如既往。"""
+    from llm_runtime import resolve_truncation_policy
+
+    with pytest.raises(ValueError):
+        resolve_truncation_policy(raw, path="LLM_ROLE_RETRY.writer")
+
+
+def test_a_bad_entry_fails_the_whole_role_retry_map():
+    from llm_runtime import parse_role_retry
+
+    with pytest.raises(ValueError, match="LLM_ROLE_RETRY.writer"):
+        parse_role_retry({"verifier": {"max_attempts": 1}, "writer": {"max_attempts": 9}})
+
+
+def test_retry_policy_resolution_prefers_the_deployment_then_the_default():
+    from llm_runtime import DEFAULT_TRUNCATION_RETRY_POLICY, TruncationRetryPolicy
+
+    configured = TruncationRetryPolicy(multiplier=3.0, max_attempts=2)
+    config = LLMConfig(provider="noop", role_retry={"writer": configured})
+
+    assert config.retry_for_role("writer") is configured
+    # 与 thinking_for_role 一样，**不**沿用 ROLE_MODEL_FALLBACKS：共用模型档位的
+    # 两个角色输出规模可以完全不同，重试策略必须各自决定。
+    assert config.retry_for_role("section_reviewer") == DEFAULT_TRUNCATION_RETRY_POLICY

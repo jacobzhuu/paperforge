@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Literal
 
-from llm_runtime import LLMConfig, parse_model_prices
+from llm_runtime import LLMConfig, parse_model_prices, parse_role_retry
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from scholar_gateway.providers import ProviderConfig
 from visuals import ImageProviderConfig
@@ -34,6 +34,11 @@ class WorkerSettings(BaseSettings):
     # 明说金额不完整，而不是显示一个看起来很划算的 $0.00。
     #   {"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}
     llm_model_prices: str = "{}"
+    # 角色 → 截断重试策略。留空则用 llm_runtime 的默认档位。
+    #   {"writer": {"max_attempts": 0}, "verifier": {"multiplier": 2.0, "max_attempts": 1}}
+    # 与上面几项不同，这一项**配错就抛**：被静默忽略的重试策略意味着某个角色继续
+    # 按旧策略烧调用，而部署以为自己已经调过了。
+    llm_role_retry: str = "{}"
 
     # Independent structured tasks can safely share the provider concurrently.
     # Keep the bounds below the default SQLAlchemy overflow capacity.
@@ -153,6 +158,10 @@ class WorkerSettings(BaseSettings):
             model_prices = json.loads(self.llm_model_prices) if self.llm_model_prices else {}
         except json.JSONDecodeError:
             model_prices = {}
+        try:
+            role_retry = json.loads(self.llm_role_retry) if self.llm_role_retry else {}
+        except json.JSONDecodeError as error:
+            raise ValueError(f"LLM_ROLE_RETRY is not valid JSON: {error}") from error
         return LLMConfig(
             provider=self.llm_default_provider,
             base_url=self.llm_openai_base_url,
@@ -160,6 +169,7 @@ class WorkerSettings(BaseSettings):
             role_models=role_models if isinstance(role_models, dict) else {},
             role_thinking=role_thinking if isinstance(role_thinking, dict) else {},
             model_prices=parse_model_prices(model_prices),
+            role_retry=parse_role_retry(role_retry),
         )
 
     def user_agent(self) -> str:

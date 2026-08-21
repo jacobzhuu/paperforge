@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from llm_runtime.retry_policy import (
+    DEFAULT_TRUNCATION_RETRY_POLICY,
+    TruncationRetryPolicy,
+)
+
 # PaperForge 扩展：把 DeepSearch 的全局 Settings 依赖解耦为显式注入的配置对象，
 # 并新增「角色 → 模型」路由（见 docs/design.md §4.9）。
 # 角色档位：planner / extractor / reranker / writer / polisher / verifier。
@@ -92,6 +97,14 @@ DEFAULT_ROLE_THINKING: dict[str, str] = {
 }
 
 
+# 截断重试策略的按角色覆盖。**故意留空**：默认策略里的 `min_growth_ratio` 已经
+# 按模型上限算出了「这次重试值不值得」，所以 writer 在 deepseek 上（8000 →
+# clamp 到 8192，只涨 2.4%）自动不重试，而它换到 gpt-4.1 上（8000 → 16000）
+# 自动恢复重试。写死一条 `"writer": max_attempts=0` 会把这个模型感知能力换成
+# 一个在换模型时**悄悄变错**的常量。部署仍可用 LLM_ROLE_RETRY 覆盖。
+DEFAULT_ROLE_RETRY: dict[str, TruncationRetryPolicy] = {}
+
+
 @dataclass(frozen=True)
 class ModelPrice:
     """单价，单位是**每百万 token 的货币金额**（业界标准报价单位）。
@@ -167,6 +180,8 @@ class LLMConfig:
     role_thinking: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_THINKING))
     # 模型 → 单价。空表示这个部署没配价格，于是所有调用都记为未定价。
     model_prices: dict[str, ModelPrice] = field(default_factory=lambda: dict(DEFAULT_MODEL_PRICES))
+    # 角色 → 截断重试策略。未配置的角色回落到 DEFAULT_ROLE_RETRY，再回落到默认策略。
+    role_retry: dict[str, TruncationRetryPolicy] = field(default_factory=dict)
 
     def price_for_model(self, model: str) -> ModelPrice | None:
         """精确匹配优先，其次取最长的前缀匹配。
@@ -218,3 +233,16 @@ class LLMConfig:
             if value in {"enabled", "disabled"}:
                 return value
         return None
+
+    def retry_for_role(self, role: Role) -> TruncationRetryPolicy:
+        """部署显式配置优先，其次本文件的默认档位，最后是策略自身的默认值。
+
+        与 ``thinking_for_role`` 同构，且同样**不**沿用 ``ROLE_MODEL_FALLBACKS``：
+        共用模型档位的两个角色，输出规模可以完全不同（``evidence_classifier``
+        请求 2400，``writer`` 请求 8000），重试策略必须各自决定。
+        """
+        for source in (self.role_retry, DEFAULT_ROLE_RETRY):
+            policy = source.get(role)
+            if policy is not None:
+                return policy
+        return DEFAULT_TRUNCATION_RETRY_POLICY
