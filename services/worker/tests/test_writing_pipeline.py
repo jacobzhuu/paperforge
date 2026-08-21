@@ -618,7 +618,10 @@ async def test_review_outline_adds_comparison_limitations_and_conflict_synthesis
         if section.get("synthesis_kind") == "comparison_limitations_conflicts"
     )
     assert synthesis["cite_keys"] == []
-    assert synthesis["evidence_gap"] is True
+    # Prose, not a bool: a bool reached the writer prompt as the literal
+    # line "[EVIDENCE GAP] True".
+    assert isinstance(synthesis["evidence_gap"], str)
+    assert synthesis["evidence_gap"]
     assert synthesis["inline_tables"] == []
 
 
@@ -1119,3 +1122,137 @@ async def test_frame_sections_carry_a_brief_and_their_own_length() -> None:
     # 摘要不该按正文小节的篇幅写，引言和结论也各有各的量。
     assert frames["abstract"]["target_words"] < frames["conclusion"]["target_words"]
     assert frames["conclusion"]["target_words"] < frames["introduction"]["target_words"]
+
+
+def _synthesis_bundle(agreements: int = 6, *, gap: str = "证据未在同一基准上比较这些方法。"):
+    return {
+        "question_id": "q-1",
+        "question": "有哪些攻击方法？",
+        "stance_summary": "consistent",
+        "answer_status": "answered",
+        "evidence": [
+            {"evidence_id": f"e{i}", "cite_key": "a", "work_id": f"w{i % 3}"} for i in range(6)
+        ],
+        "synthesis": {
+            "claim": "攻击方法分为投毒与模型提取两类。",
+            "agreement": [
+                {
+                    "statement": f"发现 {i}：这一类方法依赖不同的攻击者知识。",
+                    "evidence_ids": [f"e{i}"],
+                }
+                for i in range(agreements)
+            ],
+            "conditional": [],
+            "conflict": [],
+            "gap": [{"statement": gap, "evidence_ids": []}],
+        },
+    }
+
+
+def test_argument_points_come_from_synthesis_not_a_generic_fallback() -> None:
+    """一条方法论套话撑不起一节。
+
+    实测：每个 body 章节只拿到 1 条 `argument_points`（「按证据等级陈述现有发现与
+    适用边界」），因为要点只从 `comparison_clusters` 生成，而它几乎永远是空的；
+    与此同时 SYNTH 的 8-13 条具体结论完全没被用作章节议程。
+    """
+    from paperforge_worker.pipelines.outline import _synthesis_argument_points
+
+    points = _synthesis_argument_points(_synthesis_bundle(), language="zh")
+    assert len(points) >= 5
+    assert "按证据等级陈述现有发现与适用边界" not in points
+    assert any("发现 0" in point for point in points)
+
+
+def test_only_one_gap_reaches_the_agenda() -> None:
+    """SYNTH 每个问题能给 1-4 条缺口；全放进议程等于把综述写成检索报告。"""
+    from paperforge_worker.pipelines.outline import _synthesis_argument_points
+
+    bundle = _synthesis_bundle()
+    bundle["synthesis"]["gap"] = [
+        {"statement": f"缺口 {i}", "evidence_ids": []} for i in range(4)
+    ]
+    points = _synthesis_argument_points(bundle, language="zh")
+    assert sum(1 for point in points if "尚未解决" in point) == 1
+
+
+def test_a_section_without_synthesis_keeps_the_old_fallback() -> None:
+    from paperforge_worker.pipelines.outline import _synthesis_argument_points
+
+    points = _synthesis_argument_points({"question_id": "q"}, language="zh")
+    assert points == ["按证据等级陈述现有发现与适用边界"]
+
+
+def test_subsections_are_numbered_under_their_parent() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from paperforge_worker.pipelines.outline import (
+        _headline_subsections,
+        _with_frame_sections,
+        question_driven_sections,
+    )
+
+    class _Runner:
+        enabled = True
+
+        async def agenerate_json(self, role, *, system_prompt, user_prompt, **kwargs):
+            count = user_prompt.count("第 ")
+            return SimpleNamespace(
+                ok=True,
+                value={"headings": [f"小标题{i}" for i in range(count)]},
+                model="stub",
+                error=None,
+            )
+
+    body = question_driven_sections([_synthesis_bundle()], language="zh", allowed={"a"})
+    body = asyncio.run(_headline_subsections(body, language="zh", runner=_Runner()))
+    sections = _with_frame_sections(body, language="zh", paper_type="review")
+    children = [s for s in sections if s.get("level") == 2]
+    assert children, "6 条要点应当拆出二级小节"
+    assert all(child["parent_key"] == "s1" for child in children)
+    assert [child["key"] for child in children] == [
+        f"s1-{i + 1}" for i in range(len(children))
+    ]
+    parent = next(s for s in sections if s["key"] == "s1")
+    assert parent["has_children"] is True
+    # 母节只写引入段，子节各自成篇。
+    assert parent["target_words"] < children[0]["target_words"]
+
+
+def test_subsections_are_dropped_when_they_cannot_be_named() -> None:
+    """二级标题是 PDF 里最显眼的东西之一，宁可没有也不能是半截短语。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from paperforge_worker.pipelines.outline import (
+        _headline_subsections,
+        _with_frame_sections,
+        question_driven_sections,
+    )
+
+    class _BrokenRunner:
+        enabled = True
+
+        async def agenerate_json(self, *args, **kwargs):
+            return SimpleNamespace(ok=False, value=None, model="stub", error="boom")
+
+    body = question_driven_sections([_synthesis_bundle()], language="zh", allowed={"a"})
+    body = asyncio.run(_headline_subsections(body, language="zh", runner=_BrokenRunner()))
+    sections = _with_frame_sections(body, language="zh", paper_type="review")
+    assert not [s for s in sections if s.get("level") == 2]
+    parent = next(s for s in sections if s["key"] == "s1")
+    assert "has_children" not in parent
+    # 撤掉小节不能损失内容：要点仍然全在母节上。
+    assert len(parent["argument_points"]) >= 5
+    # 也不能留下引入段的篇幅目标，否则母节会被按 250 字验收。
+    assert "target_words" not in parent
+
+
+def test_a_thin_section_stays_flat() -> None:
+    from paperforge_worker.pipelines.outline import question_driven_sections
+
+    body = question_driven_sections(
+        [_synthesis_bundle(agreements=2)], language="zh", allowed={"a"}
+    )
+    assert [s.get("level", 1) for s in body] == [1]

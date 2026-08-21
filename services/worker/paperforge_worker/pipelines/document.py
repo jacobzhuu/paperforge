@@ -716,6 +716,7 @@ async def _upsert_draft(
         section_key=draft.section_key,
         title=draft.title,
         order_no=order_no,
+        parent_key=draft.parent_key,
         body_ir=body_ir,
         cite_keys=cite_keys,
         asset_refs=asset_refs,
@@ -1412,6 +1413,14 @@ def _frame_goal(section: dict[str, Any], outline: dict[str, Any], language: str)
     key = section.get("key")
     zh = language == "zh"
     question = outline.get("research_question") or outline.get("topic") or ""
+    # `FRAME_SECTION_BRIEFS` spells out paragraph structure and what each one
+    # must contain; flattening it to a single line here threw that away on the
+    # initial write (the repair path used the brief and produced better prose
+    # than the first draft).  The brief also disagreed with itself: it asked the
+    # abstract for 150-250 characters while the outline set `target_words` 350.
+    brief = str(section.get("summary") or "").strip()
+    if brief:
+        return f"{brief}\n研究问题：{question}" if zh else f"{brief}\nResearch question: {question}"
     if key == "abstract":
         return (
             f"用 150-250 字概述本综述：研究问题（{question}）、覆盖范围、主要发现与结论。"

@@ -63,9 +63,13 @@ OUTLINE = {
 
 
 def _zh_paragraph(sentence_count: int = 6, evidence_ids: list[str] | None = None) -> dict[str, Any]:
+    # 长到能过验收线（12 句 × 77 字 = 924 ≥ 700），但必须保持 conclusion 类：
+    # 一旦写进「差异/相比」这类比较措辞，句级比较规则会因为证据不可比而整句清空，
+    # 于是这个本该代表「好回复」的替身会变成 0 字。
     sentence = (
         "群体感应自诱导肽重塑了根际群落的组成，说明信号分子的作用范围并不局限于"
-        "产生菌自身，而是延伸到周边微生物的装配过程。"
+        "产生菌自身，而是延伸到周边微生物的装配过程，并在根系定殖的整个阶段"
+        "持续塑造群落结构。"
     )
     return {
         "stance_summary": "consistent",
@@ -539,7 +543,7 @@ def test_a_section_at_a_quarter_of_its_target_is_not_accepted() -> None:
     from paperforge_worker.pipelines.writing import section_minimum_words
 
     body = {"key": "s1", "target_words": None}
-    assert section_minimum_words(body, language="zh", is_frame=False) == 600
+    assert section_minimum_words(body, language="zh", is_frame=False) == 700
     intro = {"key": "introduction", "target_words": 800}
     assert section_minimum_words(intro, language="zh", is_frame=True) == 400
     # 没有声明目标的框架章节（旧大纲）沿用绝对下限，而不是拿正文的 1200 字去量摘要。

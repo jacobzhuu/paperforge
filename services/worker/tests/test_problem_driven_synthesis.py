@@ -155,6 +155,14 @@ def test_synthesis_detects_conflict_only_within_same_comparability_key():
 # 的词一个都对不上。可比簇因此只能靠巧合形成。
 
 
+#: 这一组用例测的是**可比簇桥接**，不是全局候选上限。它们的 filler 数量原本是
+#: 按 `MAX_CANDIDATES_PER_QUESTION` 的当时取值（24）配的：多出来的那条表格证据
+#: 要落在词面名额之外，才能证明只有桥接能把它捞进来。把上限调到 48 之后它自己
+#: 就挤进来了，六个用例一起失败——不是产品回归，是用例隐式耦合了一个可调参数。
+#: 显式钉住，这些用例从此与该常量无关。
+_LEXICAL_LIMIT = 24
+
+
 def _measurement(key: str, *, metric: str = "NDCG@10"):
     return SimpleNamespace(
         comparability_key=key, metric_name=metric, dataset="Beauty", split="test"
@@ -175,6 +183,7 @@ def test_a_comparable_sibling_is_pulled_into_the_candidate_pool():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, table),
         measurements={anchor.id: [_measurement("k1")], table.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert any(item[0] is table for item in selected)
@@ -187,7 +196,9 @@ def test_without_measurements_the_same_table_stays_out():
     filler = [_unit(text=f"filler {index}") for index in range(30)]
     table = _unit(text="Table 4 | 0.4471")
 
-    selected = _diverse_ranked_candidates(_ranked(anchor, *filler, table))
+    selected = _diverse_ranked_candidates(
+        _ranked(anchor, *filler, table), limit=_LEXICAL_LIMIT
+    )
 
     assert not any(item[0] is table for item in selected)
 
@@ -200,6 +211,7 @@ def test_a_different_comparability_key_does_not_bridge():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, other),
         measurements={anchor.id: [_measurement("k1")], other.id: [_measurement("k2")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is other for item in selected)
@@ -220,6 +232,7 @@ def test_a_salted_key_can_never_bridge():
             anchor.id: [_measurement(f"unknown:{anchor.id}")],
             table.id: [_measurement(f"unknown:{table.id}")],
         },
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is table for item in selected)
@@ -234,6 +247,7 @@ def test_an_abstract_only_sibling_is_not_bridged():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, weak),
         measurements={anchor.id: [_measurement("k1")], weak.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is weak for item in selected)
@@ -250,6 +264,7 @@ def test_a_cluster_inside_one_paper_does_not_bridge():
     selected = _diverse_ranked_candidates(
         _ranked(*filler, a, b),
         measurements={a.id: [_measurement("k1")], b.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is a or item[0] is b for item in selected)
@@ -264,6 +279,7 @@ def test_a_cross_paper_cluster_bridges_even_with_no_selected_anchor():
     selected = _diverse_ranked_candidates(
         _ranked(*filler, a, b),
         measurements={a.id: [_measurement("k1")], b.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert any(item[0] is a for item in selected)
@@ -281,6 +297,7 @@ def test_the_bridge_is_bounded_and_respects_the_per_work_cap():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, *siblings),
         measurements=measurements,
+        limit=_LEXICAL_LIMIT,
     )
 
     bridged = [item for item in selected if any(item[0] is unit for unit in siblings)]

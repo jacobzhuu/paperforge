@@ -23,7 +23,12 @@ from db import (
 
 from paperforge_worker.context import JobContext
 
-MAX_CANDIDATES_PER_QUESTION = 24
+# 从 24 提到 48。本文件的 docstring 记着：一次真实运行抽出 848 条证据单元，每个
+# 问题只看前 24 条，**97% 从没被任何问题看过**。文献库扩到 38 篇之后证据总量还会
+# 再涨，24 只会更紧；而可用证据不足 `MIN_ELIGIBLE_UNITS` 的子问题连 synthesis 都
+# 不会生成（实测子问题「防御策略」就是这么丢的），没有 synthesis 就没有论证要点，
+# 章节也就写不厚。代价是 evidence_classifier 调用量约翻倍。
+MAX_CANDIDATES_PER_QUESTION = 48
 MAX_CANDIDATES_PER_WORK = 4
 MIN_LEXICAL_SCORE = 0.02
 # 可比性桥接的上限：桥进来的是"同一比较的另一条臂"，不是新的检索面。

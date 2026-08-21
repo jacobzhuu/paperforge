@@ -40,8 +40,12 @@ MAX_ROLLING_SUMMARY_CHARS = 600
 # `clamp_max_output_tokens()` 把 deepseek 系压在 8192，加倍之后也没有第三次机会。
 # max_tokens 是上限不是计费量（按实际生成计费），所以直接按模型上限要。
 SECTION_MAX_OUTPUT_TOKENS = 8000
-TARGET_WORDS_PER_SECTION_ZH = 1200
-TARGET_WORDS_PER_SECTION_EN = 800
+# 一篇中文综述正文 8 节 × 1200 字的设计上限约 1 万字，实测交付 5,250 字——投稿级
+# 中文综述通常要 8000-15000 字。上调目标，但保持
+# `目标 × MIN_TARGET_RATIO == COMPACT_TARGET_WORDS_*`：紧凑档是截断后的退路，
+# 它的目标一旦低于验收线，被截断的那一节就会陷进永远过不了的重试。
+TARGET_WORDS_PER_SECTION_ZH = 1400
+TARGET_WORDS_PER_SECTION_EN = 900
 # 截断之后**降低需求**，而不是加预算：deepseek 系被 clamp 在 8192，供给侧已经到顶。
 # 紧凑档砍掉目标长度与段落数，让同一节的输出结构性地装得进同一个上限。
 COMPACT_TARGET_WORDS_ZH = 700
@@ -51,6 +55,12 @@ COMPACT_MAX_PARAGRAPHS = 4
 MIN_BODY_WORDS_ZH = 180
 MIN_BODY_WORDS_EN = 120
 # 框架章节（摘要/引言/结论）本来就短，用更低的下限，否则会把正常摘要判成失败。
+#: Abstract-only evidence gets rewritten into an explicit attribution rather
+#: than dropped — but past a couple of them a section stops reading as a review
+#: and starts reading as a log of what could not be verified.  One measured
+#: section had every substantive sentence in this form.  Beyond the cap the
+#: sentence follows the normal R4 path: out of the prose, into the audit trail.
+MAX_ABSTRACT_ATTRIBUTIONS_PER_SECTION = 2
 MIN_FRAME_WORDS_ZH = 80
 MIN_FRAME_WORDS_EN = 60
 WRITING_CARD_CONTEXT_CHAR_BUDGET = 36_000
@@ -79,10 +89,15 @@ _SYSTEM_PROMPT_ZH = f"""你是学术综述写作助手。根据大纲与文献�
   "terms": [{{"term": "术语", "translation": "译名/缩写"}}]
 }}
 要求：
-- 按主题论证展开，不要逐篇复述文献；每段 3-6 句，观点先行、证据跟随；
+- 按主题论证展开，不要逐篇复述文献；观点先行、证据跟随；
+- **每条论证要点写成一个独立段落**，顺序与给出的要点一致；每段 4-7 句，
+  每句都要是完整论述（交代机制、条件或数值），不要用一句话带过一条要点；
 - 每个句子的 cite_keys 只能列真正支撑该句的可用引用键；禁止发明或在段末堆整段引用；
 - 非背景句必须填写 evidence_ids；只能使用给定 EVIDENCE_ID，数字句必须绑定页码/表格/公式证据；
-- 段落按「论断→一致证据→条件差异→冲突/缺口→适用边界」展开；
+- 段落按「论断→一致证据→条件差异→适用边界」展开；
+- 证据缺口不是每段的固定环节：只在确实影响本节结论时写，且全节最多一句，
+  用作者口吻写（「现有研究尚未在统一基准上比较这些方法」），不要复述系统的
+  证据评级或检索过程（不写「现有证据未提供」「仅有摘要级证据」这类话）；
 - 连续“文献A提出…文献B提出…”式归因不得超过 2 句；
 - 正文里不要写 [1]、(Smith 2020) 之类的标记——引用由系统按 cite_keys 渲染；
 - 沿用给定术语表中的译名与缩写；新术语登记到 terms。
@@ -103,12 +118,19 @@ Output JSON only:
   "terms": [{{"term": "term", "translation": "abbreviation or gloss"}}]
 }}
 Rules:
-- argue by theme, never paper-by-paper; 3-6 sentences per paragraph, claim first, evidence after;
+- argue by theme, never paper-by-paper; claim first, evidence after;
+- **write one paragraph per argument point**, in the order given; 4-7 sentences each,
+  every sentence carrying a real step of the argument (mechanism, condition, or figure)
+  rather than disposing of a point in a single line;
 - each sentence's cite_keys MUST support that exact sentence and come from the provided list;
   never invent or pile paragraph-wide citations at the end; use [] when unsupported;
 - every non-background sentence must declare supplied evidence_ids; numeric claims require a
   page-, table-, or equation-located evidence unit;
-- structure paragraphs as claim → agreement → conditional difference → conflict/gap → boundary;
+- structure paragraphs as claim → agreement → conditional difference → boundary;
+- an evidence gap is not a required slot in every paragraph: mention one only where it
+  actually bears on this section's conclusion, at most once per section, and in the
+  author's voice ("no study has yet compared these methods on a shared benchmark").
+  Never narrate the retrieval or grading process itself;
 - never write more than two consecutive paper-by-paper attribution sentences;
 - do not write inline markers like [1] or (Smith 2020) — the system renders citations;
 - reuse the given glossary terms consistently; register new terms in `terms`.
@@ -152,6 +174,10 @@ class SectionDraft:
     section_key: str
     title: str
     appendix: bool = False
+    #: 1 = \section，2 = \subsection。渲染器（latex_render）早就支持 1-3，
+    #: 但在引入二级标题之前没有任何调用方传过 1 以外的值。
+    level: int = 1
+    parent_key: str | None = None
     paragraphs: list[dict[str, Any]] = field(default_factory=list)
     inline_tables: list[dict[str, Any]] = field(default_factory=list)
     citation_warnings: list[dict[str, Any]] = field(default_factory=list)
@@ -177,7 +203,7 @@ class SectionDraft:
             "deterministic_search_log",
         }
 
-    def to_ir_section(self, *, level: int = 1) -> Section:
+    def to_ir_section(self, *, level: int | None = None) -> Section:
         """转成 PaperIR Section：cite 是原子节点，不是正文里的字符串。"""
         blocks: list[Any] = []
         for paragraph in self.paragraphs:
@@ -243,7 +269,7 @@ class SectionDraft:
                 )
         section = Section(
             key=self.section_key,
-            level=level,
+            level=self.level if level is None else level,
             title=self.title,
             appendix=self.appendix,
             blocks=blocks,
@@ -328,6 +354,8 @@ async def write_section(
         section_key=section_key,
         title=title,
         appendix=bool(section.get("appendix")),
+        level=int(section.get("level") or 1),
+        parent_key=(str(section["parent_key"]) if section.get("parent_key") else None),
         inline_tables=[
             dict(table) for table in section.get("inline_tables") or [] if isinstance(table, dict)
         ],
@@ -709,14 +737,14 @@ def _evidence_limitation_line(section: dict[str, Any], *, language: str) -> str:
     if language == "zh":
         return (
             f"证据限度（必须遵守）：本节可用证据仅来自 {count} 篇独立文献。"
-            "只能陈述该证据直接支持的内容，明确指出这是单一来源的初步发现，"
-            "不得推广为一般结论，并在结尾用一句话点明缺口。"
+            "只能陈述该证据直接支持的内容，把它写成单一来源的初步发现，"
+            "不得推广为一般结论。用作者口吻交代这一点即可，不要描述本文的检索过程。"
         )
     return (
         f"Evidence limitation (mandatory): only {count} independent source(s) support this "
-        "section. State only what that evidence directly supports, mark it explicitly as a "
-        "single-source preliminary finding, do not generalise, and close with one sentence "
-        "naming the gap."
+        "section. State only what that evidence directly supports, present it as a "
+        "single-source preliminary finding, and do not generalise. Say so in the author's "
+        "voice; never describe this review's own retrieval process."
     )
 
 
@@ -742,18 +770,36 @@ def section_evidence_for(
     section: dict[str, Any],
     outline: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    bundles = [
+        item for item in outline.get("sub_question_bundles") or [] if isinstance(item, dict)
+    ]
     question_id = str(section.get("question_id") or "")
-    if not question_id:
+    if question_id:
+        bundle: dict[str, Any] = next(
+            (item for item in bundles if str(item.get("question_id") or "") == question_id),
+            {},
+        )
+        return [item for item in bundle.get("evidence") or [] if isinstance(item, dict)]
+    # Cross-study sections carry their own `evidence_ids` instead of a question.
+    # Returning [] for them meant the writer built an empty evidence ledger, so
+    # `_normalize_sentences` dropped every binding the model produced and
+    # `enforce_sentence_evidence_rules` blanked everything that was not
+    # background prose.  The section that makes a review's sharpest comparative
+    # claims shipped with naked cite keys and `evidence_ids: []`.
+    wanted = {str(value) for value in section.get("evidence_ids") or [] if value}
+    if not wanted:
         return []
-    bundle: dict[str, Any] = next(
-        (
-            item
-            for item in outline.get("sub_question_bundles") or []
-            if str(item.get("question_id") or "") == question_id
-        ),
-        {},
-    )
-    return [item for item in bundle.get("evidence") or [] if isinstance(item, dict)]
+    seen: set[str] = set()
+    evidence: list[dict[str, Any]] = []
+    for item in bundles:
+        for unit in item.get("evidence") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = str(unit.get("evidence_id") or unit.get("id") or "")
+            if unit_id in wanted and unit_id not in seen:
+                seen.add(unit_id)
+                evidence.append(unit)
+    return evidence
 
 
 def _evidence_context_block(
@@ -1282,6 +1328,7 @@ def enforce_sentence_evidence_rules(
     """写作后处理的 R4/R5/R6：违规句降级改写，不让摘要冒充全文。"""
     from paperforge_worker.pipelines.quality import classify_claim
 
+    attributions = 0
     for paragraph in paragraphs:
         for sentence in paragraph.get("sentences") or []:
             claim_kind = classify_claim(str(sentence.get("text") or ""))
@@ -1312,10 +1359,20 @@ def enforce_sentence_evidence_rules(
                 sentence["cite_keys"] = []
                 sentence["evidence_ids"] = []
                 sentence["downgraded_reason"] = "R5_not_comparable"
-            elif units and all(unit.get("grade") == "D_abstract_only" for unit in units):
+            elif (
+                units
+                and all(unit.get("grade") == "D_abstract_only" for unit in units)
+                and attributions < MAX_ABSTRACT_ATTRIBUTIONS_PER_SECTION
+            ):
+                attributions += 1
                 original = str(sentence.get("text") or "")
+                # Reads as authorial attribution rather than as a machine note.
+                # The old Chinese wording ("摘要层面的作者表述是：") was a visible
+                # template artifact, and — unlike the English branch — it matched
+                # none of `_ATTRIBUTION_RE`'s verbs, so the downgraded sentence
+                # was not even recognised as attribution downstream.
                 sentence["text"] = (
-                    f"摘要层面的作者表述是：{original}"
+                    f"该文献在摘要中报告，{original.lstrip()}"
                     if language == "zh"
                     else (f"The cited work reports in its abstract that {original.rstrip('.')}.")
                 )
@@ -1559,7 +1616,8 @@ def section_minimum_words(
 
     与本节自己的篇幅目标挂钩，但**证据本来就窄的小节不抬线**：那种情况下逼长度
     就是逼灌水，而灌水正是要防的东西（``evidence_limited`` 的小节另有「说清证据
-    有多窄」的写作要求，见 ``_evidence_limitation_line``）。
+    有多窄」的写作要求，见 ``_evidence_limitation_line``）。证据薄的真正修法在
+    上游——把文献库从 9 篇修到 36 篇之后，多数小节根本不会再是 evidence_limited。
     """
     zh = language == "zh"
     floor = (MIN_FRAME_WORDS_ZH if zh else MIN_FRAME_WORDS_EN) if is_frame else (
@@ -1621,7 +1679,10 @@ def inspect_section_draft(
     # 去量它，会把一节**正确的**产物判成没写成——和上面检索方法节那条豁免同理。实测
     # 台账 192 字被报成「1 个章节仍然没有正文」，而它的 block 是 paragraph、paragraph、
     # table，表就是它的内容。语种、逐字照抄这些检查照旧对附录生效。
-    if not (draft.appendix or (section or {}).get("appendix")):
+    # 有子节的母节只写一段引入，子节各自成篇并各自计长。拿正文小节的篇幅线去量
+    # 一段引入，会把一节**正确的**产物判成没写成——和附录、检索方法节同理。
+    has_children = bool((section or {}).get("has_children"))
+    if not (draft.appendix or (section or {}).get("appendix") or has_children):
         absolute_floor = section_absolute_minimum(language=language, is_frame=is_frame)
         target_floor = section_minimum_words(section, language=language, is_frame=is_frame)
         if draft.word_count < absolute_floor:
