@@ -184,6 +184,11 @@ export function ProjectOverview() {
   );
   const repairFindingCount = Number(qualityRepairJob?.checkpoint?.quality_finding_count ?? 0);
   const latestFullJob = jobs.find((job) => job.kind === 'full');
+  // 一键入口固定跑 draft 档：质检照跑、warnings 一条不少，但发现项不会升级成阻断项。
+  // 不说出来的话，用户看到的就是一份「零阻断」的报告，很容易当成已经达标。
+  const deliveredProfile =
+    ((latestFullJob?.checkpoint?.resume as { kwargs?: { quality_profile?: string } } | undefined)
+      ?.kwargs?.quality_profile ?? 'draft');
 
   const runAll = async () => {
     if (starting || busy) return;
@@ -435,6 +440,14 @@ export function ProjectOverview() {
               质检已经跑过一遍，这些是论断与证据对应关系上还能收紧的地方。
               修复会重写涉及的章节、重新核对证据并刷新导出件，通常要几分钟；
               当前稿件和 PDF 已经可以直接使用，也可以先读一遍再决定。
+              {deliveredProfile === 'draft' && (
+                <>
+                  {' '}
+                  当前这一稿是<strong className="font-medium text-foreground">初稿档</strong>
+                  产出的：质检跑了完整一轮，但发现项只作提示、不作阻断，
+                  所以「没有阻断项」不等于已经达到投稿标准。
+                </>
+              )}
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
