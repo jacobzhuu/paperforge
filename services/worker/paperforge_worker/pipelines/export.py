@@ -58,6 +58,11 @@ EXPORT_FORMATS = ("pdf", "latex_zip", "markdown", "markdown_bundle", "bibtex", "
 # 编译日志不是用户「请求」的格式（不出现在 ExportRequest.formats 里），
 # 但它必须可下载：PDF 编译失败时它是用户唯一能拿到的诊断材料。
 LOG_FORMAT = "compile_log"
+#: Section key of the per-evidence audit appendix, and the format it is filed
+#: under once it is kept out of the manuscript.  Both are 15 characters, inside
+#: ``export_artifact.format``'s String(16).
+EVIDENCE_LEDGER_KEY = "evidence_ledger"
+LEDGER_FORMAT = "evidence_ledger"
 
 _LATEX_PATCH_PROMPT = """你是 LaTeX 编译修复助手。给定报错日志与出错文件内容，
 只做**最小修补**：修正语法错误、去掉未定义命令。只输出 JSON：
@@ -135,16 +140,31 @@ async def export_document(
         if document is None:
             outcome.warnings.append({"stage": "export", "reason": "no_document"})
             return outcome
-        rows = await list_sections(session, document.id)
+        all_rows = await list_sections(session, document.id)
+        # The evidence ledger is an audit record, not a chapter.  On one real
+        # review it ran to 68 rows of verbatim 500-character source excerpts —
+        # longer than the entire manuscript, and enough to turn a 5,250-word
+        # paper into a 42-page PDF.  It still gets built and stored, just as its
+        # own artifact rather than as an appendix nobody can submit.
+        rows = [row for row in all_rows if row.section_key != EVIDENCE_LEDGER_KEY]
+        ledger_rows = [row for row in all_rows if row.section_key == EVIDENCE_LEDGER_KEY]
         whitelist = await get_writing_whitelist(session, context.project_id)
         used_keys = {key for row in rows for key in (row.cite_keys_json or [])}
+        ledger_keys = {key for row in ledger_rows for key in (row.cite_keys_json or [])}
         references: list[ReferenceMetadata] = []
+        ledger_references: list[ReferenceMetadata] = []
         for entry, work in await list_entries(session, context.project_id, status="selected"):
-            if entry.bibtex_key and entry.bibtex_key in used_keys:
+            if not entry.bibtex_key:
+                continue
+            if entry.bibtex_key in used_keys or entry.bibtex_key in ledger_keys:
                 payload = await reference_metadata_payload(
                     session, work, bibtex_key=entry.bibtex_key
                 )
-                references.append(ReferenceMetadata(**payload))
+                reference = ReferenceMetadata(**payload)
+                if entry.bibtex_key in used_keys:
+                    references.append(reference)
+                if entry.bibtex_key in ledger_keys:
+                    ledger_references.append(reference)
         document_version = document.version
         title = project.publication_title or project.title
         authors = project.authors_json or []
@@ -259,6 +279,28 @@ async def export_document(
             )
         except ValueError as error:
             outcome.warnings.append({"stage": "bibtex", "reason": str(error)[:200]})
+    if ledger_rows:
+        # Registered like the compile log: its own downloadable artifact, listed
+        # by GET /exports, never part of the paper.
+        try:
+            ledger_markdown = render_markdown(
+                _ledger_ir(ledger_rows, title=title, language=language),
+                references=ledger_references,
+                style=citation_style,
+            )
+            outcome.formats[LEDGER_FORMAT] = await _store(
+                context,
+                store,
+                LEDGER_FORMAT,
+                ledger_markdown.encode("utf-8"),
+                "md",
+                document_version,
+                quality=quality,
+            )
+        except Exception as error:  # noqa: BLE001 - an audit extra cannot fail the export
+            outcome.warnings.append(
+                {"stage": "evidence_ledger", "reason": str(error)[:200]}
+            )
     if "latex_zip" in wanted:
         outcome.formats["latex_zip"] = await _store(
             context,
@@ -826,6 +868,21 @@ def _make_patcher(context: JobContext):
     return patcher
 
 
+def _ledger_ir(rows: list[Any], *, title: str, language: str) -> PaperIR:
+    """Wrap the ledger sections in a minimal document of their own."""
+    return PaperIR(
+        meta=PaperMeta(
+            title=f"{title} — 证据台账" if language == "zh" else f"{title} — Evidence Ledger",
+            authors=[],
+            abstract="",
+            keywords=[],
+            language=language,  # type: ignore[arg-type]
+        ),
+        sections=[IRSection(**row.body_ir_json) for row in rows if row.body_ir_json],
+        bibliography=Bibliography(style="gbt7714" if language == "zh" else "apa"),
+    )
+
+
 def _build_ir(
     rows: list[Any],
     *,
@@ -1179,7 +1236,7 @@ async def _store(
     # 也没有下载地址——而界面在编译失败时明确承诺「已交付 LaTeX 工程与编译日志」。
     # 承诺一份取不到的诊断材料，恰恰是在最需要建立信任的时刻失信。
     # `export_artifact.format` 是无约束的 String(16)，登记它不需要迁移。
-    if kind in EXPORT_FORMATS or kind == LOG_FORMAT:
+    if kind in EXPORT_FORMATS or kind in {LOG_FORMAT, LEDGER_FORMAT}:
         async with context.session() as session:
             session.add(
                 ExportArtifact(

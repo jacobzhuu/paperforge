@@ -621,6 +621,9 @@ export interface MarkdownPreview {
  * `compile_log` 是编译的**副产物**而非用户请求的格式：它不出现在
  * `ExportRequest.formats` 里，但会作为产物登记以便下载——PDF 编译失败时
  * 它是用户唯一能拿到的诊断材料。
+ *
+ * `evidence_ledger` 同理：逐条证据与定位的审计记录，随综述自动产出，
+ * 但**不进正文**——它比正文本身还长，会把一篇 5000 字的稿子撑成 40 多页。
  */
 export type ExportFormat =
   | 'pdf'
@@ -629,10 +632,14 @@ export type ExportFormat =
   | 'markdown_bundle'
   | 'bibtex'
   | 'docx'
-  | 'compile_log';
+  | 'compile_log'
+  | 'evidence_ledger';
 
-/** 用户可主动勾选的导出格式（不含 compile_log）。 */
-export type RequestableExportFormat = Exclude<ExportFormat, 'compile_log'>;
+/** 用户可主动勾选的导出格式（不含副产物）。 */
+export type RequestableExportFormat = Exclude<
+  ExportFormat,
+  'compile_log' | 'evidence_ledger'
+>;
 
 export interface ExportArtifact {
   id: string;

@@ -8,9 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 from paperforge_worker.pipelines.export import (
+    EVIDENCE_LEDGER_KEY,
     MAX_FIGURE_FILES,
     _build_ir,
     _enforce_binary_channel_limits,
+    _ledger_ir,
     _markdown_bundle,
     _markdown_to_docx,
 )
@@ -167,3 +169,58 @@ def test_docx_converts_uploaded_pdf_figure_to_embedded_png() -> None:
         assert len(media) == 1
         assert media[0].endswith(".png")
         assert archive.read(media[0]).startswith(b"\x89PNG")
+
+
+def test_the_evidence_ledger_is_rendered_as_its_own_document() -> None:
+    """It must never reach the manuscript IR, only its own artifact.
+
+    One real review shipped a 68-row ledger of verbatim source excerpts as an
+    appendix: 29,313 characters against 24,091 for the whole paper, and a
+    42-page PDF for 5,250 words of prose.
+    """
+    ledger_row = SimpleNamespace(
+        section_key=EVIDENCE_LEDGER_KEY,
+        body_ir_json={
+            "key": EVIDENCE_LEDGER_KEY,
+            "level": 1,
+            "title": "附录：证据台账",
+            "appendix": True,
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "runs": [{"t": "text", "v": "逐条证据与定位。"}],
+                }
+            ],
+        },
+    )
+    ir = _ledger_ir([ledger_row], title="序列推荐攻击", language="zh")
+    assert [section.key for section in ir.sections] == [EVIDENCE_LEDGER_KEY]
+    assert ir.meta.title.endswith("证据台账")
+
+
+def test_the_manuscript_ir_excludes_the_ledger_section() -> None:
+    rows = [
+        SimpleNamespace(
+            section_key="s1",
+            body_ir_json={
+                "key": "s1",
+                "level": 1,
+                "title": "攻击类型",
+                "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": "正文。"}]}],
+            },
+        ),
+        SimpleNamespace(
+            section_key=EVIDENCE_LEDGER_KEY,
+            body_ir_json={
+                "key": EVIDENCE_LEDGER_KEY,
+                "level": 1,
+                "title": "附录：证据台账",
+                "appendix": True,
+                "blocks": [{"type": "paragraph", "runs": [{"t": "text", "v": "台账。"}]}],
+            },
+        ),
+    ]
+    # Mirrors the filter export_document applies before building the IR.
+    manuscript = [row for row in rows if row.section_key != EVIDENCE_LEDGER_KEY]
+    ir = _build_ir(manuscript, title="t", language="zh", citation_style="gbt7714")
+    assert [section.key for section in ir.sections] == ["s1"]

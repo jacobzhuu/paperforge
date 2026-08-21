@@ -62,6 +62,7 @@ const FORMAT_LABEL: Record<ExportFormat, string> = {
   bibtex: 'BibTeX',
   docx: 'Word (docx)',
   compile_log: '编译日志',
+  evidence_ledger: '证据台账（审计用）',
 };
 
 interface ExportRun {
@@ -581,7 +582,7 @@ function ArtifactRow({
   projectId: string;
   artifact: ExportArtifact;
 }) {
-  const isLog = artifact.format === 'compile_log';
+  const isLog = artifact.format === 'compile_log' || artifact.format === 'evidence_ledger';
   const isPdf = artifact.format === 'pdf';
   const ready = artifact.readiness_status === 'submission_ready';
   const needsRevision = artifact.readiness_status === 'needs_revision';

@@ -41,7 +41,7 @@ from paperforge_worker.pipelines.document import (
     write_document,
 )
 from paperforge_worker.pipelines.evidence import extract_evidence_units
-from paperforge_worker.pipelines.export import export_document
+from paperforge_worker.pipelines.export import EVIDENCE_LEDGER_KEY, export_document
 from paperforge_worker.pipelines.fulltext import acquire_fulltexts, parse_document_file
 from paperforge_worker.pipelines.importing import (
     import_references,
@@ -1709,7 +1709,16 @@ async def _quality(
             "title": row.title,
             "word_count": _section_words(row.body_ir_json or {}),
             "cite_keys": row.cite_keys_json or [],
-            "kind": "frame" if row.section_key in frame_keys else "body",
+            # The evidence ledger is an audit record that no longer ships inside
+            # the manuscript.  Counting it as a body section let a 5,250-word
+            # paper report a length and a citation count it did not have.
+            "kind": (
+                "frame"
+                if row.section_key in frame_keys
+                else "appendix"
+                if row.section_key == EVIDENCE_LEDGER_KEY
+                else "body"
+            ),
         }
         for row in rows
     ]
