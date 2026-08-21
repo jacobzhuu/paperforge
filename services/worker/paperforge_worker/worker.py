@@ -1831,6 +1831,7 @@ async def _quality(
             whitelist=set(whitelist),
             search_runs=search_runs,
             evidence_units=evidence_units,
+            references=entries,
         )
     if project is not None and project.paper_type == "original":
         from ingest.numlint import lint_sections

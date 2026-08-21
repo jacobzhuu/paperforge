@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from llm_runtime import LLMRunner
+from scholar_gateway.normalize import token_set_jaccard
 
 SOFT_CHECK_THRESHOLD = 0.5
 MAX_SOFT_CHECKS = 40
@@ -863,6 +864,62 @@ def repairable_finding_count(report: QualityReport) -> int:
     return sum(1 for item in pool if str(item.get("code")) in SCHOLARLY_BLOCKER_CODES)
 
 
+#: Two references this similar are the same paper often enough to be worth a
+#: human glance.  Measured on the real pair that shipped: the two LoRec titles
+#: score 0.571 and DARTS/DV-FSR score 0.5625.
+_DUPLICATE_TITLE_JACCARD = 0.5
+
+
+def _shares_bibtex_key_base(left: str, right: str) -> bool:
+    """True when one key is the other plus ``make_bibtex_key``'s collision suffix.
+
+    A suffix is only ever appended when first-author surname, year *and* the
+    leading title keyword all matched — the strongest duplicate signal the
+    system produces, and until now it was spent silently.
+    """
+    short, long = sorted((left, right), key=len)
+    if not short or short == long or not long.startswith(short):
+        return False
+    tail = long[len(short) :]
+    return (len(tail) == 1 and tail.isalpha()) or tail.isdigit()
+
+
+def _suspected_duplicate_references(references: list[Any]) -> list[dict[str, Any]]:
+    """Flag reference pairs that look like one work cited twice.
+
+    Dedupe merges what it can prove, and deliberately will not guess when the
+    identifiers disagree — a preprint renamed between versions keeps two rows.
+    Nothing downstream noticed, so one manuscript compared DARTS with DV-FSR as
+    though they were two studies.  This does not merge anything; it asks.
+    """
+    known = [
+        (str(entry.bibtex_key), str(getattr(work, "canonical_title", "") or ""))
+        for entry, work in references
+        if getattr(entry, "bibtex_key", None)
+    ]
+    found: list[dict[str, Any]] = []
+    for index, (left_key, left_title) in enumerate(known):
+        for right_key, right_title in known[index + 1 :]:
+            if _shares_bibtex_key_base(left_key, right_key):
+                basis = "bibtex_key_collision"
+            elif (
+                left_title
+                and right_title
+                and token_set_jaccard(left_title, right_title) >= _DUPLICATE_TITLE_JACCARD
+            ):
+                basis = "title_similarity"
+            else:
+                continue
+            found.append(
+                {
+                    "keys": (left_key, right_key),
+                    "titles": (left_title, right_title),
+                    "basis": basis,
+                }
+            )
+    return found
+
+
 def apply_readiness_gate(
     report: QualityReport,
     *,
@@ -871,6 +928,7 @@ def apply_readiness_gate(
     whitelist: set[str],
     search_runs: list[Any],
     evidence_units: dict[str, dict[str, Any]] | None = None,
+    references: list[Any] | None = None,
 ) -> QualityReport:
     """应用双模式质量门；分项评分不参与“堆数量过线”。"""
     all_text = " ".join(_body_text(getattr(row, "body_ir_json", None) or {}) for row in rows)
@@ -1160,10 +1218,32 @@ def apply_readiness_gate(
                 ),
             )
         )
+    for pair in _suspected_duplicate_references(references or []):
+        warnings.append(
+            _issue(
+                "duplicate_reference_suspected",
+                f"参考文献 {pair['keys'][0]} 与 {pair['keys'][1]} 可能是同一篇论文",
+                keys=list(pair["keys"]),
+                titles=list(pair["titles"]),
+                basis=pair["basis"],
+            )
+        )
     if report.word_count < 3000:
         warnings.append(_issue("short_manuscript", "正文篇幅低于 3000 字词单位"))
     if report.fulltext_coverage < 0.5:
         warnings.append(_issue("low_fulltext_coverage", "入选文献全文卡片覆盖率低于 50%"))
+    if getattr(project, "paper_type", None) == "review" and 0 < report.whitelist_size < 20:
+        # A review written from a handful of works cannot help but read as a
+        # report on its own evidence gaps.  One real run reached the reader with
+        # 9 references — of which two pairs were duplicates — and spent much of
+        # the manuscript explaining what it could not find.
+        warnings.append(
+            _issue(
+                "library_undersized",
+                f"综述仅有 {report.whitelist_size} 篇可引用文献，不足以支撑投稿级综述",
+                selected=report.whitelist_size,
+            )
+        )
     if report.recent_ratio > 0.85 and report.whitelist_size >= 10:
         warnings.append(_issue("year_imbalance", "文献过度集中于近五年，需补充基础研究"))
     if getattr(project, "paper_type", None) == "review":
@@ -1203,6 +1283,19 @@ def apply_readiness_gate(
         ),
         "layout": 100.0 if report.layout_checks.get("passed") is True else 0.0,
     }
+    if report.scores["evidence"] < 40 and report.core_claim_count:
+        # `evidence: 11.1` in a report otherwise showing zero blockers tells a
+        # user nothing.  Say what the number means: most of what the paper
+        # asserts is not backed by locatable full-text evidence.
+        warnings.append(
+            _issue(
+                "core_claims_mostly_unsupported",
+                f"{report.core_claim_count} 条核心论断中只有 "
+                f"{round(report.core_claim_fulltext_coverage * report.core_claim_count)} 条"
+                "有可定位的全文证据支撑，这份稿子还不能按结论来读",
+                evidence_score=report.scores["evidence"],
+            )
+        )
     if report.quality_profile == "submission":
         profile_blockers = blockers
         profile_warnings = warnings
@@ -2212,7 +2305,12 @@ def coverage_hints(
         key = str(section.get("section_key") or "")
         words = int(section.get("word_count") or 0)
         cites = len(section.get("cite_keys") or [])
-        if section.get("kind") == "frame":
+        if section.get("kind") == "appendix":
+            continue
+        # Frames used to be exempt, which is how a review's introduction and
+        # conclusion could cite nothing at all and still pass silently.  The
+        # abstract stays exempt — abstracts do not carry citations.
+        if key == "abstract":
             continue
         if words >= 300 and cites == 0:
             hints.append(
@@ -2283,10 +2381,15 @@ def build_quality_report(
 ) -> QualityReport:
     """质量评分报告：只呈现，不设门槛（取代 formal completion 的 12 项硬门槛）。"""
     clock = now or datetime.now(UTC)
-    word_count = sum(int(s.get("word_count") or 0) for s in sections)
+    # Appendices (the evidence ledger) are audit material, not manuscript.
+    word_count = sum(
+        int(s.get("word_count") or 0) for s in sections if s.get("kind") != "appendix"
+    )
     used_keys: set[str] = set()
     cite_count = 0
     for section in sections:
+        if section.get("kind") == "appendix":
+            continue
         keys = section.get("cite_keys") or []
         cite_count += len(keys)
         used_keys.update(keys)
@@ -2306,7 +2409,9 @@ def build_quality_report(
         sections_without_citations=[
             str(s.get("section_key"))
             for s in sections
-            if s.get("kind") != "frame" and not (s.get("cite_keys") or [])
+            if s.get("kind") != "appendix"
+            and s.get("section_key") != "abstract"
+            and not (s.get("cite_keys") or [])
         ],
         soft_check=[f.to_payload() for f in (soft_check or []) if f.weak],
         generated_at=clock.isoformat(),

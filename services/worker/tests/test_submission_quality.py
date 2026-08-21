@@ -771,3 +771,93 @@ def test_original_asset_audit_rejects_a_value_attached_to_the_wrong_metric() -> 
         },
     )
     assert anchors[0]["support_status"] == "asset_numeric_context_mismatch"
+
+
+def _reference(key: str, title: str) -> tuple[SimpleNamespace, SimpleNamespace]:
+    return (
+        SimpleNamespace(bibtex_key=key),
+        SimpleNamespace(canonical_title=title, publication_year=2024),
+    )
+
+
+def test_a_bibtex_key_collision_is_reported_as_a_suspected_duplicate() -> None:
+    """`make_bibtex_key`'s `a` suffix means author, year and keyword all matched.
+
+    That signal used to be spent silently, so one manuscript shipped the LoRec
+    paper twice as `zhang2024lorec` and `zhang2024loreca`.
+    """
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference("zhang2024lorec", "LoRec: Combating Poisons with Large Language Model"),
+            _reference("zhang2024loreca", "LoRec: Large Language Model for Robust Recommendation"),
+        ],
+    )
+    duplicates = [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+    assert len(duplicates) == 1
+    assert set(duplicates[0]["keys"]) == {"zhang2024lorec", "zhang2024loreca"}
+
+
+def test_near_identical_titles_are_reported_even_without_a_key_collision() -> None:
+    """DARTS and DV-FSR have different keys and different years, so dedupe keeps
+    both — but the manuscript then compared the framework with itself."""
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference(
+                "qin2025darts",
+                "DARTS: A Dual-View Attack Framework for Targeted Manipulation "
+                "in Federated Sequential Recommendation",
+            ),
+            _reference(
+                "qin2024fsr",
+                "DV-FSR: A Dual-View Target Attack Framework for Federated "
+                "Sequential Recommendation",
+            ),
+        ],
+    )
+    duplicates = [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+    assert len(duplicates) == 1
+    assert duplicates[0]["basis"] == "title_similarity"
+
+
+def test_distinct_references_raise_no_duplicate_warning() -> None:
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference("zhang2020practical", "Practical Data Poisoning Attack against Next-Item"),
+            _reference("zhao2025diversity", "Diversity-aware Dual-promotion Poisoning Attack"),
+        ],
+    )
+    assert not [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+
+
+def test_a_review_with_too_few_references_is_flagged() -> None:
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=SimpleNamespace(**{**vars(_project()), "paper_type": "review"}),
+        whitelist={"smith2020"},
+        search_runs=[],
+    )
+    assert any(item["code"] == "library_undersized" for item in report.warnings)
