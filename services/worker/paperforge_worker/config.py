@@ -102,8 +102,20 @@ class WorkerSettings(BaseSettings):
 
     # 检索预算（设计 §4.4.1 CURATE：全自动模式取 top-K）。
     search_limit_per_provider: int = 25
-    search_auto_select_top_k: int = 30
+    #: Ceiling on the auto-selected writing corpus.  Raised from 30 so it sits
+    #: above ``library_backfill_floor`` — a floor capped by the ceiling is not a
+    #: floor.  ``fulltext_max_works`` (40) bounds the expensive stage anyway.
+    search_auto_select_top_k: int = 40
     rerank_top_n: int = 40
+    #: 综述写作语料的下限。锚点闸门是字面匹配，命中数天然偏低——实测一次真实
+    #: 运行 764 篇候选只有 9 篇合取命中，写出来的稿子有近四成篇幅在描述由此
+    #: 造成的「证据空白」。命中数不足时按 relevance_score 回填到这个下限，
+    #: 名额本来就是空转的（top-K 30 只用掉 9）。
+    library_backfill_floor: int = 36
+    #: 回填的分数下限。同一次运行里 selected 的均值 0.50、被降级的
+    #: candidate_uncertain 均值 0.45，而排名 40 以后开始混入跑题文献，
+    #: 0.28 是实测的精度拐点。
+    library_backfill_min_relevance: float = 0.28
     # 一键综述默认尝试前 40 篇 OA 全文；仍可按部署成本下调。
     fulltext_max_works: int = 40
 

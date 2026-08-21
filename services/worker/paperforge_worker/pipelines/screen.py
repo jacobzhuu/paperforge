@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from db import list_entries, set_entry_status, upsert_eligibility_decision
@@ -25,6 +26,10 @@ class ScreenOutcome:
     pinned_preserved: int = 0
     selected: int = 0
     budget_limited: int = 0
+    #: Kept selected despite an anchor miss, because SEARCH had already picked them.
+    uncertain_retained: int = 0
+    #: Promoted purely on relevance rank to reach the review corpus floor.
+    backfilled: int = 0
     decisions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_payload(self) -> dict[str, Any]:
@@ -35,6 +40,8 @@ class ScreenOutcome:
             "pinned_preserved": self.pinned_preserved,
             "selected": self.selected,
             "budget_limited": self.budget_limited,
+            "uncertain_retained": self.uncertain_retained,
+            "backfilled": self.backfilled,
             "decisions": self.decisions[:30],
         }
 
@@ -115,16 +122,17 @@ async def screen_eligibility(
                 decision, reason = "uncertain", "no required anchor facet configured"
             else:
                 decision, reason = "uncertain", "no required anchor facet matched"
+            criterion_hits = {
+                "anchors": [phrase for phrase in anchors if _phrase_in_text(text, phrase)],
+                "anchor_groups": group_hits,
+                "exclusions": exclusion_hits,
+            }
             await upsert_eligibility_decision(
                 session,
                 project_id=context.project_id,
                 work_id=work.id,
                 decision=decision,
-                criterion_hits={
-                    "anchors": [phrase for phrase in anchors if _phrase_in_text(text, phrase)],
-                    "anchor_groups": group_hits,
-                    "exclusions": exclusion_hits,
-                },
+                criterion_hits=criterion_hits,
                 anchor_facet_hit=anchor_hit,
                 reason=reason,
             )
@@ -136,6 +144,11 @@ async def screen_eligibility(
                     "work": work,
                     "decision": decision,
                     "anchor_facet_hit": anchor_hit,
+                    # Hitting *some* anchor group is far weaker than hitting all
+                    # of them, but it is the difference between "adjacent to the
+                    # topic" and "a heart-failure guideline".  Backfill needs it.
+                    "partial_anchor_hit": bool(anchor_groups) and any(group_hits.values()),
+                    "criterion_hits": criterion_hits,
                     "pinned": bool(
                         entry.user_pinned or getattr(entry, "literature_role", "general") == "core"
                     ),
@@ -151,7 +164,18 @@ async def screen_eligibility(
             and record["entry"].status == "selected"
             and record["decision"] == "include"
         }
-        selection_ids = pinned_ids | preserved_ids
+        # A literal-anchor miss is not evidence that SEARCH was wrong.  SEARCH
+        # picks its top-K with a weighted multi-signal ranker plus an LLM
+        # reranker; demoting those picks because a substring test disagreed lets
+        # the crudest stage in the pipeline overrule the most informed one.
+        # Keep them, and let the exclusion list — which is precise — do the
+        # actual rejecting.
+        retained_ids = {
+            record["work"].id
+            for record in records
+            if record["decision"] == "uncertain" and record["entry"].status == "selected"
+        }
+        selection_ids = pinned_ids | preserved_ids | retained_ids
         effective_budget = max(
             selected_budget,
             len(selection_ids) + max(0, int(additional_budget)),
@@ -198,6 +222,30 @@ async def screen_eligibility(
                 if not remaining:
                     break
 
+        backfilled_ids = _backfill_to_floor(
+            records,
+            selection_ids,
+            settings=getattr(context, "settings", None),
+            ceiling=effective_budget,
+        )
+        outcome.backfilled = len(backfilled_ids)
+        for record in records:
+            if record["work"].id not in backfilled_ids:
+                continue
+            # The verdict stays `uncertain` — the anchors really did not all
+            # match.  Only the provenance changes, so an audit can always tell a
+            # relevance-backfilled work from one the criteria admitted.
+            await upsert_eligibility_decision(
+                session,
+                project_id=context.project_id,
+                work_id=record["work"].id,
+                decision="uncertain",
+                criterion_hits=record["criterion_hits"],
+                anchor_facet_hit=record["anchor_facet_hit"],
+                reason="backfilled by relevance rank to reach the review corpus floor",
+                decided_by="deterministic_backfill",
+            )
+
         for record in records:
             entry = record["entry"]
             work = record["work"]
@@ -208,8 +256,17 @@ async def screen_eligibility(
             elif decision == "exclude":
                 await set_entry_status(session, entry, "excluded")
             elif decision == "uncertain":
-                if entry.status == "selected":
-                    await set_entry_status(session, entry, UNCERTAIN_STATUS)
+                # Retained (SEARCH had picked it) or backfilled by rank.  An
+                # uncertain work that is in neither set keeps whatever status it
+                # arrived with — SCREEN only ever *adds* to the corpus here.
+                if work.id in selection_ids:
+                    # Two different facts, counted apart: SEARCH's ranker already
+                    # wanted this work, or nothing wanted it and rank alone pulled
+                    # it in to reach the floor.  Summing them would make
+                    # `backfilled` unreadable against the retained total.
+                    if work.id not in backfilled_ids:
+                        outcome.uncertain_retained += 1
+                    await set_entry_status(session, entry, "selected")
             elif work.id in selection_ids:
                 await set_entry_status(session, entry, "selected")
             else:
@@ -224,6 +281,52 @@ async def screen_eligibility(
             )
         outcome.selected = len(selection_ids)
     return outcome
+
+
+def _backfill_to_floor(
+    records: list[dict[str, Any]],
+    selection_ids: set[Any],
+    *,
+    settings: Any,
+    ceiling: int,
+) -> set[Any]:
+    """Top the corpus up to the review floor from the highest-ranked near-misses.
+
+    The anchor gate is a literal-substring test over an LLM's English phrasing,
+    so it under-counts badly: one real run matched 9 of 764 works and then spent
+    much of the manuscript describing the evidence gap that shortfall created.
+    The top-K budget was never the constraint — 21 of its 30 slots went unused.
+
+    Only works that hit *some* anchor group and cleared the relevance floor are
+    eligible, and ``selection_ids`` is mutated in place so the caller's status
+    write-back sees them.  Returns the ids that were added.
+    """
+    floor = min(
+        int(getattr(settings, "library_backfill_floor", 36) or 0),
+        max(0, int(ceiling)),
+    )
+    if len(selection_ids) >= floor:
+        return set()
+    minimum = float(getattr(settings, "library_backfill_min_relevance", 0.28) or 0.0)
+    eligible = sorted(
+        (
+            record
+            for record in records
+            if record["decision"] == "uncertain"
+            and record["partial_anchor_hit"]
+            and record["work"].id not in selection_ids
+            and float(getattr(record["entry"], "relevance_score", 0.0) or 0.0) >= minimum
+        ),
+        key=lambda record: float(getattr(record["entry"], "relevance_score", 0.0) or 0.0),
+        reverse=True,
+    )
+    added: set[Any] = set()
+    for record in eligible:
+        if len(selection_ids) >= floor:
+            break
+        selection_ids.add(record["work"].id)
+        added.add(record["work"].id)
+    return added
 
 
 def _focus_scores(text: str, questions: list[dict[str, Any]]) -> list[float]:
@@ -268,12 +371,61 @@ def _phrase_in_text(text: str, phrase: str) -> bool:
 
     In particular, the eligibility alias ``AI`` must not match ``domain``,
     ``chain`` or ``training`` and accidentally admit most of a search corpus.
-    Longer phrases retain substring matching so Chinese and inflected prose keep
-    the existing recall characteristics.
+
+    Longer phrases first try plain substring containment, so every match the
+    literal gate used to find is still found.  A miss then retries against a
+    stemmed form of both sides: SCOPE writes anchors like
+    ``"sequential recommendation"`` while the literature says ``"sequential
+    recommenders"``, and a raw substring test scores that as off-topic.  The
+    stemmer is deliberately crude — it only has to mangle both sides the same
+    way, not be linguistically right.
     """
     if re.fullmatch(r"[a-z0-9]+", phrase) and len(phrase) <= 3:
         return re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text) is not None
-    return phrase in text
+    if phrase in text:
+        return True
+    needle = _stem_text(phrase)
+    if not needle:
+        return False
+    haystack = _stem_text(text)
+    if re.search(r"[a-z0-9]", needle):
+        # Token-anchored so a stemmed "system" cannot match inside "systemic".
+        return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack) is not None
+    # CJK anchors have no word boundaries to anchor against.
+    return needle in haystack
+
+
+#: Folded away before matching, longest first.  ``ers`` precedes ``er`` precedes
+#: ``s`` so "recommenders" and "recommender" both land on "recommend".
+_INFLECTIONS = ("ations", "ation", "ers", "er", "ing", "es", "s")
+#: Never strip a word down past this, or "papers" would become "pap".
+_MIN_STEM = 4
+
+
+@lru_cache(maxsize=4096)
+def _stem_text(text: str) -> str:
+    """Fold punctuation, hyphenation and English inflection out of ``text``.
+
+    Cached because SCREEN tests every anchor term against the same title +
+    abstract blob, and the pool runs to thousands of works.
+    """
+    cleaned = re.sub(r"[^0-9a-z\u3400-\u9fff]+", " ", text.casefold())
+    return " ".join(_stem_word(word) for word in cleaned.split())
+
+
+def _stem_word(word: str) -> str:
+    for suffix in _INFLECTIONS:
+        if word.endswith(suffix) and len(word) - len(suffix) >= _MIN_STEM:
+            word = word[: -len(suffix)]
+            break
+    # "sequence"/"sequences" and "study"/"studies" only converge after the
+    # stem's own trailing vowel is normalised too.
+    if len(word) - 1 >= _MIN_STEM:
+        if word.endswith("e"):
+            return word[:-1]
+        if word.endswith("y"):
+            return f"{word[:-1]}i"
+    return word
 
 
 def _first_facet(scope: dict[str, Any]) -> list[str]:

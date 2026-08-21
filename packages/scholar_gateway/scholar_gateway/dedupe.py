@@ -302,10 +302,22 @@ def _normalized_identifiers(candidate: ScholarlyWorkCandidate) -> dict[str, tupl
     return {id_type: tuple(sorted(id_values)) for id_type, id_values in values.items() if id_values}
 
 
+#: arXiv mints a DOI per *submission*, so ``10.48550/arxiv.2401.17723`` and a
+#: publisher's DOI for the same paper are not rival claims about one work — they
+#: identify two manifestations of it.  Treating the arXiv one as an ordinary DOI
+#: made every preprint/published pair look like an identifier conflict, which
+#: blocks the merge and ships the paper twice in one bibliography.
+_ARXIV_DOI_PREFIX = "10.48550/arxiv."
+
+
 def _add_identifier(values: dict[str, set[str]], id_type: str, raw_value: object) -> None:
     normalized: str | None
     if id_type == "doi":
         normalized = normalize_doi(str(raw_value)) if raw_value is not None else None
+        if normalized and normalized.startswith(_ARXIV_DOI_PREFIX):
+            # Re-file it as the arXiv id it actually is.
+            _add_identifier(values, "arxiv", normalized[len(_ARXIV_DOI_PREFIX) :])
+            return
     elif id_type == "pmid":
         normalized = normalize_pmid(raw_value)  # type: ignore[arg-type]
     elif id_type == "pmcid":
@@ -333,12 +345,20 @@ def _normalized_first_author(candidate: ScholarlyWorkCandidate) -> str | None:
     return normalize_title_for_dedupe(author.author_name)
 
 
+#: A short leading segment is only usable because the fallback pass keys on
+#: ``(title, year, first_author)`` — the prefix never matches alone.  The old
+#: floor of 8 characters silently disabled this pass for exactly the titles it
+#: exists to catch: "LoRec:", "DARTS:", "PGAN:" are all 4-6 characters, so a
+#: preprint and its renamed published version shipped as two references.
+_MIN_FALLBACK_TITLE = 4
+
+
 def _fallback_title_for_matching(title: str) -> str | None:
     first_segment = re_split_title_segment(title)
     if first_segment is None:
         return None
     normalized = normalize_title_for_dedupe(first_segment)
-    if normalized is None or len(normalized) < 8:
+    if normalized is None or len(normalized) < _MIN_FALLBACK_TITLE:
         return None
     return normalized
 
