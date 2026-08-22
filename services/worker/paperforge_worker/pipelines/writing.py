@@ -33,6 +33,14 @@ from paper_ir import (
     TextRun,
 )
 
+from paperforge_worker.locators import (
+    evidence_locator as _evidence_locator,
+)
+from paperforge_worker.locators import (
+    is_located,
+    locator_display,
+)
+
 MAX_PARAGRAPHS_PER_SECTION = 8
 MAX_ROLLING_SUMMARY_CHARS = 600
 # 一节正文（目标 ~1200 字）外加逐句回抄的 evidence_ids，实测要 4000–8000 输出 token。
@@ -639,14 +647,15 @@ def _build_prompt(
                 reverse=True,
             )
             for point in located[:MAX_CARD_EVIDENCE_POINTS]:
-                locator = ", ".join(
-                    item
-                    for item in (
-                        f"p.{point['page']}" if point.get("page") else "",
-                        str(point.get("section") or ""),
-                        f"para.{point['paragraph']}" if point.get("paragraph") else "",
+                # 卡片证据点用的是 `section`/`paragraph` 拼写，显式传字段而不是
+                # 让适配器去猜别名。
+                locator = (
+                    _locator_text(
+                        page=point.get("page"),
+                        section_path=point.get("section"),
+                        paragraph_index=point.get("paragraph"),
                     )
-                    if item
+                    or ""
                 )
                 parts.append(f"  fulltext evidence ({locator or 'unlocated'}): {point['text']}")
         # 不再对所有文献机械 [:3]；按章节总 token 预算和文献数动态分配，
@@ -802,6 +811,12 @@ def section_evidence_for(
     return evidence
 
 
+def _locator_text(**fields: object) -> str | None:
+    """按显式字段名求定位串（卡片证据点的键名与证据单元不同）。"""
+    locator = _evidence_locator(**fields)  # type: ignore[arg-type]
+    return locator.display if locator else None
+
+
 def _evidence_context_block(
     *,
     section: dict[str, Any],
@@ -839,18 +854,7 @@ def _evidence_context_block(
         sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9))
     ):
         grade = str(item.get("grade") or "")
-        locator = (
-            ", ".join(
-                value
-                for value in (
-                    f"p.{item.get('page')}" if item.get("page") else "",
-                    str(item.get("section_path") or ""),
-                    str(item.get("object_ref") or ""),
-                )
-                if value
-            )
-            or "unlocated"
-        )
+        locator = locator_display(item) or "unlocated"
         measurements = "; ".join(
             f"{row.get('metric_name')}={row.get('value')}{row.get('unit') or ''} "
             f"dataset={row.get('dataset') or 'unknown'} "
@@ -1345,9 +1349,12 @@ def enforce_sentence_evidence_rules(
                 units,
             )
             comparable = claim_kind != "comparison" or _units_comparable(units)
-            located = claim_kind != "numeric" or any(
-                unit.get("page") or unit.get("object_ref") for unit in units
-            )
+            # 数字句要能被查证。判定与证据定级、质检 R6、定位显示共用同一个谓词
+            # （paperforge_worker.locators）：此前这里只认 page/object_ref，而定级
+            # 认 page/section/paragraph，于是本函数把 5,256 条被定级为「已定位」的
+            # 单元当成未定位，把引用它们的句子整句删掉——包括提示词里明明标着
+            # 「§Results」的那些。
+            located = claim_kind != "numeric" or any(is_located(unit) for unit in units)
             if units and grade_ok and comparable and located:
                 continue
             if claim_kind == "comparison" and units and not comparable:

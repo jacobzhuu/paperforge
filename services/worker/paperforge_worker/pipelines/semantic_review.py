@@ -25,6 +25,8 @@ from typing import Any
 
 from llm_runtime import LLMRunner
 
+from paperforge_worker.locators import locator_display
+
 #: 判断类角色。按上一轮实测（真实候选集三臂对比）：判断力跟档位走，思考开关反而
 #: 会让弱档退化成不判断，所以这个角色走 planner 档并关掉思考。
 REVIEWER_ROLE = "section_reviewer"
@@ -208,14 +210,7 @@ _COMPARE_PROMPT_ZH = """你判断同一个子问题下的多条证据**彼此是
 def _evidence_block(evidence: list[dict[str, Any]]) -> str:
     lines = []
     for item in evidence[:MAX_EVIDENCE_PER_REVIEW]:
-        locator = ", ".join(
-            value
-            for value in (
-                f"p.{item.get('page')}" if item.get("page") else "",
-                str(item.get("section_path") or ""),
-            )
-            if value
-        )
+        locator = locator_display(item) or ""
         lines.append(
             f"- evidence_id={item.get('evidence_id')} work={item.get('work_id')} "
             f"cite={item.get('cite_key')} grade={item.get('grade')} "

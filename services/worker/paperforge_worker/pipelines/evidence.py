@@ -42,6 +42,7 @@ from ingest import classify_content_role, parse_markdown_table
 from sqlalchemy import delete, or_, select
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.locators import is_located, locator_display
 from paperforge_worker.pipelines.experiment_extraction import (
     ExperimentExtraction,
     ExtractedResultCell,
@@ -1108,8 +1109,8 @@ def _source_location(candidate: EvidenceCandidate) -> str:
 
 
 def _locator_display(candidate: EvidenceCandidate) -> str | None:
-    parts = [f"p.{candidate.page}" if candidate.page else "", candidate.object_ref or ""]
-    return ", ".join(part for part in parts if part) or None
+    """人可读定位；与 `is_located` 同源，所以不会出现「可定位却显示不出来」。"""
+    return locator_display(candidate)
 
 
 def _cue_lookup(text: str, pairs: tuple[tuple[str, str], ...]) -> str | None:
@@ -1390,7 +1391,18 @@ def _fulltext_grade(
     # N4 / M1-9: A-grade only for true structured cells, never prose mentions.
     if anchor_strength == "structured_cell" and object_ref and (page or section):
         return "A_located_structured"
-    if page or section or paragraph:
+    # B/C 的分界就是「引用者能不能查证」，与 R6 判定数字句用的是同一个谓词
+    # （见 paperforge_worker.locators）。此前这里写 `page or section or paragraph`
+    # 而 R6 写 `page or object_ref`，于是 5,256 条被本函数命名为「已定位」的单元
+    # 在写作阶段被当成未定位，引用它们的数字句整句删掉。
+    if is_located(
+        {
+            "page": page,
+            "object_ref": object_ref,
+            "section_path": section,
+            "paragraph_index": paragraph,
+        }
+    ):
         return "B_located_prose"
     return "C_fulltext_unlocated"
 

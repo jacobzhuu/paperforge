@@ -18,6 +18,8 @@ from typing import Any
 
 from llm_runtime import LLMRunner
 
+from paperforge_worker.locators import locator_display
+
 MAX_SECTIONS = 8
 MIN_SECTIONS = 3
 # 8 条要点对齐 `MAX_PARAGRAPHS_PER_SECTION`（writing.py，现为 8）：一条要点写成
@@ -1032,15 +1034,7 @@ def review_synthesis_section(
             if measurement
             else ("未结构化" if zh else "Not structured")
         )
-        locator = ", ".join(
-            value
-            for value in (
-                f"p.{evidence.get('page')}" if evidence.get("page") else "",
-                str(evidence.get("section_path") or ""),
-                str(evidence.get("object_ref") or ""),
-            )
-            if value
-        ) or ("未定位" if zh else "Unlocated")
+        locator = locator_display(evidence) or ("未定位" if zh else "Unlocated")
         rows.append(
             [
                 _short_study_label(str(evidence.get("title") or ""), evidence.get("year")),
@@ -1141,15 +1135,7 @@ def evidence_ledger_section(
             seen.add(evidence_id)
             evidence_ids.append(evidence_id)
             cite_keys.append(cite_key)
-            locator = ", ".join(
-                value
-                for value in (
-                    str(evidence.get("locator_display") or ""),
-                    f"p.{evidence.get('page')}" if evidence.get("page") else "",
-                    str(evidence.get("object_ref") or ""),
-                )
-                if value
-            ) or ("未定位" if zh else "Unlocated")
+            locator = locator_display(evidence) or ("未定位" if zh else "Unlocated")
             rows.append(
                 [
                     _short_study_label(

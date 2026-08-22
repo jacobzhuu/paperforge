@@ -21,6 +21,8 @@ from typing import Any, Literal, cast
 from llm_runtime import LLMRunner
 from scholar_gateway.normalize import token_set_jaccard
 
+from paperforge_worker.locators import is_located
+
 SOFT_CHECK_THRESHOLD = 0.5
 MAX_SOFT_CHECKS = 40
 RECENT_YEARS_WINDOW = 5
@@ -307,9 +309,8 @@ def build_claim_evidence(
                         )
                         score = _support_score(sentence, excerpt or "") if excerpt else None
                         grade_ok = _evidence_grade_ok(claim_kind, sentence, grade) if unit else None
-                        numeric_locator_ok = claim_kind != "numeric" or bool(
-                            point.get("page") is not None or point.get("object_ref")
-                        )
+                        # 与写作阶段 R6、证据定级共用同一个谓词，不再各写一份。
+                        numeric_locator_ok = claim_kind != "numeric" or is_located(point)
                         supported = bool(
                             located
                             and score is not None

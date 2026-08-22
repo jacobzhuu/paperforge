@@ -22,6 +22,7 @@ from db import (
 )
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.locators import locator_display
 
 # 从 24 提到 48。本文件的 docstring 记着：一次真实运行抽出 848 条证据单元，每个
 # 问题只看前 24 条，**97% 从没被任何问题看过**。文献库扩到 38 篇之后证据总量还会
@@ -852,15 +853,7 @@ def _matrix_prompt(
 ) -> str:
     lines = [f"Sub-question: {question}", "Candidate evidence:"]
     for unit, score in candidates:
-        locator = ", ".join(
-            value
-            for value in (
-                f"p.{unit.page}" if unit.page else "",
-                unit.section_path or "",
-                unit.object_ref or "",
-            )
-            if value
-        )
+        locator = locator_display(unit) or ""
         measure_text = "; ".join(
             f"{item.metric_name}={item.value}{item.unit or ''}"
             f" dataset={item.dataset or 'unknown'} key={item.comparability_key}"

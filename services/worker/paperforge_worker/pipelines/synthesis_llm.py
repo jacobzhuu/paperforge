@@ -31,6 +31,8 @@ from typing import Any
 from ingest.numlint import build_asset_index, lint_text
 from llm_runtime import LLMRunner
 
+from paperforge_worker.locators import locator_display
+
 SYNTHESIZER_ROLE = "synthesizer"
 
 # 全文级证据。D_abstract_only 只能用于背景或「该文献报告」式转述，不能承载综合结论。
@@ -375,18 +377,7 @@ def render_bundle(bundle: dict[str, Any]) -> str:
 
     used = len("\n".join(lines))
     for row in bundle.get("evidence") or []:
-        locator = (
-            ", ".join(
-                value
-                for value in (
-                    f"p.{row.get('page')}" if row.get("page") else "",
-                    str(row.get("section_path") or ""),
-                    str(row.get("object_ref") or ""),
-                )
-                if value
-            )
-            or "unlocated"
-        )
+        locator = locator_display(row) or "unlocated"
         measurements = "; ".join(
             f"{item.get('metric_name')}={item.get('value')}{item.get('unit') or ''} "
             f"dataset={item.get('dataset') or 'unknown'} "
