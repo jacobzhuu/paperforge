@@ -95,7 +95,39 @@ async def _record_section_zh(out: Path) -> list[dict[str, Any]]:
     return provider.rows
 
 
-SCENARIOS = {"section_zh": _record_section_zh}
+async def _record_document_en(out: Path) -> list[dict[str, Any]]:
+    """整篇手稿：需要真实 Postgres，因为 `write_document` 全程读写数据库。
+
+    连接串取自 PAPERFORGE_TEST_DATABASE_URL，与测试同一个入口，绝不碰生产库。
+    """
+    import test_document_snapshot as scenario
+    from db import make_engine, make_session_factory
+    from paperforge_worker.context import JobContext
+    from paperforge_worker.pipelines.document import write_document
+
+    url = os.environ.get("PAPERFORGE_TEST_DATABASE_URL", "")
+    if not url:
+        raise SystemExit("PAPERFORGE_TEST_DATABASE_URL 未配置：整篇手稿场景需要真实 Postgres。")
+    session_factory = make_session_factory(make_engine(url, application_name="pf-record"))
+
+    provider = _RecordingProvider(create_llm_provider(_config()))
+    runner = LLMRunner(_config(), provider=provider)
+
+    project_id = await scenario._seed(session_factory)
+    context = scenario._context(project_id, session_factory)
+    JobContext.llm_runner = lambda self: runner  # type: ignore[method-assign]
+    outcome = await write_document(
+        context,
+        language="en",
+        title="Poisoning attacks on sequential recommenders",
+        paper_type="review",
+        coherence=False,
+    )
+    print(f"  wrote {outcome.section_count} section(s)")
+    return provider.rows
+
+
+SCENARIOS = {"section_zh": _record_section_zh, "document_en": _record_document_en}
 
 
 def main(argv: list[str]) -> int:
