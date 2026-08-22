@@ -167,3 +167,91 @@ def test_the_runner_leaves_cost_none_when_the_provider_reports_no_usage():
 
     assert record.input_tokens is None
     assert record.cost_estimate is None
+
+
+# --- 请求侧的形状同样要留痕 --------------------------------------------------
+
+
+def test_a_record_carries_the_shape_of_the_request_that_produced_it():
+    """台账要能回答「当时问的是什么」，不只是「花了多少」。
+
+    没有这几列，一次截断有没有预算余量、一节写薄了是不是因为议程只有一行，
+    都只能翻管线源码去猜，而源码答的是「现在」，不是「那次调用时」。
+    """
+    records: list[LLMCallRecord] = []
+    runner = LLMRunner(
+        LLMConfig(provider="stub", role_models={"planner": "deepseek-v4-pro"}),
+        provider=_StubProvider({"prompt_tokens": 10, "completion_tokens": 2}),
+        on_call=records.append,
+    )
+
+    runner.generate(
+        "planner", system_prompt="sys", user_prompt="user", max_output_tokens=1234
+    )
+
+    record = records[0]
+    assert record.max_output_tokens == 1234
+    assert record.prompt_chars == len("sys\nuser")
+    assert record.output_chars == len("{}")
+    # 摘要而非原文：64 个十六进制字符，不含任何内容。
+    assert record.prompt_sha256 is not None
+    assert len(record.prompt_sha256) == 64
+    assert int(record.prompt_sha256, 16) >= 0
+
+
+def test_the_same_prompt_hashes_the_same_and_a_changed_one_does_not():
+    """「这次和上次是不是同一个 prompt」——区分提示词回归与模型回归的那个问题。"""
+
+    def digest(system_prompt: str, user_prompt: str) -> str:
+        records: list[LLMCallRecord] = []
+        runner = LLMRunner(
+            LLMConfig(provider="stub", role_models={"planner": "deepseek-v4-pro"}),
+            provider=_StubProvider(None),
+            on_call=records.append,
+        )
+        runner.generate("planner", system_prompt=system_prompt, user_prompt=user_prompt)
+        return records[0].prompt_sha256
+
+    assert digest("sys", "user") == digest("sys", "user")
+    assert digest("sys", "user") != digest("sys", "user ")
+    # system 与 user 之间要有分隔，否则边界移动会散列成同一个值。
+    assert digest("a", "b") != digest("ab", "")
+
+
+def test_a_failed_call_still_records_what_was_asked():
+    """失败那一条恰恰最需要请求侧的形状：截断到底还有没有余量，靠的就是它。"""
+    from llm_runtime import LLMError
+
+    class _Truncating:
+        name = "stub"
+
+        def generate(self, request: LLMRequest) -> LLMResponse:
+            raise LLMError(
+                provider=self.name,
+                error_code="output_truncated",
+                message="no content before max_tokens",
+                retryable=False,
+                finish_reason="length",
+            )
+
+    records: list[LLMCallRecord] = []
+    runner = LLMRunner(
+        LLMConfig(provider="stub", role_models={"planner": "deepseek-v4-pro"}),
+        provider=_Truncating(),
+        on_call=records.append,
+    )
+
+    assert (
+        runner.generate(
+            "planner", system_prompt="s", user_prompt="u", max_output_tokens=8000
+        )
+        is None
+    )
+
+    record = records[0]
+    assert record.max_output_tokens == 8000
+    assert record.finish_reason == "length"
+    assert record.prompt_sha256 is not None
+    # 8000 在 deepseek 的 8192 上限下加不动，所以这一条记的是「没重试」而不是
+    # 「重试了又失败」。
+    assert record.error_code == "output_truncated_at_ceiling"

@@ -244,6 +244,11 @@ class JobContext:
                     cost_estimate=record.cost_estimate,
                     latency_ms=record.latency_ms,
                     error_code=record.error_code,
+                    max_output_tokens=record.max_output_tokens,
+                    finish_reason=record.finish_reason,
+                    prompt_sha256=record.prompt_sha256,
+                    prompt_chars=record.prompt_chars,
+                    output_chars=record.output_chars,
                     metadata=record.metadata,
                     occurred_at=record.occurred_at,
                 )

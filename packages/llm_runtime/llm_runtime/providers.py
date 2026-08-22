@@ -327,6 +327,7 @@ class OpenAICompatibleLLMProvider:
                     # budget — and skips even that when the model ceiling is
                     # already reached.
                     retryable=False,
+                    finish_reason=str(finish_reason) if finish_reason else None,
                 )
             # 结构合法、正常终止、却一个 content 块都没有：这是服务商偶发的退化
             # 完成，不是「响应结构非法」。这次尝试没有产生任何持久副作用，重复它
@@ -338,6 +339,7 @@ class OpenAICompatibleLLMProvider:
                 status_code=response.status_code,
                 message="LLM completed normally but returned no content.",
                 retryable=True,
+                finish_reason=str(finish_reason) if finish_reason else None,
             )
 
         usage = payload.get("usage")

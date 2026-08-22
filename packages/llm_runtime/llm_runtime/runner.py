@@ -11,6 +11,7 @@ Draft-first：``generate_json`` 在 provider 不可用或输出不合法时返�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -29,6 +30,16 @@ DEFAULT_MAX_OUTPUT_TOKENS = 4096
 #: 的上限就在这儿，再问一遍也是同一个请求」，后者说「预算不够，加了还有救」。
 #: 混成一个码，台账里就分不出「补救失败」和「压根没补救」。
 TRUNCATED_AT_CEILING = "output_truncated_at_ceiling"
+
+
+def _prompt_digest(system_prompt: str, user_prompt: str) -> tuple[str, int]:
+    """Prompt 的身份与规模：摘要 + 字符数。
+
+    只存摘要不存原文。「这次和上次是不是同一个 prompt」是区分提示词回归与模型
+    回归的那个问题，而回答它不需要留下内容。
+    """
+    joined = f"{system_prompt}\n{user_prompt}"
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest(), len(joined)
 
 
 def _retry_budget(budget: int, *, model: str, policy: TruncationRetryPolicy) -> int:
@@ -60,6 +71,12 @@ class LLMCallRecord:
     cost_estimate: float | None = None
     latency_ms: int | None = None
     error_code: str | None = None
+    #: 请求侧的形状。成功与失败都要记：失败那一条恰恰是最需要它的。
+    max_output_tokens: int | None = None
+    finish_reason: str | None = None
+    prompt_sha256: str | None = None
+    prompt_chars: int | None = None
+    output_chars: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -142,6 +159,7 @@ class LLMRunner:
             thinking_mode=self._config.thinking_for_role(role),
             metadata={"role": role, **(metadata or {})},
         )
+        prompt_sha256, prompt_chars = _prompt_digest(system_prompt, user_prompt)
         started = time.monotonic()
         try:
             response = self._resolve_provider().generate(request)
@@ -162,6 +180,10 @@ class LLMRunner:
                     if truncated and not can_retry
                     else error.error_code
                 ),
+                max_output_tokens=max_output_tokens,
+                finish_reason=error.finish_reason,
+                prompt_sha256=prompt_sha256,
+                prompt_chars=prompt_chars,
                 metadata=request.metadata,
             )
             if truncated and can_retry:
@@ -193,6 +215,9 @@ class LLMRunner:
                 provider=self._config.provider,
                 latency_ms=_elapsed_ms(started),
                 error_code=type(error).__name__,
+                max_output_tokens=max_output_tokens,
+                prompt_sha256=prompt_sha256,
+                prompt_chars=prompt_chars,
                 metadata=request.metadata,
             )
             return None
@@ -206,6 +231,11 @@ class LLMRunner:
             output_tokens=_int_or_none(
                 usage.get("completion_tokens") or usage.get("output_tokens")
             ),
+            max_output_tokens=max_output_tokens,
+            finish_reason=response.finish_reason,
+            prompt_sha256=prompt_sha256,
+            prompt_chars=prompt_chars,
+            output_chars=len(response.text),
             metadata=request.metadata,
         )
         return response
@@ -323,6 +353,11 @@ class LLMRunner:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         error_code: str | None = None,
+        max_output_tokens: int | None = None,
+        finish_reason: str | None = None,
+        prompt_sha256: str | None = None,
+        prompt_chars: int | None = None,
+        output_chars: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         if self._on_call is None:
@@ -343,6 +378,11 @@ class LLMRunner:
                 ),
                 latency_ms=latency_ms,
                 error_code=error_code,
+                max_output_tokens=max_output_tokens,
+                finish_reason=finish_reason,
+                prompt_sha256=prompt_sha256,
+                prompt_chars=prompt_chars,
+                output_chars=output_chars,
                 metadata=dict(metadata or {}),
             )
         )

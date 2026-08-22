@@ -41,12 +41,17 @@ class LLMError(RuntimeError):
         message: str,
         status_code: int | None = None,
         retryable: bool = False,
+        finish_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.error_code = error_code
         self.status_code = status_code
         self.retryable = retryable
+        # 失败也有 finish_reason。截断时它是 "length"，而这正是台账里区分
+        # 「预算不够」与「模型自己停了」的那一位信息——只在成功路径上记录，
+        # 恰好把最需要它的那一类调用漏掉了。
+        self.finish_reason = finish_reason
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -55,4 +60,5 @@ class LLMError(RuntimeError):
             "status_code": self.status_code,
             "message": str(self),
             "retryable": self.retryable,
+            "finish_reason": self.finish_reason,
         }

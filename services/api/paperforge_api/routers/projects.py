@@ -83,6 +83,7 @@ from paperforge_api.deps import (
 )
 from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.jobs import reconcile_abandoned_jobs, start_job
+from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.schemas import (
     CostResponse,
     CreateProjectRequest,
@@ -614,23 +615,24 @@ async def generate_scope_endpoint(
     session: SessionDep,
 ) -> ScopeResponse:
     """同步生成 SCOPE：planner 角色调用 + 确定性回退，秒级返回。"""
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.scope import generate_scope as run_generate_scope
 
     from paperforge_api.config import get_settings
 
     project = await _require_project(session, project_id)
     topic = (request.topic or (project.scope_json or {}).get("topic") or project.title).strip()
-    runner = LLMRunner(get_settings().llm_config())
-    scope = await run_generate_scope(
-        topic,
-        language=project.language,
-        paper_type=project.paper_type,
-        runner=runner,
-    )
-    merged = {**(project.scope_json or {}), **scope}
-    await update_project_scope(session, project, merged)
-    return ScopeResponse(project_id=str(project.id), scope=merged)
+    async with accounted_runner(
+        session, get_settings().llm_config(), project_id=project.id
+    ) as runner:
+        scope = await run_generate_scope(
+            topic,
+            language=project.language,
+            paper_type=project.paper_type,
+            runner=runner,
+        )
+        merged = {**(project.scope_json or {}), **scope}
+        await update_project_scope(session, project, merged)
+        return ScopeResponse(project_id=str(project.id), scope=merged)
 
 
 # ---- 检索与导入（异步任务） ----

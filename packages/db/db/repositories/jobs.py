@@ -400,6 +400,11 @@ async def record_llm_call(
     cost_estimate: float | None = None,
     latency_ms: int | None = None,
     error_code: str | None = None,
+    max_output_tokens: int | None = None,
+    finish_reason: str | None = None,
+    prompt_sha256: str | None = None,
+    prompt_chars: int | None = None,
+    output_chars: int | None = None,
     metadata: dict[str, Any] | None = None,
     occurred_at: datetime | None = None,
 ) -> LlmCallLog:
@@ -415,6 +420,11 @@ async def record_llm_call(
         cost_estimate=cost_estimate,
         latency_ms=latency_ms,
         error_code=error_code,
+        max_output_tokens=max_output_tokens,
+        finish_reason=finish_reason,
+        prompt_sha256=prompt_sha256,
+        prompt_chars=prompt_chars,
+        output_chars=output_chars,
         metadata_json=metadata,
         occurred_at=occurred_at or datetime.now(UTC),
     )

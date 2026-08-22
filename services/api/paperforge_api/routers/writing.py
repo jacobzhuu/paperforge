@@ -64,6 +64,7 @@ from paperforge_api.deps import (
 )
 from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.jobs import start_job
+from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
     AcceptSectionRewriteRequest,
@@ -1469,7 +1470,6 @@ async def refine_text(
     红线：润色**不得**新增引用键、不得改动任何数字——改动后一旦发现数字变化，
     直接放弃改写并原样返回（宁可不润色，也不让数字漂移）。
     """
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.writing import extract_numbers
 
     from paperforge_api.config import get_settings as api_settings
@@ -1480,61 +1480,63 @@ async def refine_text(
     if not original:
         raise HTTPException(status_code=422, detail="text must not be empty")
 
-    runner = LLMRunner(api_settings().llm_config())
-    if not runner.enabled:
-        return RefineResponse(
-            action=request.action,
-            original=original,
-            refined=original,
-            changed=False,
-            note="未配置 LLM provider：润色不可用，已原样返回",
-        )
+    async with accounted_runner(
+        session, api_settings().llm_config(), project_id=project_id
+    ) as runner:
+        if not runner.enabled:
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="未配置 LLM provider：润色不可用，已原样返回",
+            )
 
-    goals = {
-        "polish": "润色文字，使表达更准确流畅",
-        "expand": "在不引入新事实的前提下展开论述",
-        "shorten": "精简表达，保留全部论点",
-        "academic_tone": "调整为学术书面语气",
-    }
-    response = await runner.agenerate(
-        "polisher",
-        system_prompt=(
-            "你是学术论文润色助手。只输出改写后的正文纯文本，不要解释。"
-            "绝对禁止：新增或修改任何数字、新增引用标记、引入原文没有的事实。"
-        ),
-        user_prompt=(
-            f"目标：{goals.get(request.action, '润色')}\n"
-            f"额外要求：{request.instruction or '无'}\n\n原文：\n{original}"
-        ),
-        max_output_tokens=2000,
-        temperature=0.3,
-        metadata={"stage": "refine", "action": request.action},
-    )
-    if response is None or not response.text.strip():
-        return RefineResponse(
-            action=request.action,
-            original=original,
-            refined=original,
-            changed=False,
-            note="润色调用失败，已原样返回",
+        goals = {
+            "polish": "润色文字，使表达更准确流畅",
+            "expand": "在不引入新事实的前提下展开论述",
+            "shorten": "精简表达，保留全部论点",
+            "academic_tone": "调整为学术书面语气",
+        }
+        response = await runner.agenerate(
+            "polisher",
+            system_prompt=(
+                "你是学术论文润色助手。只输出改写后的正文纯文本，不要解释。"
+                "绝对禁止：新增或修改任何数字、新增引用标记、引入原文没有的事实。"
+            ),
+            user_prompt=(
+                f"目标：{goals.get(request.action, '润色')}\n"
+                f"额外要求：{request.instruction or '无'}\n\n原文：\n{original}"
+            ),
+            max_output_tokens=2000,
+            temperature=0.3,
+            metadata={"stage": "refine", "action": request.action},
         )
+        if response is None or not response.text.strip():
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="润色调用失败，已原样返回",
+            )
 
-    refined = response.text.strip()
-    if extract_numbers(refined) != extract_numbers(original):
-        # 数字红线优先于文采。
+        refined = response.text.strip()
+        if extract_numbers(refined) != extract_numbers(original):
+            # 数字红线优先于文采。
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="改写改动了正文数字，已放弃本次润色",
+            )
         return RefineResponse(
             action=request.action,
             original=original,
-            refined=original,
-            changed=False,
-            note="改写改动了正文数字，已放弃本次润色",
+            refined=refined,
+            changed=refined != original,
         )
-    return RefineResponse(
-        action=request.action,
-        original=original,
-        refined=refined,
-        changed=refined != original,
-    )
 
 
 @router.post(
@@ -1548,7 +1550,6 @@ async def rewrite_section_candidate(
     session: SessionDep,
 ) -> RewriteSectionCandidateResponse:
     """只生成候选，不写数据库；引用、数字与素材引用必须原样守恒。"""
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.writing import extract_numbers
 
     from paperforge_api.config import get_settings as api_settings
@@ -1564,58 +1565,61 @@ async def rewrite_section_candidate(
         raise HTTPException(status_code=404, detail="section not found")
     require_section_unchanged(row, request.expected_updated_at)
     original = IRSection(**(row.body_ir_json or {}))
-    runner = LLMRunner(api_settings().llm_config())
-    if not runner.enabled:
+    async with accounted_runner(
+        session, api_settings().llm_config(), project_id=project.id
+    ) as runner:
+        if not runner.enabled:
+            return RewriteSectionCandidateResponse(
+                section_key=section_key,
+                original_body_ir=original.model_dump(mode="json"),
+                candidate_body_ir=original.model_dump(mode="json"),
+                changed=False,
+                checks={"citations": "pass", "numbers": "pass", "assets": "pass"},
+                note="未配置 LLM provider，未生成候选",
+            )
+        response = await runner.agenerate_json(
+            "writer",
+            system_prompt=(
+                "你是学术论文单章重写助手。返回完整 Section JSON。只能修改 text run 的 v 字段；"
+                "所有 cite/grounding/xref/math_inline run、非文字 block、key、title "
+                "和结构必须保留。"
+                "禁止新增、删除或修改任何数字、引用键、证据 id、素材引用与图表。"
+            ),
+            user_prompt=(
+                f"用户要求：{request.instruction}\n"
+                f"允许的证据引用（仅作范围说明，不得新增）：{request.allowed_evidence_refs}\n"
+                f"原章节 JSON：{original.model_dump_json()}"
+            ),
+            max_output_tokens=8000,
+            temperature=0.2,
+            metadata={"stage": "rewrite_section", "section_key": section_key},
+        )
+        if not response.ok or not isinstance(response.value, dict):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "rewrite_generation_failed",
+                    "message": response.error or "模型未返回有效候选",
+                },
+            )
+        try:
+            candidate = IRSection(**response.value)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(
+                status_code=422, detail={"code": "rewrite_invalid_ir", "message": str(error)}
+            ) from error
+        checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
+        if any(value != "pass" for value in checks.values()):
+            raise HTTPException(
+                status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
+            )
         return RewriteSectionCandidateResponse(
             section_key=section_key,
             original_body_ir=original.model_dump(mode="json"),
-            candidate_body_ir=original.model_dump(mode="json"),
-            changed=False,
-            checks={"citations": "pass", "numbers": "pass", "assets": "pass"},
-            note="未配置 LLM provider，未生成候选",
+            candidate_body_ir=candidate.model_dump(mode="json"),
+            changed=candidate != original,
+            checks=checks,
         )
-    response = await runner.agenerate_json(
-        "writer",
-        system_prompt=(
-            "你是学术论文单章重写助手。返回完整 Section JSON。只能修改 text run 的 v 字段；"
-            "所有 cite/grounding/xref/math_inline run、非文字 block、key、title 和结构必须保留。"
-            "禁止新增、删除或修改任何数字、引用键、证据 id、素材引用与图表。"
-        ),
-        user_prompt=(
-            f"用户要求：{request.instruction}\n"
-            f"允许的证据引用（仅作范围说明，不得新增）：{request.allowed_evidence_refs}\n"
-            f"原章节 JSON：{original.model_dump_json()}"
-        ),
-        max_output_tokens=8000,
-        temperature=0.2,
-        metadata={"stage": "rewrite_section", "section_key": section_key},
-    )
-    if not response.ok or not isinstance(response.value, dict):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "rewrite_generation_failed",
-                "message": response.error or "模型未返回有效候选",
-            },
-        )
-    try:
-        candidate = IRSection(**response.value)
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(
-            status_code=422, detail={"code": "rewrite_invalid_ir", "message": str(error)}
-        ) from error
-    checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
-    if any(value != "pass" for value in checks.values()):
-        raise HTTPException(
-            status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
-        )
-    return RewriteSectionCandidateResponse(
-        section_key=section_key,
-        original_body_ir=original.model_dump(mode="json"),
-        candidate_body_ir=candidate.model_dump(mode="json"),
-        changed=candidate != original,
-        checks=checks,
-    )
 
 
 @router.post(
