@@ -218,6 +218,10 @@ class QuestionSynthesis(Base):
 
 class GenerationJob(Base):
     __tablename__ = "generation_job"
+    # 0027 用 SQL 建了这个索引却没有在模型上声明它，于是 `alembic check` 从那次
+    # 提交起一直把它报成「该被删掉的索引」——一条阻断性 CI 步骤自此常红，
+    # 下一个真正的 schema 漂移就没人看得见了。
+    __table_args__ = (Index("ix_generation_job_status_heartbeat", "status", "heartbeat_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     project_id: Mapped[uuid.UUID] = mapped_column(
@@ -647,6 +651,16 @@ class LlmCallLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     # 失败调用也要留痕：否则成本面板里「失败」与「零 token 成功」无法区分。
     error_code: Mapped[str | None] = mapped_column(String(64))
+    # 请求侧的形状。没有这几列，台账只能回答「花了多少」，回答不了「当时问的是
+    # 什么」——一次截断到底还有没有预算余量、一节写薄了是不是因为议程只有一行，
+    # 都得靠翻管线源码去猜。全部可空：蓝绿部署下正在排空的旧 worker 会省略它们。
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer)
+    finish_reason: Mapped[str | None] = mapped_column(String(32))
+    # 只存摘要不存原文：64 字节、零内容、零隐私风险，却足以回答「这次和上次是不是
+    # 同一个 prompt」——那正是区分「提示词回归」与「模型回归」的那个问题。
+    prompt_sha256: Mapped[str | None] = mapped_column(String(64))
+    prompt_chars: Mapped[int | None] = mapped_column(Integer)
+    output_chars: Mapped[int | None] = mapped_column(Integer)
     metadata_json: Mapped[dict | None] = mapped_column(JSONB)
     # Keep a server default for blue/green compatibility: an older worker may
     # finish an in-flight job after this column exists and omit it on INSERT.
