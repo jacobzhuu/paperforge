@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -257,12 +258,15 @@ class OpenAICompatibleLLMProvider:
 
     def _parse_response(self, response: httpx.Response) -> LLMResponse:
         if response.status_code >= 400:
-            error_code, retryable = _classify_http_status(response.status_code)
+            # 分类要看正文，不只看状态码：服务商用来表达「余额耗尽」的状态码并不统一
+            # （DeepSeek 用 402，也有用 429 的），而措辞是稳定的。
+            message = _sanitize_message(_error_message(response), self.api_key)
+            error_code, retryable = _classify_http_status(response.status_code, message)
             raise LLMError(
                 provider=self.name,
                 error_code=error_code,
                 status_code=response.status_code,
-                message=_sanitize_message(_error_message(response), self.api_key),
+                message=message,
                 retryable=retryable,
             )
 
@@ -357,7 +361,42 @@ class OpenAICompatibleLLMProvider:
         )
 
 
-def _classify_http_status(status_code: int) -> tuple[str, bool]:
+#: 账户余额或配额耗尽。与 ``rate_limited`` 是两件事：限流等一会儿就好，余额耗尽
+#: 在有人去充值之前，重试多少次都是同一个回答。也与 ``auth_error`` 不同——凭证是
+#: 好的，只是没钱了，修法是充值而不是换 key。
+QUOTA_EXHAUSTED = "quota_exhausted"
+
+#: 服务商表达「没钱了 / 配额用完了」的措辞。状态码不统一（DeepSeek 余额不足返回
+#: 402，另一些返回 429），措辞反而稳定，所以两个信号都认。
+_QUOTA_PHRASES = re.compile(
+    r"insufficient\s+(?:balance|quota|credits?|funds?)"
+    r"|(?:quota|usage\s+limit)\s+(?:exceeded|exhausted|reached)"
+    r"|exceed(?:ed|s)?\s+(?:(?:your|the)\s+)?(?:current\s+)?quota"
+    r"|(?:balance|credits?)\s+(?:(?:are|is|have|has)\s+(?:been\s+)?)?(?:exhausted|depleted)"
+    r"|out\s+of\s+(?:credits?|budget)"
+    r"|billing\s+(?:hard\s+)?limit"
+    r"|余额不足|额度不足|配额不足|欠费",
+    re.IGNORECASE,
+)
+
+
+def is_quota_exhausted(status_code: int | None, detail: str = "") -> bool:
+    """这次失败是不是「账户没钱 / 配额用完」。
+
+    :param status_code: HTTP 状态码；402 Payment Required 本身就够定性。
+    :param detail: 服务商返回的错误正文（已脱敏）。
+    :returns: 判定结果。
+    """
+    if status_code == 402:
+        return True
+    return bool(_QUOTA_PHRASES.search(detail or ""))
+
+
+def _classify_http_status(status_code: int, detail: str = "") -> tuple[str, bool]:
+    # 余额判定放在最前：一个正文写着 "Insufficient Balance" 的 429 是余额耗尽，
+    # 不是限流，把它当限流去重试只会一直撞同一堵墙。
+    if is_quota_exhausted(status_code, detail):
+        return QUOTA_EXHAUSTED, False
     if status_code in {401, 403}:
         return "auth_error", False
     if status_code == 429:

@@ -29,7 +29,7 @@ from db import (
     update_job,
 )
 from db.session import make_engine, make_session_factory
-from llm_runtime import LLMCallRecord, LLMConfig, LLMRunner
+from llm_runtime import QUOTA_EXHAUSTED, LLMCallRecord, LLMConfig, LLMRunner
 from observability import get_logger
 from scholar_gateway import InMemoryHttpCache, SqlAlchemyHttpCache
 from sqlalchemy import select
@@ -298,6 +298,29 @@ class JobContext:
     def warn(self, stage: str, reason: str, detail: dict[str, Any] | None = None) -> None:
         """记录降级标记：任何阶段失败都留痕，但不阻断交付（draft-first）。"""
         self.warnings.append({"stage": stage, "reason": reason, **(detail or {})})
+
+    def provider_quota_failure(self) -> dict[str, Any] | None:
+        """本次运行有没有因为余额/配额耗尽而失败的模型调用。
+
+        Draft-first 让每个阶段自己吞掉 LLM 失败并降级，这在内容问题上是对的；但
+        账户没钱是**外部终局故障**，降级之后交付出来的是一份空稿，而用户读到的是
+        「章节重试后仍没有正文」——真正该做的事（充值）一个字都没提。记账缓冲区是
+        唯一还留着原始错误码的地方，收尾时据此把话说清楚。
+
+        :returns: 首次余额失败的摘要；本次运行没有则为 ``None``。
+        """
+        for record in self.llm_calls:
+            if record.error_code == QUOTA_EXHAUSTED:
+                return {
+                    "provider": record.provider,
+                    "model": record.model,
+                    "role": record.role,
+                    "occurred_at": record.occurred_at.isoformat(),
+                    "affected_calls": sum(
+                        1 for item in self.llm_calls if item.error_code == QUOTA_EXHAUSTED
+                    ),
+                }
+        return None
 
 
 async def _load_job(session: AsyncSession, job_id: uuid.UUID):

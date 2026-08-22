@@ -28,6 +28,7 @@ from db import (
     update_project_scope,
 )
 from db.session import make_engine, make_session_factory
+from llm_runtime import QUOTA_EXHAUSTED
 from observability import configure_logging, get_logger, record_job_stage
 
 from paperforge_worker.config import WorkerSettings as Settings
@@ -3703,6 +3704,11 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
         error_payload = {"reason": "not_delivered", "warnings": context.warnings}
         if context.last_failure:
             error_payload["failure"] = context.last_failure
+        quota = context.provider_quota_failure()
+        if quota is not None:
+            # 交付不出来而账户没钱时，行上必须写着「没钱」，不能只留一个 not_delivered。
+            error_payload["reason"] = QUOTA_EXHAUSTED
+            error_payload["failure"] = {"error_code": QUOTA_EXHAUSTED, **quota}
     async with context.session() as session:
         job = await session.get(GenerationJob, context.job_id)
         if job is not None:
@@ -3738,8 +3744,60 @@ async def _finish_write_outcome(context: JobContext, outcome: Any) -> None:
     await _finish(context, delivered=True)
 
 
+async def _finish_provider_quota_exhausted(
+    context: JobContext, quota: dict[str, Any], *, quality_report: Any = None
+) -> None:
+    """账户余额/配额耗尽：说清楚是没钱了，而不是「章节写不出来」。
+
+    这不是内容问题，也不是用户能靠「再修一轮」解决的问题——重试在有人充值之前
+    只会得到同一个回答。所以状态用 ``failed`` 而不是 ``needs_input``：后者会给出
+    修复/润色入口，而那两个动作此刻必然立刻再失败一次。
+    """
+    calls = int(quota.get("affected_calls") or 0)
+    payload = {
+        "status": "failed",
+        "readiness_status": "provider_quota_exhausted",
+        "blockers": [
+            {
+                "code": "provider_quota_exhausted",
+                "message": (
+                    f"模型服务商账户余额或配额已耗尽（{quota.get('provider') or '未知服务商'}），"
+                    f"本次运行有 {calls} 次调用因此失败。充值或提升配额后重新运行即可，"
+                    "重试在此之前不会有不同结果。"
+                ),
+                "provider": quota.get("provider"),
+                "model": quota.get("model"),
+                "failed_calls": calls,
+            }
+        ],
+        "failure": {"error_code": QUOTA_EXHAUSTED, **quota},
+        "quality_report_id": getattr(quality_report, "report_id", None),
+    }
+    await context.emit(
+        "job.failed",
+        payload,
+        stage="done",
+        checkpoint={"provider_quota_exhausted": payload},
+    )
+    if context.job_id is None:
+        return
+    from db.models.paper import GenerationJob
+
+    async with context.session() as session:
+        job = await session.get(GenerationJob, context.job_id)
+        if job is not None:
+            await update_job(session, job, status="failed", error=payload)
+    await context.notify_event()
+
+
 async def _finish_incomplete(context: JobContext, write_outcome: Any, quality_report: Any) -> None:
     """稿子不完整：保留产物，但明说缺哪几节、缺什么。"""
+    # 「一节都没写出来」最常见的外部成因是账户没钱。先把这件事认出来，否则报出去的
+    # 是「重试与自动修复之后仍然没有正文」，而它一个字都没提该去充值。
+    quota = context.provider_quota_failure()
+    if quota is not None:
+        await _finish_provider_quota_exhausted(context, quota, quality_report=quality_report)
+        return
     incomplete = (
         list(getattr(write_outcome, "incomplete_sections", None) or [])
         if write_outcome is not None

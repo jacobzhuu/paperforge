@@ -16,12 +16,14 @@ from llm_runtime.config import (
 )
 from llm_runtime.json_utils import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 from llm_runtime.providers import (
+    QUOTA_EXHAUSTED,
     LLMProvider,
     NoopLLMProvider,
     OpenAICompatibleLLMProvider,
     UnsupportedLLMProvider,
     build_chat_completions_url,
     clamp_max_output_tokens,
+    is_quota_exhausted,
     sanitize_openai_compatible_base_url,
 )
 from llm_runtime.retry_policy import (
@@ -52,6 +54,7 @@ __all__ = [
     "ModelPrice",
     "NoopLLMProvider",
     "OpenAICompatibleLLMProvider",
+    "QUOTA_EXHAUSTED",
     "Role",
     "TruncationRetryPolicy",
     "UnsupportedLLMProvider",
@@ -59,6 +62,7 @@ __all__ = [
     "clamp_max_output_tokens",
     "clean_and_parse_json",
     "create_llm_provider",
+    "is_quota_exhausted",
     "parse_model_prices",
     "parse_role_retry",
     "preflight_llm_provider",
