@@ -249,7 +249,11 @@ async def test_persisted_chunks_restore_page_and_section_markers(
             [work_id],
         )
     )[str(work_id)]
-    assert "[[PAGE=3 | SECTION=Results]]" in source.text
+    # 标记从落库的 chunk 还原；CHAR 是 Step 3 新增的一项，所以逐项断言而不是钉死
+    # 整串——再加一个标记不该让这条用例红。
+    assert "PAGE=3" in source.text
+    assert "SECTION=Results" in source.text
+    assert f"CHAR=0-{len(passage)}" in source.text
     assert passage in source.text
 
 

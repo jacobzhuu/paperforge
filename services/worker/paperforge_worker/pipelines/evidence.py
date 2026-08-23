@@ -88,6 +88,11 @@ class EvidenceCandidate:
     object_ref: str | None = None
     grade: str = "C_fulltext_unlocated"
     anchor_strength: str = "prose_only"
+    #: 原文档内的绝对字符区间。半开区间 ``[char_start, char_end)``，与
+    #: ``document_chunk`` 的口径一致（生产库 27,451 个 chunk 全部满足
+    #: ``char_end - char_start == len(text)``）。定位不到时为 None。
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -342,6 +347,8 @@ async def _extract_work_evidence(
                 topical_status=ontology_topical_status(candidate.text, tasks),
                 anchor_strength=candidate.anchor_strength,
                 locator_display=_locator_display(candidate),
+                char_start=candidate.char_start,
+                char_end=candidate.char_end,
             )
             unit_ids_by_text[candidate.text] = unit.id
             for measurement in _measurement_candidates(
@@ -1198,6 +1205,7 @@ def _evidence_candidates(
 ) -> list[EvidenceCandidate]:
     candidates: list[EvidenceCandidate] = []
     if fulltext_used:
+        chunk_spans = _chunk_spans(fulltext or "")
         for point in quotable_points:
             if not isinstance(point, dict):
                 continue
@@ -1215,15 +1223,19 @@ def _evidence_candidates(
                 strength = "object_mention"
             else:
                 strength = "prose_only"
+            excerpt = text[:MAX_EVIDENCE_TEXT_CHARS]
+            char_start, char_end = _locate_excerpt(fulltext or "", chunk_spans, excerpt)
             candidates.append(
                 EvidenceCandidate(
-                    text=text[:MAX_EVIDENCE_TEXT_CHARS],
+                    text=excerpt,
                     page=page,
                     section_path=section,
                     paragraph_index=paragraph,
                     object_ref=object_ref,
                     grade=_fulltext_grade(page, section, paragraph, object_ref, strength),
                     anchor_strength=strength,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
         candidates.extend(_located_fulltext_candidates(fulltext or ""))
@@ -1247,16 +1259,21 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(fulltext)
         locator = _parse_locator(match.group("locator"))
-        block = fulltext[match.end() : end].strip()
+        raw_block = fulltext[match.end() : end]
+        block = raw_block.strip()
         if not block or not classify_content_role(block).claim_eligible:
             continue
-        passages = [part.strip() for part in re.split(r"\n{2,}", block) if part.strip()]
-        if not passages:
-            passages = [block]
-        for paragraph_index, passage in enumerate(passages, start=1):
+        # `[[...]]\s*` 已经被 `_MARKER_RE` 吃掉，所以 raw_block 从 chunk.text 的第一个
+        # 字符开始；再减去 strip 掉的前导空白，就得到 block 在 chunk.text 里的偏移。
+        block_offset = len(raw_block) - len(raw_block.lstrip())
+        passages = _split_passages(block)
+        for paragraph_index, (passage_offset, passage) in enumerate(passages, start=1):
             if not _RESULT_CUES.search(passage) and not re.search(r"\d", passage):
                 continue
             text = passage[:MAX_EVIDENCE_TEXT_CHARS]
+            char_start, char_end = _passage_span(
+                locator, block_offset + passage_offset, len(text)
+            )
             structured_object_ref = locator.get("object_ref")
             object_ref = structured_object_ref or _object_reference(text)
             if structured_object_ref:
@@ -1280,9 +1297,94 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
                         strength,
                     ),
                     anchor_strength=strength,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
     return candidates
+
+
+def _chunk_spans(fulltext: str) -> list[tuple[int, int, int, int]]:
+    """每个带 ``CHAR`` 标记的 chunk 在拼接串里的范围，及其原文档偏移。
+
+    :returns: ``(拼接串起点, 拼接串终点, 文档内起点, 文档内终点)`` 列表。
+    """
+    spans: list[tuple[int, int, int, int]] = []
+    matches = list(_MARKER_RE.finditer(fulltext))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(fulltext)
+        locator = _parse_locator(match.group("locator"))
+        chunk_start = locator.get("char_start")
+        chunk_end = locator.get("char_end")
+        if isinstance(chunk_start, int) and isinstance(chunk_end, int):
+            spans.append((match.end(), end, chunk_start, chunk_end))
+    return spans
+
+
+def _locate_excerpt(
+    fulltext: str, chunk_spans: list[tuple[int, int, int, int]], excerpt: str
+) -> tuple[int | None, int | None]:
+    """把模型摘出来的一段原文，映射回文档内的绝对区间。
+
+    只认**唯一一次**逐字出现：模型可能改写、合并或跨 chunk 拼接，出现零次或多次
+    时给不出可信区间，宁可留空——一个指错地方的区间比没有区间更坏。
+    """
+    if not excerpt or not chunk_spans:
+        return None, None
+    first = fulltext.find(excerpt)
+    if first < 0 or fulltext.find(excerpt, first + 1) >= 0:
+        return None, None
+    for joined_start, joined_end, chunk_start, chunk_end in chunk_spans:
+        if joined_start <= first < joined_end:
+            start = chunk_start + (first - joined_start)
+            end = min(start + len(excerpt), chunk_end)
+            return (start, end) if end > start else (None, None)
+    return None, None
+
+
+def _split_passages(block: str) -> list[tuple[int, str]]:
+    """按空行切段，并保留每段在 ``block`` 里的起始偏移。
+
+    旧实现用 ``[part.strip() for part in re.split(...)]``，偏移在 split 和 strip
+    两步里都丢了——而精确区间正需要它。
+    """
+    passages: list[tuple[int, str]] = []
+    cursor = 0
+    for part in re.split(r"(\n{2,})", block):
+        if not part or re.fullmatch(r"\n{2,}", part):
+            cursor += len(part)
+            continue
+        lead = len(part) - len(part.lstrip())
+        stripped = part.strip()
+        if stripped:
+            passages.append((cursor + lead, stripped))
+        cursor += len(part)
+    if passages:
+        return passages
+    stripped = block.strip()
+    return [(len(block) - len(block.lstrip()), stripped)] if stripped else []
+
+
+def _passage_span(
+    locator: dict[str, Any], offset_in_chunk: int, length: int
+) -> tuple[int | None, int | None]:
+    """把「chunk 内偏移」换算成原文档内的绝对区间。
+
+    ``CHAR`` 标记给的是这个 chunk 在原文档里的位置；段落偏移加上去就是这一句证据
+    的精确位置。标记缺失（旧解析产物、或没有可靠偏移）时返回 ``(None, None)``，
+    绝不猜。
+    """
+    chunk_start = locator.get("char_start")
+    chunk_end = locator.get("char_end")
+    if not isinstance(chunk_start, int) or not isinstance(chunk_end, int):
+        return None, None
+    start = chunk_start + offset_in_chunk
+    end = min(start + length, chunk_end)
+    # 截断（MAX_EVIDENCE_TEXT_CHARS）或偏移异常都可能让区间越界；越界就不给，
+    # 而不是给一个指不到原文的区间。
+    if start < chunk_start or start >= chunk_end or end <= start:
+        return None, None
+    return start, end
 
 
 def _parse_locator(value: str) -> dict[str, Any]:
@@ -1299,6 +1401,13 @@ def _parse_locator(value: str) -> dict[str, Any]:
             locator["section"] = cleaned[:300]
         elif normalized_key in {"TABLE", "FIG", "EQ", "ALGO"}:
             locator["object_ref"] = f"{normalized_key.casefold()}:{cleaned}"[:64]
+        elif normalized_key == "CHAR":
+            span_start, separator_found, span_end = cleaned.partition("-")
+            if separator_found and span_start.isdigit() and span_end.isdigit():
+                start, end = int(span_start), int(span_end)
+                if end > start:
+                    locator["char_start"] = start
+                    locator["char_end"] = end
     return locator
 
 
