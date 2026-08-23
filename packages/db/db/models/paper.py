@@ -628,6 +628,62 @@ class ExportArtifact(Base):
     )
 
 
+class SentenceDowngrade(Base):
+    """写作阶段规则从正文里拿掉（或改写）的一句，及其判定依据。
+
+    句级证据规则会删 prose。此前 ``enforce_sentence_evidence_rules`` 把弃用句收进
+    ``paragraph["downgraded_sentences"]``，但 ``to_ir_section()`` 只读
+    ``paragraph["sentences"]``——线索死在 Draft→IR 那一步，434 个已交付章节里
+    没有一个留下过删除记录。资产接地规则更彻底：直接 ``continue``，连收都没收。
+
+    一句一行，与所属章节同一事务写入；该节被重写时整节替换，生命周期与
+    ``citation_usage`` 一致。
+    """
+
+    __tablename__ = "sentence_downgrade"
+    __table_args__ = (
+        Index("ix_sentence_downgrade_section", "section_id"),
+        Index("ix_sentence_downgrade_document_rule", "document_id", "rule"),
+        Index("ix_sentence_downgrade_project", "project_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), nullable=False
+    )
+    #: 哪一次运行删的。测试与影子评估里写作阶段没有 job，所以可空。
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="SET NULL")
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_document.id", ondelete="CASCADE"), nullable=False
+    )
+    section_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_section.id", ondelete="CASCADE"), nullable=False
+    )
+    section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    paragraph_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    sentence_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: 触发的规则代号：R4_grade_missing / R5_not_comparable / R6_locator_missing /
+    #: numlint_unsourced_number / asset_* 等。
+    rule: Mapped[str] = mapped_column(String(48), nullable=False)
+    #: ``removed``（整句从正文拿掉）或 ``rewritten``（改写后仍在正文里，如 R4 归因）。
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False, server_default="removed")
+    #: 模型原本写出来的那一句，在规则清空它之前取。
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    cite_keys_json: Mapped[list | None] = mapped_column(JSONB)
+    evidence_ids_json: Mapped[list | None] = mapped_column(JSONB)
+    #: ``located`` / ``unlocated`` / ``no_evidence``——删除当时这句绑的证据能不能被查证。
+    locator_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, server_default="unknown"
+    )
+    #: 每条绑定证据的定位快照：evidence_id、grade、located、人可读 display。
+    locators_json: Mapped[list | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class LlmCallLog(Base):
     """LLM 成本记账（简化自旧 token_ledger 设计）。"""
 

@@ -30,6 +30,7 @@ from db import (
     polish_skip_requested,
     reference_metadata_payload,
     replace_citation_usage,
+    replace_sentence_downgrades,
     upsert_section,
 )
 from db.models.paper import PaperDocument, PaperSection
@@ -55,6 +56,7 @@ from paperforge_worker.pipelines.writing import (
     inspect_section_draft,
     repair_unsourced_numbers,
     section_evidence_for,
+    sentence_downgrade_events,
     write_section,
 )
 
@@ -364,6 +366,7 @@ async def write_document(
                 order_no=order_no,
                 body_ir=ir_section.model_dump(mode="json") if ir_section else None,
                 whitelist=whitelist,
+                job_id=context.job_id,
             )
 
     # 摘要在正文之后生成，并可能经过连贯性润色；必须使用这里的最终版本，避免
@@ -677,6 +680,7 @@ async def _persist_draft(
                 order_no=order_no,
                 body_ir=ir_section.model_dump(mode="json") if ir_section else None,
                 whitelist=whitelist,
+                job_id=context.job_id,
             )
     except Exception as error:  # noqa: BLE001 - 中途落库失败不该毁掉整轮写作
         logger.warning(
@@ -701,6 +705,7 @@ async def _upsert_draft(
     order_no: int,
     body_ir: dict[str, Any] | None,
     whitelist: dict[str, uuid.UUID],
+    job_id: uuid.UUID | None = None,
 ) -> None:
     """章节 + 引用使用记录的落库动作，中途存与收尾存共用同一份实现。"""
     cite_keys = sorted({key for p in draft.paragraphs for key in p.get("cite_keys", [])})
@@ -732,6 +737,18 @@ async def _upsert_draft(
         for key in cite_keys
         if key in whitelist
     ]
+    # 规则拿掉的句子与正文同一事务落库。`to_ir_section()` 只读 `sentences`，所以
+    # 线索必须从**草稿**上取——这正是它此前消失的那一步。整节替换：修复轮重写章节
+    # 时，上一轮的删除记录跟着旧正文一起走，计数不会随轮次累加。
+    await replace_sentence_downgrades(
+        session,
+        project_id=project_id,
+        job_id=job_id,
+        document_id=document_id,
+        section_id=row.id,
+        section_key=draft.section_key,
+        events=sentence_downgrade_events(draft),
+    )
     await replace_citation_usage(
         session,
         project_id=project_id,

@@ -781,6 +781,21 @@ def test_original_sentence_grounding_is_interleaved_in_ir() -> None:
     assert runs[-1].source_refs == ["ua_12345678"]
 
 
+def _no_prose_survived(paragraphs) -> bool:
+    """规则拿掉每一句之后，正文里什么都不剩。
+
+    从前这些用例断言返回的段落列表为空。现在被删的句子会留在
+    ``downgraded_sentences`` 里供审计（Step 2：删除事件要能追踪），所以段落对象
+    本身还在——但它一个字的正文都没有，``to_ir_section()`` 的 ``if not runs:
+    continue`` 也不会为它生成任何 IR 块。要断言的是后者。
+    """
+    return all(
+        not str(p.get("text") or "").strip()
+        and not [s for s in p.get("sentences") or [] if str(s.get("text") or "").strip()]
+        for p in paragraphs
+    )
+
+
 def test_original_result_grounding_requires_a_value_from_the_bound_table() -> None:
     assets = {
         "ua_12345678": {
@@ -804,7 +819,12 @@ def test_original_result_grounding_requires_a_value_from_the_bound_table() -> No
         require_grounding=True,
         require_numeric=True,
     )
-    assert qualitative == []
+    assert _no_prose_survived(qualitative), "数值型断言必须有表格里的值支撑"
+    assert [
+        s.get("downgraded_reason")
+        for p in qualitative
+        for s in p.get("downgraded_sentences") or []
+    ], "删除要留痕"
 
     mislabeled = enforce_sentence_grounding_rules(
         [
@@ -821,7 +841,12 @@ def test_original_result_grounding_requires_a_value_from_the_bound_table() -> No
         require_grounding=True,
         require_numeric=True,
     )
-    assert mislabeled == []
+    assert _no_prose_survived(mislabeled), "标错来源的数字同样留不下"
+    assert [
+        s.get("downgraded_reason")
+        for p in mislabeled
+        for s in p.get("downgraded_sentences") or []
+    ], "删除要留痕"
 
     grounded = enforce_sentence_grounding_rules(
         [
@@ -863,7 +888,12 @@ def test_original_method_grounding_requires_content_from_the_bound_note() -> Non
         assets_by_ref=assets,
         require_grounding=True,
     )
-    assert unsupported == []
+    assert _no_prose_survived(unsupported), "笔记里没有的内容不许当作已接地"
+    assert [
+        s.get("downgraded_reason")
+        for p in unsupported
+        for s in p.get("downgraded_sentences") or []
+    ], "删除要留痕"
 
     supported = enforce_sentence_grounding_rules(
         [

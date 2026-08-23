@@ -1149,6 +1149,7 @@ def enforce_sentence_grounding_rules(
 
     for paragraph in paragraphs:
         kept: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
         for sentence in paragraph.get("sentences") or []:
             refs = [ref for ref in sentence.get("source_refs") or [] if ref in assets_by_ref]
             claim_kind = classify_claim(str(sentence.get("text") or ""))
@@ -1191,24 +1192,38 @@ def enforce_sentence_grounding_rules(
                 or not numbers.issubset(values)
                 or (bool(numbers) and numeric_support < 0.1)
             ):
-                sentence["downgraded_reason"] = (
-                    "asset_grounding_missing"
-                    if not refs
-                    else "asset_result_value_missing"
-                    if require_numeric and not numbers
-                    else "asset_content_mismatch"
-                    if content_missing
-                    else "asset_numeric_context_mismatch"
-                    if numbers.issubset(values) and numeric_support < 0.1
-                    else "asset_number_mismatch"
+                record_downgrade(
+                    sentence,
+                    rule=(
+                        "asset_grounding_missing"
+                        if not refs
+                        else "asset_result_value_missing"
+                        if require_numeric and not numbers
+                        else "asset_content_mismatch"
+                        if content_missing
+                        else "asset_numeric_context_mismatch"
+                        if numbers.issubset(values) and numeric_support < 0.1
+                        else "asset_number_mismatch"
+                    ),
                 )
+                # 此前这里直接 `continue`，句子连 `downgraded_sentences` 都没进——
+                # 原创论文模式下被资产接地规则删掉的句子，在任何地方都查不到。
+                dropped.append(sentence)
                 continue
             sentence["source_refs"] = refs
             kept.append(sentence)
         if paragraph.get("sentences") is not None:
             paragraph["sentences"] = kept
+            if dropped:
+                paragraph["downgraded_sentences"] = (
+                    list(paragraph.get("downgraded_sentences") or []) + dropped
+                )
             paragraph["text"] = " ".join(str(item.get("text") or "") for item in kept).strip()
-    return [paragraph for paragraph in paragraphs if str(paragraph.get("text") or "").strip()]
+    return [
+        paragraph
+        for paragraph in paragraphs
+        if str(paragraph.get("text") or "").strip() or paragraph.get("downgraded_sentences")
+    ]
 
 
 def normalize_paragraphs(
@@ -1323,6 +1338,91 @@ def _normalize_stance(value: Any) -> str | None:
     return normalized if normalized in allowed else None
 
 
+def sentence_downgrade_events(draft: SectionDraft) -> list[dict[str, Any]]:
+    """把一份草稿里所有被规则拿掉/改写的句子摊成可落库的事件。
+
+    这是 Draft→IR 那道坎的解法：``to_ir_section()`` 只读 ``paragraph["sentences"]``，
+    审计线索到那一步就没了，所以在**草稿**上把它取出来，与正文同一事务落库。
+
+    :returns: 每句一条，带规则、原句、段落/句序、引用与证据绑定、locator 状态。
+    """
+    events: list[dict[str, Any]] = []
+    for paragraph_index, paragraph in enumerate(draft.paragraphs, start=1):
+        entries = list(paragraph.get("downgraded_sentences") or [])
+        # R4 归因是**改写**：句子仍在正文里，但同样是规则动过的，要能查。
+        entries += [
+            sentence
+            for sentence in paragraph.get("sentences") or []
+            if sentence.get("downgraded_reason")
+        ]
+        for sentence_index, sentence in enumerate(entries, start=1):
+            rule = str(sentence.get("downgraded_reason") or "")
+            if not rule:
+                continue
+            locators = list(sentence.get("downgraded_locators") or [])
+            if not locators:
+                locator_status = "no_evidence"
+            elif any(item.get("located") for item in locators):
+                locator_status = "located"
+            else:
+                locator_status = "unlocated"
+            events.append(
+                {
+                    "section_key": draft.section_key,
+                    "paragraph_index": paragraph_index,
+                    "sentence_index": sentence_index,
+                    "rule": rule,
+                    # 正文里还有内容 = 被改写；空 = 被整句拿掉。
+                    "outcome": (
+                        "rewritten" if str(sentence.get("text") or "").strip() else "removed"
+                    ),
+                    "text": str(sentence.get("downgraded_text") or sentence.get("text") or ""),
+                    "cite_keys": list(sentence.get("downgraded_cite_keys") or []),
+                    "evidence_ids": list(sentence.get("downgraded_evidence_ids") or []),
+                    "locator_status": locator_status,
+                    "locators": locators,
+                }
+            )
+    return events
+
+
+def record_downgrade(
+    sentence: dict[str, Any],
+    *,
+    rule: str,
+    units: list[dict[str, Any]] | None = None,
+) -> None:
+    """把一句从正文里拿掉之前，先留下追责需要的一切。
+
+    降级分支紧接着就会清空 ``text`` / ``cite_keys`` / ``evidence_ids``，所以审计副本
+    必须在清空**之前**取——此前 `downgraded_sentences` 收集到的是清空后的空壳，
+    连原句都没有，而它又在 `to_ir_section()` 那一步整个丢掉了。
+
+    ``setdefault`` 是有意的：一句可能先被一条规则降级、再被另一条改写，最早那一次
+    看到的才是模型真正写出来的原文。
+
+    :param sentence: 正在被降级的句子（原地修改）。
+    :param rule: 触发的规则代号，例如 ``R6_locator_missing``。
+    :param units: 该句绑定的证据单元，用来记录当时的 locator 状态。
+    """
+    sentence["downgraded_reason"] = rule
+    sentence.setdefault("downgraded_text", str(sentence.get("text") or ""))
+    sentence.setdefault("downgraded_cite_keys", list(sentence.get("cite_keys") or []))
+    sentence.setdefault("downgraded_evidence_ids", list(sentence.get("evidence_ids") or []))
+    sentence.setdefault(
+        "downgraded_locators",
+        [
+            {
+                "evidence_id": unit.get("evidence_id"),
+                "grade": unit.get("grade"),
+                "located": is_located(unit),
+                "display": locator_display(unit),
+            }
+            for unit in units or []
+        ],
+    )
+
+
 def enforce_sentence_evidence_rules(
     paragraphs: list[dict[str, Any]],
     *,
@@ -1362,10 +1462,10 @@ def enforce_sentence_evidence_rules(
                 # 那句话是写给系统看的判定说明，不是作者的论述：它出现在成稿里读起来
                 # 就是一行模板（实测出现在项目 6a6bbf18 的 s4 正文中段）。下面
                 # R6/R4 分支早就确立了正确做法——句子留在审计记录里，正文里删掉。
+                record_downgrade(sentence, rule="R5_not_comparable", units=units)
                 sentence["text"] = ""
                 sentence["cite_keys"] = []
                 sentence["evidence_ids"] = []
-                sentence["downgraded_reason"] = "R5_not_comparable"
             elif (
                 units
                 and all(unit.get("grade") == "D_abstract_only" for unit in units)
@@ -1373,6 +1473,7 @@ def enforce_sentence_evidence_rules(
             ):
                 attributions += 1
                 original = str(sentence.get("text") or "")
+                record_downgrade(sentence, rule="R4_abstract_attribution", units=units)
                 # Reads as authorial attribution rather than as a machine note.
                 # The old Chinese wording ("摘要层面的作者表述是：") was a visible
                 # template artifact, and — unlike the English branch — it matched
@@ -1383,17 +1484,18 @@ def enforce_sentence_evidence_rules(
                     if language == "zh"
                     else (f"The cited work reports in its abstract that {original.rstrip('.')}.")
                 )
-                sentence["downgraded_reason"] = "R4_abstract_attribution"
             else:
                 # Do not spray an internal quality warning into the prose. The
                 # discarded sentence and reason remain in claim/evidence audit
                 # records and the evidence appendix.
+                record_downgrade(
+                    sentence,
+                    rule="R6_locator_missing" if not located else "R4_grade_missing",
+                    units=units,
+                )
                 sentence["text"] = ""
                 sentence["cite_keys"] = []
                 sentence["evidence_ids"] = []
-                sentence["downgraded_reason"] = (
-                    "R6_locator_missing" if not located else "R4_grade_missing"
-                )
         # R18 / N0-6: physically drop blanked sentences so IR never keeps empty
         # runs or dangling connective adverbs without antecedents.  Keep the
         # audit trail on the paragraph for quality/claim review.
@@ -1807,8 +1909,8 @@ async def repair_unsourced_numbers(
             sentence["repaired_reason"] = "numlint_unsourced_number"
             stats["rewritten"] += 1
             continue
+        record_downgrade(sentence, rule="numlint_unsourced_number")
         sentence["text"] = ""
-        sentence["downgraded_reason"] = "numlint_unsourced_number"
         stats["removed"] += 1
 
     draft.paragraphs = _drop_blanked_sentences(draft.paragraphs)

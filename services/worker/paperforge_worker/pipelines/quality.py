@@ -132,6 +132,9 @@ class QualityReport:
     layout_checks: dict[str, Any] = field(default_factory=dict)
     depth_metrics: dict[str, Any] = field(default_factory=dict)
     claim_evidence: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    #: 写作阶段规则拿掉/改写了多少句、按什么规则、在哪些章节。空 dict 表示这一轮
+    #: 没有统计到（例如没有 document）。见 `db.sentence_downgrade_summary`。
+    sentence_downgrades: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -163,6 +166,7 @@ class QualityReport:
             "core_claim_fulltext_coverage": round(self.core_claim_fulltext_coverage, 4),
             "layout_checks": self.layout_checks,
             "depth_metrics": self.depth_metrics,
+            "sentence_downgrades": self.sentence_downgrades,
         }
 
 

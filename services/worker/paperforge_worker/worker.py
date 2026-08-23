@@ -24,6 +24,7 @@ from db import (
     WRITE_DOCUMENT_KEY,
     get_project,
     latest_quality_report,
+    sentence_downgrade_summary,
     update_job,
     update_project_scope,
 )
@@ -1749,6 +1750,14 @@ async def _quality(
     report.quality_profile = quality_profile
     report.review_style = review_style
     report.layout_checks = layout_checks or {"status": "not_run", "passed": None}
+    # 写作阶段规则删了多少句、为什么删。此前这个数字在系统里根本不存在：线索死在
+    # Draft→IR，质检报告只统计**幸存**句子，一份被删掉三成论述的稿子和一份完好的
+    # 稿子在报告上长得一模一样。
+    if document is not None:
+        async with context.session() as downgrade_session:
+            report.sentence_downgrades = await sentence_downgrade_summary(
+                downgrade_session, document_id=document.id
+            )
     unused_core_literature = (
         _unused_core_literature(entries, usage_rows) if document is not None else []
     )
