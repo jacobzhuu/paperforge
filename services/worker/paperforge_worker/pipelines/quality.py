@@ -21,6 +21,7 @@ from typing import Any, Literal, cast
 from llm_runtime import LLMRunner
 from scholar_gateway.normalize import token_set_jaccard
 
+from paperforge_worker.comparability import comparison_admissible
 from paperforge_worker.locators import is_located
 
 SOFT_CHECK_THRESHOLD = 0.5
@@ -266,7 +267,7 @@ def build_claim_evidence(
                         if evidence_id in units_by_id
                     ]
                     comparability_ok = (
-                        _evidence_units_comparable(explicit_units)
+                        comparison_admissible(explicit_units)
                         if claim_kind == "comparison"
                         else None
                     )
@@ -779,20 +780,6 @@ def _evidence_grade_ok(claim_kind: str, text: str, grade: str) -> bool:
         and claim_kind in {"effect", "conclusion"}
         and bool(_UNCERTAINTY_RE.search(text))
     )
-
-
-def _evidence_units_comparable(units: list[dict[str, Any]]) -> bool:
-    if len({str(unit.get("work_id")) for unit in units if unit.get("work_id")}) < 2:
-        return False
-    key_sets = [
-        {
-            str(item.get("comparability_key"))
-            for item in unit.get("measurements") or []
-            if item.get("comparability_key")
-        }
-        for unit in units
-    ]
-    return bool(key_sets) and all(key_sets) and bool(set.intersection(*key_sets))
 
 
 # 学术严谨档会拦下导出的那组问题码。draft 档把它们降级成 warning 照样报出来，

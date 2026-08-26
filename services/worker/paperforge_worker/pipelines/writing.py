@@ -33,6 +33,7 @@ from paper_ir import (
     TextRun,
 )
 
+from paperforge_worker.comparability import comparison_admissible
 from paperforge_worker.locators import (
     evidence_locator as _evidence_locator,
 )
@@ -1448,7 +1449,7 @@ def enforce_sentence_evidence_rules(
                 str(sentence.get("text") or ""),
                 units,
             )
-            comparable = claim_kind != "comparison" or _units_comparable(units)
+            comparable = claim_kind != "comparison" or comparison_admissible(units)
             # 数字句要能被查证。判定与证据定级、质检 R6、定位显示共用同一个谓词
             # （paperforge_worker.locators）：此前这里只认 page/object_ref，而定级
             # 认 page/section/paragraph，于是本函数把 5,256 条被定级为「已定位」的
@@ -1540,20 +1541,6 @@ def _sentence_grade_ok(
         )
     )
     return claim_kind in {"effect", "conclusion"} and "C_fulltext_unlocated" in grades and uncertain
-
-
-def _units_comparable(units: list[dict[str, Any]]) -> bool:
-    if len({str(unit.get("work_id")) for unit in units if unit.get("work_id")}) < 2:
-        return False
-    key_sets = [
-        {
-            str(measurement.get("comparability_key"))
-            for measurement in unit.get("measurements") or []
-            if measurement.get("comparability_key")
-        }
-        for unit in units
-    ]
-    return bool(key_sets) and all(key_sets) and bool(set.intersection(*key_sets))
 
 
 def normalize_terms(raw: Any) -> dict[str, str]:
