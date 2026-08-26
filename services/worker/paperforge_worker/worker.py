@@ -3847,6 +3847,14 @@ async def _finish_incomplete(context: JobContext, write_outcome: Any, quality_re
 
 
 async def _finish_needs_input(context: JobContext, report: Any) -> None:
+    # 余额耗尽会让每个 LLM 阶段静默降级，最先垮掉的是 SCOPE：拿不到英文检索词，
+    # 就用中文原句去检索，arXiv 直接拒收 CJK，最后报出来的是「可回答问题的全文
+    # 证据不足两个独立文献来源」。那是降级的**后果**，不是原因——生产实测
+    # （job 44641362，2026-08-26）就是这样把一次欠费说成了检索质量问题。
+    quota = context.provider_quota_failure()
+    if quota is not None:
+        await _finish_provider_quota_exhausted(context, quota, quality_report=report)
+        return
     payload = {
         "status": "needs_input",
         "readiness_status": report.readiness_status,

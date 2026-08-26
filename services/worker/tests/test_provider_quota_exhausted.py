@@ -263,3 +263,59 @@ def test_the_blocker_message_survives_the_json_round_trip_the_ui_reads():
     }
     restored = json.loads(json.dumps(payload, ensure_ascii=False))
     assert restored["blockers"][0]["message"].startswith("模型服务商账户余额")
+
+
+async def test_a_pre_write_evidence_gate_blocked_by_billing_says_so():
+    """写作前的证据闸门也要认出余额问题。
+
+    真实样本（job 44641362，2026-08-26）：账户欠费 → SCOPE 拿不到英文检索词 →
+    用中文原句检索、arXiv 拒收 CJK → 一篇都没选中 → 报「可回答问题的全文证据不足
+    两个独立文献来源」。那是降级的后果，不是原因。
+    """
+    from paperforge_worker.worker import _finish_needs_input
+
+    emitted: list[tuple[str, dict]] = []
+    context = _context([_record(QUOTA_EXHAUSTED, role="planner")] * 3)
+
+    async def _emit(event, payload, **_kw):
+        emitted.append((event, payload))
+
+    context.emit = _emit  # type: ignore[assignment]
+
+    readiness = SimpleNamespace(
+        readiness_status="evidence_insufficient",
+        blockers=[{"code": "evidence_source_diversity_low", "message": "可回答问题的全文证据不足"}],
+        report_id=None,
+    )
+    await _finish_needs_input(context, readiness)
+
+    event, payload = emitted[0]
+    assert event == "job.failed"
+    assert payload["status"] == "failed"
+    assert payload["blockers"][0]["code"] == "provider_quota_exhausted"
+    assert "证据" not in payload["blockers"][0]["message"], "不要把账单问题说成证据不足"
+
+
+async def test_a_genuine_evidence_shortfall_still_reports_as_needs_input():
+    """没有余额问题时，证据不足照旧按原样报告。"""
+    from paperforge_worker.worker import _finish_needs_input
+
+    emitted: list[tuple[str, dict]] = []
+    context = _context([_record(None), _record("output_truncated")])
+
+    async def _emit(event, payload, **_kw):
+        emitted.append((event, payload))
+
+    context.emit = _emit  # type: ignore[assignment]
+
+    readiness = SimpleNamespace(
+        readiness_status="evidence_insufficient",
+        blockers=[{"code": "evidence_source_diversity_low", "message": "证据不足"}],
+        report_id=None,
+    )
+    await _finish_needs_input(context, readiness)
+
+    event, payload = emitted[0]
+    assert event == "job.needs_input"
+    assert payload["status"] == "needs_input"
+    assert payload["blockers"][0]["code"] == "evidence_source_diversity_low"
