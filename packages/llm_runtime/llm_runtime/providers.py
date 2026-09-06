@@ -112,8 +112,8 @@ class OpenAICompatibleLLMProvider:
         }
         if request.json_output:
             payload["response_format"] = {"type": "json_object"}
-        if request.thinking_mode in {"enabled", "disabled"} and _is_deepseek_v4(model_name):
-            payload["thinking"] = {"type": request.thinking_mode}
+        if request.thinking_mode in {"enabled", "disabled"}:
+            _apply_thinking_controls(payload, model_name, request.thinking_mode)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -410,6 +410,53 @@ def _is_deepseek_v4(model: str) -> bool:
     return model.strip().lower().startswith("deepseek-v4-")
 
 
+def _is_glm_5(model: str) -> bool:
+    """GLM-5 系整体（glm-5.2 / glm-5.3 / glm-5.3-flash …）。"""
+    return model.strip().lower().startswith("glm-5")
+
+
+def _is_glm_5_3(model: str) -> bool:
+    """GLM-5.3 系（``glm-5.3`` / ``glm-5.3-flash`` 及其带日期的快照）。
+
+    与系内更早的版本分开判定：思考开关的契约在 5.3 这一代变了，见
+    ``_apply_thinking_controls()``。
+    """
+    return model.strip().lower().startswith("glm-5.3")
+
+
+def _apply_thinking_controls(payload: dict[str, Any], model: str, thinking_mode: str) -> None:
+    """把角色的 enabled/disabled 档位翻译成**这个服务商实际接受的**参数。
+
+    每家把「少想一点」放在不同的键上，而传错的键不会报错——它会被静默忽略。
+    于是一份用生产截断数据调出来的思考策略，会在换模型那天悄无声息地失效，
+    表现为「新模型质量莫名其妙变差」而不是一个配置错误。
+    """
+    if _is_deepseek_v4(model):
+        payload["thinking"] = {"type": thinking_mode}
+        return
+    if _is_glm_5_3(model):
+        # GLM-5.3 起**不再支持关闭思考**：官方文档写明 `thinking.type` 传 `disabled`
+        # 会报错，且 `reasoning_effort` 在这一代只接受 `max` / `high` / `low`——
+        # 5.2 上可用的 `none` / `minimal` 在 5.3 上同样报错。于是有两个陷阱：
+        #   照搬 deepseek 的 {"type": "disabled"} → 请求被服务商拒绝；
+        #   什么都不传          → 每个角色都跑在**默认的 max** 推理档上，而那正是
+        #                        DEFAULT_ROLE_THINKING 里那批 "disabled" 用生产
+        #                        截断数据（writer 21 次调用 11 次零内容返回）
+        #                        换来的、要极力避开的档位。
+        # 所以这里降档而不是关闭：low 是这一代给出的、最接近「别把输出预算烧在
+        # 推理上」的**合法**档位。
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = "low" if thinking_mode == "disabled" else "max"
+        return
+    if _is_glm_5(model):
+        # GLM-5.2 及更早：`thinking.type` 仍然接受 `disabled`，形状与 deepseek 相同。
+        # **不要**把这个分支并进上面那个：在 5.2 上 `disabled` 是真的关掉推理，翻成
+        # `reasoning_effort=low` 只会让它继续拿输出预算去想。
+        payload["thinking"] = {"type": thinking_mode}
+        return
+    # 其余服务商未声明思考开关：不传，保持其默认档位。
+
+
 def sanitize_openai_compatible_base_url(base_url: str) -> str:
     return base_url.strip().rstrip("/")
 
@@ -432,6 +479,11 @@ _MODEL_MAX_OUTPUT_TOKENS_CAPS: dict[str, int] = {
     "gpt-4.1": 32768,
     "gpt-4.1-mini": 32768,
     "o4-mini": 100000,
+    # 官方文档：单次最大输出 128K，请求参数 `max_tokens` 上限 131072。这里取一半
+    # （65536）而不是顶格：本管线最大的一次请求是 writer 的 16000，截断重试加倍到
+    # 32000 也还在这个数以下，所以保守取值不损失任何一次重试的余量。
+    "glm-5.3": 65536,
+    "glm-5.3-flash": 65536,
 }
 
 
@@ -453,6 +505,10 @@ def clamp_max_output_tokens(requested: int, *, model: str | None) -> int:
         cap = 16384
     elif model_key not in _MODEL_MAX_OUTPUT_TOKENS_CAPS and model_key.startswith("deepseek"):
         cap = 8192
+    elif model_key not in _MODEL_MAX_OUTPUT_TOKENS_CAPS and model_key.startswith("glm-5"):
+        # 未列名的 GLM-5 快照不该掉回 8192：那个上限是 deepseek 的，套在 GLM 上
+        # 会让截断重试策略误判「加预算没余量」而直接放弃重试。
+        cap = 65536
     return min(value, cap)
 
 

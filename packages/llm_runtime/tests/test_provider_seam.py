@@ -252,6 +252,77 @@ def test_deepseek_structured_request_sets_json_and_disables_thinking():
     ]
 
 
+def _capture_payload(model: str, thinking_mode: str) -> dict:
+    payloads: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": model,
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleLLMProvider(
+            base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key="k",
+            model=model,
+            timeout_seconds=5,
+            max_retries=0,
+            client=client,
+        )
+        provider.generate(
+            LLMRequest(
+                system_prompt="s",
+                user_prompt="u",
+                model=model,
+                max_output_tokens=100,
+                thinking_mode=thinking_mode,
+            )
+        )
+    return payloads[0]
+
+
+def test_glm_never_receives_the_disabled_thinking_deepseek_accepts():
+    """GLM-5.3 系只接受 thinking.type=enabled，照搬 deepseek 的 disabled 会被服务商拒绝。
+
+    角色档位里的 "disabled" 必须翻译成 reasoning_effort=low（降档），而不是原样透传。
+    """
+    payload = _capture_payload("glm-5.3-flash", "disabled")
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "low"
+
+
+def test_glm_enabled_thinking_keeps_the_deep_reasoning_tier():
+    payload = _capture_payload("glm-5.3-flash", "enabled")
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+
+
+def test_glm_5_2_still_gets_the_real_disabled_switch():
+    """5.2 **接受** thinking.type=disabled，5.3 才不接受。两代不能共用一个分支。
+
+    把 5.2 的 disabled 也翻成 reasoning_effort=low，等于让一个本可以真正关掉推理的
+    模型继续拿输出预算去想——正是 `_apply_thinking_controls()` 要防的那类静默降级。
+    """
+    payload = _capture_payload("glm-5.2", "disabled")
+    assert payload["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in payload
+
+
+def test_glm_output_budget_is_not_clamped_to_the_deepseek_ceiling():
+    """8192 是 deepseek 的上限。套在 GLM 上会让截断重试误判为「加预算没余量」。"""
+    assert clamp_max_output_tokens(999_999, model="glm-5.3-flash") == 65_536
+    assert clamp_max_output_tokens(999_999, model="glm-5.3") == 65_536
+    # 未列名的 GLM-5 快照同样不该掉回 8192。
+    assert clamp_max_output_tokens(999_999, model="glm-5.3-flash-250901") == 65_536
+    # 管线自己请求的预算不受影响。
+    assert clamp_max_output_tokens(8_000, model="glm-5.3-flash") == 8_000
+
+
 def test_runner_retries_once_with_doubled_budget_on_truncation():
     import httpx
     from llm_runtime import LLMConfig, LLMRunner
@@ -536,6 +607,19 @@ def test_the_same_budget_does_retry_on_a_model_with_real_headroom():
     runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=8000)
 
     assert budgets == [8000, 16000]
+
+
+def test_writer_regains_its_truncation_retry_on_glm():
+    """writer 在 GLM 上请求 16000（`writing.SECTION_MAX_OUTPUT_TOKENS`）。
+
+    deepseek 的 8192 上限让这次重试永远发不出去；GLM 的 65536 让 16000 → 32000 是
+    实打实的 2 倍，于是截断终于有一次补救，紧凑档退居第三道防线。
+    """
+    runner, budgets, _ = _truncating_runner("glm-5.3-flash")
+
+    runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=16000)
+
+    assert budgets == [16000, 32000]
 
 
 def test_a_budget_with_headroom_still_retries():

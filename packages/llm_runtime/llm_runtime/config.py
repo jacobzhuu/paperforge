@@ -53,11 +53,15 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
     "section_reviewer": "planner",
 }
 
-# DeepSeek V4 defaults to high-effort thinking.  That is useful for planning, but it
-# wastes latency/output budget on tasks whose prompts already define a closed JSON
-# schema — and on any task whose own output is large enough to compete with the
-# reasoning for the same `max_output_tokens`.  Keep the remaining roles on the
-# provider default unless a deployment opts in.
+# Reasoning models default to high-effort thinking (DeepSeek V4 and GLM-5.3 both do).
+# That is useful for planning, but it wastes latency/output budget on tasks whose
+# prompts already define a closed JSON schema — and on any task whose own output is
+# large enough to compete with the reasoning for the same `max_output_tokens`.  Keep
+# the remaining roles on the provider default unless a deployment opts in.
+#
+# "disabled" is a *policy*, not a wire value: `providers._apply_thinking_controls()`
+# translates it into whatever the provider actually accepts (GLM-5.3 cannot turn
+# thinking off at all, so it becomes `reasoning_effort="low"`).
 DEFAULT_ROLE_THINKING: dict[str, str] = {
     "extractor": "disabled",
     "reranker": "disabled",
@@ -186,8 +190,8 @@ class LLMConfig:
     def price_for_model(self, model: str) -> ModelPrice | None:
         """精确匹配优先，其次取最长的前缀匹配。
 
-        服务商经常在模型名后面挂日期或版本后缀（``deepseek-v4-pro-0711``）。
-        配了 ``deepseek-v4-pro`` 就该覆盖它的所有快照，否则每次服务商发新版本，
+        服务商经常在模型名后面挂日期或版本后缀（``glm-5.3-flash-250901``）。
+        配了 ``glm-5.3-flash`` 就该覆盖它的所有快照，否则每次服务商发新版本，
         成本面板都会毫无征兆地退回未定价。
         """
         key = (model or "").strip().casefold()

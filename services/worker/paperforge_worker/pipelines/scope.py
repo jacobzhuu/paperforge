@@ -173,7 +173,7 @@ async def generate_scope(
         "planner",
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        # 推理型 planner 模型（deepseek-v4-pro 等）把思维链算进 max_tokens，
+        # 推理型 planner 模型把思维链算进 max_tokens（GLM-5.3 系还关不掉思考），
         # 1500 只够想不够写：JSON 会在中途断掉，整个 SCOPE 静默退回确定性回退。
         max_output_tokens=3000,
         temperature=0.2,
