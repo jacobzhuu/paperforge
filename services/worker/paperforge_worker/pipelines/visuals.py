@@ -233,7 +233,7 @@ async def suggest_visuals(
         short_review = _is_short_review(paper_type, briefs)
         full_paper_context = _paper_context(project_title, sections)
 
-    deepseek_prompt_ready = True
+    analyzed_prompt_ready = True
     if summary_only:
         summary = _summary_visual_proposal(
             project_title,
@@ -267,9 +267,9 @@ async def suggest_visuals(
             summary.caption = analysis.caption
             summary.alt_text = analysis.alt_text
         else:
-            # 全流程不得绕过 DeepSeek 把模板提示词直接发给 Yunwu。草稿保留，
+            # 全流程不得绕过模型分析把模板提示词直接发给 Yunwu。草稿保留，
             # 用户之后可在工作台重试论文上下文分析。
-            deepseek_prompt_ready = False
+            analyzed_prompt_ready = False
         planned = [summary]
         generator = "graphical_abstract"
     else:
@@ -380,7 +380,7 @@ async def suggest_visuals(
     )
     auto_results: list[VisualOutcome] = []
     generation_deferred = 0
-    if summary_only and auto_generate and generation_candidates and deepseek_prompt_ready:
+    if summary_only and auto_generate and generation_candidates and analyzed_prompt_ready:
         yunwu_config = context.settings.image_provider_config("yunwu")
         if context.settings.ai_images_enabled and image_provider_configured(yunwu_config):
             # 全流程的唯一一张付费图固定走 Yunwu。generate_visual 自己会完成网络重试、
@@ -724,7 +724,7 @@ async def generate_visual(
                 )
             if not spec.refined_prompt or spec.prompt_override:
                 raise ImageProviderError(
-                    "AI image prompt has not been analyzed by DeepSeek",
+                    "AI image prompt has not been analyzed by the text model",
                     code=INVALID_REQUEST,
                     retryable=False,
                 )

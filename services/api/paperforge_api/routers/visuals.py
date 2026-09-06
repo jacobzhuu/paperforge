@@ -292,10 +292,10 @@ async def draft_visual(
             spec=analyzed_spec.model_dump(mode="json"),
             target_section_key=target_key,
             suggested_block_index=suggested_block_index,
-            reason=f"DeepSeek 已结合论文分节上下文分析本次意图；{reason}",
+            reason=f"模型已结合论文分节上下文分析本次意图；{reason}",
             context_summary=_full_paper_context_summary(project.title, rows),
             warnings=warnings,
-            generator=f"llm:{analysis.model or 'deepseek'}",
+            generator=f"llm:{analysis.model or 'unknown'}",
         )
 
     section_list = "\n".join(
@@ -667,14 +667,14 @@ def _full_paper_context(project_title: str, rows: list[Any]) -> str:
 
 def _full_paper_context_summary(project_title: str, rows: list[Any]) -> str:
     if not rows:
-        return "DeepSeek 已读取当前项目题目；论文正文尚为空。"
+        return "模型已读取当前项目题目；论文正文尚为空。"
     source_characters = sum(len(_section_excerpt(row)) for row in rows)
     context = _full_paper_context(project_title, rows)
     sent_characters = len(context)
     if "middle content omitted" not in context:
-        return f"DeepSeek 已读取当前论文全部 {len(rows)} 个章节（约 {source_characters} 字符）。"
+        return f"模型已读取当前论文全部 {len(rows)} 个章节（约 {source_characters} 字符）。"
     return (
-        f"DeepSeek 已读取全部 {len(rows)} 个章节的均衡上下文"
+        f"模型已读取全部 {len(rows)} 个章节的均衡上下文"
         f"（原文约 {source_characters} 字符，本次发送 {sent_characters} 字符）。"
     )
 
@@ -704,7 +704,7 @@ async def _analyze_ai_spec(
     user_intent: str,
     spec: dict[str, Any],
 ) -> tuple[AIImageSpec, Any]:
-    """强制通过 DeepSeek 论文上下文分析；失败时阻止未润色提示词进入 Yunwu。"""
+    """强制通过模型的论文上下文分析；失败时阻止未润色提示词进入 Yunwu。"""
     from paperforge_worker.pipelines.image_prompt import analyze_image_prompt
 
     async with accounted_runner(
@@ -720,9 +720,9 @@ async def _analyze_ai_spec(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
-                    "code": "deepseek_image_prompt_failed",
+                    "code": "image_prompt_analysis_failed",
                     "message": (
-                        "DeepSeek 未能完成论文上下文分析，请稍后重试；"
+                        "模型未能完成论文上下文分析，请稍后重试；"
                         "系统不会把未分析的提示词直接发送给生图服务。"
                     ),
                 },
@@ -745,8 +745,8 @@ async def _analyze_ai_spec(
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "code": "deepseek_image_prompt_invalid",
-                    "message": "DeepSeek 返回的生图规格未通过安全校验，请重试。",
+                    "code": "image_prompt_invalid",
+                    "message": "模型返回的生图规格未通过安全校验，请重试。",
                 },
             ) from error
 
@@ -794,7 +794,7 @@ async def create_visual_endpoint(
         target_section_key=request.target_section_key,
         suggested_block_index=request.suggested_block_index,
         document_version=document.version if document else None,
-        # 只有经过 DeepSeek 的提示词才能声明自己绑定了当前全文；未润色的直接
+        # 只有经过模型分析的提示词才能声明自己绑定了当前全文；未润色的直接
         # API 草稿会在生成前由 prepare 端点补分析。
         paper_snapshot_hash=snapshot
         if isinstance(spec, AIImageSpec) and spec.refined_prompt
@@ -883,9 +883,9 @@ async def prepare_ai_generation(
     visual_id: str,
     session: SessionDep,
 ) -> VisualResponse:
-    """为旧草稿或正文已变化的草稿补做 DeepSeek 论文上下文分析。
+    """为旧草稿或正文已变化的草稿补做论文上下文分析。
 
-    前端在打开付费确认框前调用；这样确认框里展示的已经是 DeepSeek 结合当前分节上下文
+    前端在打开付费确认框前调用；这样确认框里展示的已经是模型结合当前分节上下文
     生成的最终提示词，而不是在用户确认以后再偷偷改写。
     """
     project = await _require_project(session, project_id)
@@ -959,8 +959,8 @@ async def generate(
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "ai_prompt_requires_deepseek",
-                    "message": "请先让 DeepSeek 结合当前论文全文生成最终提示词。",
+                    "code": "ai_prompt_requires_analysis",
+                    "message": "请先让模型结合当前论文全文生成最终提示词。",
                 },
             )
     visual.generation_status = "queued"

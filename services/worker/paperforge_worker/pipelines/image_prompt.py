@@ -1,4 +1,4 @@
-"""用文本模型（线上为 DeepSeek）把论文上下文与用户意图写成生图提示词。
+"""用文本模型把论文上下文与用户意图写成生图提示词。
 
 此前最终提示词是字段拼接的产物：
 
@@ -30,7 +30,7 @@ from typing import Any
 from llm_runtime import LLMRunner
 
 #: 润色属于「把已有内容写好」，与写作管线的 polisher 档位同源，因此复用该 role 的
-#: 模型路由（线上映射到 deepseek-v4-pro）。
+#: 模型路由（由部署的 LLM_ROLE_MODELS 决定，线上是全系单档）。
 IMAGE_PROMPT_ROLE = "polisher"
 
 #: 成品提示词的长度窗口。太短说明模型没干活（多半是原样回抄），
@@ -130,7 +130,7 @@ class CompliancePromptRewrite:
 
 @dataclass(frozen=True)
 class ImagePromptAnalysis:
-    """DeepSeek 对全文和用户意图的结构化分析结果。"""
+    """模型对全文和用户意图的结构化分析结果。"""
 
     prompt: str
     title: str
@@ -238,7 +238,7 @@ async def analyze_image_prompt(
     runner: LLMRunner | None,
     current_spec: dict[str, Any] | None = None,
 ) -> ImagePromptAnalysis | None:
-    """让 DeepSeek 读取全文、理解本次用户意图并写出最终 GPT Image 提示词。
+    """让模型读取全文、理解本次用户意图并写出最终 GPT Image 提示词。
 
     这是交互式 AI 生图的强制入口。失败返回 ``None``，由 API 明确告知用户并停止，
     绝不把未分析的原始短句直接交给图片服务商。
@@ -260,7 +260,7 @@ async def analyze_image_prompt(
             f"AUTHOR'S CURRENT IMAGE REQUEST:\n{user_intent.strip()}"
             f"{previous}\n\nSECTION-BALANCED PAPER CONTEXT:\n{bounded_paper}"
         ),
-        # DeepSeek 的推理 token 也占预算；给足空间，最终 prompt 仍由本地校验收口。
+        # 推理型模型的思维链也占同一份预算；给足空间，最终 prompt 仍由本地校验收口。
         max_output_tokens=4000,
         temperature=0.3,
         metadata={"stage": "image_prompt_full_paper"},
@@ -330,7 +330,7 @@ async def refine_image_prompt(
 ) -> str | None:
     """返回润色后的提示词；模型不可用或输出不可信时返回 None。
 
-    `spec` 是 `AIImageSpec.model_dump()`；`context` 可以是完整论文，作为 DeepSeek 的
+    `spec` 是 `AIImageSpec.model_dump()`；`context` 可以是完整论文，作为模型的
     事实来源，不会被原样拼接进最终提示词。
     """
     if runner is None or not runner.enabled:
@@ -469,7 +469,7 @@ def _limited_text(value: Any, limit: int) -> str:
 
 
 def _spec_brief(spec: dict[str, Any]) -> str:
-    """把当前规格作为修订背景交给 DeepSeek，不把它当作最终提示词。"""
+    """把当前规格作为修订背景交给模型，不把它当作最终提示词。"""
     semantics = spec.get("semantics")
     semantics = semantics if isinstance(semantics, dict) else {}
     existing_prompt = (

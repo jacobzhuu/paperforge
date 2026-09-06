@@ -137,7 +137,7 @@ PostgreSQL 16 + Alembic、MinIO/文件系统对象存储、OpenSearch(新系统�
 | `literature_review/section_chunks.py`(329 行) | section 线索组(methods/results/discussion/limitations)、内容角色分类(作者署名/纯引用/样板文本识别)、Markdown 表格解析、字符预算选块 | `packages/ingest/section_chunks.py` | 直接复用,服务于文献卡片抽取 |
 | `literature_review/json_utils.py` | LLM JSON 输出净化 | `packages/llm_runtime/json_utils.py` | 零改动 |
 | `literature_review/report_i18n.py` | 中/英报告语言辅助 | `packages/paper_ir/i18n.py` | 直接复用 |
-| `llm/`(client/providers/types) | OpenAI-compatible provider seam(DeepSeek 等即插即用)、noop provider | `packages/llm_runtime/` | 扩展:多模型角色路由、流式输出、并发限额、成本记账钩子 |
+| `llm/`(client/providers/types) | OpenAI-compatible provider seam(智谱 GLM / DeepSeek 等即插即用)、noop provider | `packages/llm_runtime/` | 扩展:多模型角色路由、流式输出、并发限额、成本记账钩子 |
 | `parsing/document_extractors.py`、`chunking.py`、`quality.py` | PDF/DOCX/HTML/纯文本抽取(标准库实现,不执行宏)、稳定切块、质量评分 | `packages/ingest/` | 直接复用;V2 评估 GROBID/marker 升级 PDF 结构化质量 |
 | `packages/db`(base/session/repositories 模式 + Alembic 约定) | ORM 基类、会话、仓储模式、迁移纪律 | 新仓库 `packages/db/` | 沿用约定,模型全新 |
 | `packages/db/models/literature_review.py` 中 `scholarly_work`/`work_identifier`/`work_url`/`work_author` 四表 | 文献实体与标识符/作者/URL 归一 | `packages/db/models/library.py` | 保留字段(含 is_retracted/oa_status/license);去掉 source_priority 等 lane 相关字段 |
@@ -205,7 +205,7 @@ PostgreSQL 16 + Alembic、MinIO/文件系统对象存储、OpenSearch(新系统�
 | 实时进度 | **SSE**(Server-Sent Events) | 单向进度流足够,免 WebSocket 复杂度 |
 | LaTeX 编译 | **Tectonic**(独立容器,无网络、只读模板、资源限额) | 自包含、可沙箱、可缓存包;比完整 TeXLive 轻一个量级 |
 | 视觉渲染 | **Matplotlib + Graphviz + Pillow**（独立 `visuald`） | 只接收结构化规格和服务端解析数据；固定字体/配色，无外网，不执行 LLM 代码 |
-| LLM | **OpenAI-compatible 多 provider**(迁移自旧 `llm/`) | DeepSeek/GPT/Claude/本地 vLLM 即插即用;按角色路由(§4.9) |
+| LLM | **OpenAI-compatible 多 provider**(迁移自旧 `llm/`) | 智谱 GLM/DeepSeek/GPT/Claude/本地 vLLM 即插即用;按角色路由(§4.9) |
 | 图像生成 | **独立 `ImageProvider` seam + registry/factory** | 与文本模型密钥/端点隔离；默认 Cloudflare Workers AI `FLUX.1-schnell`，保留 OpenAI 适配器；只生成概念性位图 |
 | 仓库形态 | **独立新仓库 `paper-forge/`,monorepo(uv workspace + pnpm)** | 与 DeepSearch 完全解耦,拷贝式迁移代码与测试,不产生运行时依赖 |
 

@@ -1205,7 +1205,7 @@ export function generateVisual(
 }
 
 /**
- * 在付费确认框出现前，让 DeepSeek 读取当前论文全文并生成最终生图提示词。
+ * 在付费确认框出现前，让模型读取当前论文全文并生成最终生图提示词。
  * 已经绑定当前正文快照的提示词由后端直接复用；旧草稿或正文变化后会重新分析。
  */
 export function prepareVisualGeneration(

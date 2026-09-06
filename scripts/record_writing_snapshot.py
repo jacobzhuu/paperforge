@@ -9,7 +9,7 @@ diff 都只可能来自我们自己的代码。回放键与 ``llm_call_log.promp
 
     LLM_DEFAULT_PROVIDER=openai-compatible \\
     LLM_OPENAI_BASE_URL=... LLM_OPENAI_API_KEY=... \\
-    LLM_ROLE_MODELS='{"writer":"deepseek-v4-pro"}' \\
+    LLM_ROLE_MODELS='{"writer":"glm-5.3-flash"}' \\
     python scripts/record_writing_snapshot.py section_zh
 
 录完之后**逐行审阅**再签入：这份录制此后就是「模型会怎么回答」的定义，一段糊掉的

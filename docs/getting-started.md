@@ -277,7 +277,7 @@ POST /api/v1/projects/{id}/exports
 | `STORAGE_FS_ROOT` | filesystem 后端根目录 | 用 filesystem 时才需要，默认 `./data/objects` |
 | `MINIO_ENDPOINT` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` / `MINIO_SECURE` | MinIO 连接 | 用 minio 后端时必填；默认值与 compose 一致 |
 | `LLM_DEFAULT_PROVIDER` | `noop` / `openai`（=任意 OpenAI-compatible） | 开发期建议 `noop`：示例默认 `openai` 且 key 为空，一旦接通 LLM 调用会直接 configuration_error |
-| `LLM_OPENAI_BASE_URL` | OpenAI-compatible 端点（DeepSeek 等替换此处） | provider=openai 时必填 |
+| `LLM_OPENAI_BASE_URL` | OpenAI-compatible 端点（智谱 `https://open.bigmodel.cn/api/paas/v4` 等替换此处） | provider=openai 时必填 |
 | `LLM_OPENAI_API_KEY` | API key | provider=openai 时必填 |
 | `LLM_ROLE_MODELS` | JSON：角色→模型映射（planner/extractor/reranker/writer/polisher/verifier） | 可留空 `{}`，回退 DEFAULT_ROLE_MODELS |
 | `SCHOLAR_CONTACT_EMAIL` / `SCHOLAR_USER_AGENT` | OpenAlex/Crossref polite pool 礼貌标头 | M0 可留空（providers 尚未迁移）；M1 检索前务必填真实邮箱 |
@@ -323,7 +323,7 @@ curl -fsS http://localhost:3000
   `IMAGE_ACCOUNT_ID` + `IMAGE_API_KEY`）并开启 `AI_IMAGES_ENABLED`。普通视觉建议不会自动
   生图；“跑通全流程”只通过 Yunwu 自动生成一张论文摘要图。启动检查或缺配置时不触发外部调用，
   摘要图保留为可重试建议且不阻断导出。
-- AI 插图的提示词由文本模型（线上为 DeepSeek）在**规划/起草**阶段写成，落进
+- AI 插图的提示词由文本模型（走 `polisher` 角色路由）在**规划/起草**阶段写成，落进
   `AIImageSpec.refined_prompt`；文本模型不可用时退回字段拼接，插图照样能生成。生成确认框展示的
   与真正发出去的始终是同一句（都走 `AIImageSpec.render_prompt()`）。
 - worker 只依赖统一的 `ImageProvider` 协议。现有 Yunwu/Cloudflare/OpenAI 适配器均通过注册表装配；

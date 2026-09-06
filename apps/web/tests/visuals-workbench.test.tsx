@@ -86,10 +86,10 @@ describe('视觉工作台', () => {
         generation_status: 'proposed',
         spec: {
           kind: 'ai_image',
-          prompt: 'A DeepSeek-composed academic figure prompt.',
-          refined_prompt: 'A DeepSeek-composed academic figure prompt.',
+          prompt: 'A model-composed academic figure prompt.',
+          refined_prompt: 'A model-composed academic figure prompt.',
         },
-        resolved_prompt: 'A DeepSeek-composed academic figure prompt.',
+        resolved_prompt: 'A model-composed academic figure prompt.',
       })),
     );
     approveVisual.mockReturnValue(ok(makeVisual({ id: 'v1', review_status: 'approved' })));
@@ -446,7 +446,7 @@ describe('视觉工作台', () => {
     await userEvent.click(screen.getByRole('button', { name: '删除画面元素 1' }));
 
     expect(
-      (screen.getByLabelText('给 DeepSeek 的生图要求') as HTMLTextAreaElement).value,
+      (screen.getByLabelText('给模型的生图要求') as HTMLTextAreaElement).value,
     ).toContain('elements: 结论, 模型');
     await userEvent.click(screen.getByRole('button', { name: /生成新版本/ }));
 
@@ -457,7 +457,7 @@ describe('视觉工作台', () => {
     expect(payload.spec.semantics.elements).toEqual(['结论', '模型']);
   });
 
-  it('手动修改生图要求后作为下一轮 DeepSeek 分析输入保存', async () => {
+  it('手动修改生图要求后作为下一轮分析输入保存', async () => {
     listVisuals.mockReturnValue(
       ok([
         makeVisual({
@@ -476,7 +476,7 @@ describe('视觉工作台', () => {
     await userEvent.click(await screen.findByRole('button', { name: '更多' }));
     await userEvent.click(await screen.findByRole('menuitem', { name: /调整视觉/ }));
     await userEvent.click(await screen.findByText('专业检查器'));
-    const finalPrompt = screen.getByLabelText('给 DeepSeek 的生图要求');
+    const finalPrompt = screen.getByLabelText('给模型的生图要求');
     await userEvent.clear(finalPrompt);
     await userEvent.type(
       finalPrompt,
@@ -485,7 +485,7 @@ describe('视觉工作台', () => {
     await userEvent.clear(screen.getByLabelText('主题'));
     await userEvent.type(screen.getByLabelText('主题'), '新主题');
 
-    expect(screen.getByText(/保存后 DeepSeek 会结合论文全文/)).toBeInTheDocument();
+    expect(screen.getByText(/保存后模型会结合论文全文/)).toBeInTheDocument();
     expect(finalPrompt).toHaveValue(
       'A user-authored final prompt that must remain exactly in control.',
     );

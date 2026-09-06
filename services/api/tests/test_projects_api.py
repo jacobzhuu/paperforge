@@ -2209,7 +2209,7 @@ def test_ai_image_draft_fails_closed_when_deepseek_is_unavailable(client: TestCl
         json={"kind": "ai_image", "intent": "生成全文综述图"},
     )
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "deepseek_image_prompt_failed"
+    assert response.json()["detail"]["code"] == "image_prompt_analysis_failed"
 
 
 def test_yunwu_ai_draft_requires_deepseek_full_paper_analysis(
@@ -2301,7 +2301,7 @@ def test_old_ai_draft_is_analyzed_against_full_paper_before_generation(
             f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/generate"
         )
         assert blocked.status_code == 409
-        assert blocked.json()["detail"]["code"] == "ai_prompt_requires_deepseek"
+        assert blocked.json()["detail"]["code"] == "ai_prompt_requires_analysis"
 
         prepared = client.post(
             f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/prepare-generation"
