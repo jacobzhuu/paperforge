@@ -44,19 +44,23 @@ from paperforge_worker.locators import (
 
 MAX_PARAGRAPHS_PER_SECTION = 8
 MAX_ROLLING_SUMMARY_CHARS = 600
-# 一节正文（目标 ~1200 字）外加逐句回抄的 evidence_ids，实测要 4000–8000 输出 token。
-# 从 4000 起步等于先买一次必然截断的调用：截断后 runner 只加倍重试一次，而
-# `clamp_max_output_tokens()` 把 deepseek 系压在 8192，加倍之后也没有第三次机会。
-# max_tokens 是上限不是计费量（按实际生成计费），所以直接按模型上限要。
-SECTION_MAX_OUTPUT_TOKENS = 8000
+# 一节正文（目标 ~1400 字）外加逐句回抄的 evidence_ids，实测要 4000–8000 输出 token，
+# 而推理型模型的思维链和正文抢的是同一份 max_tokens。8000 这个数原本是被
+# `clamp_max_output_tokens()` 对 deepseek 系的 8192 上限逼出来的：加倍重试只能涨到
+# 8192（+2.4%），等于没有第二次机会，所以只能一次要满。GLM-5.3 系的上限是 128K，
+# 这个约束没有了——16000 让正文和推理各有余量，而且加倍重试（32000）也仍在上限内，
+# 于是截断真的有一次补救，紧凑档退居第三道防线。
+# max_tokens 是上限不是计费量（按实际生成计费），抬高它不产生成本。
+SECTION_MAX_OUTPUT_TOKENS = 16000
 # 一篇中文综述正文 8 节 × 1200 字的设计上限约 1 万字，实测交付 5,250 字——投稿级
 # 中文综述通常要 8000-15000 字。上调目标，但保持
 # `目标 × MIN_TARGET_RATIO == COMPACT_TARGET_WORDS_*`：紧凑档是截断后的退路，
 # 它的目标一旦低于验收线，被截断的那一节就会陷进永远过不了的重试。
 TARGET_WORDS_PER_SECTION_ZH = 1400
 TARGET_WORDS_PER_SECTION_EN = 900
-# 截断之后**降低需求**，而不是加预算：deepseek 系被 clamp 在 8192，供给侧已经到顶。
-# 紧凑档砍掉目标长度与段落数，让同一节的输出结构性地装得进同一个上限。
+# 紧凑档砍掉目标长度与段落数，让同一节的输出结构性地装得进同一个上限。它是**加预算
+# 重试之后**的退路：在 deepseek 上供给侧顶在 8192、重试无效，降低需求是唯一方向；在
+# GLM 上 runner 会先把预算加倍再试一次，这一档只在那次也截断时才生效。
 COMPACT_TARGET_WORDS_ZH = 700
 COMPACT_TARGET_WORDS_EN = 450
 COMPACT_MAX_PARAGRAPHS = 4
@@ -336,9 +340,10 @@ async def write_section(
 ) -> SectionDraft:
     """生成单个章节。R2 违规先重写一次，再违规则 strip 并留告警。
 
-    ``compact`` 走紧凑档：目标长度与段落数都压下来。这是截断之后唯一有效的方向——
-    deepseek 系的输出上限被 ``clamp_max_output_tokens()`` 压在 8192，供给侧没有余量，
-    只能让需求装进去。``corrections`` 是上一版的具体问题（照抄原文、语种不对、太短），
+    ``compact`` 走紧凑档：目标长度与段落数都压下来，让需求装进供给侧。这是加预算重试
+    之后的退路——模型上限够高时 runner 会先加倍预算再试一次（见
+    ``llm_runtime.runner._retry_can_help``），上限顶死时它是唯一方向。
+    ``corrections`` 是上一版的具体问题（照抄原文、语种不对、太短），
     直接回灌给模型，重试才有理由产生不同的结果。
     """
     section_key = str(section.get("key") or "section")

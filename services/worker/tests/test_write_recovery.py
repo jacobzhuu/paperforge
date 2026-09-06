@@ -198,10 +198,12 @@ async def _run(script: list[Any], session_factory) -> tuple[SectionDraft, WriteO
 async def test_a_section_that_comes_back_empty_is_retried_with_a_smaller_ask(
     session_factory,
 ) -> None:
-    """零内容返回不是「写得不对」，是要的太多——重试必须降低需求。
+    """零内容返回不是「写得不对」，是要的太多——这一层的重试必须降低需求。
 
-    deepseek 系的输出上限被 clamp 在 8192，加预算没有余量；唯一能变的是让这一节
-    少写一点。所以第二次请求里必须出现紧凑档的指令。
+    加预算那条路归 ``LLMRunner``（它按模型上限判断值不值得，见
+    ``llm_runtime.runner._retry_can_help``）；到了这一层就说明预算这边已经试过或者
+    根本没有余量，管线自己能变的只剩「让这一节少写一点」。所以第二次请求里必须
+    出现紧凑档的指令。
     """
     draft, outcome, provider = await _run(["", _good_payload()], session_factory)
 
