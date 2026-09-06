@@ -420,6 +420,8 @@ export interface ProjectCost {
   unpriced_call_count?: number;
   /** 为假时 cost_estimate 只是下界，界面必须显示为「≥」而不是确定值。 */
   cost_complete?: boolean;
+  /** cost_estimate 的货币代码（部署的 LLM_PRICE_CURRENCY）。金额不换算，界面只据此选符号。 */
+  currency?: string;
 }
 
 // ---- 大纲与章节（设计 §4.3 outline / paper_section） ----

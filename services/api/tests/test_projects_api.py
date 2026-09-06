@@ -1615,6 +1615,9 @@ def test_cost_endpoint_starts_at_zero(client: TestClient) -> None:
         # 一次调用都没有时金额是完整的 0；有未定价调用才降级成下界（P1-4）。
         "unpriced_call_count": 0,
         "cost_complete": True,
+        # 金额的货币代码（部署的 LLM_PRICE_CURRENCY）。默认 USD——界面据此选符号，
+        # 不做任何换算。
+        "currency": "USD",
     }
 
 

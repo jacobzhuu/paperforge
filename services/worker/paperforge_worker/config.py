@@ -32,7 +32,7 @@ class WorkerSettings(BaseSettings):
     llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled","verifier":"disabled"}'
     # 模型 → 单价（每百万 token）。留空则所有调用记为**未定价**，成本面板会
     # 明说金额不完整，而不是显示一个看起来很划算的 $0.00。
-    #   {"deepseek-v4-pro": {"input": 0.27, "output": 1.10}}
+    #   {"glm-5.3-flash": {"input": 0.8, "output": 2.8}}
     llm_model_prices: str = "{}"
     # 角色 → 截断重试策略。留空则用 llm_runtime 的默认档位。
     #   {"writer": {"max_attempts": 0}, "verifier": {"multiplier": 2.0, "max_attempts": 1}}

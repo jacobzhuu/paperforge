@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     llm_openai_api_key: str = ""
     llm_role_models: str = "{}"
     llm_role_thinking: str = '{"extractor":"disabled","reranker":"disabled"}'
+    # LLM_MODEL_PRICES 里那些数字的货币。**只**决定成本面板与 `paperforge-admin cost`
+    # 打印哪个符号，不做任何换算——照抄哪张价目表，就配哪个币种。默认 USD 保持既有
+    # 部署原样；一个用 `$` 显示出来的人民币金额，面板自己是发现不了的。
+    llm_price_currency: str = "USD"
 
     scholar_contact_email: str = ""
     scholar_user_agent: str = "PaperForge/0.1"
@@ -126,6 +130,17 @@ class Settings(BaseSettings):
             timeout_seconds=self.image_timeout_seconds,
             max_retries=self.image_max_retries,
         )
+
+
+#: 已知币种的显示符号。未列入的币种直接打币种代码——猜一个符号比打 "SEK" 更容易
+#: 让人看错金额。
+_CURRENCY_SYMBOLS = {"USD": "$", "CNY": "¥"}
+
+
+def currency_symbol(code: str) -> str:
+    """货币代码 → 金额前缀。未知币种回落到代码本身（带一个空格便于阅读）。"""
+    key = (code or "").strip().upper()
+    return _CURRENCY_SYMBOLS.get(key) or (f"{key} " if key else "$")
 
 
 _settings: Settings | None = None

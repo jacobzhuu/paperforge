@@ -1037,6 +1037,14 @@ function jobState(
   return { label: '进行中', state: 'running' };
 }
 
+/** 货币代码 → 金额前缀。未列入的币种直接打代码，猜一个符号比打 'SEK ' 更容易让人看错金额。 */
+function currencySymbol(code: string | undefined): string {
+  const key = (code ?? '').trim().toUpperCase();
+  if (key === 'CNY') return '\u00a5';
+  if (key === 'USD' || key === '') return '$';
+  return `${key} `;
+}
+
 function CostSummary({ cost }: { cost: CostDetail | undefined }) {
   const failed = cost?.totals.failed_call_count ?? 0;
   const spend = cost?.totals.cost_estimate ?? 0;
@@ -1045,6 +1053,8 @@ function CostSummary({ cost }: { cost: CostDetail | undefined }) {
   const unpricedCalls = cost?.totals.unpriced_call_count ?? 0;
   const unpricedImages = cost?.images?.unpriced_call_count ?? 0;
   const complete = (cost?.totals.cost_complete ?? true) && unpricedImages === 0;
+  // 金额的货币由部署配置决定；把人民币印成 `$` 是这里唯一要防的事。
+  const symbol = currencySymbol(cost?.totals.currency);
   return (
     <section className="space-y-3">
       <SectionTitle>成本</SectionTitle>
@@ -1064,7 +1074,9 @@ function CostSummary({ cost }: { cost: CostDetail | undefined }) {
           <>
             <Sep />
             <span className="font-medium tabular-nums text-foreground">
-              {complete ? '' : '≥ '}${spend.toFixed(4)}
+              {complete ? '' : '≥ '}
+              {symbol}
+              {spend.toFixed(4)}
             </span>
           </>
         )}

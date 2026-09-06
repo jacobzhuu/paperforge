@@ -453,6 +453,9 @@ class CostResponse(BaseModel):
     unpriced_call_count: int = 0
     # 为假时 cost_estimate 只是**下界**；界面必须照实说，不能显示成确定值。
     cost_complete: bool = True
+    # cost_estimate 的货币代码（来自部署的 LLM_PRICE_CURRENCY）。金额本身不换算，
+    # 界面据此选符号——把人民币印成 `$` 是这个字段唯一要防的事。
+    currency: str = "USD"
 
 
 # ---- M2：大纲 / 章节 / 引用审计 / 预览 ----

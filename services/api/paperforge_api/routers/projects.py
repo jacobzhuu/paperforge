@@ -1164,9 +1164,15 @@ async def resume_job(
 
 @router.get("/projects/{project_id}/cost", response_model=CostResponse)
 async def get_cost(project_id: str, session: SessionDep) -> CostResponse:
+    from paperforge_api.config import get_settings
+
     project = await _require_project(session, project_id)
     totals = await project_llm_cost(session, project.id)
-    return CostResponse(project_id=str(project.id), **totals)
+    return CostResponse(
+        project_id=str(project.id),
+        currency=get_settings().llm_price_currency,
+        **totals,
+    )
 
 
 # ---- 内部工具 ----

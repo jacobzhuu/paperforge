@@ -33,7 +33,7 @@ from sqlalchemy import func, select, update
 from storage import make_object_store
 
 from paperforge_api.auth_service import hash_password
-from paperforge_api.config import get_settings
+from paperforge_api.config import currency_symbol, get_settings
 from paperforge_api.routers.projects import TASK_PROFILE_USER_BOUND_KEY
 from paperforge_api.storage_migration import (
     export_storage,
@@ -338,10 +338,11 @@ def _llm_spend_line(calls: list[Any]) -> str:
     output_tokens = sum(record.output_tokens or 0 for record in ok)
     priced = [record.cost_estimate for record in ok if record.cost_estimate is not None]
     unpriced = len(ok) - len(priced)
+    symbol = currency_symbol(get_settings().llm_price_currency)
     amount = (
         "unpriced (set LLM_MODEL_PRICES)"
         if not priced
-        else f"{'≥ ' if unpriced else ''}${sum(priced):.4f}"
+        else f"{'≥ ' if unpriced else ''}{symbol}{sum(priced):.4f}"
     )
     reasons = Counter(record.error_code for record in calls if record.error_code)
     failures = (
@@ -419,13 +420,16 @@ async def _cost_command(args: argparse.Namespace) -> None:
     print(header)
     print("-" * len(header))
     totals = dict.fromkeys(("calls", "failed", "in", "out", "unpriced", "no_usage"), 0)
+    # 金额单位由部署配置决定（LLM_MODEL_PRICES 抄的是哪张价目表）；这里只负责别把
+    # 人民币印成美元。
+    symbol = currency_symbol(get_settings().llm_price_currency)
     spend = 0.0
     unpriced_models: dict[str, int] = {}
     for role, model, calls, failed, in_tok, out_tok, priced, cost, unpriced, no_usage in rows:
         print(
             f"{role:<30} {model:<22} {calls:>7} {failed:>7} "
             f"{int(in_tok):>11} {int(out_tok):>11} "
-            f"{('$' + format(float(cost), '.4f')) if priced else '—':>12} {unpriced:>9}"
+            f"{(symbol + format(float(cost), '.4f')) if priced else '—':>12} {unpriced:>9}"
         )
         totals["calls"] += calls
         totals["failed"] += failed
@@ -442,7 +446,7 @@ async def _cost_command(args: argparse.Namespace) -> None:
     print(
         f"{'TOTAL':<30} {'':<22} {totals['calls']:>7} {totals['failed']:>7} "
         f"{totals['in']:>11} {totals['out']:>11} "
-        f"{bound + '$' + format(spend, '.4f'):>12} {totals['unpriced']:>9}"
+        f"{bound + symbol + format(spend, '.4f'):>12} {totals['unpriced']:>9}"
     )
     if totals["unpriced"]:
         print(

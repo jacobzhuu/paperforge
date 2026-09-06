@@ -315,7 +315,8 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
     ).all()
     return {
         "project_id": str(project.id),
-        "totals": totals,
+        # 金额不换算，只带上它的货币代码——界面据此选符号，而不是假定美元。
+        "totals": {**totals, "currency": get_settings().llm_price_currency},
         "by_role": [
             {
                 "role": row[0],
