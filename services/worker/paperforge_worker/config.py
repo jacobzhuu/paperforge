@@ -39,6 +39,20 @@ class WorkerSettings(BaseSettings):
     # 与上面几项不同，这一项**配错就抛**：被静默忽略的重试策略意味着某个角色继续
     # 按旧策略烧调用，而部署以为自己已经调过了。
     llm_role_retry: str = "{}"
+    # 单次 HTTP 尝试的分段超时（connect/read/write），秒。**这才是长调用真正撞上的墙**：
+    # 生产实测（2026-09-07，GLM-5.3-Flash）writer 请求 16000 预算时平均 52.5s，贴着
+    # 默认的 60s 跑；偶尔越线的那次会被重试两轮，最终以 60×3+退避 ≈ 183.8s 失败。
+    # 那个数字长期被误读成 `total_deadline_seconds`（180s）在生效——两条路径的
+    # error_code 都是 `timeout`，只看错误码分不出来，要看耗时。
+    # 代价要知情：调高它会让**真正卡死**的端点等更久（最坏 timeout × (max_retries+1)）。
+    llm_timeout_seconds: float = 60.0
+    # 写作后的「重写未达标章节 + 全文重新评估」轮数。2 是设计值：一轮走一条修复路，
+    # 两轮足以让「先补证据、再收回论断」这条最常见的组合走完。做成可配置是因为它是
+    # 全流程最大的一块墙钟——生产实测（2026-09-06）66 分钟里 37 分钟在这里，29 次
+    # 章节重写。赶时间的 draft 档可以降到 1：实测（2026-09-07）修好按节结算之后，
+    # 单轮已能保留 9 节里的 5 节，代价是放弃上面那条要两轮才走得完的组合路径。
+    # 0 表示写完就交，不做任何修复。
+    quality_repair_rounds: int = 2
 
     # Independent structured tasks can safely share the provider concurrently.
     # Keep the bounds below the default SQLAlchemy overflow capacity.
@@ -170,6 +184,7 @@ class WorkerSettings(BaseSettings):
             role_thinking=role_thinking if isinstance(role_thinking, dict) else {},
             model_prices=parse_model_prices(model_prices),
             role_retry=parse_role_retry(role_retry),
+            timeout_seconds=self.llm_timeout_seconds,
         )
 
     def user_agent(self) -> str:

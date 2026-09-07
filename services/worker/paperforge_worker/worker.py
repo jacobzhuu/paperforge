@@ -2287,14 +2287,97 @@ _NON_DEGENERATION_CODES = frozenset(
 )
 
 
-def _repair_candidate_improves(previous: Any, candidate: Any) -> bool:
-    if candidate.readiness_status == "preflight_ready":
-        return True
+async def _unresolved_anchor_counts(context: JobContext, report: Any) -> dict[str, int]:
+    """每个章节还有多少条待修的 claim anchor。
+
+    与 ``_quality_failing_sections`` 用**同一个** ``_claim_anchor_requires_repair``
+    判据，这不是巧合：选择和验收必须数同一批东西，否则修复轮就是在为一个它动不了的
+    计数付钱。
+    """
+    from db import list_claim_evidence
+
+    if not report.report_id:
+        return {}
+    async with context.session() as session:
+        anchors = await list_claim_evidence(
+            session,
+            context.project_id,
+            quality_report_id=uuid.UUID(str(report.report_id)),
+            core_only=True,
+        )
+    counts: dict[str, int] = {}
+    for anchor in anchors:
+        if _claim_anchor_requires_repair(anchor):
+            key = str(anchor.section_key or "")
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+async def _roll_back_worsened_sections(
+    context: JobContext,
+    *,
+    snapshot: dict[str, dict[str, Any]],
+    before: dict[str, int],
+    after: dict[str, int],
+) -> list[str]:
+    """只退回未解决锚点**变多**的那些章节，其余保留重写结果。
+
+    ``restore_document_sections`` 会删掉快照里没有的章节，所以这里**不能**传一份过滤过
+    的快照——那会把要保留的章节一起删掉。改为构造一份完整快照：以重写后的现状为底，
+    把要退回的那几节换成修复前的版本。
+
+    :returns: 实际退回的章节 key，按字典序。
+    """
+    worsened = sorted(
+        key
+        for key in snapshot
+        if after.get(key, 0) > before.get(key, 0)
+    )
+    if not worsened:
+        return []
+    current_state = await snapshot_document_sections(context)
+    merged: dict[str, dict[str, Any]] = dict(current_state)
+    for key in worsened:
+        merged[key] = snapshot[key]
+    # 重写把某一节整个弄丢时，现状里没有它——补回修复前的版本，别让它消失。
+    for key, item in snapshot.items():
+        merged.setdefault(key, item)
+    await restore_document_sections(context, merged)
+    return worsened
+
+
+def _repair_objective(report: Any, unresolved_anchors: int) -> int:
+    """修复轮真正要压小的那个数：可计数的发现项 + 未解决的 claim anchor。
+
+    生产实测（项目 aaa9a5b1，2026-09-06）：报告里可计数的发现项只有 1 条，而触发
+    重写的是 56 条未定位的 claim anchor，摊在 9 个章节上。于是修复去修锚点、验收却数
+    发现项——两轮 29 次重写全部判为「没有改善」并整体回滚，37 分钟（全程 56%）产出为零。
+    把锚点计入目标函数，改善才看得见。
+
+    锚点数由调用方查好后传进来，这个判据保持无 I/O：它要能在不接数据库的情况下被断言。
+    """
+    return _blocker_instances(report) + max(0, unresolved_anchors)
+
+
+def _introduces_degeneration(previous: Any, candidate: Any) -> bool:
     previous_codes = {str(item.get("code")) for item in previous.blockers or []}
     candidate_codes = {str(item.get("code")) for item in candidate.blockers or []}
-    introduced_degeneration = (candidate_codes - previous_codes) & _NON_DEGENERATION_CODES
-    return not introduced_degeneration and _blocker_instances(candidate) < _blocker_instances(
-        previous
+    return bool((candidate_codes - previous_codes) & _NON_DEGENERATION_CODES)
+
+
+def _repair_candidate_improves(
+    previous: Any,
+    candidate: Any,
+    *,
+    previous_unresolved: int = 0,
+    candidate_unresolved: int = 0,
+) -> bool:
+    if candidate.readiness_status == "preflight_ready":
+        return True
+    if _introduces_degeneration(previous, candidate):
+        return False
+    return _repair_objective(candidate, candidate_unresolved) < _repair_objective(
+        previous, previous_unresolved
     )
 
 
@@ -3209,17 +3292,23 @@ async def _converge_scholarly_quality(
     review_style: str,
     quality_profile: str = "scholarly",
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """At most two monotonic local rewrite rounds after the pre-write evidence gate.
+    """Monotonic local rewrite rounds after the pre-write evidence gate.
 
     ``quality_profile`` 必须跟着调用方走。此前这里写死 scholarly，于是 draft 档的
     任务一旦进来，重新评估出的是一份 scholarly 报告，和用户选的档位对不上；更实际的
     后果是 draft 根本没被允许进来过——可恢复的缺陷因此永远只是提示。
+
+    轮数由部署配置（``QUALITY_REPAIR_ROUNDS``，默认仍是设计值 2）。这里是全流程最大
+    的一块墙钟，但降轮数是拿质量换时间，不是免费的：见 WorkerSettings 上的注释。
     """
     current = initial_report
     history: list[dict[str, Any]] = []
-    for attempt in range(1, 3):
+    rounds = max(0, int(context.settings.quality_repair_rounds))
+    for attempt in range(1, rounds + 1):
         section_keys = await _quality_failing_sections(context, current)
         before = _blocker_instances(current)
+        # 修复前的锚点分布：既是验收的基线，也是按节回滚的依据。查一次，两处用。
+        before_anchors = await _unresolved_anchor_counts(context, current)
         snapshot = await snapshot_document_sections(context)
         await context.emit(
             "quality_repair.started",
@@ -3257,9 +3346,46 @@ async def _converge_scholarly_quality(
             )
             break
         after = _blocker_instances(candidate)
-        accepted = _repair_candidate_improves(current, candidate)
+        after_anchors = await _unresolved_anchor_counts(context, candidate)
+        accepted = _repair_candidate_improves(
+            current,
+            candidate,
+            previous_unresolved=sum(before_anchors.values()),
+            candidate_unresolved=sum(after_anchors.values()),
+        )
+        # 净改善被接受时，允许个别章节变差（整体目标优先）。但那一节必须留下痕迹：
+        # 最后一轮之后没有下一轮能补救它，而锚点信号与 report.blockers 基本脱钩，
+        # 交付的 readiness_status 不会说出「有一节比进来时更差」。
+        regressed_kept = sorted(
+            key for key, count in after_anchors.items() if count > before_anchors.get(key, 0)
+        )
+        rolled_back: list[str] = []
         if not accepted:
-            await restore_document_sections(context, snapshot)
+            # 全有全无的回滚是这一段最大的浪费：9 个章节里 8 个改好了、1 个没改好，
+            # 整轮一起退回。所以能**归因到具体章节**时改成按节结算。
+            #
+            # 但按节结算是一个优化，不是新的安全边界：不变量始终是「被判为更差的
+            # 候选绝不留在库里」。归因不成立时必须整轮退回，有三种情况——
+            #   1. 引入了退化码（删掉综述核心也能让计数变小，那是安全属性）；
+            #   2. 报告级阻断项自己变差了（它和任何单一章节的锚点数都不对应，
+            #      按节回滚会一节都不退，把更差的稿子留在库里）；
+            #   3. 重写新增了快照里没有的章节（按节路径会把它们留下）。
+            attributable_to_sections = (
+                not _introduces_degeneration(current, candidate)
+                and _blocker_instances(candidate) <= before
+                and set(after_anchors) <= set(snapshot)
+            )
+            if attributable_to_sections:
+                rolled_back = await _roll_back_worsened_sections(
+                    context,
+                    snapshot=snapshot,
+                    before=before_anchors,
+                    after=after_anchors,
+                )
+            if not attributable_to_sections or not rolled_back:
+                # 归因不到，或归因到了却一节都没退：都说明这次退步不是按节能表达的。
+                await restore_document_sections(context, snapshot)
+                rolled_back = sorted(snapshot)
             # 回滚之后库里 live 的还是被拒候选的报告，必须让它重新对上正文。
             # 正文是逐字复原的，所以先试着把 current 这份结论重新落库（无 LLM 调用）；
             # 快照哈希对不上才说明复原不完整，那时才真的重新评估一次。
@@ -3281,6 +3407,16 @@ async def _converge_scholarly_quality(
             "before": before,
             "after": after,
             "accepted": accepted,
+            "rolled_back": rolled_back,
+            # 变差、但仍然活在库里的章节。两层排除缺一不可：已回滚的不算；
+            # 被拒时**快照里没有**的那些是重写新增的，整轮回滚会把它们删掉
+            # （restore_document_sections 会删掉快照外的章节），它们同样不算「保留」。
+            # 少这一层就会在台账里显示一个其实已经不存在的「更差的章节」。
+            "regressed_kept": [
+                key
+                for key in regressed_kept
+                if key not in set(rolled_back) and (accepted or key in snapshot)
+            ],
             "sections": sorted(section_keys),
             "report_id": candidate.report_id,
             "readiness_status": candidate.readiness_status,

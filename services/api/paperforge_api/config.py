@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # 打印哪个符号，不做任何换算——照抄哪张价目表，就配哪个币种。默认 USD 保持既有
     # 部署原样；一个用 `$` 显示出来的人民币金额，面板自己是发现不了的。
     llm_price_currency: str = "USD"
+    # 与 WorkerSettings 同名同义：单次 HTTP 尝试的分段超时（秒）。API 侧只有生图提示词
+    # 分析走 LLM，但两边配同一个值，免得同一次调用在两个服务里有两种超时。
+    llm_timeout_seconds: float = 60.0
 
     scholar_contact_email: str = ""
     scholar_user_agent: str = "PaperForge/0.1"
@@ -104,6 +107,7 @@ class Settings(BaseSettings):
             api_key=self.llm_openai_api_key,
             role_models=role_models if isinstance(role_models, dict) else {},
             role_thinking=role_thinking if isinstance(role_thinking, dict) else {},
+            timeout_seconds=self.llm_timeout_seconds,
         )
 
     def image_provider_config(self, provider_override: str | None = None) -> ImageProviderConfig:
