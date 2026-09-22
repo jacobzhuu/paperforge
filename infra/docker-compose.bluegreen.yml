@@ -72,6 +72,7 @@ services:
     env_file:
       - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
     environment:
+      AUTH_REGISTRATION_RESTRICTED: ${AUTH_REGISTRATION_RESTRICTED:-true}
       AUTH_COOKIE_SECURE: "true"
       AUTH_DEV_LOGIN_ENABLED: "false"
       AUTH_EMAIL_MODE: smtp
