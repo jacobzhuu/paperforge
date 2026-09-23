@@ -10,7 +10,6 @@ Draft-first：LLM 不可用时用确定性回退（摘要切句），卡片永�
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -21,6 +20,7 @@ from db.models.library import LiteratureCard
 from llm_runtime import LLMRunner
 from sqlalchemy import select
 
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.fulltext import load_persisted_fulltext_sources
 
@@ -219,28 +219,59 @@ async def generate_cards(
     # call in that batch has been persisted.  This preserves the existing
     # interruption guarantee while removing the N × provider-latency wall time.
     concurrency = max(1, min(int(context.settings.card_concurrency), 12))
-    for batch_start in range(0, len(entries), concurrency):
-        batch = entries[batch_start : batch_start + concurrency]
-        results = await asyncio.gather(*(_generate_one(work) for _entry, work in batch))
-        for result in results:
-            if result.disposition == "cached":
-                outcome.cached += 1
-            elif result.disposition == "fallback":
-                outcome.fallback += 1
-            else:
-                outcome.generated += 1
-            if result.fulltext_generated:
-                outcome.fulltext_cards += 1
-        done = batch_start + len(batch)
-        await context.emit(
-            "cards.progress",
-            {"done": done, "total": outcome.requested},
-            stage="cards",
-            progress=None,
-        )
-        # Cards in the whole batch are upserted before honoring the stop flag;
-        # no completed provider call is discarded.
-        await context.raise_if_stopped()
+
+    async def _card_for(entry_work: tuple[Any, Any]) -> _CardGenerationResult:
+        _entry, work = entry_work
+        return await _generate_one(work)
+
+    async def _count_one(index: int, entry_work: tuple[Any, Any], result: Any) -> None:
+        _entry, work = entry_work
+        if isinstance(result, BaseException):
+            # 一篇失败只损失这一篇：记降级标记，其余照常计数。
+            # `_generate_one` 只兜住了 LLM 侧的失败，落库那两段逃出来的异常
+            # （最典型的是连接池耗尽的 TimeoutError）以前会掀掉整批。
+            context.warn(
+                "cards",
+                type(result).__name__,
+                {"work_id": str(work.id), "message": str(result)[:300]},
+            )
+            outcome.warnings.append(
+                {
+                    "stage": "cards",
+                    "reason": type(result).__name__,
+                    "work_id": str(work.id),
+                }
+            )
+        elif result.disposition == "cached":
+            outcome.cached += 1
+        elif result.disposition == "fallback":
+            outcome.fallback += 1
+        else:
+            outcome.generated += 1
+        if not isinstance(result, BaseException) and result.fulltext_generated:
+            outcome.fulltext_cards += 1
+        # 进度事件保持原来的节奏（每 concurrency 篇一次 + 收尾一次）。
+        # 每篇都发会让 `context.emit` 的次数涨 6 倍，而每次 emit 要占一条数据库
+        # 连接、走 5 个来回——恰好发生在全流程并发度最高的阶段。
+        done = index + 1
+        if done % concurrency == 0 or done == len(entries):
+            await context.emit(
+                "cards.progress",
+                {"done": done, "total": outcome.requested},
+                stage="cards",
+                progress=None,
+            )
+
+    # 滑动窗口取代批次栅栏：原来一批 6 篇要等最慢的那篇跑完才开下一批，
+    # 而卡片延迟实测在 15-51 秒之间摆动，栅栏因此吃掉该阶段约四成时间。
+    # 停止语义不变：`bounded_map` 只停止**准入**，在飞的照常跑完并落库。
+    await bounded_map(
+        entries,
+        _card_for,
+        limit=concurrency,
+        on_ready=_count_one,
+        stop_check=context.raise_if_stopped,
+    )
     return outcome
 
 

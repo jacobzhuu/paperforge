@@ -1,0 +1,65 @@
+{
+  "kind": "infrastructure_fixture_not_real_agent_or_llm",
+  "resource_profile": "container-limited-final-deployed-image",
+  "streams_per_job": 5,
+  "works_per_project": 40,
+  "submit_interval_seconds": 0,
+  "read_mix": [
+    "project",
+    "library",
+    "jobs"
+  ],
+  "at": "2026-09-16T12:33:25.291905+00:00",
+  "seconds": 120.99704927788116,
+  "accounts": 100,
+  "active_users": 30,
+  "job_fixture_seconds": "10",
+  "request_count": 3068,
+  "request_per_second": 25.355990235382087,
+  "http_statuses": {
+    "200": 3048,
+    "202": 20
+  },
+  "latency_seconds": {
+    "p50": 0.13401079596951604,
+    "p95": 0.538219268899411,
+    "p99": 0.7372569071594626
+  },
+  "sampled_running_peak": 8,
+  "sampled_queued_peak": 20,
+  "job_failure_ratio": 0.0,
+  "accepted_jobs": 20,
+  "completed_jobs": 20,
+  "job_states": {
+    "b332cc0c-1387-412f-b943-32e6110a1fa4": "succeeded",
+    "7f50f951-761e-4af8-9aa5-85bec235687b": "succeeded",
+    "34c7a482-84b8-481f-ad0d-54350fe46bf6": "succeeded",
+    "eb7cc396-2a70-4863-9257-ab06fce66adb": "succeeded",
+    "30d16d4c-7c58-4259-a0d3-98642a60f708": "succeeded",
+    "828e9c18-b061-427f-87a2-41dfc5e1ddd2": "succeeded",
+    "c289d609-c23b-4417-9a44-9e0f9a38af23": "succeeded",
+    "1cddbe8e-624f-4c58-92da-bfe6d4e46578": "succeeded",
+    "06f66858-f6bd-4bde-8dd5-8c57441c3270": "succeeded",
+    "6afaff2c-67a9-48f2-bceb-3d96e4b610f6": "succeeded",
+    "ad58d6d2-91ab-4330-b187-71dd9a9447d6": "succeeded",
+    "84236a79-a529-47bc-ba04-9f4003ac5398": "succeeded",
+    "603bfe96-478b-4349-a161-a46363f6a626": "succeeded",
+    "4500c4aa-d0d0-4222-bccc-a7533d17c9bc": "succeeded",
+    "50807f49-2422-4bb4-8d0c-8b130c80a0bd": "succeeded",
+    "aa3aa6db-478a-4cc0-ba74-c93c7bfdbb8b": "succeeded",
+    "a5820ea8-b97e-4646-92a1-c15e0a135397": "succeeded",
+    "d473055b-8837-4bad-896e-b7e3dc1bb481": "succeeded",
+    "35278f2d-ded5-4d96-9dcb-58ed6f710f0f": "succeeded",
+    "2159c3b1-4bf8-4bfe-b924-346fdfcd3935": "succeeded"
+  },
+  "observed_completions_per_hour": 595.055833424873,
+  "queue_wait_seconds": {
+    "p50": 12.495964,
+    "p95": 24.427428,
+    "max": 24.511447
+  },
+  "sse_peak": 100,
+  "sse_unique_events_received": 600,
+  "sse_errors": [],
+  "failure_ratio": 0.0
+}

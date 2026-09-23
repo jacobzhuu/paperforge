@@ -164,12 +164,35 @@ class OpenAICompatibleLLMProvider:
         delay += random.uniform(0.0, delay * 0.25)
         time.sleep(delay)
 
-    def _post_chat_completions(
+    def _post_chat_completions(self, *, payload, headers):
+        # Gate actual HTTP attempts, including sync export/preflight callers.
+        # The calling HTTP thread owns the lease until the attempt returns.
+        from types import SimpleNamespace
+
+        from llm_runtime.limits import provider_slot
+
+        with provider_slot(
+            SimpleNamespace(
+                provider=self.name,
+                base_url=self.base_url,
+                api_key=self.api_key,
+            )
+        ):
+            return self._post_chat_completions_admitted(payload=payload, headers=headers)
+
+    def _post_chat_completions_admitted(
         self,
         *,
         payload: dict[str, Any],
         headers: dict[str, str],
     ) -> httpx.Response:
+        from llm_runtime.limits import reserve_attempt
+
+        reserve_attempt(self, payload)
+        from llm_runtime.telemetry import admission_event, check_admission_cancelled
+
+        check_admission_cancelled()
+        admission_event("http_attempt_started")
         try:
             if self.client is not None:
                 return self._send_with_deadline(
@@ -211,6 +234,8 @@ class OpenAICompatibleLLMProvider:
                 message=_sanitize_message(str(error), self.api_key),
                 retryable=True,
             ) from error
+        finally:
+            admission_event("http_attempt_finished")
 
     def _send_with_deadline(
         self,

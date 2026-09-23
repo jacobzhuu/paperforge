@@ -918,6 +918,7 @@ function RecentJobs({
                 </button>
                 {open && (
                   <div className="space-y-3 pb-2 text-meta text-muted-foreground sm:pl-28">
+                    <Link href={`/projects/${projectId}/jobs/${job.id}`} className="text-foreground underline">查看执行详情与修复记录 →</Link>
                     {(job.error?.code as string | undefined) === 'job_abandoned' ? (
                       <div className="space-y-2">
                         {/* 被硬杀掉的任务（部署换掉了 worker 容器、进程被 OOM）没有任何

@@ -51,6 +51,9 @@ class PaperProject(Base, TimestampMixin):
     citation_style: Mapped[str] = mapped_column(String(32), default="author_year", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     scope_json: Mapped[dict | None] = mapped_column(JSONB)
+    web_research_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # 软删除：删掉的项目动辄是几小时 LLM 花费的产物，误删不可逆太贵。
     # 置位后所有 project 作用域路由一律 404（收口在 get_owned_project），
     # 真正的行删除与对象回收由保留期后的 `paperforge-admin purge-projects` 执行。
@@ -245,6 +248,30 @@ class GenerationJob(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class JobDispatch(Base):
+    """Transactional dispatch intent; queue identity contains no credentials."""
+    __tablename__ = "job_dispatch"
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="CASCADE"), index=True
+    )
+    queue_identity: Mapped[str] = mapped_column(String(64), index=True)
+    function: Mapped[str] = mapped_column(String(120))
+    kwargs_json: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(String(120))
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executions: Mapped[int] = mapped_column(Integer, server_default="0")
+
+
 class JobEvent(Base):
     """SSE 进度源（借鉴 DeepSearch task_event）。"""
 
@@ -398,6 +425,7 @@ class PaperDocument(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     outline_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outline.id"))
     status: Mapped[str] = mapped_column(String(24), default="draft", nullable=False)
+    writing_state_json: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class PaperSection(Base):
@@ -416,6 +444,7 @@ class PaperSection(Base):
     asset_refs_json: Mapped[list | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(16), default="generated", nullable=False)
     model: Mapped[str | None] = mapped_column(String(128))
+    generation_json: Mapped[dict | None] = mapped_column(JSONB)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -556,9 +585,9 @@ class ClaimEntailmentCache(Base):
     * ``reason`` is model-authored prose that routinely paraphrases both the claim and the cited
       excerpt, so this table **does** hold derived manuscript text — the claim/evidence columns are
       hashes, but the reason is not.
-    * There is no ``project_id`` and no FK, which is what lets one verdict serve every project.
-      The cost is that ``purge_project`` (a plain delete relying on ``ON DELETE CASCADE``) cannot
-      reach these rows, so they outlive the project whose claims produced them.
+    * New rows carry project_id and cascade on project deletion. NULL rows belong to the
+      legacy global namespace, retained for draining old workers. New workers neither read
+      nor copy that namespace; its historic derived text needs a separate retention decision.
     """
 
     __tablename__ = "claim_entailment_cache"
@@ -567,6 +596,10 @@ class ClaimEntailmentCache(Base):
     )
 
     cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # NULL belongs to the legacy global namespace; new workers never read it.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
+    )
     claim_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     claim_kind: Mapped[str] = mapped_column(String(24), nullable=False)
@@ -726,3 +759,25 @@ class LlmCallLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class EvaluatorShadowRun(Base):
+    """Isolated evaluation outbox; never a delivery/quality authority."""
+    __tablename__ = "evaluator_shadow_run"
+    __table_args__ = (UniqueConstraint("source_job_id", "version", name="uq_shadow_job_version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    source_job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    input_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    results_json: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    artifact_prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

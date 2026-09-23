@@ -19,6 +19,7 @@ R2 三道防线（设计 §4.4.3）：
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +41,12 @@ from paperforge_worker.locators import (
 from paperforge_worker.locators import (
     is_located,
     locator_display,
+)
+from paperforge_worker.orchestration.writing_graph import (
+    WRITING_VERSION,
+    findings_snapshot,
+    fingerprint,
+    is_frame,
 )
 
 MAX_PARAGRAPHS_PER_SECTION = 8
@@ -182,6 +189,20 @@ Never add, remove, or swap cite keys, evidence_ids, or source_refs. Never add or
 number."""
 
 
+def writer_policy(language: str, paper_type: str) -> str:
+    return fingerprint(
+        {
+            "version": WRITING_VERSION,
+            "system": (
+                _ORIGINAL_SYSTEM_PROMPT_ZH if language == "zh" else _ORIGINAL_SYSTEM_PROMPT_EN
+            )
+            if paper_type == "original"
+            else (_SYSTEM_PROMPT_ZH if language == "zh" else _SYSTEM_PROMPT_EN),
+            "coherence": _COHERENCE_PROMPT_ZH if language == "zh" else _COHERENCE_PROMPT_EN,
+        }
+    )
+
+
 @dataclass
 class SectionDraft:
     section_key: str
@@ -203,6 +224,9 @@ class SectionDraft:
     failure_reason: str | None = None
     #: 这一节实际经历了几次写作调用（含重试），落进 outcome 供成本核对。
     attempts: int = 0
+    generation: dict[str, Any] = field(default_factory=dict)
+    # Optimistic guard for every generated write, including polish and final assembly.
+    expected_body_hash: str | None = None
 
     @property
     def word_count(self) -> int:
@@ -307,6 +331,18 @@ class WritingContext:
     paper_type: str = "review"
     glossary: dict[str, str] = field(default_factory=dict)
     rolling_summaries: dict[str, str] = field(default_factory=dict)
+    dependency_summaries: dict[str, str] | None = None
+    integration_notes: str = ""
+
+    def section_summary(self, section_key: str) -> str:
+        section = next(
+            (s for s in self.outline.get("sections", []) if s.get("key") == section_key), {}
+        )
+        if is_frame(section):
+            return findings_snapshot(self.outline.get("sections", []), self.rolling_summaries)
+        if self.dependency_summaries is not None:
+            return "\n".join(f"[{k}] {v}" for k, v in self.dependency_summaries.items())
+        return self.preceding_summary(section_key)
 
     def preceding_summary(self, section_key: str) -> str:
         sections = self.outline.get("sections") or []
@@ -537,21 +573,39 @@ async def coherence_pass(
     runner: LLMRunner | None = None,
 ) -> SectionDraft:
     """连贯性重写：只调整行文，不新增引用、不改数字。"""
-    if runner is None or not runner.enabled or not draft.paragraphs:
+
+    def rejected(reason):
+        draft.generation["polish_result"] = {
+            "accepted": False,
+            "changed": False,
+            "reason": reason,
+        }
         return draft
+
+    if runner is None or not runner.enabled or not draft.paragraphs:
+        return rejected("disabled_or_empty")
     allowed = {key for p in draft.paragraphs for key in p.get("cite_keys", [])} & whitelist
     body = "\n\n".join(p.get("text", "") for p in draft.paragraphs)
     numbers_before = extract_numbers(body)
+    # Sentence identity is explicit: a set-level equality cannot detect swapped bindings.
+    numbered = deepcopy(draft.paragraphs)
+    for pi, paragraph in enumerate(numbered):
+        for si, sentence in enumerate(paragraph.get("sentences") or []):
+            sentence["sentence_id"] = f"{pi}:{si}"
 
     result = await runner.agenerate_json(
         "writer",
-        system_prompt=_COHERENCE_PROMPT_ZH if context.language == "zh" else _COHERENCE_PROMPT_EN,
+        system_prompt=(
+            (_COHERENCE_PROMPT_ZH if context.language == "zh" else _COHERENCE_PROMPT_EN)
+            + " Preserve every sentence_id, its position and its exact provenance bindings."
+        ),
         user_prompt=(
-            f"Preceding sections summary:\n{context.preceding_summary(draft.section_key)}\n\n"
+            f"Preceding sections summary:\n{context.section_summary(draft.section_key)}\n\n"
             f"Glossary: {_format_glossary(context.glossary)}\n\n"
+            f"Integration findings: {context.integration_notes}\n\n"
             f"Target section: {draft.title}\n"
             f"Allowed cite keys: {', '.join(sorted(allowed)) or '(none)'}\n\n"
-            f"Current paragraphs JSON:\n{_paragraphs_json(draft.paragraphs)}"
+            f"Current paragraphs JSON:\n{_paragraphs_json(numbered)}"
         ),
         max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
         temperature=0.2,
@@ -560,7 +614,30 @@ async def coherence_pass(
         metadata={"stage": "coherence", "section": draft.section_key},
     )
     if not result.ok or not isinstance(result.value, dict):
-        return draft
+        return rejected("model_invalid")
+    original_sentences = [s for p in numbered for s in p.get("sentences", [])]
+    candidate_sentences = [
+        s
+        for p in result.value.get("paragraphs", [])
+        if isinstance(p, dict)
+        for s in p.get("sentences", [])
+        if isinstance(s, dict)
+    ]
+    if original_sentences:
+        if len(original_sentences) != len(candidate_sentences):
+            return rejected("sentence_count")
+        for before, after in zip(original_sentences, candidate_sentences, strict=True):
+            if before["sentence_id"] != after.get("sentence_id"):
+                return rejected("sentence_identity")
+            if any(
+                list(before.get(k) or []) != list(after.get(k) or [])
+                for k in ("cite_keys", "evidence_ids", "source_refs")
+            ):
+                return rejected("provenance_binding")
+            if extract_numbers(str(before.get("text", ""))) != extract_numbers(
+                str(after.get("text", ""))
+            ):
+                return rejected("sentence_numbers")
     allowed_evidence_ids = {
         str(evidence_id)
         for paragraph in draft.paragraphs
@@ -580,7 +657,7 @@ async def coherence_pass(
         allowed_source_refs=allowed_source_refs,
     )
     if not rewritten:
-        return draft
+        return rejected("empty_normalization")
     evidence_ids_after = {
         str(evidence_id)
         for paragraph in rewritten
@@ -589,7 +666,7 @@ async def coherence_pass(
     }
     # 连贯性编辑只能改措辞，不能悄悄增删句子的证据绑定。
     if evidence_ids_after != allowed_evidence_ids:
-        return draft
+        return rejected("evidence_binding")
     source_refs_after = {
         str(source_ref)
         for paragraph in rewritten
@@ -597,11 +674,16 @@ async def coherence_pass(
         for source_ref in sentence.get("source_refs") or []
     }
     if source_refs_after != allowed_source_refs:
-        return draft
+        return rejected("source_binding")
     # 连贯性 pass 不得引入新数字：一旦发现新数值，放弃改写保留原稿（红线优先于文采）。
     numbers_after = extract_numbers("\n\n".join(p.get("text", "") for p in rewritten))
     if numbers_after - numbers_before:
-        return draft
+        return rejected("new_numbers")
+    draft.generation["polish_result"] = {
+        "accepted": True,
+        "changed": draft.paragraphs != rewritten,
+        "reason": None,
+    }
     draft.paragraphs = rewritten
     return draft
 
@@ -713,7 +795,7 @@ def _build_prompt(
             f"Paper topic: {context.outline.get('topic', '')}",
             f"Research question: {context.outline.get('research_question', '')}",
             f"Full outline: {' | '.join(outline_titles)}",
-            f"Preceding sections summary:\n{context.preceding_summary(str(section.get('key')))}",
+            f"Preceding sections summary:\n{context.section_summary(str(section.get('key')))}",
             f"Glossary (reuse these): {_format_glossary(context.glossary)}",
             "",
             f"Write section: {section.get('title')}",
@@ -785,9 +867,7 @@ def section_evidence_for(
     section: dict[str, Any],
     outline: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    bundles = [
-        item for item in outline.get("sub_question_bundles") or [] if isinstance(item, dict)
-    ]
+    bundles = [item for item in outline.get("sub_question_bundles") or [] if isinstance(item, dict)]
     question_id = str(section.get("question_id") or "")
     if question_id:
         bundle: dict[str, Any] = next(
@@ -1721,8 +1801,10 @@ def section_minimum_words(
     上游——把文献库从 9 篇修到 36 篇之后，多数小节根本不会再是 evidence_limited。
     """
     zh = language == "zh"
-    floor = (MIN_FRAME_WORDS_ZH if zh else MIN_FRAME_WORDS_EN) if is_frame else (
-        MIN_BODY_WORDS_ZH if zh else MIN_BODY_WORDS_EN
+    floor = (
+        (MIN_FRAME_WORDS_ZH if zh else MIN_FRAME_WORDS_EN)
+        if is_frame
+        else (MIN_BODY_WORDS_ZH if zh else MIN_BODY_WORDS_EN)
     )
     section = section or {}
     if section.get("evidence_limited"):

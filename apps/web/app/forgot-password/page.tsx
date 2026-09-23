@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { requestPasswordReset } from '@/lib/api';
+import { ApiError, requestPasswordReset } from '@/lib/api';
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = React.useState('');
@@ -21,8 +21,8 @@ export default function ForgotPasswordPage() {
     try {
       await requestPasswordReset(email);
       setSent(true);
-    } catch {
-      setError('暂时无法发送重置邮件，请稍后重试。');
+    } catch (cause) {
+      setError(cause instanceof ApiError && cause.code === 'email_delivery_disabled' ? '暂未启用邮件找回密码，请联系管理员。' : '暂时无法发送重置邮件，请稍后重试。');
     } finally {
       setSubmitting(false);
     }

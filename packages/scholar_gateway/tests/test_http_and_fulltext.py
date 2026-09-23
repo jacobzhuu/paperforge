@@ -337,3 +337,152 @@ def test_doaj_discovery_reads_fulltext_url_and_license() -> None:
     )
     assert links[0]["url"] == "https://journal.example/article.pdf"
     assert links[0]["license"] == "CC BY"
+
+
+# ---------------------------------------------------------------------------
+# 并发抓取（2026-09-07）。串行的三次 ingest 合计约 6 分钟墙钟，而每篇之间完全独立。
+# 下面这组钉住并发**不能**改变的三件事。
+# ---------------------------------------------------------------------------
+
+
+def _many_works_plan(count: int):
+    targets = [
+        OaFulltextTarget(work_id=f"w-{index}", arxiv_id=f"2401.{index:05d}")
+        for index in range(count)
+    ]
+    return plan_oa_fulltext(targets)
+
+
+def test_parallel_acquisition_keeps_plan_order_regardless_of_completion_order() -> None:
+    """attempts/documents/failures 的顺序被写进 fulltext_attempt 行，不能随完成序漂移。"""
+    import time
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 让靠后的文献先返回：完成序与计划序刻意相反。
+        index = int(str(request.url).split("2401.")[1].split(".")[0].split("/")[0])
+        time.sleep(0.02 * (5 - index))
+        return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
+
+    plan = _many_works_plan(5)
+    result = acquire_oa_fulltext(
+        plan,
+        http_client=_client(handler, resolver=_StubResolver({"arxiv.org": ("151.101.3.42",)})),
+        concurrency=5,
+    )
+    assert [document.work_id for document in result.documents] == [f"w-{i}" for i in range(5)]
+    assert [attempt.work_id for attempt in result.attempts] == [f"w-{i}" for i in range(5)]
+
+
+def test_parallel_acquisition_keeps_per_work_url_fallback_sequential() -> None:
+    """每篇内部仍是「按回退顺序逐个试、首个成功即停」——并发发出会换掉留下的那个 URL。"""
+    calls: list[str] = []
+    lock = __import__("threading").Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with lock:
+            calls.append(str(request.url))
+        # 第一个候选（e-print）失败，第二个（pdf）成功。
+        if "e-print" in str(request.url):
+            return httpx.Response(404, content=b"missing")
+        return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
+
+    plan = plan_oa_fulltext([OaFulltextTarget(work_id="w-1", arxiv_id="2401.01234")])
+    result = acquire_oa_fulltext(
+        plan,
+        http_client=_client(handler, resolver=_StubResolver({"arxiv.org": ("151.101.3.42",)})),
+        concurrency=8,
+    )
+    assert len(result.documents) == 1
+    # 恰好两次：失败一次、成功一次。全部并发发出的话这里会是候选总数。
+    assert len(calls) == 2
+    assert "e-print" in calls[0]
+
+
+def test_per_host_concurrency_of_one_keeps_a_single_host_serial() -> None:
+    """SafeHttpClient 没有任何限速，所以礼貌度只能靠这个信号量。"""
+    import threading
+    import time
+
+    inflight = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with lock:
+            inflight["now"] += 1
+            inflight["peak"] = max(inflight["peak"], inflight["now"])
+        time.sleep(0.02)
+        with lock:
+            inflight["now"] -= 1
+        return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
+
+    plan = _many_works_plan(6)
+    acquire_oa_fulltext(
+        plan,
+        http_client=_client(handler, resolver=_StubResolver({"arxiv.org": ("151.101.3.42",)})),
+        concurrency=6,
+        per_host_concurrency=1,
+    )
+    # 全部候选都在 arxiv.org 上，所以尽管 concurrency=6，同时在飞的也只能是 1。
+    assert inflight["peak"] == 1
+
+
+def test_distinct_hosts_do_run_concurrently() -> None:
+    """并行度本来就在 host 之间——否则上面那条限制会让并发化毫无意义。"""
+    import threading
+    import time
+
+    inflight = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        with lock:
+            inflight["now"] += 1
+            inflight["peak"] = max(inflight["peak"], inflight["now"])
+        time.sleep(0.05)
+        with lock:
+            inflight["now"] -= 1
+        return httpx.Response(200, content=PDF_BYTES, headers={"content-type": "application/pdf"})
+
+    targets = [
+        OaFulltextTarget(work_id="w-arxiv", arxiv_id="2401.01234"),
+        OaFulltextTarget(work_id="w-pmc", pmcid="PMC7654321"),
+    ]
+    plan = plan_oa_fulltext(targets)
+    acquire_oa_fulltext(
+        plan,
+        http_client=_client(
+            handler,
+            resolver=_StubResolver(
+                {
+                    "arxiv.org": ("151.101.3.42",),
+                    "europepmc.org": ("193.62.193.80",),
+                    "pmc.ncbi.nlm.nih.gov": ("130.14.29.110",),
+                }
+            ),
+        ),
+        concurrency=4,
+        per_host_concurrency=1,
+    )
+    assert inflight["peak"] > 1
+
+
+def test_lazy_client_construction_is_thread_safe() -> None:
+    """并发抓取会同时撞上懒初始化；没有锁就会建出两个 client，其中一个永不回收。"""
+    import threading
+
+    client = SafeHttpClient(user_agent="PaperForge/0.1")
+    seen: list[object] = []
+    barrier = threading.Barrier(8)
+
+    def grab() -> None:
+        barrier.wait()
+        seen.append(client.client)
+
+    threads = [threading.Thread(target=grab) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len({id(item) for item in seen}) == 1
+    client.close()

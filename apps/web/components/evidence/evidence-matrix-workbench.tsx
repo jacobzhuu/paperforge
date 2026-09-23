@@ -1,5 +1,7 @@
 'use client';
 
+import { EvidenceSearchPanel } from './evidence-search';
+
 import * as React from 'react';
 import { ExternalLink, Loader2, RefreshCw, Save } from 'lucide-react';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
@@ -282,6 +284,7 @@ export function EvidenceMatrixWorkbench() {
 
   return (
     <div className="space-y-6">
+      <EvidenceSearchPanel />
       <WorkbenchHeader
         title="证据矩阵"
         description="在写作前核对每条证据回答哪个问题，以及研究之间是否真的可比较。"

@@ -20,18 +20,29 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from llm_runtime import LLMRunner
 
 from paperforge_worker.locators import locator_display
+from paperforge_worker.orchestration.writing_graph import fingerprint
+from paperforge_worker.pipelines.review_contract import (
+    CLAIM_CHECK_SCHEMA,
+    EVIDENCE_REVIEW_RULES,
+    checked_payload,
+    table_role_conflicts,
+    validate_claim_checks,
+)
+from paperforge_worker.pipelines.review_inputs import MAX_REVIEW_INPUT_CHARS, REVIEW_INPUT_VERSION
 
 #: 判断类角色。按上一轮实测（真实候选集三臂对比）：判断力跟档位走，思考开关反而
 #: 会让弱档退化成不判断，所以这个角色走 planner 档并关掉思考。
 REVIEWER_ROLE = "section_reviewer"
 
 MAX_OUTPUT_TOKENS = 2000
+SECTION_MAX_OUTPUT_TOKENS = 8192
 #: 一次评审最多看多少条证据。够覆盖一个子问题的证据面，又不至于把预算烧在上下文上。
 MAX_EVIDENCE_PER_REVIEW = 14
 EVIDENCE_TEXT_CHARS = 700
@@ -69,6 +80,8 @@ class SectionVerdict:
     #: 证据确实不够时，正文有没有**明说**这个缺口。说了就不算失败——
     #: 目标明确要求「证据不足就报告缺口，而不是把段落灌长」。
     gap_declared: bool = False
+    claim_checks: tuple[dict[str, Any], ...] = ()
+    deterministic_findings: tuple[dict[str, Any], ...] = ()
 
     @property
     def acceptable(self) -> bool:
@@ -107,6 +120,8 @@ class SectionVerdict:
             "acceptable": self.acceptable,
             "unanswered_aspects": list(self.unanswered_aspects),
             "unsupported_claims": list(self.unsupported_claims),
+            "claim_checks": list(self.claim_checks),
+            "deterministic_findings": list(self.deterministic_findings),
             "rationale": self.rationale,
         }
 
@@ -226,21 +241,37 @@ async def _judge(
     system_prompt: str,
     user_prompt: str,
     metadata: dict[str, Any],
+    trace_context: Any = None,
+    retry_invalid: bool = False,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any] | None:
     """跑一次评审调用。判断不出来就返回 None——调用方保持既有行为，绝不臆造判定。"""
     if runner is None or not runner.enabled:
         return None
-    result = await runner.agenerate_json(
-        REVIEWER_ROLE,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0.0,
-        metadata=metadata,
-    )
-    if not result.ok or not isinstance(result.value, dict):
-        return None
-    return result.value
+    for attempt in range(2 if retry_invalid else 1):
+        result = await runner.agenerate_json(
+            REVIEWER_ROLE,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            temperature=0.0,
+            metadata={**metadata, "format_attempt": attempt + 1},
+        )
+        if trace_context is not None:
+            await trace_context.emit(
+                "review.raw_result",
+                {
+                    **metadata,
+                    "format_attempt": attempt + 1,
+                    "raw_text": result.raw_text,
+                    "error": result.error,
+                },
+            )
+        if result.ok and isinstance(result.value, dict):
+            return result.value
+        if not str(result.error or "").startswith("invalid_json"):
+            break
+    return None
 
 
 def _one_of(value: Any, allowed: tuple[str, ...], default: str) -> str:
@@ -279,8 +310,10 @@ def build_section_verdict(
         diagnosis=diagnosis,
         rationale=str(payload.get("rationale") or "")[:400],
         unanswered_aspects=_strings(payload.get("unanswered_aspects")),
-        unsupported_claims=_strings(payload.get("unsupported_claims")),
+        unsupported_claims=_strings(payload.get("unsupported_claims"), limit=1000),
         gap_declared=bool(payload.get("gap_declared")),
+        claim_checks=tuple(payload.get("claim_checks") or ()),
+        deterministic_findings=tuple(payload.get("deterministic_findings") or ()),
     )
     if verdict.acceptable:
         # 合格的章节没有病因可言；模型偶尔会两边都填，以验收判据为准。
@@ -378,20 +411,106 @@ async def review_section(
     evidence: list[dict[str, Any]],
     runner: LLMRunner | None,
     language: str = "zh",
+    review_input: dict[str, Any] | None = None,
+    trace_context: Any = None,
 ) -> SectionVerdict | None:
-    """评审一节。拿不到判定返回 None（调用方视为「未评审」，不是「不合格」）。"""
+    """Review a complete frozen input; unavailable/oversized inputs are unassessed."""
     if not prose.strip() or not question.strip():
+        return None
+    material = review_input or {
+        "version": REVIEW_INPUT_VERSION,
+        "section_key": section_key,
+        "question": question,
+        "prose": prose,
+        "evidence": evidence,
+    }
+    material = {k: v for k, v in material.items() if k != "input_hash"}
+    if "claims" in material:
+        material["table_role_conflicts"] = table_role_conflicts(material)
+    input_hash = fingerprint(material)
+    material["input_hash"] = input_hash
+    serialized = json.dumps(material, ensure_ascii=False, sort_keys=True, default=str)
+    user_prompt = (
+        "评审以下完整输入。claims 保留正文实际引用绑定；evidence 仅为已解析的绑定材料。"
+        "不得用其他论断的证据补造当前论断的绑定。binding_issues 是绑定缺口，"
+        "不能将缺口解释为已验证支持。普通的待补证据说明不等于 TODO 占位。\n" + serialized
+    )
+    strict = "claims" in material
+    prompt = _SECTION_PROMPT_ZH + EVIDENCE_REVIEW_RULES + (CLAIM_CHECK_SCHEMA if strict else "")
+    artifact = {
+        "review_input": material,
+        "system_prompt": prompt,
+        "user_prompt": user_prompt,
+        "role": REVIEWER_ROLE,
+        "temperature": 0.0,
+        "max_output_tokens": SECTION_MAX_OUTPUT_TOKENS,
+    }
+    artifact_hash = fingerprint(artifact)
+    metadata = {
+        "stage": "section_review",
+        "section": section_key,
+        "review_version": REVIEW_INPUT_VERSION,
+        "review_input_hash": input_hash,
+    }
+    oversized = len(serialized) > MAX_REVIEW_INPUT_CHARS
+    if trace_context is not None:
+        import asyncio
+
+        from storage import make_object_store
+
+        key = f"projects/{trace_context.project_id}/review-inputs/{artifact_hash}.json"
+        await asyncio.to_thread(
+            make_object_store(trace_context.settings).put,
+            key,
+            json.dumps(artifact, ensure_ascii=False, sort_keys=True, default=str).encode(),
+            content_type="application/json",
+        )
+        await trace_context.emit(
+            "review.input",
+            {
+                **metadata,
+                "artifact_key": key,
+                "artifact_hash": artifact_hash,
+                "input_chars": len(serialized),
+                "coverage": material.get("coverage"),
+                "status": "unassessed" if oversized else "ready",
+                "reason": "input_budget_exceeded" if oversized else None,
+            },
+        )
+    if oversized:
         return None
     payload = await _judge(
         runner,
-        system_prompt=_SECTION_PROMPT_ZH,
-        user_prompt=(
-            f"子问题：{question}\n\n"
-            f"本节正文：\n{prose[:SECTION_TEXT_CHARS]}\n\n"
-            f"本节可用证据（正文只能靠这些支撑）：\n{_evidence_block(evidence)}"
-        ),
-        metadata={"stage": "section_review", "section": section_key},
+        system_prompt=prompt,
+        user_prompt=user_prompt,
+        metadata=metadata,
+        trace_context=trace_context,
+        retry_invalid=strict,
+        max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
     )
+    raw_payload = payload
+    invalid = None
+    if payload is not None and strict:
+        invalid = validate_claim_checks(payload, material)
+        if invalid is None:
+            try:
+                payload = checked_payload(payload, material)
+            except ValueError as error:
+                invalid = str(error)
+        if invalid:
+            payload = None
+    if trace_context is not None:
+        await trace_context.emit(
+            "review.result",
+            {
+                **metadata,
+                "status": "assessed" if payload is not None else "unassessed",
+                "reason": invalid
+                or (None if payload is not None else "model_unavailable_or_invalid"),
+                "raw_judgment": raw_payload,
+                "claim_checks": payload.get("claim_checks", []) if payload else [],
+            },
+        )
     if payload is None:
         return None
     return build_section_verdict(payload, section_key=section_key)

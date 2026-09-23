@@ -6,6 +6,7 @@ import json
 from typing import Literal
 
 from llm_runtime import LLMConfig, parse_model_prices, parse_role_retry
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from scholar_gateway.providers import ProviderConfig
 from visuals import ImageProviderConfig
@@ -13,6 +14,22 @@ from visuals import ImageProviderConfig
 
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    worker_max_jobs: int = Field(default=4, ge=1, le=32)
+    worker_queue_name: str = "arq:queue"
+    mcp_web_enabled: bool = True
+    exa_api_key: str = Field(default="", repr=False)
+    mcp_run_call_limit: int = Field(default=10, ge=1, le=20)
+    mcp_user_daily_calls: int = Field(default=100, ge=1)
+    mcp_global_daily_calls: int = Field(default=1000, ge=1)
+    mcp_call_timeout: float = Field(default=30, gt=0, le=60)
+    mcp_run_timeout: float = Field(default=180, gt=0, le=300)
+
+    evidence_retrieval_mode: Literal["legacy", "hybrid", "hybrid_rerank"] = "legacy"
+
+    writer_polish_policy: Literal["legacy", "full_parallel", "selective_parallel"] = "legacy"
+    writer_polish_concurrency: int = Field(default=2, ge=1, le=2)
+    semantic_repair_engine: Literal["legacy", "langgraph"] = "legacy"
 
     database_url: str = "postgresql+asyncpg://paperforge:paperforge@localhost:15432/paperforge"
     redis_url: str = "redis://localhost:16379/0"
@@ -46,6 +63,19 @@ class WorkerSettings(BaseSettings):
     # error_code 都是 `timeout`，只看错误码分不出来，要看耗时。
     # 代价要知情：调高它会让**真正卡死**的端点等更久（最坏 timeout × (max_retries+1)）。
     llm_timeout_seconds: float = 60.0
+    # Jev/System One is an independent, typed decision path.  It is disabled by
+    # default; rollout is controlled separately from the generative provider.
+    typesafe_api_key: str = Field(default="", repr=False)
+    typesafe_base_url: str = "https://api.typesafe.ai/v1/systemone"
+    typesafe_model: str = "jev-1.13.0"
+    typesafe_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    typesafe_concurrency: int = Field(default=2, ge=1, le=8)
+    typesafe_failure_threshold: int = Field(default=5, ge=1, le=20)
+    typesafe_cooldown_seconds: float = Field(default=60.0, gt=0, le=600)
+    typesafe_soft_check_mode: Literal["off", "shadow", "on"] = "off"
+    typesafe_confidence_threshold: float = Field(default=0.90, ge=0, le=1)
+    typesafe_cache_enabled: bool = True
+    typesafe_model_prices: str = '{"jev-1.13.0":{"input":0.042,"output":0}}'
     # 写作后的「重写未达标章节 + 全文重新评估」轮数。2 是设计值：一轮走一条修复路，
     # 两轮足以让「先补证据、再收回论断」这条最常见的组合走完。做成可配置是因为它是
     # 全流程最大的一块墙钟——生产实测（2026-09-06）66 分钟里 37 分钟在这里，29 次
@@ -58,6 +88,42 @@ class WorkerSettings(BaseSettings):
     # Keep the bounds below the default SQLAlchemy overflow capacity.
     card_concurrency: int = 6
     qmatrix_concurrency: int = 4
+
+    # ---- 并发化（2026-09-07）----------------------------------------------
+    # 生产实测（job 1b6ba10a，65.7 分钟）：**51.4 分钟里只有一个 LLM 调用在飞**，
+    # 所有调用延迟之和 65.6 分钟 ≈ 墙钟，也就是说管线几乎完全串行。下面这组是
+    # 把各段独立工作并发起来的闸门，**不改变任何一次调用的输入**——提速全部来自调度。
+    #
+    # 真正的绑定约束是数据库连接池，不是 provider：`db/session.py` 是
+    # pool_size=2 + max_overflow=12，每进程上限 14 条，而每个并发任务的落库与
+    # 每次 `context.emit` 都要占一条。各阶段互不重叠，所以逐项限额不必相加，
+    # 但全局闸门是保险带。provider 侧没有任何背压（`proxy_relay.py` 是裸 TCP 转发，
+    # 无连接上限、无排队），所以客户端这顶帽子是唯一的帽子。
+    # 从 6 起步；上调前先看 `llm_call_log.error_code` 有没有出现限流码。
+    llm_max_concurrency: int = 6
+    # 修复轮章节重写的波宽。章节之间有「前两节滚动摘要」的依赖，所以不是简单扇出，
+    # 而是按 outline 序号分层（见 `document._repair_levels`），层内才并发。
+    writer_repair_concurrency: int = 3
+    # Opt in only after the paired A/B/C evaluation; resumes pin their original mode.
+    writer_execution_mode: Literal["legacy", "dag_serial", "dag_parallel"] = "legacy"
+    writer_concurrency: int = Field(default=2, ge=1, le=4)
+    writer_frame_concurrency: int = Field(default=1, ge=1, le=2)
+    agent_max_calls: int = Field(default=2000, ge=1)
+    agent_max_reserved_tokens: int = Field(default=50_000_000, ge=1)
+    agent_max_seconds: int = Field(default=7200, ge=1)
+    evaluator_shadow_enabled: bool = True
+    evaluator_shadow_document_limit: int = Field(default=10, ge=0, le=20)
+    evaluator_shadow_repeats: int = Field(default=3, ge=2, le=3)
+    section_review_concurrency: int = 4
+    verifier_concurrency: int = 3
+    synthesis_concurrency: int = 3
+    rerank_concurrency: int = 2
+    # OA 全文抓取：按文献并发，但**同一 host 仍然串行**。
+    # `SafeHttpClient` 自己完全没有限速，而一次抓取计划高度集中在少数几个 host
+    # （arXiv/PMC/DOAJ/出版商落地页），无界扇出会被限流甚至封禁——那会表现为
+    # 全文变少、卡片变薄，也就是**质量退化**。没有正当理由不要调高 per_host。
+    fulltext_download_concurrency: int = 6
+    fulltext_per_host_concurrency: int = 1
 
     # LLM 结构化实验抽取（P0-3 / Phase 2）。
     #   off    —— 完全不调用，行为与引入前逐字节相同（默认）。
@@ -185,7 +251,31 @@ class WorkerSettings(BaseSettings):
             model_prices=parse_model_prices(model_prices),
             role_retry=parse_role_retry(role_retry),
             timeout_seconds=self.llm_timeout_seconds,
+            max_concurrency=self.llm_max_concurrency,
         )
+
+    def typesafe_decision_config(self) -> dict[str, object]:
+        """Return Jev settings without exposing the credential in logs or payloads."""
+
+        try:
+            model_prices = (
+                json.loads(self.typesafe_model_prices) if self.typesafe_model_prices else {}
+            )
+        except json.JSONDecodeError:
+            model_prices = {}
+        return {
+            "api_key": self.typesafe_api_key,
+            "base_url": self.typesafe_base_url,
+            "model": self.typesafe_model,
+            "timeout_seconds": self.typesafe_timeout_seconds,
+            "max_concurrency": self.typesafe_concurrency,
+            "failure_threshold": self.typesafe_failure_threshold,
+            "cooldown_seconds": self.typesafe_cooldown_seconds,
+            "soft_check_mode": self.typesafe_soft_check_mode,
+            "confidence_threshold": self.typesafe_confidence_threshold,
+            "cache_enabled": self.typesafe_cache_enabled,
+            "model_prices": parse_model_prices(model_prices),
+        }
 
     def user_agent(self) -> str:
         agent = self.scholar_user_agent.strip() or "PaperForge/0.1"

@@ -364,6 +364,42 @@ export function restoreProject(id: string): Promise<Project> {
 
 // ---- Library ----
 
+export interface WebResearchSource {
+  id: string;
+  url: string;
+  title: string;
+  snippet: string;
+  body: string;
+  status: string;
+  fetched_at: string | null;
+  verification: { identifiers: { verified: number; doi?: string; arxiv_id?: string }[] } | null;
+}
+
+export interface WebResearchRun {
+  id: string;
+  status: string;
+  queries: string[];
+  calls: number;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+  sources?: WebResearchSource[];
+}
+
+export function listWebResearch(projectId: string, offset = 0) {
+  return request<{ available: boolean; runs: WebResearchRun[] }>(
+    `/projects/${projectId}/web-research/runs?offset=${offset}`,
+  );
+}
+
+export function getWebResearch(projectId: string, runId: string) {
+  return request<WebResearchRun>(`/projects/${projectId}/web-research/runs/${runId}`);
+}
+
+export function refreshWebResearch(projectId: string) {
+  return request<Job>(`/projects/${projectId}/web-research/runs`, { method: 'POST' });
+}
+
 export function listLibrary(
   projectId: string,
   status?: string,
@@ -846,6 +882,12 @@ export function getOutline(projectId: string): Promise<ApiResult<OutlinePayload 
   return withFallback(() => request<OutlinePayload>(`/projects/${projectId}/outline`), undefined);
 }
 
+export function rebuildDependencies(projectId: string, outlineId: string, contentHash: string): Promise<ApiResult<Job | undefined>> {
+  return withFallback(() => request<Job>(`/projects/${projectId}/outline/dependencies/rebuild`, {
+    method: 'POST', body: JSON.stringify({ outline_id: outlineId, content_hash: contentHash }),
+  }), undefined);
+}
+
 export function generateOutline(projectId: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () => request<Job>(`/projects/${projectId}/outline/generate`, { method: 'POST' }),
@@ -880,12 +922,13 @@ export function updateOutline(
 export function generateSections(
   projectId: string,
   coherence = true,
+  polishPolicy?: import("./types").PolishPolicy,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
       request<Job>(`/projects/${projectId}/sections/generate`, {
         method: 'POST',
-        body: JSON.stringify({ coherence }),
+        body: JSON.stringify({ coherence, polish_policy: polishPolicy }),
       }),
     undefined,
   );
@@ -1569,5 +1612,25 @@ export function restoreDocumentVersion(
 ): Promise<DocumentVersion> {
   return request<DocumentVersion>(`/projects/${projectId}/versions/${documentId}/restore`, {
     method: 'POST',
+  });
+}
+
+export function getAgentTrace(projectId: string, jobId: string, signal?: AbortSignal) {
+  return request<import('./types').AgentTrace>(`/projects/${projectId}/jobs/${jobId}/trace`, { signal });
+}
+
+export function searchEvidence(projectId: string, query: string, signal?: AbortSignal) {
+  return request<import('./types').EvidenceSearch>(
+    `/projects/${projectId}/evidence/search?q=${encodeURIComponent(query)}&mode=hybrid_rerank`, { signal });
+}
+
+export function indexEvidence(projectId: string) {
+  return request<Job>(`/projects/${projectId}/evidence/index`, { method: 'POST' });
+}
+
+export function respondToRepair(projectId: string, jobId: string,
+  response: { interrupt_id: string; choice: 'continue' | 'finish' }) {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/resume`, {
+    method: 'POST', body: JSON.stringify(response),
   });
 }

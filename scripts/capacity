@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# All state is isolated from public deployment; no inherited provider credentials.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+export DATABASE_URL=postgresql+asyncpg://paperforge:paperforge@127.0.0.1:25432/paperforge_capacity
+export REDIS_URL=redis://127.0.0.1:26379/1
+export STORAGE_BACKEND=minio MINIO_ENDPOINT=127.0.0.1:29000
+export MINIO_ACCESS_KEY=capacity MINIO_SECRET_KEY=capacity-test-only MINIO_BUCKET=capacity
+export MINIO_SECURE=false LLM_DEFAULT_PROVIDER=noop LLM_OPENAI_API_KEY='' YUNWU_API_KEY=''
+export IMAGE_API_KEY='' AI_IMAGES_ENABLED=false LLM_LIMIT_REDIS_URL=''
+export AUTH_COOKIE_SECURE=false AUTH_DEV_LOGIN_ENABLED=false AUTH_EMAIL_MODE=file
+export PUBLIC_APP_URL=http://127.0.0.1:28080 CORS_ALLOW_ORIGINS=http://127.0.0.1:28080
+export AUTH_RATE_LIMIT_ENABLED=false JOB_DISPATCH_ENABLED=true
+export REQUEST_LIMITS_ENABLED=true
+export JOB_DISPATCH_SLOTS=8 JOB_SHORT_SLOTS=0 WORKER_MAX_JOBS=4 DB_MAX_OVERFLOW=6
+export CAPACITY_JOB_SECONDS="${CAPACITY_JOB_SECONDS:-10}"
+export PYTHONPATH="$PWD/evals/capacity${PYTHONPATH:+:$PYTHONPATH}"
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+state=.paperforge/capacity
+mkdir -p "$state"
+case "${1:-}" in
+  init)
+    docker inspect pf-capacity-test-pg >/dev/null 2>&1 || docker run -d --name pf-capacity-test-pg \
+      -e POSTGRES_USER=paperforge -e POSTGRES_PASSWORD=paperforge -e POSTGRES_DB=paperforge_test \
+      -p 127.0.0.1:25432:5432 postgres:16-alpine
+    docker inspect pf-capacity-test-redis >/dev/null 2>&1 || docker run -d --name pf-capacity-test-redis \
+      -p 127.0.0.1:26379:6379 redis:7-alpine redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    docker inspect pf-capacity-test-minio >/dev/null 2>&1 || docker run -d --name pf-capacity-test-minio \
+      -p 127.0.0.1:29000:9000 -e MINIO_ROOT_USER=capacity -e MINIO_ROOT_PASSWORD=capacity-test-only \
+      quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+    until docker exec pf-capacity-test-pg pg_isready -U paperforge >/dev/null; do sleep 1; done
+    exists="$(docker exec pf-capacity-test-pg psql -U paperforge -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname='paperforge_capacity'")"
+    if [ "$exists" != 1 ]; then
+      docker exec pf-capacity-test-pg createdb -U paperforge paperforge_capacity
+    fi
+    .venv/bin/alembic upgrade head
+    ;;
+  start)
+    for name in api worker1 worker2; do
+      if [ -f "$state/$name.pid" ] && kill -0 "$(cat "$state/$name.pid")" 2>/dev/null; then
+        echo "already running: $name" >&2; exit 1
+      fi
+    done
+    nohup .venv/bin/uvicorn paperforge_api.main:app --host 127.0.0.1 --port 28080 --workers 2 >"$state/api.log" 2>&1 &
+    echo $! >"$state/api.pid"
+    for name in worker1 worker2; do
+      nohup .venv/bin/arq worker.WorkerSettings >"$state/$name.log" 2>&1 &
+      echo $! >"$state/$name.pid"
+    done
+    ;;
+  run)
+    shift
+    .venv/bin/python evals/capacity/run.py "$@"
+    ;;
+  faults)
+    shift
+    .venv/bin/python evals/capacity/faults.py "$@"
+    ;;
+  stop)
+    # Only stop recorded processes after checking the expected executable command.
+    for name in api worker1 worker2; do
+      [ -f "$state/$name.pid" ] || continue
+      pid="$(cat "$state/$name.pid")"
+      command="$(ps -p "$pid" -o args= || true)"
+      case "$command" in
+        *uvicorn*28080*|*arq\ worker.WorkerSettings*) kill -TERM "$pid" ;;
+        '') ;;
+        *) echo "PID ownership changed; refusing $pid" >&2; exit 1 ;;
+      esac
+    done
+    ;;
+  *) echo 'usage: scripts/capacity init|start|run --output PATH [--seconds 120 --active 30 --jobs 10]|stop' >&2; exit 2 ;;
+esac

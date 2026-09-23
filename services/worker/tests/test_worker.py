@@ -40,6 +40,24 @@ def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
     assert llm.thinking_for_role("writer") == "disabled"
 
 
+def test_worker_exposes_disabled_typesafe_defaults_and_explicit_rollout_config():
+    defaults = worker_config.WorkerSettings(_env_file=None)
+    assert defaults.typesafe_soft_check_mode == "off"
+    assert defaults.typesafe_api_key == ""
+    assert defaults.typesafe_decision_config()["model"] == "jev-1.13.0"
+
+    settings = worker_config.WorkerSettings(
+        _env_file=None,
+        typesafe_api_key="test-key",
+        typesafe_soft_check_mode="shadow",
+        typesafe_confidence_threshold=0.87,
+    )
+    config = settings.typesafe_decision_config()
+    assert config["api_key"] == "test-key"
+    assert config["soft_check_mode"] == "shadow"
+    assert config["confidence_threshold"] == pytest.approx(0.87)
+
+
 def test_worker_rejects_unknown_claim_entailment_mode():
     with pytest.raises(ValueError):
         worker_config.WorkerSettings(_env_file=None, claim_entailment_mode="unsafe")

@@ -429,6 +429,7 @@ def question_driven_sections(
         section_key = f"q{index + 1}"
         section = {
                 "key": section_key,
+                "independent": True,
                 "level": 1,
                 # 小标题不是子问题原文。子问题是**给写作器和评审器的输入**，写成标题
                 # 就成了「CRISPR-Cas 在作物抗病性改良中面临哪些技术挑战（如脱靶效应、
@@ -529,6 +530,7 @@ def _subsections_for(
                     if key in parent
                 },
                 "key": f"{parent_key}s{ordinal}",
+                "depends_on": [parent_key],
                 "level": 2,
                 "parent_key": parent_key,
                 # 占位：`_headline_subsections` 要么给它一个真标题，要么把整个
@@ -1040,7 +1042,7 @@ def review_synthesis_section(
                 _short_study_label(str(evidence.get("title") or ""), evidence.get("year")),
                 task_dataset,
                 (
-                    _clean(card.methods[0])
+                    _clip(card.methods[0], 90)
                     if card and card.methods
                     else ("未报告" if zh else "Not reported")
                 ),
@@ -1051,6 +1053,9 @@ def review_synthesis_section(
         )
         if len(rows) >= 40:
             break
+    headers, rows, omission_note = _drop_empty_matrix_columns(
+        headers, rows, language=language
+    )
     cite_keys = list(by_cite)
     evidence_ids = list(
         dict.fromkeys(
@@ -1059,6 +1064,7 @@ def review_synthesis_section(
     )
     return {
         "key": "review_synthesis",
+        "requires_all_body": True,
         "level": 1,
         "title": "跨研究比较、局限与证据冲突"
         if zh
@@ -1094,9 +1100,12 @@ def review_synthesis_section(
         "inline_tables": (
             [
                 {
-                    "caption": "纳入研究的方法与证据基础比较"
-                    if zh
-                    else "Methods and evidence basis of included studies",
+                    "caption": (
+                        "纳入研究的方法与证据基础比较"
+                        if zh
+                        else "Methods and evidence basis of included studies"
+                    )
+                    + omission_note,
                     "label": "tab:literature-matrix",
                     "headers": headers,
                     "rows": rows,
@@ -1206,8 +1215,82 @@ def _task_label(task_id: str, *, language: str) -> str:
 
 def _short_study_label(title: str, year: Any) -> str:
     cleaned = _clean(title)
-    first = re.split(r"[:.。]", cleaned, maxsplit=1)[0][:56]
+    first = _clip(re.split(r"[:.。]", cleaned, maxsplit=1)[0], 40)
     return f"{first} ({year})" if year else first
+
+
+def _clip(text: str, limit: int) -> str:
+    """在词边界截断，超出时补省略号。
+
+    比较矩阵的每一列都是窄 ``p{}`` 列，一段 200 字的方法描述会把整行撑成十几行
+    高——16 行的表因此排到 5 页。硬切会留下 ``unseen ta`` 这种半个单词，
+    所以优先退到最后一个空格/标点。
+
+    先过 :func:`_clean`：来源字段可能带 ``<i>`` 一类轻量标记，截断长度必须按
+    去标记后的可见文本算，否则一个 ``<sub>`` 就吃掉五个字的配额。
+    """
+    cleaned = _clean(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    head = cleaned[:limit]
+    cut = max(head.rfind(" "), head.rfind("，"), head.rfind("、"), head.rfind(","))
+    if cut > limit * 0.6:
+        head = head[:cut]
+    return head.rstrip(" ,，、;；") + "…"
+
+
+# 「本列没有任何一行报告了内容」的判据。
+#
+# 这些占位串由 `review_synthesis_section` 自己写入：真实数据里
+# 「任务/数据集」与「关键指标与数值」经常整列都是它们（结构化抽取没命中），
+# 于是一整列只贡献了 16 个「未报告」，却和有内容的列平分了版面宽度。
+_MATRIX_PLACEHOLDERS = frozenset(
+    {
+        "未报告",
+        "Not reported",
+        "未结构化",
+        "Not structured",
+        "未定位",
+        "Unlocated",
+        "未评定",
+        "Unassessed",
+    }
+)
+
+
+def _drop_empty_matrix_columns(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    language: str,
+) -> tuple[list[str], list[list[str]], str]:
+    """删掉整列都是占位符的列，并返回一句如实说明。
+
+    静默删列会让读者以为这些维度从未被考察过，所以省略的事实写进 caption——
+    「降级可以，装作没降级不行」。第一列（研究）永远保留。
+    """
+    keep = [
+        index
+        for index in range(len(headers))
+        if index == 0
+        or any(str(row[index]).strip() not in _MATRIX_PLACEHOLDERS for row in rows)
+    ]
+    if len(keep) == len(headers) or len(keep) < 2:
+        return headers, rows, ""
+    dropped = [headers[index] for index in range(len(headers)) if index not in keep]
+    note = (
+        f"（纳入研究均未报告以下维度，已略去相应列：{'、'.join(dropped)}）"
+        if language == "zh"
+        else (
+            "(Columns omitted because no included study reported them: "
+            f"{', '.join(dropped)}.)"
+        )
+    )
+    return (
+        [headers[index] for index in keep],
+        [[row[index] for index in keep] for row in rows],
+        note,
+    )
 
 
 def imrad_body_sections(cite_keys: list[str], *, language: str = "en") -> list[dict[str, Any]]:
@@ -1322,6 +1405,14 @@ def _with_frame_sections(
                 entry.pop("parent_key", None)
                 entry["level"] = 1
         sections.append(entry)
+    for entry in sections:
+        if entry.get("requires_all_body"):
+            entry["depends_on"] = [
+                s["key"] for s in sections if s.get("kind") != "frame"
+                and s["key"] != entry["key"] and not s.get("appendix")
+            ]
+        elif "depends_on" in entry:
+            entry["depends_on"] = [key_map.get(k, k) for k in entry["depends_on"]]
     for key in BACK_SECTION_KEYS:
         sections.append(
             {

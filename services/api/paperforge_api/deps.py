@@ -42,12 +42,19 @@ async def dispose_engine() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """请求级会话：正常返回时提交，异常回滚。"""
+    """Commit before sending HTTP headers (all users declare function scope).
+
+    A 202 is a durable acknowledgement: another API replica must immediately
+    see the job, including an SSE subscription started as soon as fetch returns.
+    """
     factory = get_session_factory()
     async with factory() as session:
         try:
             yield session
             await session.commit()
+            from paperforge_api.dispatch import dispatch_after_commit
+
+            await dispatch_after_commit(session)
         except Exception:
             await session.rollback()
             raise
@@ -74,7 +81,7 @@ def _session_hash(token: str) -> str:
 
 
 async def get_current_auth(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     settings: Annotated[Settings, Depends(get_settings)],
     session_token: Annotated[str | None, Cookie(alias="paperforge_session")] = None,
     secure_session_token: Annotated[str | None, Cookie(alias="__Host-paperforge_session")] = None,
@@ -119,7 +126,7 @@ async def get_current_user(
 
 async def require_owned_project(
     project_id: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     auth: Annotated[AuthContext, Depends(get_current_auth)],
 ) -> PaperProject:
     try:
@@ -134,7 +141,7 @@ async def require_owned_project(
 
 async def authorize_project_request(
     request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     auth: Annotated[AuthContext, Depends(get_current_auth)],
 ) -> AuthContext:
     """Authenticate a router and enforce ownership whenever its route has project_id."""

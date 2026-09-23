@@ -32,7 +32,7 @@ router = APIRouter(
 )
 
 # Redis unavailable is a supported degradation path; only that path retains the old fast poll.
-POLL_INTERVAL_SECONDS = 0.5
+POLL_INTERVAL_SECONDS = 2.0
 PUBSUB_WAIT_SECONDS = 1.0
 EVENT_PAGE_SIZE = 200
 # 空闲心跳：穿透代理的空闲超时，同时让前端知道连接仍然活着。
@@ -96,6 +96,7 @@ async def _event_stream(
     last_activity = loop.time()
     refresh = True
     heartbeat_due = False
+    resubscribe_at = loop.time() + 15
     try:
         while True:
             if await request.is_disconnected():
@@ -155,6 +156,9 @@ async def _event_stream(
                     continue
 
             if pubsub is None:
+                if event_bus is not None and loop.time() >= resubscribe_at:
+                    pubsub = await _subscribe(event_bus, channel)
+                    resubscribe_at = loop.time() + 15
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 refresh = True
             else:

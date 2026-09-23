@@ -21,6 +21,7 @@ from paperforge_worker.pipelines.outline import (
     generate_outline,
     imrad_body_sections,
     question_driven_sections,
+    review_synthesis_section,
 )
 from paperforge_worker.pipelines.writing import (
     SectionDraft,
@@ -655,6 +656,97 @@ async def test_review_synthesis_keeps_complete_titles_and_removes_source_markup(
     )
     assert synthesis["inline_tables"] == []
     assert synthesis["cite_keys"] == []
+
+
+def _synthesis_bundles(*, metric: bool) -> list[dict]:
+    measurements = [{"task": "5-way 1-shot", "dataset": "miniImageNet",
+                     "metric_name": "acc", "value": 62.1, "unit": "%"}] if metric else []
+    return [
+        {
+            "evidence": [
+                {
+                    "evidence_id": f"e{index}",
+                    "cite_key": "a",
+                    "title": (
+                        "Multi-stage fusion of local and global features "
+                        "for few-shot image classification"
+                    ),
+                    "year": 2025,
+                    "grade": "B_located_prose",
+                    "measurements": measurements,
+                    "section_path": "Related work",
+                    "paragraph_index": 1,
+                }
+                for index in range(3)
+            ]
+        }
+    ]
+
+
+def test_literature_matrix_drops_columns_no_study_reported() -> None:
+    """整列都是「未报告」的列只会和有内容的列平分版面宽度。
+
+    实测：16 行 × 6 列的矩阵排了 5 页，其中「任务/数据集」与「关键指标与数值」
+    两列每一行都是占位符。省略它们是排版决定，但必须**写进 caption**——
+    静默删列会让读者以为这些维度从没被考察过。
+    """
+    cards = [
+        CardBrief(
+            cite_key="a", title="Study A", year=2025, methods=("contrastive pre-training",)
+        )
+    ]
+    section = review_synthesis_section(
+        cards, language="zh", sub_question_bundles=_synthesis_bundles(metric=False)
+    )
+    table = section["inline_tables"][0]
+    assert "任务/数据集" not in table["headers"]
+    assert "关键指标与数值" not in table["headers"]
+    assert table["headers"][0] == "研究"
+    assert all(len(row) == len(table["headers"]) for row in table["rows"])
+    assert "已略去相应列" in table["caption"]
+    assert "任务/数据集" in table["caption"]
+
+
+def test_literature_matrix_keeps_columns_that_carry_data() -> None:
+    cards = [
+        CardBrief(
+            cite_key="a", title="Study A", year=2025, methods=("contrastive pre-training",)
+        )
+    ]
+    section = review_synthesis_section(
+        cards, language="zh", sub_question_bundles=_synthesis_bundles(metric=True)
+    )
+    table = section["inline_tables"][0]
+    assert table["headers"] == ["研究", "任务/数据集", "方法", "关键指标与数值", "证据等级", "定位"]
+    assert "已略去相应列" not in table["caption"]
+
+
+def test_literature_matrix_clips_long_cells_at_a_word_boundary() -> None:
+    """窄 ``p{}`` 列里一段 200 字的方法描述会把整行撑成十几行高。
+
+    硬切会留下半个单词（真实产物里出现过 ``unseen ta``），所以退到词边界并补省略号。
+    """
+    method = (
+        "Supervised <i>contrastive</i> pre-training of the encoder followed by a "
+        "nearest centroid classifier trained on the few-shot split"
+    )
+    cards = [CardBrief(cite_key="a", title="Study A", year=2025, methods=(method,))]
+    section = review_synthesis_section(
+        cards, language="en", sub_question_bundles=_synthesis_bundles(metric=True)
+    )
+    row = section["inline_tables"][0]["rows"][0]
+    study, _task, rendered_method = row[0], row[1], row[2]
+    # 截断长度按去标记后的可见文本算，标记本身不进 PDF。
+    assert "<i>" not in rendered_method
+    plain = method.replace("<i>", "").replace("</i>", "")
+    assert rendered_method.endswith("…")
+    assert len(rendered_method) <= 91
+    head = rendered_method[:-1]
+    assert plain.startswith(head)
+    # 词边界：截断点后面一个字符必须是空格，否则就切在了单词中间。
+    assert plain[len(head)] == " "
+    assert study.endswith("(2025)")
+    assert len(study) <= 48
 
 
 async def test_review_synthesis_table_becomes_inline_table_ir() -> None:

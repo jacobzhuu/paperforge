@@ -14,6 +14,12 @@ from llm_runtime.config import (
     Role,
     parse_model_prices,
 )
+from llm_runtime.decision import (
+    DecisionResult,
+    DecisionRunner,
+    decision_cache_key,
+    validate_decision_response,
+)
 from llm_runtime.json_utils import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 from llm_runtime.providers import (
     QUOTA_EXHAUSTED,
@@ -43,6 +49,8 @@ __all__ = [
     "DEFAULT_TRUNCATION_RETRY_POLICY",
     "TRUNCATED_AT_CEILING",
     "CiteKeyViolation",
+    "DecisionResult",
+    "DecisionRunner",
     "LLMConfig",
     "LLMError",
     "LLMProvider",
@@ -62,6 +70,7 @@ __all__ = [
     "clamp_max_output_tokens",
     "clean_and_parse_json",
     "create_llm_provider",
+    "decision_cache_key",
     "is_quota_exhausted",
     "parse_model_prices",
     "parse_role_retry",
@@ -69,4 +78,5 @@ __all__ = [
     "purify_llm_json",
     "resolve_truncation_policy",
     "sanitize_openai_compatible_base_url",
+    "validate_decision_response",
 ]

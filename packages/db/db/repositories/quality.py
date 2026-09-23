@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import uuid
 from typing import Any
@@ -152,8 +153,7 @@ async def replace_claim_evidence(
     persisted_fields = {
         column.name
         for column in ClaimEvidenceAnchor.__table__.columns
-        if column.name
-        not in {"id", "quality_report_id", "project_id", "document_id", "created_at"}
+        if column.name not in {"id", "quality_report_id", "project_id", "document_id", "created_at"}
     }
     for anchor in unique_anchors:
         session.add(
@@ -212,24 +212,36 @@ async def list_claim_evidence(
     )
 
 
+def _scoped_cache_key(project_id: uuid.UUID | None, key: str) -> str:
+    if project_id is None:
+        return key  # Legacy callers and draining deployments keep their own namespace.
+    return hashlib.sha256(f"project:{project_id}:{key}".encode()).hexdigest()
+
+
 async def get_claim_entailment_cache(
     session: AsyncSession,
     cache_keys: set[str] | list[str] | tuple[str, ...],
+    *,
+    project_id: uuid.UUID | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Load durable exact-pair verdicts without exposing cached source text."""
     keys = list(dict.fromkeys(str(key) for key in cache_keys if key))
     if not keys:
         return {}
+    identities = {_scoped_cache_key(project_id, key): key for key in keys}
     rows = list(
         (
             await session.scalars(
-                select(ClaimEntailmentCache).where(ClaimEntailmentCache.cache_key.in_(keys))
+                select(ClaimEntailmentCache).where(
+                    ClaimEntailmentCache.cache_key.in_(identities),
+                    ClaimEntailmentCache.project_id == project_id,
+                )
             )
         ).all()
     )
     return {
-        row.cache_key: {
-            "cache_key": row.cache_key,
+        identities[row.cache_key]: {
+            "cache_key": identities[row.cache_key],
             "verdict": row.verdict,
             "confidence": row.confidence,
             "reason": row.reason,
@@ -247,6 +259,8 @@ async def get_claim_entailment_cache(
 async def store_claim_entailment_cache(
     session: AsyncSession,
     entries: list[dict[str, Any]],
+    *,
+    project_id: uuid.UUID | None = None,
 ) -> int:
     """Insert immutable verdicts; a verifier-version bump is the invalidation mechanism.
 
@@ -273,7 +287,8 @@ async def store_claim_entailment_cache(
         if math.isnan(confidence):
             continue
         row = {
-            "cache_key": cache_key,
+            "cache_key": _scoped_cache_key(project_id, cache_key),
+            "project_id": project_id,
             "claim_hash": str(entry.get("claim_hash") or ""),
             "evidence_hash": str(entry.get("evidence_hash") or ""),
             "claim_kind": str(entry.get("claim_kind") or ""),

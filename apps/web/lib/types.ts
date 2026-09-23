@@ -36,6 +36,7 @@ export type ProjectStatus =
   | 'done';
 
 export interface Project {
+  web_research_enabled?: boolean;
   id: string;
   title: string;
   paper_type: PaperType;
@@ -127,6 +128,7 @@ export interface MaterialPreflight {
  * 换类型等于新建项目（详见后端同名 schema 的注释）。
  */
 export interface UpdateProjectRequest {
+  web_research_enabled?: boolean;
   title?: string;
   topic?: string | null;
   venue_template?: string | null;
@@ -160,6 +162,7 @@ export interface EligibilityDecision {
 
 export type LiteratureRole = 'general' | 'core';
 export type AddedVia =
+  | 'mcp_web_verified'
   | 'search'
   | 'snowball'
   | 'doi_import'
@@ -327,6 +330,7 @@ export interface ScopePayload {
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
 export type JobKind =
+  | 'web_research'
   | 'search'
   | 'ingest'
   | 'cards'
@@ -426,7 +430,13 @@ export interface ProjectCost {
 
 // ---- 大纲与章节（设计 §4.3 outline / paper_section） ----
 
+export type PolishPolicy = 'legacy' | 'full_parallel' | 'selective_parallel';
+
 export interface OutlineSection {
+  depends_on?: string[];
+  independent?: boolean;
+  dependency_reason?: string;
+  dependency_source?: string;
   key: string;
   level?: number;
   title: string;
@@ -439,6 +449,7 @@ export interface OutlineSection {
 }
 
 export interface OutlineTree {
+  dependency_contract?: { version: string; content_hash: string; invalidated?: boolean; requires_confirmation?: boolean };
   topic?: string;
   research_question?: string;
   language?: Language;
@@ -447,6 +458,7 @@ export interface OutlineTree {
 }
 
 export interface OutlinePayload {
+  content_hash?: string | null;
   project_id: string;
   outline_id?: string | null;
   version: number;
@@ -1176,4 +1188,35 @@ export interface ProjectTaskProfile {
   effective_tasks: TaskDefinitionSummary[];
   fallback_mode: string;
   fallback_note: string | null;
+}
+
+export interface AgentTrace {
+  trace_id: string;
+  engine: string;
+  currency: string;
+  jobs: { id: string; status: string; created_at: string }[];
+  summary: { calls: number; known_cost: number; unpriced_calls: number;
+    input_tokens: number; output_tokens: number; unknown_usage_calls: number;
+    errors: Record<string, number> };
+  budget: { calls?: number; reserved_tokens?: number; started_at?: string };
+  interruption: { id: string; reason: string; sections: string[] } | null;
+  events_truncated: boolean;
+  calls_truncated: boolean;
+  events: { type: string; at: string; job_id: string; name?: string; kind?: string;
+    action?: string; elapsed_ms?: number; status?: string; reason?: string;
+    total?: number; rewritten?: number; skipped?: number; rejected?: number; concurrency?: number; policy?: string }[];
+  calls: { role: string; model: string; latency_ms: number | null;
+    cost_estimate: number | null; error_code: string | null; input_tokens: number | null;
+    output_tokens: number | null; local_queue_wait_ms?: number;
+    provider_slot_wait_ms?: number; rate_limit_wait_ms?: number }[];
+}
+
+export interface EvidenceSearch {
+  version: string; mode: string; vector_backend: string; reranked: boolean;
+  corpus_count: number; indexed_count: number; corpus_truncated: boolean;
+  warnings: string[]; elapsed_ms: number;
+  results: { evidence_id: string; work_id: string; text: string; content_hash: string;
+    page: number | null; section_path: string | null; source_document_file_id: string | null;
+    char_start: number | null; char_end: number | null; grade: string; score: number;
+    verification_status: string }[];
 }

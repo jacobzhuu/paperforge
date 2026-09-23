@@ -383,7 +383,11 @@ async def test_card_generation_uses_configured_bounded_concurrency(
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
-        await asyncio.sleep(0.01)
+        # 这里必须明显长于每篇卡片前后那两段数据库往返。cards 已经从「批次栅栏」
+        # 换成「滑动窗口」：栅栏会让一批 3 篇同时起跑，窗口则是谁跑完就补一个，
+        # 各任务的 DB 阶段因此天然错开。观测窗太短（原来是 10ms）就只能看到 2，
+        # 那测的是栅栏的同步起跑，不是并发上限本身。
+        await asyncio.sleep(0.2)
         active -= 1
         return (
             {
@@ -408,6 +412,7 @@ async def test_card_generation_uses_configured_bounded_concurrency(
 
     assert outcome.requested == 7
     assert outcome.generated == 7
+    # 窗口宽度就是配置值：既真的并发，也绝不越过上限（上限是数据库连接池，不是 provider）。
     assert peak == 3
 
 

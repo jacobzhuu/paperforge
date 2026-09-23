@@ -1,0 +1,31 @@
+groups:
+  - name: paperforge
+    rules:
+      - alert: PaperForgeServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: PaperForge scrape target unavailable
+      - alert: PaperForgeQueueWait
+        expr: histogram_quantile(0.95, sum by (le) (rate(paperforge_job_queue_wait_seconds_bucket[30m]))) > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Long job queue wait exceeds ten minutes
+      - alert: PaperForgeApiErrors
+        expr: sum(rate(paperforge_http_requests_total{status_code=~"5.."}[5m])) / clamp_min(sum(rate(paperforge_http_requests_total[5m])), 0.001) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: API server error ratio exceeds one percent
+      - alert: PaperForgeOldestQueued
+        expr: max(paperforge_oldest_queued_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A queued job has waited more than ten minutes

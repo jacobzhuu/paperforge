@@ -164,6 +164,7 @@ class UpdateProjectRequest(BaseModel):
     author_details: list[AuthorDetail] | None = None
     keywords: list[str] | None = None
     metadata_confirmed: bool | None = None
+    web_research_enabled: bool | None = None
 
 
 class ProjectAttentionSummary(BaseModel):
@@ -205,6 +206,7 @@ class ProjectResponse(BaseModel):
     author_details: list[AuthorDetail] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     metadata_confirmed: bool = False
+    web_research_enabled: bool = False
     library_count: int = 0
     section_count: int = 0
     created_at: datetime | None = None
@@ -461,7 +463,13 @@ class CostResponse(BaseModel):
 # ---- M2：大纲 / 章节 / 引用审计 / 预览 ----
 
 
+class RebuildDependenciesRequest(BaseModel):
+    outline_id: uuid.UUID
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class OutlineResponse(BaseModel):
+    content_hash: str | None = None
     project_id: str
     outline_id: str | None = None
     version: int = 0
@@ -478,6 +486,7 @@ class UpdateOutlineRequest(BaseModel):
 
 class WriteRequest(BaseModel):
     coherence: bool = True
+    polish_policy: Literal["legacy", "full_parallel", "selective_parallel"] | None = None
 
 
 class SectionResponse(BaseModel):

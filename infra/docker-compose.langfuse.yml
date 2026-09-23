@@ -1,0 +1,120 @@
+# Independent observability deployment. No application data volumes or public ports.
+# Based on the upstream Langfuse v4 Compose topology; secrets supplied via --env-file.
+x-environment: &env
+  DATABASE_URL: postgresql://langfuse:${LF_DB_PASSWORD:?required}@postgres:5432/langfuse
+  NEXTAUTH_URL: http://localhost:3300
+  NEXTAUTH_SECRET: ${LF_AUTH_SECRET:?required}
+  SALT: ${LF_SALT:?required}
+  ENCRYPTION_KEY: ${LF_ENCRYPTION_KEY:?required}
+  TELEMETRY_ENABLED: 'false'
+  AUTH_DISABLE_SIGNUP: 'true'
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: langfuse
+  CLICKHOUSE_PASSWORD: ${LF_CLICKHOUSE_PASSWORD:?required}
+  CLICKHOUSE_CLUSTER_ENABLED: 'false'
+  REDIS_HOST: redis
+  REDIS_PORT: '6379'
+  REDIS_AUTH: ${LF_REDIS_PASSWORD:?required}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LF_S3_PASSWORD:?required}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: 'true'
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LF_S3_PASSWORD:?required}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: 'true'
+  LANGFUSE_INIT_ORG_ID: paperforge
+  LANGFUSE_INIT_ORG_NAME: PaperForge
+  LANGFUSE_INIT_PROJECT_ID: paperforge-agent
+  LANGFUSE_INIT_PROJECT_NAME: PaperForge Agent
+  LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LF_PUBLIC_KEY:?required}
+  LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LF_SECRET_KEY:?required}
+  LANGFUSE_INIT_USER_EMAIL: admin@paperforge.local
+  LANGFUSE_INIT_USER_NAME: PaperForge Administrator
+  LANGFUSE_INIT_USER_PASSWORD: ${LF_ADMIN_PASSWORD:?required}
+services:
+  web:
+    image: docker.m.daocloud.io/langfuse/langfuse:4
+    environment:
+      <<: *env
+      HOSTNAME: 0.0.0.0
+    ports: ['127.0.0.1:3300:3000']
+    networks:
+      default:
+      application:
+        aliases: [paperforge-langfuse]
+    depends_on: &dependencies
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+      minio: {condition: service_started}
+    mem_limit: 3g
+    restart: unless-stopped
+  worker:
+    image: docker.m.daocloud.io/langfuse/langfuse-worker:4
+    environment: *env
+    depends_on: *dependencies
+    mem_limit: 3g
+    restart: unless-stopped
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LF_DB_PASSWORD:?required}
+    volumes: [postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U langfuse']
+      interval: 5s
+      retries: 20
+    mem_limit: 512m
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ['redis-server', '--requirepass', '${LF_REDIS_PASSWORD:?required}', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction', '--appendonly', 'yes']
+    volumes: [redis:/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$${REDIS_PASSWORD}" ping | grep PONG']
+      interval: 5s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${LF_REDIS_PASSWORD:?required}
+    mem_limit: 512m
+    restart: unless-stopped
+  clickhouse:
+    image: docker.m.daocloud.io/clickhouse/clickhouse-server:25.12
+    environment:
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${LF_CLICKHOUSE_PASSWORD:?required}
+    volumes: [clickhouse:/var/lib/clickhouse]
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:8123/ping']
+      interval: 5s
+      retries: 30
+    mem_limit: 3g
+    restart: unless-stopped
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    entrypoint: ['/bin/sh', '-c']
+    command: ['mkdir -p /data/langfuse && minio server /data']
+    environment:
+      MINIO_ROOT_USER: langfuse
+      MINIO_ROOT_PASSWORD: ${LF_S3_PASSWORD:?required}
+    volumes: [minio:/data]
+    mem_limit: 512m
+    restart: unless-stopped
+volumes:
+  postgres:
+  redis:
+  clickhouse:
+  minio:
+networks:
+  application:
+    external: true
+    name: ${LF_APPLICATION_NETWORK:?set application shared network}

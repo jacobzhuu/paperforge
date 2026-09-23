@@ -298,7 +298,7 @@ POST /api/v1/projects/{id}/exports
 | `AUTH_SESSION_DAYS` / `AUTH_IDLE_DAYS` | 会话绝对过期 / 空闲过期，默认 30 / 7 天 | 可留默认 |
 | `AUTH_RATE_LIMIT_ENABLED` | 登录、注册、找回密码 Redis 限流；不可用时失败关闭 | 应保持 `true` |
 | `PUBLIC_APP_URL` | 验证与重置链接的站点根地址 | 生产必须为 HTTPS |
-| `AUTH_EMAIL_MODE` / `AUTH_EMAIL_OUTBOX_DIR` | 本地权限受限投递箱或生产 SMTP | 本地 `file`，生产 `smtp` |
+| `AUTH_EMAIL_MODE` / `AUTH_EMAIL_OUTBOX_DIR` | 本地投递箱、SMTP 或免邮件验证登录 | 本地 `file`，生产 `smtp`；暂不使用邮件时设为 `disabled` |
 | `SMTP_*` | 认证邮件发件配置 | 生产必填 |
 | `PAPERFORGE_API_INTERNAL_BASE` | Next 服务端同源代理的 FastAPI 内部地址 | 本地默认 `http://localhost:8080` |
 | `NEXT_PUBLIC_DEMO_MODE` | 显式开发演示数据开关；生产构建强制关闭 | 默认 `false` |
@@ -328,3 +328,28 @@ curl -fsS http://localhost:3000
   与真正发出去的始终是同一句（都走 `AIImageSpec.render_prompt()`）。
 - worker 只依赖统一的 `ImageProvider` 协议。现有 Yunwu/Cloudflare/OpenAI 适配器均通过注册表装配；
   未来接入 Gemini 或本地 ComfyUI 时，只需新增适配器并注册，无需修改视觉业务管线。
+
+当 `AUTH_EMAIL_MODE=disabled` 时，用户注册后可直接用邮箱和自设密码登录，已有未验证账户也可登录；系统不会将邮箱标记为已验证，邮件找回密码和重发验证邮件暂不可用。注册白名单仍然生效，由 `AUTH_REGISTRATION_ALLOWLIST` 管理。恢复 `smtp` 后，未验证账户需要完成邮箱验证才能登录。
+
+
+## 11. 润色与章节依赖实验
+
+大纲页提供“优化章节依赖”：任务读取当前版本及内容指纹，生成新的草稿版本；检查展示的
+章节关系并点击“确认章节关系”后，新写作任务才采用该依赖图。原有大纲、稿件和进行中的
+任务不迁移。修改已重建大纲的内容会另建版本、使推断关系失效，并重新要求确认。
+显式依赖、父子关系和综合章节的汇总屏障必须保留；无法判断的章节仍按顺序执行。
+
+“润色策略”可选择逐节全部润色、并行全部润色、按需并行润色。两种并行策略仍属实验：
+固定正文、摘要和术语上下文，以最多两路执行并按大纲顺序提交。按需策略先检查完整章节，
+只跳过明确无需修改且内容指纹匹配的章节；判断失败、结果不明、术语冲突或重复段落均进入
+润色。跳过润色不会跳过最终质量检查。修改正文或来源后，旧任务暂停，不能覆盖新内容。
+任务详情显示润色策略、处理数量、跳过数量和耗时；并发上限不等于模型端实际并发数。
+
+服务端默认 `WRITER_POLISH_POLICY=legacy`、`WRITER_POLISH_CONCURRENCY=2`。旧任务继续使用
+原策略；已确认的依赖重建仅影响显式启动的新任务。自动生成大纲不会自行打开实验并行模式。
+
+隔离数据库中的评测入口为 `evals.writing_efficiency.run`（两组各三次整篇写作）和
+`evals.writing_efficiency.replay`（同一润色前快照，三种策略各三次）。要求显式 `--live`、
+CNY 价格及共享预算台账，不可用生产数据库。整篇耗时至少降低 15%、Token 增幅不超过 10%、
+硬违规不增加、完整 AI 双顺序盲审通过，才具备推进下一阶段的资格。两个开发主题通过后才运行
+第三个保留主题；AI 评审不是人工认证，未评估、输入超限或顺序不一致都会阻止默认切换。

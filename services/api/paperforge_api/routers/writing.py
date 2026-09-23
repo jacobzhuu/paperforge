@@ -51,6 +51,7 @@ from db.repositories.exports import list_export_artifacts
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from paper_ir import Bibliography, PaperIR, PaperMeta, ReferenceMetadata, render_markdown
 from paper_ir.schema import Section as IRSection
+from paperforge_worker.orchestration.writing_graph import fingerprint
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
@@ -86,6 +87,7 @@ from paperforge_api.schemas import (
     OutlineResponse,
     QualityResponse,
     QuestionEvidenceLinkResponse,
+    RebuildDependenciesRequest,
     RefineRequest,
     RefineResponse,
     ResearchQuestionResponse,
@@ -106,7 +108,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["writing"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 
@@ -134,6 +136,34 @@ async def generate_outline_endpoint(
     return _job_response(job)
 
 
+@router.post(
+    "/projects/{project_id}/outline/dependencies/rebuild",
+    response_model=JobResponse,
+    status_code=202,
+)
+async def rebuild_dependencies(
+    project_id: str, request: RebuildDependenciesRequest, session: SessionDep, queue: QueueDep
+):
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    project = await _require_project(session, project_id)
+    source = await latest_outline(session, project.id)
+    if source is None or source.id != request.outline_id:
+        raise HTTPException(409, "outline version changed")
+    if fingerprint(source.tree_json) != request.content_hash:
+        raise HTTPException(409, "outline content changed")
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="outline",
+        function="run_dependency_rebuild_pipeline",
+        outline_id=str(source.id),
+        source_hash=request.content_hash,
+    )
+    return _job_response(job)
+
+
 @router.get("/projects/{project_id}/outline", response_model=OutlineResponse)
 async def get_outline_endpoint(project_id: str, session: SessionDep) -> OutlineResponse:
     project = await _require_project(session, project_id)
@@ -152,6 +182,7 @@ async def get_outline_endpoint(project_id: str, session: SessionDep) -> OutlineR
     return OutlineResponse(
         project_id=str(project.id),
         outline_id=str(outline.id),
+        content_hash=fingerprint(outline.tree_json),
         version=outline.version,
         status=outline.status,
         tree=outline.tree_json or {},
@@ -176,11 +207,24 @@ async def put_outline(
     if outline is None:
         raise HTTPException(status_code=404, detail="outline not generated yet")
     whitelist = set(await get_writing_whitelist(session, project.id))
+    from db import create_outline
+    from paperforge_worker.orchestration.dependency_contract import content_hash, validate_edit
+
     tree = _sanitize_outline_tree(request.tree, whitelist)
-    await update_outline_tree(session, outline, tree, status=request.status)
+    try:
+        tree = validate_edit(tree, outline.tree_json or {})
+    except (ValueError, TypeError) as error:
+        raise HTTPException(422, str(error)) from error
+    if (outline.tree_json or {}).get("dependency_contract") and content_hash(tree) != content_hash(
+        outline.tree_json
+    ):
+        outline = await create_outline(session, project_id=project.id, tree=tree, status="draft")
+    else:
+        await update_outline_tree(session, outline, tree, status=request.status)
     return OutlineResponse(
         project_id=str(project.id),
         outline_id=str(outline.id),
+        content_hash=fingerprint(outline.tree_json),
         version=outline.version,
         status=outline.status,
         tree=outline.tree_json or {},
@@ -624,12 +668,31 @@ async def generate_sections(
     outline = await latest_outline(session, project.id)
     if outline is None:
         raise HTTPException(status_code=409, detail="generate an outline first")
+    contract = (outline.tree_json or {}).get("dependency_contract")
+    if contract and contract.get("requires_confirmation", True) and outline.status != "confirmed":
+        raise HTTPException(409, "confirm rebuilt outline before writing")
+    from paperforge_api.config import get_settings
+
+    settings = get_settings()
+    checkpoint = {
+        "writer_outline_id": str(outline.id),
+        "writer_outline_hash": fingerprint(outline.tree_json),
+        "semantic_repair_engine": settings.semantic_repair_engine,
+        "evidence_retrieval_mode": settings.evidence_retrieval_mode,
+        "writer_polish_policy": settings.writer_polish_policy,
+        "writer_polish_concurrency": settings.writer_polish_concurrency,
+    }
+    if request.polish_policy is not None:
+        checkpoint["writer_polish_policy"] = request.polish_policy
+    if contract and contract.get("requires_confirmation", True):
+        checkpoint["writer_execution_mode"] = "dag_parallel"
     job = await start_job(
         session,
         queue,
         project_id=project.id,
         kind="write",
         function="run_write_pipeline",
+        checkpoint=checkpoint or None,
         coherence=request.coherence,
     )
     return _job_response(job)

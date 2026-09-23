@@ -72,6 +72,10 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build
+      - name: Browser contracts (controlled API, no paid calls)
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm test:e2e
 
   macos-host:
     runs-on: macos-15

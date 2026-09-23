@@ -11,13 +11,10 @@ from urllib.parse import quote
 
 from arq.connections import ArqRedis
 from db import (
-    JOB_RESUME_KEY,
     assign_bibtex_key,
-    create_job,
     get_work_authors,
     reference_metadata_payload,
     set_entry_status,
-    update_job,
     upsert_entry,
 )
 from db.models.library import DocumentFile, LiteraturePdfUpload, ScholarlyWork
@@ -47,7 +44,7 @@ router = APIRouter(
     dependencies=[Depends(authorize_project_request)],
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 MAX_LITERATURE_PDF_BYTES = 64 * 1024 * 1024
@@ -469,52 +466,25 @@ async def _commit_and_enqueue_pdf_job(
     enqueue_failure_status: str,
     upload_id: str,
 ) -> GenerationJob:
-    """Commit domain state and its job before making it visible to ARQ.
+    """Commit upload state and its durable dispatch intent together.
 
-    The general job helper predates an outbox and enqueues inside the request
-    transaction. PDF workers immediately need the just-created upload/document,
-    so that ordering can race. A deterministic ARQ id also makes dispatch safe
-    if an HTTP intermediary retries the enqueue request.
+    Queue transport failure retains queued work for the background dispatcher.
+    The signature remains compatible with upload callers; no private object is
+    deleted merely because Redis is temporarily unavailable.
     """
-    ready = await require_queue(queue)
-    await ensure_project_job_slot(session, project_id, ready)
-    kwargs = {"upload_id": upload_id}
-    job = await create_job(
+    from paperforge_api.dispatch import dispatch_after_commit
+    from paperforge_api.jobs import start_job
+
+    job = await start_job(
         session,
+        queue,
         project_id=project_id,
         kind="ingest",
-        checkpoint={
-            JOB_RESUME_KEY: {
-                "function": function,
-                "kwargs": kwargs,
-            }
-        },
+        function=function,
+        upload_id=upload_id,
     )
     await session.commit()
-    try:
-        await ready.enqueue_job(
-            function,
-            str(project_id),
-            str(job.id),
-            _job_id=str(job.id),
-            upload_id=upload_id,
-        )
-    except Exception as error:
-        failure = {
-            "reason": "task_enqueue_failed",
-            "error_type": type(error).__name__,
-        }
-        try:
-            upload.status = enqueue_failure_status
-            upload.error_json = failure
-            await update_job(session, job, status="failed", error=failure)
-            await session.commit()
-        except Exception:  # noqa: BLE001 - preserve the already committed private object
-            await session.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="task queue could not accept the PDF job; retry is available",
-        ) from error
+    await dispatch_after_commit(session)
     return job
 
 

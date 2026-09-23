@@ -15,7 +15,7 @@ from arq.connections import ArqRedis
 from arq.jobs import Job as ArqJob
 from arq.jobs import JobStatus
 from db import JOB_RESUME_KEY, abandon_job, create_job, job_is_abandoned
-from db.models.paper import GenerationJob, PaperProject
+from db.models.paper import GenerationJob, JobDispatch, PaperProject
 from fastapi import HTTPException
 from observability import get_logger
 from sqlalchemy import select
@@ -45,6 +45,13 @@ async def start_job(
     **kwargs: Any,
 ) -> GenerationJob:
     """建 generation_job 并入队，同时记下重放所需的 function/kwargs。"""
+    from paperforge_api.config import get_settings
+
+    pinned_engine = (
+        (checkpoint or {}).get("semantic_repair_engine", "legacy")
+        if checkpoint
+        else get_settings().semantic_repair_engine
+    )
     ready = await require_queue(queue)
     await ensure_project_job_slot(session, project_id, ready)
     job = await create_job(
@@ -52,22 +59,29 @@ async def start_job(
         project_id=project_id,
         kind=kind,
         checkpoint={
+            "semantic_repair_engine": pinned_engine,
+            "writer_polish_policy": (
+                (checkpoint or {}).get("writer_polish_policy", "legacy")
+                if checkpoint
+                else get_settings().writer_polish_policy
+            ),
+            "writer_polish_concurrency": (
+                (checkpoint or {}).get("writer_polish_concurrency", 2)
+                if checkpoint
+                else get_settings().writer_polish_concurrency
+            ),
+            "evidence_retrieval_mode": (
+                (checkpoint or {}).get("evidence_retrieval_mode", "legacy")
+                if checkpoint
+                else get_settings().evidence_retrieval_mode
+            ),
             **(checkpoint or {}),
             JOB_RESUME_KEY: {"function": function, "kwargs": kwargs},
         },
     )
-    # arq 的任务 id 就用我们自己的 job id：没有它，一条 generation_job 行和队列里的
-    # 那条任务之间没有任何可查的联系，「它还在队列里吗」这个问题就问不出口。
-    enqueued = await ready.enqueue_job(
-        function, str(project_id), str(job.id), _job_id=str(job.id), **kwargs
-    )
-    if enqueued is None:
-        # 只有 job id 撞车才会走到这里。此前入队失败是静默的：行建好了、队列里没有，
-        # 于是它永远停在 queued，而且把项目锁死。
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "job_enqueue_failed", "message": "任务未能进入队列，请重试"},
-        )
+    from paperforge_api.dispatch import record_dispatch
+
+    await record_dispatch(session, job, function, kwargs, ready)
     return job
 
 
@@ -101,7 +115,13 @@ async def reconcile_abandoned_jobs(
     for job in jobs:
         if job.status not in {"queued", "running"}:
             continue
-        knows = await queue_knows_job(queue, job.id) if job.status == "queued" else None
+        # A new API must never declare another deployment's queued work lost.
+        # Durable intents are repaired by dispatch; legacy queue ownership is unknown.
+        if job.status == "queued":
+            continue
+        if await session.get(JobDispatch, job.id) is not None:
+            continue
+        knows = None
         if not job_is_abandoned(job, queue_knows=knows):
             continue
         await abandon_job(session, job)

@@ -52,3 +52,17 @@ def record_scholar_provider(provider: str, outcome: str) -> None:
 
 def render_metrics() -> tuple[bytes, str]:
     return generate_latest(), CONTENT_TYPE_LATEST
+
+_JOB_WAIT_SECONDS = Histogram(
+    "paperforge_job_queue_wait_seconds", "Committed job to first execution",
+    buckets=(1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200),
+)
+
+
+def record_job_wait(seconds: float) -> None:
+    _JOB_WAIT_SECONDS.observe(seconds)
+
+from prometheus_client import Gauge  # noqa: E402
+
+JOB_COUNTS = Gauge("paperforge_jobs", "Durable jobs by status", ("status",))
+OLDEST_QUEUED = Gauge("paperforge_oldest_queued_seconds", "Age of the oldest queued job")

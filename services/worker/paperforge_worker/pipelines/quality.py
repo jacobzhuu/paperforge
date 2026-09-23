@@ -18,11 +18,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from llm_runtime import LLMRunner
+from llm_runtime import DecisionRunner, LLMRunner
 from scholar_gateway.normalize import token_set_jaccard
 
 from paperforge_worker.comparability import comparison_admissible
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.locators import is_located
+from paperforge_worker.pipelines.citation_decisions import (
+    TYPESAFE_SOFT_CHECK_VERSION,
+    citation_pairs,
+    decision_request,
+    verifier_prompt,
+)
+from paperforge_worker.pipelines.review_contract import EVIDENCE_REVIEW_RULES
 
 SOFT_CHECK_THRESHOLD = 0.5
 MAX_SOFT_CHECKS = 40
@@ -52,7 +60,8 @@ _SOFT_CHECK_PROMPT = """判断每条「引用位置的上下文」与「被引�
 只输出 JSON：{"judgements": [{"index": 0, "score": 0.0-1.0, "reason": "简短理由"}]}
 score 表示该证据能否支撑该处论述；无法判断时给 0.5 并说明。不要臆测摘录之外的内容。"""
 
-_CLAIM_EVIDENCE_PROMPT = """You are a strict academic evidence auditor.
+_CLAIM_EVIDENCE_PROMPT = (
+    """You are a strict academic evidence auditor.
 Each pair contains one manuscript claim and one exact, located source excerpt.  They may use the
 same language or different languages.  Judge only whether the excerpt directly supports the
 complete claim; never use outside knowledge and never infer support from shared vocabulary alone.
@@ -69,6 +78,8 @@ Return JSON only:
 {"judgements": [{"index": 0, "verdict": "supported|partial|unsupported|contradicted|uncertain",
 "confidence": 0.0, "reason": "brief evidence-bound explanation"}]}
 confidence is confidence in the verdict, not topical similarity."""
+    + EVIDENCE_REVIEW_RULES
+)
 
 # Verdicts are cached in a durable, immutable table, so a prompt edit must invalidate them the way
 # a model change does.  CLAIM_VERIFIER_VERSION alone cannot: it is hand-maintained and nothing
@@ -172,8 +183,9 @@ class QualityReport:
 
 
 _PLACEHOLDER_RE = re.compile(
-    r"(?:待实验补充|待补充实验数据|待补充|尚无满足定位与可比性要求的证据|"
-    r"no evidence meeting the required provenance|TODO|TBD|PLACEHOLDER|\[待[^\]]*\])",
+    r"(?:待实验补充|待补充实验数据|尚无满足定位与可比性要求的证据|"
+    r"no evidence meeting the required provenance|\bTODO\b|\bTBD\b|\bPLACEHOLDER\b|"
+    r"\[待[^\]]*\]|(?:^|[\n。])\s*待补充\s*(?:[。\n]|$))",
     re.IGNORECASE,
 )
 _NUMBER_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
@@ -555,6 +567,8 @@ def asset_numeric_support_score(
 
 def _claims_with_local_citations(
     runs: list[dict[str, Any]],
+    *,
+    min_chars: int = 12,
 ) -> list[tuple[str, list[str], list[str], list[str]]]:
     """Bind CiteRuns to the nearest sentence instead of every claim in the paragraph."""
     claims: list[dict[str, Any]] = []
@@ -565,7 +579,7 @@ def _claims_with_local_citations(
 
     def append_claim(value: str) -> None:
         text = " ".join(value.split()).strip()
-        if len(text) >= 12:
+        if len(text) >= min_chars:
             claims.append(
                 {
                     "text": text,
@@ -912,6 +926,19 @@ def _suspected_duplicate_references(references: list[Any]) -> list[dict[str, Any
     return found
 
 
+def placeholder_sections(rows: list[Any]) -> list[str]:
+    """Inspect block boundaries before flattening; ordinary gap prose is not a marker."""
+    return [
+        str(row.section_key)
+        for row in rows
+        if (getattr(row, "generation_json", None) or {}).get("generator") == "evidence_gap_skeleton"
+        or any(
+            _PLACEHOLDER_RE.search(_body_text({"blocks": [block]}))
+            for block in (getattr(row, "body_ir_json", None) or {}).get("blocks") or []
+        )
+    ]
+
+
 def apply_readiness_gate(
     report: QualityReport,
     *,
@@ -923,7 +950,6 @@ def apply_readiness_gate(
     references: list[Any] | None = None,
 ) -> QualityReport:
     """应用双模式质量门；分项评分不参与“堆数量过线”。"""
-    all_text = " ".join(_body_text(getattr(row, "body_ir_json", None) or {}) for row in rows)
     unresolved = sorted(
         {
             key
@@ -965,7 +991,7 @@ def apply_readiness_gate(
     )
 
     blockers: list[dict[str, Any]] = []
-    if _PLACEHOLDER_RE.search(all_text):
+    if placeholder_sections(rows):
         blockers.append(_issue("placeholders_present", "正文仍含待补占位符"))
     missing_evidence = len(core_hashes - supported_hashes)
     if missing_evidence:
@@ -1897,6 +1923,7 @@ async def verify_claim_evidence(
     runner: LLMRunner | None,
     cache: dict[str, dict[str, Any]] | None = None,
     mode: ClaimEntailmentMode = "promote_only",
+    verifier_concurrency: int = 1,
 ) -> dict[str, Any]:
     """Conservatively verify exact claim/excerpt pairs under an explicit rollout mode.
 
@@ -2023,11 +2050,19 @@ async def verify_claim_evidence(
 
         if runner is None or not runner.enabled:
             return resolved
-        for batch_start in range(0, len(pending), CLAIM_EVIDENCE_BATCH_SIZE):
-            batch = pending[batch_start : batch_start + CLAIM_EVIDENCE_BATCH_SIZE]
-            batch_by_index = {pair_index: (anchor, key) for pair_index, anchor, key in batch}
+        # 每批的 pair_index 互不相交，所以调用之间是独立的。但**写入不是**：
+        # `claim_verification_cache_key` 在不同槽位上可能归一到同一个 key，
+        # 今天是「最后一批确定性获胜」，并发写会让它变成不确定——而这个 cache
+        # 还会落进持久表 claim_entailment_cache。所以解析与写入一律在 on_ready 里
+        # 按批次序串行做，只有 LLM 调用并发。
+        batches = [
+            pending[batch_start : batch_start + CLAIM_EVIDENCE_BATCH_SIZE]
+            for batch_start in range(0, len(pending), CLAIM_EVIDENCE_BATCH_SIZE)
+        ]
+
+        async def _verify_batch(batch: list[tuple[int, dict[str, Any], str]]) -> Any:
             try:
-                result = await runner.agenerate_json(
+                return await runner.agenerate_json(
                     "verifier",
                     system_prompt=_CLAIM_EVIDENCE_PROMPT,
                     user_prompt=json.dumps(
@@ -2047,9 +2082,19 @@ async def verify_claim_evidence(
                     },
                 )
             except Exception:  # noqa: BLE001 - verifier failure must not fail the quality job
-                continue
+                # 每批隔离保持不变：这一批失败只是没有判定，不影响其他批。
+                return None
+
+        async def _apply_batch(
+            _index: int,
+            batch: list[tuple[int, dict[str, Any], str]],
+            result: Any,
+        ) -> None:
+            if result is None or isinstance(result, BaseException):
+                return
             if not result.ok or not isinstance(result.value, dict):
-                continue
+                return
+            batch_by_index = {pair_index: (anchor, key) for pair_index, anchor, key in batch}
             for item in result.value.get("judgements") or []:
                 if not isinstance(item, dict):
                     continue
@@ -2072,6 +2117,13 @@ async def verify_claim_evidence(
                     summary["alternative_model_checked_count"] += 1
                 else:
                     summary["model_checked_count"] += 1
+
+        await bounded_map(
+            batches,
+            _verify_batch,
+            limit=verifier_concurrency,
+            on_ready=_apply_batch,
+        )
         return resolved
 
     primary_pairs = [
@@ -2226,6 +2278,10 @@ async def soft_check_citations(
     abstracts: dict[str, str],
     runner: LLMRunner | None,
     limit: int = MAX_SOFT_CHECKS,
+    decision_runner: DecisionRunner | None = None,
+    decision_mode: Literal["off", "shadow", "on"] = "off",
+    decision_confidence_threshold: float = 0.90,
+    trace_context: Any = None,
 ) -> list[SoftCheckFinding]:
     """对引用位置做语义相关性软校验（verifier 角色，便宜档）。
 
@@ -2237,47 +2293,183 @@ async def soft_check_citations(
         for usage in usages
         if usage.get("cite_key") in abstracts and usage.get("context_snippet")
     ][:limit]
-    if not checkable or runner is None or not runner.enabled:
+    if not checkable:
         return []
 
-    lines = []
-    for index, usage in enumerate(checkable):
-        key = str(usage["cite_key"])
-        lines.append(
-            f"[{index}] 上下文: {str(usage['context_snippet'])[:300]}\n"
-            f"     被引证据({key})摘录: {abstracts[key][:400]}"
+    pairs = citation_pairs(checkable, abstracts, limit=limit)
+    observation: dict[str, Any] = {
+        "version": TYPESAFE_SOFT_CHECK_VERSION,
+        "threshold": decision_confidence_threshold,
+        "item_count": len(pairs),
+        "items": [{"index": i, "pair_hash": p["pair_hash"]} for i, p in enumerate(pairs)],
+    }
+
+    async def run_jev() -> tuple[list[SoftCheckFinding], bool, str | None]:
+        if decision_runner is None or not decision_runner.enabled:
+            return [], False, "unavailable"
+        state, questions = decision_request(pairs)
+        response = await decision_runner.decide(
+            state=state,
+            questions=questions,
+            metadata={"stage": "soft_check", "decision_version": TYPESAFE_SOFT_CHECK_VERSION},
         )
+        observation.update(
+            {
+                "model": response.model,
+                "request_id": response.request_id,
+                "cache_hit": response.cache_hit,
+                "latency_ms": response.latency_ms,
+                "usage": response.usage,
+                "decision_error": response.error,
+            }
+        )
+        if not response.ok or response.answers is None:
+            return [], False, response.error or "invalid_response"
+        findings: list[SoftCheckFinding] = []
+        for index, usage in enumerate(checkable):
+            answer = response.answers.get(f"item_{index}")
+            if not isinstance(answer, dict):
+                return [], False, f"missing_answer:{index}"
+            score = answer.get("score")
+            confidence = answer.get("confidence")
+            if (
+                not isinstance(score, int | float)
+                or isinstance(score, bool)
+                or not 0.0 <= float(score) <= 4.0
+                or not isinstance(confidence, int | float)
+                or isinstance(confidence, bool)
+                or not 0.0 <= float(confidence) <= 1.0
+            ):
+                return [], False, f"invalid_score:{index}"
+            findings.append(
+                SoftCheckFinding(
+                    cite_key=str(usage["cite_key"]),
+                    section_key=str(usage.get("section_key") or ""),
+                    score=min(1.0, max(0.0, float(score) / 4.0)),
+                    reason="Jev semantic relevance score",
+                    context=str(usage.get("context_snippet") or ""),
+                )
+            )
+            observation["items"][index].update(
+                {
+                    "score": score,
+                    "confidence": confidence,
+                    "probabilities": answer.get("probabilities"),
+                    "weak": findings[-1].weak,
+                    "threshold_passed": float(confidence) >= decision_confidence_threshold,
+                }
+            )
+        confidences = [float(item["confidence"]) for item in observation["items"]]
+        observation["confidence_summary"] = {
+            "zero_count": sum(c == 0 for c in confidences),
+            "min": min(confidences),
+            "max": max(confidences),
+            "mean": sum(confidences) / len(confidences),
+        }
+        accepted = all(
+            isinstance(response.answers.get(f"item_{index}"), dict)
+            and float(response.answers[f"item_{index}"].get("confidence", 0.0))
+            >= decision_confidence_threshold
+            for index in range(len(checkable))
+        )
+        return findings, accepted, None if accepted else "low_confidence"
+
+    jev_findings: list[SoftCheckFinding] = []
+    jev_accepted = False
+    jev_reason: str | None = None
+    if decision_mode in {"shadow", "on"}:
+        jev_findings, jev_accepted, jev_reason = await run_jev()
+
+    if decision_mode == "on" and jev_accepted:
+        return jev_findings
+
+    if runner is None or not runner.enabled:
+        if trace_context is not None and decision_mode == "shadow":
+            await trace_context.emit(
+                "quality.jev_shadow",
+                {
+                    **observation,
+                    "version": TYPESAFE_SOFT_CHECK_VERSION,
+                    "status": "jev_only",
+                    "decision_count": len(jev_findings),
+                    "accepted": jev_accepted,
+                    "fallback_reason": "llm_unavailable",
+                },
+                stage="quality",
+            )
+        return []
+
     result = await runner.agenerate_json(
         "verifier",
         system_prompt=_SOFT_CHECK_PROMPT,
-        user_prompt="\n\n".join(lines),
+        user_prompt=verifier_prompt(pairs),
         max_output_tokens=2000,
         temperature=0.0,
         metadata={"stage": "soft_check"},
     )
+    observation["baseline_model"] = result.model
+    observation["baseline_error"] = result.error
     if not result.ok or not isinstance(result.value, dict):
-        return []
+        llm_findings: list[SoftCheckFinding] = []
+    else:
+        llm_findings = []
 
-    findings: list[SoftCheckFinding] = []
-    for item in result.value.get("judgements") or []:
-        if not isinstance(item, dict):
-            continue
-        judgement_index = item.get("index")
-        if not isinstance(judgement_index, int) or not 0 <= judgement_index < len(checkable):
-            continue
-        raw_score = item.get("score")
-        score = float(raw_score) if isinstance(raw_score, int | float) else 0.5
-        usage = checkable[judgement_index]
-        findings.append(
-            SoftCheckFinding(
-                cite_key=str(usage["cite_key"]),
-                section_key=str(usage.get("section_key") or ""),
-                score=min(1.0, max(0.0, score)),
-                reason=str(item.get("reason") or "")[:200],
-                context=str(usage.get("context_snippet") or ""),
+        for item in result.value.get("judgements") or []:
+            if not isinstance(item, dict):
+                continue
+            judgement_index = item.get("index")
+            if not isinstance(judgement_index, int) or not 0 <= judgement_index < len(checkable):
+                continue
+            raw_score = item.get("score")
+            score = float(raw_score) if isinstance(raw_score, int | float) else 0.5
+            usage = checkable[judgement_index]
+            llm_findings.append(
+                SoftCheckFinding(
+                    cite_key=str(usage["cite_key"]),
+                    section_key=str(usage.get("section_key") or ""),
+                    score=min(1.0, max(0.0, score)),
+                    reason=str(item.get("reason") or "")[:200],
+                    context=str(usage.get("context_snippet") or ""),
+                )
             )
+            observation["items"][judgement_index].update(
+                {
+                    "baseline_score": llm_findings[-1].score,
+                    "baseline_weak": llm_findings[-1].weak,
+                }
+            )
+
+    if trace_context is not None and decision_mode == "shadow":
+        for item in observation["items"]:
+            item["missing_reason"] = (
+                jev_reason or "decision_missing"
+                if "weak" not in item
+                else "baseline_missing"
+                if "baseline_weak" not in item
+                else None
+            )
+        comparable = [
+            item for item in observation["items"] if "weak" in item and "baseline_weak" in item
+        ]
+        await trace_context.emit(
+            "quality.jev_shadow",
+            {
+                **observation,
+                "version": TYPESAFE_SOFT_CHECK_VERSION,
+                "status": "compared" if jev_findings else "jev_failed",
+                "decision_count": len(jev_findings),
+                "llm_count": len(llm_findings),
+                "comparable_count": len(comparable),
+                "weak_agreement_count": sum(
+                    item["weak"] == item["baseline_weak"] for item in comparable
+                ),
+                "accepted": jev_accepted,
+                "fallback_reason": jev_reason,
+            },
+            stage="quality",
         )
-    return findings
+
+    return llm_findings
 
 
 def coverage_hints(
@@ -2374,9 +2566,7 @@ def build_quality_report(
     """质量评分报告：只呈现，不设门槛（取代 formal completion 的 12 项硬门槛）。"""
     clock = now or datetime.now(UTC)
     # Appendices (the evidence ledger) are audit material, not manuscript.
-    word_count = sum(
-        int(s.get("word_count") or 0) for s in sections if s.get("kind") != "appendix"
-    )
+    word_count = sum(int(s.get("word_count") or 0) for s in sections if s.get("kind") != "appendix")
     used_keys: set[str] = set()
     cite_count = 0
     for section in sections:

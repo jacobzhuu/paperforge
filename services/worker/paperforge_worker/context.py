@@ -12,7 +12,8 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -29,13 +30,20 @@ from db import (
     update_job,
 )
 from db.session import make_engine, make_session_factory
-from llm_runtime import QUOTA_EXHAUSTED, LLMCallRecord, LLMConfig, LLMRunner
+from llm_runtime import (
+    QUOTA_EXHAUSTED,
+    DecisionRunner,
+    LLMCallRecord,
+    LLMConfig,
+    LLMRunner,
+)
 from observability import get_logger
 from scholar_gateway import InMemoryHttpCache, SqlAlchemyHttpCache
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from paperforge_worker.config import WorkerSettings
+from paperforge_worker.orchestration.tracing import current_span
 
 logger = get_logger(__name__)
 
@@ -70,6 +78,9 @@ async def _committing_session(
     async with session_factory() as session:
         try:
             yield session
+            from paperforge_worker.execution import fence_commit
+
+            await fence_commit(session)
             await session.commit()
         except Exception:
             await session.rollback()
@@ -130,9 +141,10 @@ class JobStopped(Exception):
     checkpoint 供「继续」续跑。
     """
 
-    def __init__(self, mode: str) -> None:
-        super().__init__(f"job stopped by user: {mode}")
+    def __init__(self, mode: str, *, reason: str | None = None) -> None:
+        super().__init__(f"job stopped: {reason or mode}")
         self.mode = mode
+        self.reason = reason
 
 
 @dataclass
@@ -159,18 +171,203 @@ class JobContext:
         default_factory=dict,
         repr=False,
     )
+    #: Job-local Jev cache.  It is deliberately not shared across projects or
+    #: resumed jobs; the key includes the full state and question rubric.
+    decision_cache: dict[str, Any] = field(default_factory=dict, repr=False)
     #: The most recent failure a stage reported through ``emit``.  ``_finish`` persists it so a
     #: failed job explains itself on its own row instead of only in the event stream.
     last_failure: dict[str, Any] | None = field(default=None, repr=False)
     #: 停止开关的轮询缓存：(读到的时刻, 结果)。
     _stop_cache: tuple[float, str | None] | None = field(default=None, repr=False)
+    _agent_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _loop: Any = field(default=None, repr=False)
+    _budget_exhausted: bool = False
+    _persisted_calls: set[int] = field(default_factory=set, repr=False)
+    _decision_runner: DecisionRunner | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        with suppress(RuntimeError):
+            self._loop = asyncio.get_running_loop()
+
+    @asynccontextmanager
+    async def span(self, kind: str, name: str, **attributes: Any):
+        parent = current_span.get() or {}
+        trace_id = self.checkpoint.get("agent_trace_id") or str(self.job_id or uuid.uuid4())
+        fields = {
+            "trace_id": trace_id,
+            "span_id": str(uuid.uuid4()),
+            "parent_span_id": parent.get("span_id"),
+            "kind": kind,
+            "name": name,
+            **attributes,
+        }
+        token = current_span.set(fields)
+        started = time.monotonic()
+        started_ns = time.time_ns()
+        export_status = "completed"
+        try:
+            await self.emit("agent.span_started", fields, checkpoint={"agent_trace_id": trace_id})
+            yield fields
+        except BaseException as error:
+            export_status = "interrupted" if isinstance(error, JobStopped) else "failed"
+            # Lease loss must not be converted to degradation by trace recording.
+            with suppress(Exception):
+                await self.emit(
+                    "agent.span_finished",
+                    {
+                        **fields,
+                        "status": "interrupted"
+                        if not isinstance(error, Exception) or isinstance(error, JobStopped)
+                        else "failed",
+                        "error_type": type(error).__name__,
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                    },
+                )
+            raise
+        else:
+            await self.emit(
+                "agent.span_finished",
+                {
+                    **fields,
+                    "status": "completed",
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                },
+            )
+        finally:
+            from observability.tracing import export_span
+
+            export_span(
+                {
+                    **fields,
+                    "project_id": str(self.project_id),
+                    "job_id": str(self.job_id),
+                    "status": export_status,
+                },
+                started_ns=started_ns,
+                ended_ns=time.time_ns(),
+            )
+            current_span.reset(token)
+
+    async def _reserve_call(self, request, parent: dict) -> dict | None:
+        """Durable conservative reservations, shared by all loops and inherited on resume.
+
+        These count model invocations, including runner truncation retries, not HTTP
+        transport retries. Reserved tokens are a byte-based upper estimate plus output
+        allowance, never a claim about actual billing. Ambiguous calls are not refunded.
+        """
+        async with self._agent_lock:
+            now = datetime.now(UTC)
+            state = dict(self.checkpoint.get("agent_budget") or {})
+            state.setdefault("version", 1)
+            state.setdefault("started_at", now.isoformat())
+            state.setdefault("calls", 0)
+            state.setdefault("reserved_tokens", 0)
+            tokens = len((request.system_prompt + request.user_prompt).encode()) + max(
+                0, request.max_output_tokens
+            )
+            elapsed = (now - datetime.fromisoformat(state["started_at"])).total_seconds()
+            reason = (
+                "calls"
+                if state["calls"] >= self.settings.agent_max_calls
+                else "tokens"
+                if state["reserved_tokens"] + tokens > self.settings.agent_max_reserved_tokens
+                else "deadline"
+                if elapsed >= self.settings.agent_max_seconds
+                else None
+            )
+            trace_id = self.checkpoint.get("agent_trace_id") or str(self.job_id or uuid.uuid4())
+            fields = {
+                "trace_id": trace_id,
+                "scheduler_job_id": str(self.job_id or trace_id),
+                "scheduler_priority": "shadow"
+                if getattr(self, "shadow_admission", False)
+                else "foreground",
+                "span_id": str(uuid.uuid4()),
+                "parent_span_id": parent.get("span_id"),
+                "node_id": parent.get("node_id", request.metadata.get("section")),
+                "attempt": state["calls"] + 1,
+            }
+            if reason:
+                state["stop_reason"] = reason
+                self._budget_exhausted = True
+                await self.emit(
+                    "agent.budget_exhausted", {"reason": reason}, checkpoint={"agent_budget": state}
+                )
+                return None
+            state["calls"] += 1
+            state["reserved_tokens"] += tokens
+            await self.emit(
+                "agent.call_reserved",
+                {
+                    **fields,
+                    "role": request.metadata.get("role"),
+                    "model": request.model,
+                    "reserved_tokens": tokens,
+                },
+                checkpoint={"agent_budget": state, "agent_trace_id": trace_id},
+            )
+            return fields
 
     def llm_runner(self, *, config: LLMConfig | None = None) -> LLMRunner:
         """构造带记账回调的 runner；所有管线只能通过它调用 LLM（设计 §4.9）。"""
+        if self._loop is None:
+            with suppress(RuntimeError):
+                self._loop = asyncio.get_running_loop()
+
+        def reserve(request):
+            if self._loop is None:
+                raise RuntimeError("JobContext runner requires an owning event loop")
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is self._loop:
+                raise RuntimeError("use agenerate on the job event loop")
+            return asyncio.run_coroutine_threadsafe(
+                self._reserve_call(request, dict(current_span.get() or {})), self._loop
+            ).result()
+
+        def record(record):
+            self.llm_calls.append(record)
+            try:
+                asyncio.run_coroutine_threadsafe(self._save_call(record), self._loop).result()
+            except Exception:  # noqa: BLE001 - final flush retries transient ledger failures
+                logger.warning("deferred LLM ledger write", exc_info=True)
+
         return LLMRunner(
             config or self.settings.llm_config(),
-            on_call=self.llm_calls.append,
+            on_call=record,
+            before_call=reserve,
         )
+
+    async def _record_decision_call(self, record: LLMCallRecord) -> None:
+        self.llm_calls.append(record)
+        await self._save_call(record)
+
+    async def _reserve_decision_call(self, request) -> dict[str, Any] | None:
+        await self.raise_if_stopped()
+        return await self._reserve_call(request, dict(current_span.get() or {}))
+
+    def decision_runner(self) -> DecisionRunner:
+        """Construct the typed Jev client through the same budget/ledger seam as LLMs."""
+
+        if self._decision_runner is None:
+            config = self.settings.typesafe_decision_config()
+            self._decision_runner = DecisionRunner(
+                api_key=str(config["api_key"]),
+                base_url=str(config["base_url"]),
+                model=str(config["model"]),
+                timeout_seconds=float(config["timeout_seconds"]),
+                max_concurrency=int(config["max_concurrency"]),
+                failure_threshold=int(config["failure_threshold"]),
+                cooldown_seconds=float(config["cooldown_seconds"]),
+                cache=self.decision_cache,
+                cache_enabled=bool(config["cache_enabled"]),
+                model_prices=config["model_prices"],
+                before_call=self._reserve_decision_call,
+                on_call=self._record_decision_call,
+            )
+        return self._decision_runner
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
@@ -201,7 +398,9 @@ class JobContext:
             logger.info("job_event", extra={"event_type": event_type, "payload": payload})
             return
         async with self.session() as session:
-            job = await _load_job(session, self.job_id)
+            # Lock BEFORE reading/merging JSON: parallel spans must not overwrite
+            # a newer model reservation with a stale checkpoint snapshot.
+            job = await _lock_job(session, self.job_id)
             if job is not None:
                 await update_job(
                     session,
@@ -224,34 +423,27 @@ class JobContext:
         """Wake SSE subscribers after a committed event or status-only transition."""
         await _publish_job_event(self.event_publisher, self.job_id)
 
-    async def flush_llm_calls(self) -> None:
-        """把本次运行的 LLM 调用写入 llm_call_log（成本面板数据源）。"""
-        if not self.llm_calls:
-            return
-        pending = list(self.llm_calls)
-        self.llm_calls.clear()
-        async with self.session() as session:
-            for record in pending:
+    async def _save_call(self, record: LLMCallRecord) -> None:
+        async with self._agent_lock:
+            if id(record) in self._persisted_calls:
+                return
+            async with self.session() as session:
                 await record_llm_call(
-                    session,
-                    project_id=self.project_id,
-                    job_id=self.job_id,
-                    role=record.role,
-                    model=record.model,
-                    provider=record.provider,
-                    input_tokens=record.input_tokens,
-                    output_tokens=record.output_tokens,
-                    cost_estimate=record.cost_estimate,
-                    latency_ms=record.latency_ms,
-                    error_code=record.error_code,
-                    max_output_tokens=record.max_output_tokens,
-                    finish_reason=record.finish_reason,
-                    prompt_sha256=record.prompt_sha256,
-                    prompt_chars=record.prompt_chars,
-                    output_chars=record.output_chars,
-                    metadata=record.metadata,
-                    occurred_at=record.occurred_at,
+                    session, project_id=self.project_id, job_id=self.job_id, **asdict(record)
                 )
+            self._persisted_calls.add(id(record))
+            from observability.tracing import export_call
+
+            export_call(record, project_id=str(self.project_id), job_id=str(self.job_id))
+
+    async def flush_llm_calls(self) -> None:
+        """Retry deferred writes; successful calls are durable before accepting node results."""
+        pending = list(self.llm_calls)
+        for record in pending:
+            await self._save_call(record)
+        saved_ids = {id(record) for record in pending}
+        self.llm_calls[:] = [r for r in self.llm_calls if id(r) not in saved_ids]
+        self._persisted_calls.difference_update(saved_ids)
 
     async def stop_requested(self) -> str | None:
         """用户是否请求了停止（标记写在 job.checkpoint_json 上）。
@@ -276,6 +468,8 @@ class JobContext:
 
     async def raise_if_stopped(self) -> None:
         """在安全点调用：用户按过停止就抛 JobStopped，当前这一步的产物已经落库。"""
+        if self._budget_exhausted:
+            raise JobStopped("pause", reason="agent_budget_exhausted")
         mode = await self.stop_requested()
         if mode is not None:
             raise JobStopped(mode)
@@ -432,7 +626,7 @@ async def job_context(
         # 也会让 `_mark_interrupted` 把任务改写成 failed。异常在这里被吞掉后，
         # `async with` 块剩下的代码不再执行，各 `run_*_pipeline` 返回 None——
         # run_full_pipeline 依赖这一点做早退（它分两段开 job_context）。
-        await _mark_stopped(context, stop.mode)
+        await _mark_stopped(context, stop.mode, reason=stop.reason)
     except (Exception, asyncio.CancelledError) as error:
         # CancelledError 必须单列（它不是 Exception）：arq 的 job_timeout 走
         # asyncio.wait_for、worker 停机走 task.cancel()，两条路都绕开 `_finish`，
@@ -490,17 +684,17 @@ async def _dispose_after(task: asyncio.Task | None, engine: Any) -> None:
 _STOP_STATUS = {"cancel": "cancelled", "pause": "paused"}
 
 
-async def _mark_stopped(context: JobContext, mode: str) -> None:
+async def _mark_stopped(context: JobContext, mode: str, *, reason: str | None = None) -> None:
     """把用户停下的任务落到 cancelled/paused，并留一条能解释「为什么没下文」的事件。"""
     if context.job_id is None:
         return
     try:
-        await _shielded(_write_stopped(context, mode))
+        await _shielded(_write_stopped(context, mode, reason=reason))
     except Exception:  # noqa: BLE001 - 收尾失败不再制造新的异常
         logger.warning("failed to mark job stopped", extra={"mode": mode}, exc_info=True)
 
 
-async def _write_stopped(context: JobContext, mode: str) -> None:
+async def _write_stopped(context: JobContext, mode: str, *, reason: str | None = None) -> None:
     if context.job_id is None:
         return
     status = _STOP_STATUS[mode]
@@ -527,9 +721,10 @@ async def _write_stopped(context: JobContext, mode: str) -> None:
                 "warnings": context.warnings,
                 # 暂停时前端要显示「从哪一步接着跑」，取的就是这个。
                 "resumable": mode == "pause",
+                **({"reason": reason} if reason else {}),
             },
         )
-        await update_job(session, job, status=status)
+        await update_job(session, job, status=status, error={"code": reason} if reason else None)
     await context.notify_event()
 
 

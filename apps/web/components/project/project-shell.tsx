@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { DataSourceBanner } from '@/components/data-source-banner';
 import { JobProgressCard } from '@/components/jobs/job-progress-card';
@@ -166,10 +167,12 @@ function ShellBody({ children }: { children: React.ReactNode }) {
               </span>
             </span>
             <span className="flex shrink-0 items-center gap-2">
-              <Button size="xs" onClick={resume}>
+              {pausedJob.checkpoint?.repair_interrupt ? (
+                <Link className="text-sm underline" href={`/projects/${projectId}/jobs/${pausedJob.id}`}>查看待补充材料</Link>
+              ) : <Button size="xs" onClick={resume}>
                 <Play className="h-3 w-3" />
                 继续
-              </Button>
+              </Button>}
               <Button
                 variant="ghost"
                 size="xs"

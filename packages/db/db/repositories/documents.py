@@ -127,6 +127,11 @@ async def upsert_section(
 ) -> PaperSection:
     if status not in SECTION_STATUSES:
         raise ValueError(f"unsupported section status: {status}")
+    # Serialize inserts as well as updates; an absent section row cannot be locked.
+    # Generated writers and API edits use the same document-first lock order.
+    await session.scalar(
+        select(PaperDocument.id).where(PaperDocument.id == document_id).with_for_update()
+    )
     section = await session.scalar(
         select(PaperSection).where(
             PaperSection.document_id == document_id,
@@ -334,8 +339,11 @@ async def list_sentence_downgrades(
             await session.execute(
                 select(SentenceDowngrade)
                 .where(SentenceDowngrade.document_id == document_id)
-                .order_by(SentenceDowngrade.section_key, SentenceDowngrade.paragraph_index,
-                          SentenceDowngrade.sentence_index)
+                .order_by(
+                    SentenceDowngrade.section_key,
+                    SentenceDowngrade.paragraph_index,
+                    SentenceDowngrade.sentence_index,
+                )
                 .limit(limit)
             )
         ).scalars()

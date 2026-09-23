@@ -1,0 +1,46 @@
+{
+  "kind": "infrastructure_fixture_not_real_agent_or_llm",
+  "at": "2026-09-16T11:57:25.008579+00:00",
+  "seconds": 121.03124302788638,
+  "accounts": 100,
+  "active_users": 30,
+  "job_fixture_seconds": "10",
+  "request_count": 3416,
+  "request_per_second": 28.224117298480788,
+  "http_statuses": {
+    "200": 3406,
+    "202": 10
+  },
+  "latency_seconds": {
+    "p50": 0.03311343304812908,
+    "p95": 0.1941456461790949,
+    "p99": 0.9514622171409428
+  },
+  "sampled_running_peak": 8,
+  "sampled_queued_peak": 10,
+  "job_failure_ratio": 0.0,
+  "accepted_jobs": 10,
+  "completed_jobs": 10,
+  "job_states": {
+    "0246d58e-e37d-4814-b439-ca720edb6bd0": "succeeded",
+    "821ba5d3-e59f-4d3f-83da-c4229b300fe7": "succeeded",
+    "4dd95a23-345d-432d-ab3d-99689885a120": "succeeded",
+    "d8d62342-3122-41cf-811a-da1cf3a7cebf": "succeeded",
+    "c354d536-80b5-4dfc-87d6-4514945c8b03": "succeeded",
+    "8f415acd-c299-4ea8-935a-a0a7342b8c38": "succeeded",
+    "dc6c427a-78d4-4de0-83ac-088657404567": "succeeded",
+    "2de60bde-aee1-40a8-8a07-805e9fff75ae": "succeeded",
+    "91137941-138d-48ae-bea9-b2ab0f07443c": "succeeded",
+    "8e528bc3-c038-4860-9915-b27cc29a959a": "succeeded"
+  },
+  "observed_completions_per_hour": 297.443859117479,
+  "queue_wait_seconds": {
+    "p50": 0.835114,
+    "p95": 13.441167,
+    "max": 13.469292
+  },
+  "sse_peak": 10,
+  "sse_unique_events_received": 50,
+  "sse_errors": [],
+  "failure_ratio": 0.0
+}

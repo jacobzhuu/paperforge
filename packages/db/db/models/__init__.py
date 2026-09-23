@@ -53,8 +53,18 @@ from db.models.paper import (
     VisualGenerationAttempt,
     VisualSourceAsset,
 )
+from db.models.web_research import (
+    McpDailyBudget,
+    McpToolInvocation,
+    WebResearchRun,
+    WebResearchSource,
+)
 
 __all__ = [
+    "McpDailyBudget",
+    "McpToolInvocation",
+    "WebResearchRun",
+    "WebResearchSource",
     "DOCUMENT_ACCESS_SCOPES",
     "LITERATURE_ROLES",
     "PDF_UPLOAD_STATUSES",
@@ -103,3 +113,5 @@ __all__ = [
     "WorkUrl",
     "WorkVersionRelation",
 ]
+
+from db.models.retrieval import EvidenceEmbedding  # noqa: F401

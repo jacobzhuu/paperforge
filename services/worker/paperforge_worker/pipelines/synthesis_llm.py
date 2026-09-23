@@ -92,9 +92,7 @@ class QuestionSynthesisResult:
     @property
     def is_empty(self) -> bool:
         """一条都没留下。此时仍要落行（generator='deterministic'）当作负缓存。"""
-        return not (
-            self.claim or self.agreement or self.conditional or self.conflict or self.gap
-        )
+        return not (self.claim or self.agreement or self.conditional or self.conflict or self.gap)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -114,11 +112,20 @@ def bundle_fingerprint(bundle: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def synthesis_policy(*, model: str, language: str, dimensions: frozenset[str]) -> dict:
+    return {
+        "version": "synthesis-v2",
+        "model": model,
+        "language": language,
+        "prompt_hash": hashlib.sha256(
+            _system_prompt(language=language, dimensions=dimensions).encode()
+        ).hexdigest(),
+    }
+
+
 def eligible_unit_count(bundle: dict[str, Any]) -> int:
     return sum(
-        1
-        for row in bundle.get("evidence") or []
-        if str(row.get("grade") or "") in FULLTEXT_GRADES
+        1 for row in bundle.get("evidence") or [] if str(row.get("grade") or "") in FULLTEXT_GRADES
     )
 
 

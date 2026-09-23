@@ -72,7 +72,9 @@ async def import_references(
     outcome = ImportOutcome(requested=len(requests))
     if not requests:
         return outcome
-    if added_via not in {"doi_import", "bibtex_import", "llm_suggested_verified"}:
+    if added_via not in {
+        "doi_import", "bibtex_import", "llm_suggested_verified", "mcp_web_verified"
+    }:
         raise ValueError(f"unsupported import source: {added_via}")
 
     for index, request in enumerate(requests[:MAX_IMPORT_ITEMS]):

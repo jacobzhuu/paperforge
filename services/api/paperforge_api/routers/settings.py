@@ -42,7 +42,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["settings"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 ROLES = (
     "planner",

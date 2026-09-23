@@ -34,6 +34,7 @@ import {
 } from '@/components/project/project-context';
 import { PdfMatchDialog, PdfUploadQueue } from './pdf-upload-queue';
 import { SearchStats } from './search-stats';
+import { WebResearchPanel } from './web-research-panel';
 import { ProviderFilter } from './provider-filter';
 import { EntryList } from './entry-list';
 import { UtilizationSummary, entryRole } from './utilization-status';
@@ -519,6 +520,7 @@ export function LibraryWorkbench() {
 
   return (
     <div className="space-y-4">
+      <WebResearchPanel />
       <WorkbenchHeader
         title={
           <span className="inline-flex items-baseline gap-2">

@@ -49,7 +49,7 @@ from paperforge_api.schemas import (
 )
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -57,6 +57,13 @@ DEV_LOGIN_USERNAME = "admin"
 DEV_LOGIN_PASSWORD = "123456"
 DEV_LOGIN_EMAIL = "admin@paperforge.local"
 LEGACY_USER_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
+
+
+def _registration_allowed(settings, email: str) -> bool:
+    if not settings.auth_registration_restricted:
+        return True
+    allowed = {item.strip().casefold() for item in settings.auth_registration_allowlist.split(",")}
+    return email.strip().casefold() in allowed
 
 
 @router.post("/register", response_model=AuthMessageResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -68,6 +75,12 @@ async def register(
     settings: SettingsDep,
 ) -> AuthMessageResponse:
     await _rate_limit(queue, settings, request, "register", str(body.email), limit=5, window=3600)
+    if not _registration_allowed(settings, str(body.email)):
+        if settings.auth_email_mode == "disabled":
+            raise HTTPException(status_code=403, detail={"code": "registration_not_allowed"})
+        return AuthMessageResponse(
+            message="If the address can be registered, a verification email was sent."
+        )
     try:
         password_hash = hash_password(body.password)
     except ValueError as error:
@@ -88,6 +101,9 @@ async def register(
                 )
         except IntegrityError:
             user = await get_user_by_email(session, str(body.email))
+
+    if settings.auth_email_mode == "disabled":
+        return AuthMessageResponse(message="Registration complete. You can sign in.")
 
     if user is not None and user.email_verified_at is None and user.status == "active":
         raw_token = new_token()
@@ -114,6 +130,8 @@ async def verify_email(body: TokenRequest, session: SessionDep) -> AuthMessageRe
     if pair is None:
         raise HTTPException(status_code=422, detail={"code": "invalid_or_expired_token"})
     _token, user = pair
+    if not _registration_allowed(get_settings(), user.email):
+        raise HTTPException(status_code=403, detail={"code": "registration_not_allowed"})
     user.email_verified_at = datetime.now(UTC)
     return AuthMessageResponse(message="Email verified.")
 
@@ -134,8 +152,15 @@ async def resend_verification(
     await _rate_limit(
         queue, settings, request, "verify-resend", str(body.email), limit=3, window=3600
     )
+    if settings.auth_email_mode == "disabled":
+        raise HTTPException(status_code=503, detail={"code": "email_delivery_disabled"})
     user = await get_user_by_email(session, str(body.email))
-    if user is not None and user.status == "active" and user.email_verified_at is None:
+    if (
+        user is not None
+        and user.status == "active"
+        and user.email_verified_at is None
+        and _registration_allowed(settings, user.email)
+    ):
         raw_token = new_token()
         await create_action_token(
             session,
@@ -175,7 +200,7 @@ async def login(
         password_matches = verify_login_password(usable_hash, body.password)
     if user is None or user.status != "active" or not password_matches:
         raise HTTPException(status_code=401, detail={"code": "invalid_credentials"})
-    if user.email_verified_at is None:
+    if user.email_verified_at is None and settings.auth_email_mode != "disabled":
         raise HTTPException(status_code=403, detail={"code": "email_verification_required"})
     if not dev_login and password_needs_rehash(user.password_hash):
         user.password_hash = hash_password(body.password)
@@ -265,6 +290,8 @@ async def forgot_password(
     settings: SettingsDep,
 ) -> AuthMessageResponse:
     await _rate_limit(queue, settings, request, "recover", str(body.email), limit=5, window=3600)
+    if settings.auth_email_mode == "disabled":
+        raise HTTPException(status_code=503, detail={"code": "email_delivery_disabled"})
     user = await get_user_by_email(session, str(body.email))
     if user is not None and user.status == "active":
         raw_token = new_token()

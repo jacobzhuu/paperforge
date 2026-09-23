@@ -178,6 +178,11 @@ class LLMConfig:
     trust_env_proxy: bool = False
     total_deadline_seconds: float | None = 180.0
     retry_backoff_seconds: float = 1.0
+    # 全进程在飞请求上限。None 表示不限（库的默认，也是非 worker 消费者的行为）。
+    # worker 显式设置它，因为那边的绑定约束是数据库连接池而不是 provider：
+    # 每个并发任务的落库与事件都要占一条连接。闸门在 `runner.agenerate` 上，
+    # 见 `runner._concurrency_gate` 关于「为什么不能放在实例上」的说明。
+    max_concurrency: int | None = None
     # 角色 → 模型 覆盖映射；缺省回退到 DEFAULT_ROLE_MODELS，再回退到 self.model。
     role_models: dict[str, str] = field(default_factory=dict)
     # 角色 → enabled/disabled。未配置的角色保留 provider 默认思考档位。

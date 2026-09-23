@@ -6,7 +6,6 @@ search_query / term_aliases 做桥接；零候选时降级放行，绝不静默�
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -21,6 +20,7 @@ from db import (
     upsert_question_evidence_link,
 )
 
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.context import JobContext
 from paperforge_worker.locators import locator_display
 
@@ -171,26 +171,60 @@ async def build_question_evidence_matrix(
     if deepen_question_ids is not None:
         questions = [question for question in questions if question.id in deepen_question_ids]
     concurrency = max(1, min(int(context.settings.qmatrix_concurrency), 8))
-    for batch_start in range(0, len(questions), concurrency):
-        batch = questions[batch_start : batch_start + concurrency]
-        results = await asyncio.gather(
-            *(
-                _classify_question(
-                    question,
-                    evidence=evidence,
-                    measurements=measurements,
-                    work_context=work_context,
-                    runner=runner,
-                    language=language,
-                    exclude_unit_ids=(
-                        already_linked.get(question.id, set())
-                        if deepen_question_ids is not None
-                        else None
-                    ),
-                )
-                for question in batch
-            )
+
+    retrieval_mode = context.checkpoint.get("evidence_retrieval_mode")
+    if retrieval_mode is None:
+        retrieval_mode = "legacy"
+        await context.emit("retrieval.configured", {"mode": retrieval_mode},
+                           checkpoint={"evidence_retrieval_mode": retrieval_mode})
+
+    async def _classify_one(question: Any) -> Any:
+        retrieval_ids = None
+        if retrieval_mode != "legacy":
+            from retrieval.search import search
+
+            async with context.session() as session:
+                found = await search(session, context.project_id, question.text,
+                                     limit=40, mode=retrieval_mode)
+            retrieval_ids = [item["evidence_id"] for item in found["results"]]
+            await context.emit("retrieval.completed", {
+                "question_id": str(question.id), "version": found["version"],
+                "mode": found["mode"], "elapsed_ms": found["elapsed_ms"],
+                "indexed_count": found["indexed_count"], "warnings": found["warnings"],
+            })
+        return await _classify_question(
+            question,
+            retrieval_ids=retrieval_ids,
+            evidence=evidence,
+            measurements=measurements,
+            work_context=work_context,
+            runner=runner,
+            language=language,
+            exclude_unit_ids=(
+                already_linked.get(question.id, set())
+                if deepen_question_ids is not None
+                else None
+            ),
         )
+
+    async def _process_batch(batch: list[Any], results: list[Any]) -> None:
+        failed = [
+            (question, result)
+            for question, result in zip(batch, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        for question, error in failed:
+            warning = {
+                "stage": "qmatrix",
+                "reason": type(error).__name__,
+                "question_id": str(question.id),
+                "message": str(error)[:300],
+            }
+            outcome.warnings.append(warning)
+            context.warn("qmatrix.classification", type(error).__name__, warning)
+            await context.emit("qmatrix.warning", warning, stage="qmatrix")
+        # 后面两趟都只看成功的那些；顺序仍是输入序，诊断与链接决策因此不变。
+        results = [result for result in results if not isinstance(result, BaseException)]
         # LLM classification is concurrent; events and writes stay ordered so
         # SSE/checkpoint semantics and deterministic diagnostics do not change.
         for result in results:
@@ -276,7 +310,31 @@ async def build_question_evidence_matrix(
                             bridge_source=result.bridge_source,
                         )
                         previous_automatic[result.question.id].append(stored)
-        await context.raise_if_stopped()
+
+    # 滑动窗口取代批次栅栏：原来一批 4 个问题要等最慢的那个跑完才开下一批。
+    # 但**落库仍按原来的批粒度**——`on_ready` 按前缀序调用，所以缓冲区攒满
+    # concurrency 个就是原来的那一批，链接更新的事务边界与停止语义都不变。
+    pending_batch: list[Any] = []
+    pending_results: list[Any] = []
+
+    async def _collect(index: int, question: Any, result: Any) -> None:
+        pending_batch.append(question)
+        pending_results.append(result)
+        if len(pending_batch) < concurrency and index != len(questions) - 1:
+            return
+        batch, results = list(pending_batch), list(pending_results)
+        pending_batch.clear()
+        pending_results.clear()
+        await _process_batch(batch, results)
+
+    await bounded_map(
+        questions,
+        _classify_one,
+        limit=concurrency,
+        on_ready=_collect,
+        stop_check=context.raise_if_stopped,
+    )
+
     async with context.session() as session:
         outcome.links = len(await list_question_evidence_links(session, context.project_id))
     return outcome
@@ -291,6 +349,7 @@ async def _classify_question(
     runner: Any,
     language: str,
     exclude_unit_ids: set[Any] | None = None,
+    retrieval_ids: list[str] | None = None,
 ) -> _QuestionClassification:
     if exclude_unit_ids:
         # 加挂时把已经挂上的单元从池子里拿掉，前 24 名于是让给了从没被看过的那一批。
@@ -307,6 +366,18 @@ async def _classify_question(
             return_diagnostics=True,
         ),
     )
+    if retrieval_ids:
+        from retrieval.ranking import rrf
+
+        # Only replace candidate ranking. Task compatibility, per-work diversity,
+        # comparability bridging and the existing classifier remain authoritative.
+        eligible = {str(unit.id): unit for unit in evidence
+                    if not question.task_id or getattr(unit, "task_id", None) in
+                    {None, question.task_id}}
+        merged = rrf([(str(unit.id), score) for unit, score in ranked],
+                     [(key, 1.0) for key in retrieval_ids if key in eligible],
+                     limit=MAX_CANDIDATES_PER_QUESTION * 2)
+        ranked = [(eligible[key], score) for key, score in merged if key in eligible]
     routing_mode = "lexical"
     bridge_source_count = None
     if bridge_source and bridge_source != "text":

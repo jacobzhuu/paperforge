@@ -72,10 +72,17 @@ services:
     env_file:
       - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
     environment:
+      REQUEST_LIMITS_ENABLED: "true"
+      JOB_DISPATCH_SLOTS: "8"
+      JOB_SHORT_SLOTS: "2"
+      DB_MAX_OVERFLOW: "4"
       AUTH_REGISTRATION_RESTRICTED: ${AUTH_REGISTRATION_RESTRICTED:-true}
+      AUTH_REGISTRATION_ALLOWLIST: ${AUTH_REGISTRATION_ALLOWLIST:-}
+      LLM_LIMIT_REDIS_URL: ${PAPERFORGE_DEPLOY_REDIS_URL:-redis://redis:6379/0}
+      LLM_GLOBAL_CONCURRENCY: "6"
       AUTH_COOKIE_SECURE: "true"
       AUTH_DEV_LOGIN_ENABLED: "false"
-      AUTH_EMAIL_MODE: smtp
+      AUTH_EMAIL_MODE: ${AUTH_EMAIL_MODE:-smtp}
       CORS_ALLOW_ORIGINS: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
       PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
       PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
@@ -90,10 +97,9 @@ services:
         condition: service_healthy
     networks:
       core: {}
-      runtime: {}
-      ingress:
+      runtime:
         aliases:
-          - api
+          - api-backend
     read_only: true
     tmpfs:
       - /tmp
@@ -105,7 +111,9 @@ services:
       timeout: 3s
       retries: 20
       start_period: 20s
-    mem_limit: 768m
+    deploy:
+      replicas: 2
+    mem_limit: 1g
     cpus: 1.0
     pids_limit: 256
     restart: unless-stopped
@@ -131,15 +139,20 @@ services:
     pids_limit: 64
     restart: unless-stopped
 
-  worker:
+  worker: &capacity-worker
     image: ${PAPERFORGE_DEPLOY_WORKER_IMAGE:?set PAPERFORGE_DEPLOY_WORKER_IMAGE}
     profiles: ["worker"]
     env_file:
       - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
-    environment:
+    environment: &capacity-worker-env
+      DB_MAX_OVERFLOW: "6"
+      WORKER_METRICS_PORT: "9090"
+      WORKER_MAX_JOBS: "4"
+      LLM_LIMIT_REDIS_URL: ${PAPERFORGE_DEPLOY_REDIS_URL:-redis://redis:6379/0}
+      LLM_GLOBAL_CONCURRENCY: "6"
       REDIS_URL: ${PAPERFORGE_DEPLOY_REDIS_URL:-redis://redis:6379/0}
       HTTPS_PROXY: http://${PAPERFORGE_DEPLOY_RUNTIME_GATEWAY:?set PAPERFORGE_DEPLOY_RUNTIME_GATEWAY}:${PAPERFORGE_DEPLOY_PROXY_RELAY_PORT:-38888}
-      NO_PROXY: 127.0.0.1,localhost,postgres,redis,minio,texd,visuald
+      NO_PROXY: 127.0.0.1,localhost,postgres,redis,minio,texd,visuald,paperforge-langfuse
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -168,10 +181,36 @@ services:
       timeout: 12s
       retries: 8
       start_period: 20s
-    mem_limit: 2g
+    deploy:
+      replicas: 2
+    mem_limit: 3g
     cpus: 2.0
     pids_limit: 512
     restart: unless-stopped
+
+  worker-short:
+    <<: *capacity-worker
+    environment:
+      <<: *capacity-worker-env
+      WORKER_MAX_JOBS: "2"
+      WORKER_QUEUE_NAME: arq:short
+    deploy:
+      replicas: 1
+    cpus: 1.0
+    mem_limit: 1g
+
+  api-gateway:
+    image: ${PAPERFORGE_DEPLOY_GATEWAY_IMAGE:-paperforge-gateway:local}
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      runtime: {}
+      ingress:
+        aliases:
+          - api
+    restart: unless-stopped
+    mem_limit: 128m
 
   web:
     image: ${PAPERFORGE_DEPLOY_WEB_IMAGE:?set PAPERFORGE_DEPLOY_WEB_IMAGE}
@@ -180,8 +219,8 @@ services:
       PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
       PAPERFORGE_PUBLIC_APP_URL: ${PAPERFORGE_PUBLIC_URL:-https://paperforge-linux.tail53ab99.ts.net}
     depends_on:
-      api:
-        condition: service_healthy
+      api-gateway:
+        condition: service_started
     ports:
       - "127.0.0.1:${PAPERFORGE_DEPLOY_WEB_PORT:?set PAPERFORGE_DEPLOY_WEB_PORT}:3000"
     networks:

@@ -179,6 +179,7 @@ async def run_search(
         scope=scope,
         runner=context.llm_runner(),
         top_n=settings.rerank_top_n,
+        concurrency=settings.rerank_concurrency,
     )
 
     top_k = settings.search_auto_select_top_k if auto_select_top_k is None else auto_select_top_k

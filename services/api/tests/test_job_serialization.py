@@ -28,6 +28,9 @@ class _Session:
     async def scalars(self, statement):
         return SimpleNamespace(all=lambda: list(self.jobs))
 
+    async def get(self, model, identifier):
+        return None
+
     async def flush(self) -> None:
         self.flushes += 1
 
@@ -128,9 +131,9 @@ async def test_a_queued_job_is_judged_by_the_queue_not_by_the_clock(monkeypatch)
 
     redis_status = JobStatus.not_found
     session = _Session([waiting])
-    await ensure_project_job_slot(session, uuid4(), object())  # type: ignore[arg-type]
-    assert waiting.status == "failed"
-    assert waiting.error_json["code"] == JOB_ABANDONED_CODE
+    with pytest.raises(HTTPException):
+        await ensure_project_job_slot(session, uuid4(), object())  # type: ignore[arg-type]
+    assert waiting.status == "queued"  # Legacy queue ownership is unknown after blue/green.
 
 
 async def test_a_queue_that_cannot_be_asked_leaves_the_job_alone(monkeypatch) -> None:

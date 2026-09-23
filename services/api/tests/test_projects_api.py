@@ -499,22 +499,12 @@ def test_full_generation_defaults_to_delivering_a_draft(client: TestClient) -> N
     assert client.queue.job_ids[-1] == started.json()["id"]  # type: ignore[attr-defined]
 
 
-def test_a_job_that_never_reaches_the_queue_is_reported_not_silently_left_queued(
-    client: TestClient,
-) -> None:
-    """入队失败此前是静默的：行建好了、队列里没有，于是它永远停在 queued。
-
-    那条行还会通过 ``ensure_project_job_slot`` 把整个项目锁死——用户此后点什么都是
-    409，界面上也没有任何解释。
-    """
+def test_deduplicated_dispatch_is_accepted_as_already_published(client: TestClient) -> None:
     project = _create_project(client)
-    client.app.dependency_overrides[get_queue] = lambda: _DedupedQueue()  # type: ignore[attr-defined]
-    try:
-        response = client.post(f"/api/v1/projects/{project['id']}/generate")
-    finally:
-        client.app.dependency_overrides[get_queue] = lambda: client.queue  # type: ignore[attr-defined]
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "job_enqueue_failed"
+    client.app.dependency_overrides[get_queue] = lambda: _DedupedQueue()
+    response = client.post(f"/api/v1/projects/{project['id']}/generate")
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
 
 
 def test_delivered_full_job_can_start_or_skip_quality_repair(
@@ -1082,12 +1072,12 @@ def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
         f"/api/v1/projects/{project['id']}/library/pdf-uploads",
         files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
     )
-    assert response.status_code == 503, response.text
+    assert response.status_code == 202, response.text
 
     uploads = client.get(f"/api/v1/projects/{project['id']}/library/pdf-uploads").json()
     assert len(uploads) == 1
-    assert uploads[0]["status"] == "match_failed"
-    assert uploads[0]["error"]["reason"] == "task_enqueue_failed"
+    assert uploads[0]["status"] == "matching"
+    assert not uploads[0]["error"]
     downloaded = client.get(
         f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploads[0]['id']}/download"
     )
@@ -1100,8 +1090,8 @@ def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
         return row.status, row.error_json
 
     job_status, error = seed(clean_pg_database_url, _job_state)
-    assert job_status == "failed"
-    assert error["reason"] == "task_enqueue_failed"
+    assert job_status == "queued"
+    assert not error
 
 
 def test_cancelling_queued_pdf_job_makes_upload_retryable(client: TestClient) -> None:

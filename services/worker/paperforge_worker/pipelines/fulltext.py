@@ -172,7 +172,17 @@ async def acquire_fulltexts(
             outcome.coverage = outcome.reused / selected_count if selected_count else 0.0
             await context.emit("ingest.fulltext", outcome.to_payload(), stage="ingest")
             return outcome, texts
-        result = await asyncio.to_thread(acquire_oa_fulltext, plan, http_client=http)
+        # 进线程池之前先把懒建的 httpx.Client 摸出来：`SafeHttpClient.client` 内部
+        # 虽然已经加了锁，但在这里预热一次可以让所有抓取线程共用同一条连接池，
+        # 少一次锁竞争，也让「这个客户端是谁建的」在时序上不含糊。
+        _ = http.client
+        result = await asyncio.to_thread(
+            acquire_oa_fulltext,
+            plan,
+            http_client=http,
+            concurrency=context.settings.fulltext_download_concurrency,
+            per_host_concurrency=context.settings.fulltext_per_host_concurrency,
+        )
     finally:
         http.close()
 

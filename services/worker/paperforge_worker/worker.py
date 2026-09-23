@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
 
-from arq import func
+from arq import cron, func
 from arq.connections import RedisSettings
 from db import (
     FINISHED_JOB_STATUSES,
@@ -32,9 +32,20 @@ from db.session import make_engine, make_session_factory
 from llm_runtime import QUOTA_EXHAUSTED
 from observability import configure_logging, get_logger, record_job_stage
 
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.config import WorkerSettings as Settings
 from paperforge_worker.config import get_settings
 from paperforge_worker.context import JobContext, JobStopped, build_scholar_cache, job_context
+from paperforge_worker.orchestration.semantic_repair import (
+    CHECKPOINT_KEY as SEMANTIC_REPAIR_KEY,
+)
+from paperforge_worker.orchestration.semantic_repair import (
+    RepairAction,
+    RepairState,
+    execute_actions,
+    plan_repairs,
+)
+from paperforge_worker.orchestration.tracing import traced
 from paperforge_worker.pipelines.cards import generate_cards
 from paperforge_worker.pipelines.document import (
     repair_document_sections,
@@ -83,7 +94,6 @@ from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
 from paperforge_worker.pipelines.semantic_review import (
     ReviewOutcome,
     SectionVerdict,
-    repair_route,
     review_section,
 )
 from paperforge_worker.pipelines.synthesis import (
@@ -91,6 +101,7 @@ from paperforge_worker.pipelines.synthesis import (
     synthesize_questions,
 )
 from paperforge_worker.pipelines.visuals import generate_visual, suggest_visuals
+from paperforge_worker.pipelines.web_research import run_web_research
 from paperforge_worker.pipelines.writing import dedupe_evidence_by_text
 
 logger = get_logger(__name__)
@@ -171,7 +182,8 @@ async def _run_stage(
     await context.raise_if_stopped()
     await context.emit(f"{stage}.started", {}, stage=stage)
     try:
-        result = await runner()
+        async with context.span("tool", stage):
+            result = await runner()
     except JobStopped:
         # 必须先于下面的兜底 except：否则停止信号会被当成「阶段降级」吞掉，
         # 管线接着跑下一阶段，用户点的停止毫无效果。
@@ -206,6 +218,7 @@ async def _run_stage(
         progress=progress if progress is not None else _STAGE_PROGRESS.get(stage),
         checkpoint={stage: payload or True},
     )
+    await context.raise_if_stopped()
     return result
 
 
@@ -332,6 +345,7 @@ async def run_library_pipeline(
             lambda: run_search(context, scope=scope, providers=providers),
             critical=strict_dependencies,
         )
+        await _run_stage(context, "web_research", lambda: run_web_research(context))
         await _run_stage(
             context,
             "screen",
@@ -441,6 +455,22 @@ async def run_library_pipeline(
             or None,
             "warnings": context.warnings,
         }
+
+
+async def run_web_research_pipeline(ctx: dict, project_id: str, job_id: str) -> dict:
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        outcome = await _run_stage(context, "web_research", lambda: run_web_research(context))
+        outcome = outcome or context.stage_payload("web_research")
+        await _finish(context, delivered=outcome.get("status") in {"completed", "partial"})
+        return outcome
 
 
 async def run_import_pipeline(
@@ -560,6 +590,36 @@ async def run_qdecomp_pipeline(
         )
         await _finish(context, delivered=bool(outcome and outcome.sub_question_count))
         return {"project_id": project_id, "questions": outcome.to_payload() if outcome else None}
+
+
+async def run_evidence_index_pipeline(ctx: dict, project_id: str, job_id: str) -> dict:
+    from retrieval.search import index_project
+
+    from paperforge_worker.execution import fence_commit
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        result = await _run_stage(
+            context,
+            "evidence_index",
+            lambda: index_project(
+                context.session_factory,
+                context.project_id,
+                stop_check=context.raise_if_stopped,
+                before_commit=fence_commit,
+            ),
+            kind="evidence",
+            resumable=False,
+        )
+        await _finish(context, delivered=result is not None)
+        return result or {}
 
 
 async def run_evidence_pipeline(
@@ -718,6 +778,79 @@ async def run_synthesis_pipeline(
         }
 
 
+async def run_dependency_rebuild_pipeline(
+    ctx: dict, project_id: str, job_id: str, outline_id: str, source_hash: str
+) -> dict:
+    from copy import deepcopy
+
+    from db import create_outline, get_outline, latest_outline
+    from db.models.paper import PaperProject
+    from sqlalchemy import select
+
+    from paperforge_worker.orchestration.dependency_contract import propose
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        intent = context.checkpoint.get("dependency_rebuild_intent") or job_id
+        await context.emit(
+            "outline.dependencies_started", {}, checkpoint={"dependency_rebuild_intent": intent}
+        )
+        async with context.session() as session:
+            source = await get_outline(session, uuid.UUID(outline_id))
+            if (
+                source is None
+                or source.project_id != context.project_id
+                or fingerprint(source.tree_json) != source_hash
+            ):
+                raise JobStopped("pause", reason="outline_source_changed")
+            tree = deepcopy(source.tree_json)
+        # A retry after the version transaction must reuse that version, even if
+        # the completion event was never delivered. The marker is server-owned.
+        marker = {"job_id": intent, "source_id": outline_id, "source_hash": source_hash}
+        async with context.session() as session:
+            latest = await latest_outline(session, context.project_id)
+            saved = (latest.tree_json or {}).get("dependency_contract", {}) if latest else {}
+            result_id = str(latest.id) if saved.get("rebuild") == marker else None
+            if result_id is None and (latest is None or str(latest.id) != outline_id):
+                raise JobStopped("pause", reason="outline_source_changed")
+        if result_id is None:
+            async with context.span("outline", "dependency_plan"):
+                proposed = await propose(tree, context.llm_runner())
+            proposed["dependency_contract"]["rebuild"] = marker
+            await context.raise_if_stopped()
+            async with context.session() as session:
+                await session.scalar(
+                    select(PaperProject)
+                    .where(PaperProject.id == context.project_id)
+                    .with_for_update()
+                )
+                latest = await latest_outline(session, context.project_id)
+                saved = (latest.tree_json or {}).get("dependency_contract", {}) if latest else {}
+                if saved.get("rebuild") == marker:
+                    result_id = str(latest.id)
+                elif (
+                    latest is None
+                    or str(latest.id) != outline_id
+                    or fingerprint(latest.tree_json) != source_hash
+                ):
+                    raise JobStopped("pause", reason="outline_source_changed")
+                else:
+                    result = await create_outline(
+                        session, project_id=context.project_id, tree=proposed, status="draft"
+                    )
+                    result_id = str(result.id)
+        await context.emit("outline.dependencies_rebuilt", {"outline_id": result_id})
+        await _finish(context, delivered=True)
+        return {"outline_id": result_id}
+
+
 async def run_outline_pipeline(
     ctx: dict,
     project_id: str,
@@ -813,6 +946,15 @@ async def run_write_pipeline(
         )
         # 完整性是交付的前提：``section_count`` 只说明有章节行，不说明每一节都有正文。
         # 补写扫描已经尽过力，到这里还缺的章节必须体现在任务状态上。
+        if context.checkpoint.get("writer_execution_mode") in {"dag_serial", "dag_parallel"}:
+            # Standalone WRITE has no downstream full-pipeline evaluator. Record
+            # final-snapshot evidence checks here, preserving its draft delivery policy.
+            await _run_stage(
+                context,
+                "quality",
+                lambda: _quality(context, quality_profile="draft"),
+                resumable=False,
+            )
         await _finish_write_outcome(context, outcome)
         return {"project_id": project_id, "write": outcome.to_payload() if outcome else None}
 
@@ -1599,6 +1741,7 @@ async def run_quality_repair_pipeline(
         }
 
 
+@traced("evaluator", "quality")
 async def _quality(
     context: JobContext,
     *,
@@ -1654,11 +1797,6 @@ async def _quality(
             if previous_report is not None
             else []
         )
-        abstracts = {
-            entry.bibtex_key: work.abstract
-            for entry, work in entries
-            if entry.bibtex_key and work.abstract
-        }
         years = [work.publication_year for _e, work in entries if work.publication_year]
         fulltext_used = sum(1 for card in cards if card.fulltext_used)
         scope = dict((project.scope_json or {}) if project else {})
@@ -1685,24 +1823,9 @@ async def _quality(
         assets_by_ref = {
             str(item.get("_asset_ref")): item for item in grounded_assets if item.get("_asset_ref")
         }
-        cite_key_by_work_id = {
-            str(work.id): entry.bibtex_key for entry, work in entries if entry.bibtex_key
-        }
-        evidence_excerpts: dict[str, list[str]] = {}
-        for item in evidence_units.values():
-            cite_key = cite_key_by_work_id.get(str(item.get("work_id") or ""))
-            if cite_key and item.get("text"):
-                evidence_excerpts.setdefault(cite_key, []).append(str(item["text"]))
-        semantic_sources = {
-            cite_key: "\n".join(excerpts)[:4000] for cite_key, excerpts in evidence_excerpts.items()
-        }
-        semantic_sources.update(
-            {
-                cite_key: abstract
-                for cite_key, abstract in abstracts.items()
-                if cite_key not in semantic_sources
-            }
-        )
+        from paperforge_worker.pipelines.citation_decisions import semantic_sources as sources_for
+
+        semantic_sources = sources_for(entries, list(evidence_units.values()))
 
     frame_keys = {"abstract", "introduction", "conclusion"}
     sections = [
@@ -1736,6 +1859,16 @@ async def _quality(
         usages=usages,
         abstracts=semantic_sources,
         runner=context.llm_runner(),
+        decision_runner=(
+            context.decision_runner()
+            if getattr(context.settings, "typesafe_soft_check_mode", "off") != "off"
+            else None
+        ),
+        decision_mode=getattr(context.settings, "typesafe_soft_check_mode", "off"),
+        decision_confidence_threshold=getattr(
+            context.settings, "typesafe_confidence_threshold", 0.90
+        ),
+        trace_context=context,
     )
     report = build_quality_report(
         sections=sections,
@@ -1793,7 +1926,9 @@ async def _quality(
             try:
                 async with context.session() as session:
                     context.claim_verification_cache.update(
-                        await get_claim_entailment_cache(session, missing_cache_keys)
+                        await get_claim_entailment_cache(
+                            session, missing_cache_keys, project_id=context.project_id
+                        )
                     )
             except Exception:  # noqa: BLE001 - cache outages must not fail quality verification
                 logger.warning(
@@ -1806,6 +1941,7 @@ async def _quality(
         runner=verifier_runner,
         cache=context.claim_verification_cache,
         mode=claim_entailment_mode,
+        verifier_concurrency=context.settings.verifier_concurrency,
     )
     if (
         claim_verification["model_checked_count"]
@@ -1820,6 +1956,7 @@ async def _quality(
                         for entry in context.claim_verification_cache.values()
                         if entry.get("cache_key")
                     ],
+                    project_id=context.project_id,
                 )
         except Exception:  # noqa: BLE001 - a cache write failure cannot invalidate verdicts
             logger.warning(
@@ -1843,6 +1980,32 @@ async def _quality(
             evidence_units=evidence_units,
             references=entries,
         )
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    body_hash = fingerprint(
+        {
+            row.section_key: fingerprint(row.body_ir_json)
+            for row in rows
+            if row.section_key not in frame_keys
+        }
+    )
+    stale_frames = [
+        row.section_key
+        for row in rows
+        if row.section_key in frame_keys
+        and (getattr(row, "generation_json", None) or {}).get("body_snapshot")
+        not in {None, body_hash}
+    ]
+    if stale_frames:
+        issue = {
+            "code": "frame_snapshot_stale",
+            "sections": stale_frames,
+            "message": "框架章节尚未与最终正文同步，需要重新生成",
+        }
+        report.warnings.append(issue)
+        if quality_profile != "draft":
+            report.blockers.append(issue)
+            report.readiness_status = "needs_revision"
     if project is not None and project.paper_type == "original":
         from ingest.numlint import lint_sections
 
@@ -2328,11 +2491,7 @@ async def _roll_back_worsened_sections(
 
     :returns: 实际退回的章节 key，按字典序。
     """
-    worsened = sorted(
-        key
-        for key in snapshot
-        if after.get(key, 0) > before.get(key, 0)
-    )
+    worsened = sorted(key for key in snapshot if after.get(key, 0) > before.get(key, 0))
     if not worsened:
         return []
     current_state = await snapshot_document_sections(context)
@@ -2421,10 +2580,14 @@ def _cited_evidence_ids(body: dict[str, Any]) -> set[str]:
     return found
 
 
-async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
+async def _section_review_inputs(
+    context: JobContext, *, include_unlinked: bool = False
+) -> list[dict[str, Any]]:
     """凑齐评审要看的三样东西：子问题、这一节的正文、这一节能用的证据。"""
     from db import (
         get_outline,
+        get_writing_whitelist,
+        grounded_asset_payloads,
         latest_document,
         list_evidence_units,
         list_question_evidence_links,
@@ -2444,6 +2607,14 @@ async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
         }
         links = await list_question_evidence_links(session, context.project_id)
         units = {unit.id: unit for unit in await list_evidence_units(session, context.project_id)}
+        whitelist = await get_writing_whitelist(session, context.project_id)
+        assets = await grounded_asset_payloads(session, context.project_id)
+
+    from db import evidence_payload
+
+    from paperforge_worker.pipelines.review_inputs import build_review_input
+
+    all_evidence = [evidence_payload(unit) for unit in units.values()]
 
     evidence_by_question: dict[str, list[dict[str, Any]]] = {}
     for link in links:
@@ -2471,8 +2642,13 @@ async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
     for row in rows:
         question_id = question_by_section.get(row.section_key)
         question = questions.get(question_id or "")
-        if question is None:
+        if question is None and not include_unlinked:
             continue
+        question_text = (
+            question.text
+            if question
+            else str((row.body_ir_json or {}).get("title", row.section_key))
+        )
         # 评审器看到的证据要和写作器看到的一致：重复文本只算一条，否则「有多少证据
         # 没用上」会虚高，那道不再检索的闸就会因为重复条目误触发。
         pool = dedupe_evidence_by_text(evidence_by_question.get(question_id or "", []))
@@ -2481,9 +2657,19 @@ async def _section_review_inputs(context: JobContext) -> list[dict[str, Any]]:
             {
                 "section_key": row.section_key,
                 "question_id": question_id,
-                "question": question.text,
+                "question": question_text,
                 "prose": _body_text_for_quality(row.body_ir_json or {}),
                 "evidence": pool,
+                "review_input": build_review_input(
+                    section_key=row.section_key,
+                    question=question_text,
+                    prose=_body_text_for_quality(row.body_ir_json or {}),
+                    body=row.body_ir_json or {},
+                    evidence=all_evidence,
+                    whitelist=whitelist,
+                    assets=assets,
+                    scope={"project_id": str(context.project_id), "document_id": str(document.id)},
+                ),
                 "pool_size": len(pool),
                 "unused_evidence": sum(1 for item in pool if item["evidence_id"] not in cited),
             }
@@ -2521,6 +2707,75 @@ def _repair_note(verdict: SectionVerdict, item: dict[str, Any]) -> str:
     return "\n".join(notes)
 
 
+async def _current_document_snapshot(context: JobContext) -> tuple[str | None, str | None]:
+    from db import document_snapshot_hash, latest_document, list_sections
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        rows = await list_sections(session, document.id) if document else []
+    return (str(document.id), document_snapshot_hash(rows)) if document else (None, None)
+
+
+async def _quality_after_semantics(
+    context: JobContext,
+    report: Any,
+    *,
+    quality_profile: str,
+    review_style: str,
+) -> Any:
+    """Never let a pre-rewrite report authorize the current manuscript's export."""
+    _document_id, snapshot = await _current_document_snapshot(context)
+    if (
+        quality_profile != "submission"
+        and report is not None
+        and snapshot
+        and snapshot == report.paper_snapshot_hash
+    ):
+        # Persisting an identical rewrite still invalidates the DB row. Re-publish the
+        # matching verdict without another model call so UI/export see a live report.
+        if report.report_id:
+            from db.models.paper import QualityReportRecord
+
+            async with context.session() as session:
+                record = await session.get(QualityReportRecord, uuid.UUID(report.report_id))
+            if record is None or record.stale:
+                reused = await _republish_after_rollback(
+                    context,
+                    report,
+                    quality_profile=quality_profile,
+                    review_style=review_style,
+                )
+                if reused is not None:
+                    return reused
+            else:
+                return report
+        else:
+            return report
+    # Invalidate the resume fallback before attempting a potentially failing reassessment.
+    await context.emit(
+        "quality.invalidated",
+        {"reason": "semantic_reassessment", "snapshot": snapshot},
+        stage="quality_recheck",
+        checkpoint={"quality": {"readiness_status": "unassessed"}},
+    )
+    try:
+        return await _quality(context, quality_profile=quality_profile, review_style=review_style)
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - retain manuscript, never reuse stale clearance
+        from paperforge_worker.pipelines.quality import QualityReport
+
+        context.warn("quality_recheck", type(error).__name__, {"message": str(error)[:300]})
+        return QualityReport(
+            readiness_status="needs_revision",
+            quality_profile=quality_profile,
+            review_style=review_style,
+            paper_snapshot_hash=snapshot,
+            blockers=[{"code": "quality_reassessment_failed", "message": "请重新运行质量检查"}],
+        )
+
+
+@traced("planner", "converge_section_semantics")
 async def _converge_section_semantics(
     context: JobContext,
     *,
@@ -2534,33 +2789,173 @@ async def _converge_section_semantics(
     模型判——但修复动作由确定性规则分流，模型的病因只是输入之一。
     """
     runner = context.llm_runner()
-    history: list[dict[str, Any]] = []
-    attempted: dict[str, set[str]] = {}
-    last_note: dict[str, str] = {}
-    verdict_payloads: dict[str, dict[str, Any]] = {}
+    # Read the actual document identity; never share attempts across manuscript replacements.
+    document_id, _ = await _current_document_snapshot(context)
+    from paperforge_worker.pipelines.review_inputs import REVIEW_INPUT_VERSION
 
-    for attempt in range(1, MAX_SEMANTIC_ROUNDS + 1):
+    state = RepairState.load(
+        context.checkpoint.get(SEMANTIC_REPAIR_KEY),
+        scope=f"{context.project_id}:{document_id}:{REVIEW_INPUT_VERSION}",
+    )
+    history = state.history
+    verdict_payloads = state.verdicts
+
+    async def save(event: str, payload: dict[str, Any]) -> None:
+        await context.emit(
+            event,
+            {"attempt": state.rounds_used, **payload},
+            stage="quality_repair",
+            checkpoint={SEMANTIC_REPAIR_KEY: state.payload()},
+        )
+
+    async def execute(action: RepairAction) -> dict[str, Any]:
+        async with context.span(
+            "repair", action.kind, sections=action.sections, attempt=state.rounds_used
+        ):
+            return await _execute_action(action)
+
+    async def _execute_action(action: RepairAction) -> dict[str, Any]:
+        questions: set[Any] = set()
+        for value in action.questions:
+            try:
+                questions.add(uuid.UUID(value))
+            except ValueError:
+                questions.add(value)
+        result: Any = None
+        if action.kind == "deepen":
+            result = await _deepen_question_evidence(
+                context,
+                question_ids=questions,
+                language=language,
+                attempt=state.rounds_used,
+            )
+        elif action.kind == "retrieve":
+            result = await _supplement_review_evidence(
+                context,
+                language=language,
+                round_index=state.rounds_used,
+                question_ids=questions,
+            )
+        elif action.kind == "matrix":
+            await _rebuild_question_matrix(context, language=language)
+        elif action.kind == "resynthesize":
+            await _resynthesize_questions(context)
+        elif action.kind == "rewrite":
+            result = await repair_document_sections(
+                context,
+                section_keys=set(action.sections),
+                language=language,
+                paper_type=paper_type,
+                notes={key: state.notes[key] for key in action.sections if key in state.notes},
+                concurrency=context.settings.writer_repair_concurrency,
+            )
+        else:
+            raise ValueError(f"unknown semantic repair action: {action.kind}")
+        payload = result.to_payload() if hasattr(result, "to_payload") else result
+        # Keep checkpoint results small; detailed provenance is in the existing domain events.
+        return {
+            key: value
+            for key, value in (payload or {}).items()
+            if isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    if context.checkpoint.get("semantic_repair_engine") == "langgraph":
+        from paperforge_worker.orchestration.semantic_graph import run_graph
+
+        async def graph_review(items, repair_state):
+            verdicts = []
+
+            async def review_one(item):
+                return await review_section(
+                    section_key=item["section_key"],
+                    question=item["question"],
+                    prose=item["prose"],
+                    evidence=item["evidence"],
+                    review_input=item.get("review_input"),
+                    trace_context=context,
+                    runner=runner,
+                    language=language,
+                )
+
+            async def collect(_index, item, verdict):
+                if isinstance(verdict, BaseException) or verdict is None:
+                    repair_state.unassessed.append(item["section_key"])
+                else:
+                    verdicts.append(verdict)
+
+            await bounded_map(
+                items,
+                review_one,
+                limit=context.settings.section_review_concurrency,
+                on_ready=collect,
+                stop_check=context.raise_if_stopped,
+            )
+            return verdicts
+
+        return await run_graph(
+            context=context,
+            state=state,
+            review=graph_review,
+            inputs=lambda: _section_review_inputs(context),
+            execute=execute,
+            note_for=_repair_note,
+            save=save,
+            snapshot=lambda: _current_document_snapshot(context),
+            max_rounds=MAX_SEMANTIC_ROUNDS,
+        )
+
+    if state.actions and state.stop_reason is None:
+        await execute_actions(
+            state, execute=execute, save=save, stop_check=context.raise_if_stopped
+        )
+    for attempt in range(state.rounds_used + 1, MAX_SEMANTIC_ROUNDS + 1):
+        if state.stop_reason is not None:
+            break
         inputs = await _section_review_inputs(context)
         if not inputs:
+            state.stop_reason = "no_sections"
             break
+        state.unassessed = []
         outcome = ReviewOutcome()
-        for item in inputs:
-            await context.raise_if_stopped()
-            verdict = await review_section(
+
+        # 每次 `review_section` 只吃自己的 item，不共享任何状态——这是全流程里最干净的
+        # 一处扇出。计数与 verdicts 仍按输入序在 on_ready 里累加：`ReviewOutcome.to_payload`
+        # 按位置读 verdicts，完成序会让同一批评审产出不同的 payload。
+        async def _review_one(item: dict[str, Any]) -> Any:
+            return await review_section(
                 section_key=item["section_key"],
                 question=item["question"],
                 prose=item["prose"],
                 evidence=item["evidence"],
+                review_input=item.get("review_input"),
+                trace_context=context,
                 runner=runner,
                 language=language,
             )
+
+        async def _collect_verdict(
+            _index: int,
+            _item: dict[str, Any],
+            verdict: Any,
+            *,
+            outcome: ReviewOutcome = outcome,
+        ) -> None:
             outcome.calls += 1
-            if verdict is None:
+            if isinstance(verdict, BaseException) or verdict is None:
                 # 评审器不可用不能变成「不合格」：保持既有交付判断。
                 outcome.failed_calls += 1
-                continue
+                state.unassessed.append(_item["section_key"])
+                return
             outcome.verdicts.append(verdict)
             verdict_payloads[verdict.section_key] = verdict.to_payload()
+
+        await bounded_map(
+            inputs,
+            _review_one,
+            limit=context.settings.section_review_concurrency,
+            on_ready=_collect_verdict,
+            stop_check=context.raise_if_stopped,
+        )
 
         failing = [item for item in outcome.verdicts if not item.acceptable]
         await context.emit(
@@ -2570,110 +2965,76 @@ async def _converge_section_semantics(
         )
         if not failing:
             history.append({"attempt": attempt, "failing": [], "routes": {}})
+            state.stop_reason = "reviewer_unavailable" if state.unassessed else "acceptable"
             break
 
-        shelf = {item["section_key"]: item for item in inputs}
-        routes: dict[str, str] = {}
-        for verdict in failing:
-            tried = attempted.setdefault(verdict.section_key, set())
-            item = shelf.get(verdict.section_key, {})
-            # 重写的指令是随判定走的，这一轮点名的句子和上一轮不一样，就还值得再写一次:
-            # 实测 s2 第一轮被点名「微生物 VOCs 使植物进入防御准备状态」，重写之后那句话
-            # 的主语确实换成了「有益微生物」，但同一段里「VOCs 激活 ISR/SAR」还留着，
-            # 第二轮点的是这句新的。补检索和重跑综合不吃这一条——它们的输入是项目级的，
-            # 判定变了输入也不变，再跑一遍就是重复付钱。
-            note = _repair_note(verdict, item)
-            if note and note != last_note.get(verdict.section_key):
-                tried.discard("rewrite")
-            last_note[verdict.section_key] = note
-            route = repair_route(
-                verdict,
-                attempted=frozenset(tried),
-                pool_size=int(item.get("pool_size", 0)),
-                unused_evidence=int(item.get("unused_evidence", 0)),
-            )
-            if route == "none":
-                continue
-            tried.add(route)
-            routes[verdict.section_key] = route
-        history.append(
-            {
-                "attempt": attempt,
-                "failing": [item.section_key for item in failing],
-                "diagnoses": {item.section_key: item.diagnosis for item in failing},
-                "routes": routes,
-            }
-        )
+        routes = plan_repairs(state, failing, inputs, _repair_note)
+        await save("semantic_repair.planned", state.history[-1])
         if not routes:
+            state.stop_reason = "no_untried_route"
             break
-
         await context.emit(
             "section_review.repairing",
             {"attempt": attempt, "routes": routes},
             stage="quality_repair",
         )
-        # 一条路只跑一次，即使多节共用：补检索与重跑综合都是项目级动作。
-        if "retrieve" in routes.values():
-            gap_question_ids = {
-                shelf[key].get("question_id")
-                for key, route in routes.items()
-                if route == "retrieve" and shelf.get(key)
-            }
-            gap_question_ids.discard(None)
-            await _deepen_question_evidence(
-                context,
-                question_ids=gap_question_ids,
-                language=language,
-                attempt=attempt,
-            )
-            await _supplement_review_evidence(
-                context,
-                language=language,
-                round_index=attempt,
-                question_ids=gap_question_ids,
-            )
-            await _rebuild_question_matrix(context, language=language)
-        if "resynthesize" in routes.values():
-            await _resynthesize_questions(context)
-        # 补证据与重跑综合之后，正文必须**跟着重写**才能把新东西写进去。漏掉
-        # resynthesize 那一半的后果是隐蔽的：综合确实重跑了、库里也更新了，但正文
-        # 一个字没变，于是下一轮复评看到的还是同一段话，判定当然也不会变。
-        rewrite_sections = {
-            key for key, route in routes.items() if route in {"rewrite", "retrieve", "resynthesize"}
-        }
-        if rewrite_sections:
-            await repair_document_sections(
-                context,
-                section_keys=rewrite_sections,
-                language=language,
-                paper_type=paper_type,
-                notes={key: note for key, note in last_note.items() if key in rewrite_sections},
-            )
+        await execute_actions(
+            state, execute=execute, save=save, stop_check=context.raise_if_stopped
+        )
 
     # 最后一轮的修复必须再评一次，否则 ``unresolved`` 报的是**修之前**的判定——
     # 一个刚被修好的章节会被永远记成未解决，而验收判据也就不再是判据。
     repaired = {key for round_ in history for key in (round_.get("routes") or {})}
     if repaired:
-        for item in await _section_review_inputs(context):
-            if item["section_key"] not in repaired:
-                continue
-            verdict = await review_section(
+        recheck = [
+            item
+            for item in await _section_review_inputs(context)
+            if item["section_key"] in repaired
+        ]
+
+        async def _recheck_one(item: dict[str, Any]) -> Any:
+            return await review_section(
                 section_key=item["section_key"],
                 question=item["question"],
                 prose=item["prose"],
                 evidence=item["evidence"],
+                review_input=item.get("review_input"),
+                trace_context=context,
                 runner=runner,
                 language=language,
             )
-            if verdict is not None:
-                verdict_payloads[verdict.section_key] = verdict.to_payload()
 
-    payload = {
-        "rounds": history,
-        "verdicts": list(verdict_payloads.values()),
-        "unresolved": [key for key, item in verdict_payloads.items() if not item.get("acceptable")],
-    }
-    await context.emit("section_review.converged", payload, stage="quality")
+        async def _record_recheck(_index: int, _item: dict[str, Any], verdict: Any) -> None:
+            # 评审器失败保持原语义：不覆盖上一轮的判定，不记成「不合格」。
+            if isinstance(verdict, BaseException) or verdict is None:
+                if _item["section_key"] not in state.unassessed:
+                    state.unassessed.append(_item["section_key"])
+                return
+            if verdict.section_key in state.unassessed:
+                state.unassessed.remove(verdict.section_key)
+            verdict_payloads[verdict.section_key] = verdict.to_payload()
+
+        await bounded_map(
+            recheck,
+            _recheck_one,
+            limit=context.settings.section_review_concurrency,
+            on_ready=_record_recheck,
+            stop_check=context.raise_if_stopped,
+        )
+
+    if state.unassessed:
+        state.stop_reason = "reviewer_unavailable"
+    elif verdict_payloads and all(item.get("acceptable") for item in verdict_payloads.values()):
+        state.stop_reason = "acceptable"
+    else:
+        state.stop_reason = state.stop_reason or "budget_exhausted"
+    payload = state.result()
+    await context.emit(
+        "section_review.converged",
+        payload,
+        stage="quality",
+        checkpoint={SEMANTIC_REPAIR_KEY: state.payload()},
+    )
     return payload
 
 
@@ -2681,6 +3042,8 @@ async def _rebuild_question_matrix(context: JobContext, *, language: str) -> Non
     """补检索之后重建问题—证据矩阵，否则新文献永远进不了任何一节。"""
     try:
         await build_question_evidence_matrix(context, language=language)
+    except JobStopped:
+        raise
     except Exception as error:  # noqa: BLE001 - 补证据失败不该毁掉已有稿子
         context.warn("section_review", type(error).__name__, {"stage": "qmatrix_rebuild"})
 
@@ -2752,6 +3115,8 @@ async def _deepen_question_evidence(
             language=language,
             deepen_question_ids=targets,
         )
+    except JobStopped:
+        raise
     except Exception as error:  # noqa: BLE001 - 加挂失败不该毁掉已有稿子
         context.warn("section_review", type(error).__name__, {"stage": "qmatrix_deepen"})
         return {"deepened": 0, "error": type(error).__name__}
@@ -2759,8 +3124,7 @@ async def _deepen_question_evidence(
     payload = {
         "attempt": attempt,
         "questions": {
-            str(qid): {"before": before.get(qid, 0), "after": after.get(qid, 0)}
-            for qid in targets
+            str(qid): {"before": before.get(qid, 0), "after": after.get(qid, 0)} for qid in targets
         },
         "added": sum(after.get(qid, 0) - before.get(qid, 0) for qid in targets),
     }
@@ -2805,6 +3169,8 @@ async def _resynthesize_questions(context: JobContext) -> None:
         )
     try:
         await synthesize_questions(context)
+    except JobStopped:
+        raise
     except Exception as error:  # noqa: BLE001
         context.warn("section_review", type(error).__name__, {"stage": "resynthesize"})
 
@@ -3283,6 +3649,7 @@ async def _prewrite_evidence_gate(
     return report, enrichments
 
 
+@traced("repair", "converge_scholarly_quality")
 async def _converge_scholarly_quality(
     context: JobContext,
     *,
@@ -3322,12 +3689,15 @@ async def _converge_scholarly_quality(
                 section_keys=section_keys,
                 language=language,
                 paper_type=paper_type,
+                concurrency=context.settings.writer_repair_concurrency,
             )
             candidate = await _quality(
                 context,
                 quality_profile=quality_profile,
                 review_style=review_style,
             )
+        except JobStopped:
+            raise
         except Exception as error:  # noqa: BLE001 - restore the last known-good manuscript
             await restore_document_sections(context, snapshot)
             context.warn(
@@ -3567,16 +3937,12 @@ async def run_full_pipeline(
                 language=language,
                 paper_type=paper_type,
             )
-            if (
-                quality_profile == "submission"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status == "preflight_ready"
-            ):
-                quality_outcome = await _quality(
-                    context,
-                    quality_profile="submission",
-                    review_style=review_style,
-                )
+            quality_outcome = await _quality_after_semantics(
+                context,
+                quality_outcome,
+                quality_profile=quality_profile,
+                review_style=review_style,
+            )
             if quality_outcome is not None:
                 await context.emit(
                     "quality.final",
@@ -3797,6 +4163,10 @@ async def _outline(context: JobContext, *, review_style: str = "narrative"):
         search_method=search_method,
         sub_question_bundles=synthesis_bundles,
     )
+    from paperforge_worker.orchestration.dependency_contract import apply_proposals
+
+    outcome.tree = apply_proposals(outcome.tree, [])
+    outcome.tree["dependency_contract"]["requires_confirmation"] = False
     async with context.session() as session:
         outline = await create_outline(
             session,
@@ -4018,31 +4388,60 @@ async def _finish_needs_input(context: JobContext, report: Any) -> None:
 async def startup(ctx: dict) -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
+    from observability.tracing import configure_tracing
+
+    configure_tracing("paperforge-worker")
     engine = make_engine(settings.database_url, application_name="paperforge-worker")
+    from paperforge_worker.orchestration.semantic_graph import setup_graph_store
+
+    await setup_graph_store(settings.database_url)
     ctx["settings"] = settings
     ctx["engine"] = engine
     ctx["session_factory"] = make_session_factory(engine)
     ctx["scholar_cache"] = build_scholar_cache(settings)
+    import os
+
+    if os.environ.get("WORKER_METRICS_PORT"):
+        from prometheus_client import start_http_server
+
+        ctx["metrics_server"] = start_http_server(int(os.environ["WORKER_METRICS_PORT"]))
     logger.info("worker started")
 
 
 async def shutdown(ctx: dict) -> None:
+    import asyncio
+
+    from observability.tracing import shutdown_tracing
+
+    await asyncio.to_thread(shutdown_tracing)
     engine = ctx.get("engine")
     if engine is not None:
         await engine.dispose()
 
 
+from paperforge_worker.evaluator_shadow import after_job_end, shadow_tick  # noqa: E402
+
+
 class WorkerSettings:
+    after_job_end = after_job_end
+    cron_jobs = (
+        []
+        if get_settings().worker_queue_name == "arq:short"
+        else [cron(shadow_tick, minute=set(range(60)), second=35, timeout=1800, max_tries=1)]
+    )
     functions = [
+        run_web_research_pipeline,
         run_library_pipeline,
         run_import_pipeline,
         run_cards_pipeline,
         run_qdecomp_pipeline,
         run_evidence_pipeline,
+        run_evidence_index_pipeline,
         run_qmatrix_pipeline,
         run_alignment_pipeline,
         run_synthesis_pipeline,
         run_outline_pipeline,
+        run_dependency_rebuild_pipeline,
         func(run_write_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         func(run_draft_rebuild_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         func(run_polish_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
@@ -4067,4 +4466,17 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     # 论文生成是分钟级任务：给足超时，并限制并发以尊重 provider 配额。
     job_timeout = 3600
-    max_jobs = 4
+    queue_name = get_settings().worker_queue_name
+    max_jobs = get_settings().worker_max_jobs
+    job_completion_wait = 30
+    max_tries = 3
+
+
+# Keep wire names stable while enforcing one fenced executor per durable intent.
+from paperforge_worker.execution import guarded  # noqa: E402
+
+for _function in WorkerSettings.functions:
+    if hasattr(_function, "coroutine"):
+        _function.coroutine = guarded(_function.coroutine)
+    else:
+        WorkerSettings.functions[WorkerSettings.functions.index(_function)] = guarded(_function)

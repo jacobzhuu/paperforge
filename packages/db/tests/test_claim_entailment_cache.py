@@ -23,6 +23,38 @@ def _entry(**overrides):
     }
 
 
+async def test_project_cache_does_not_read_legacy_or_other_projects_and_cascades(session):
+    from db import create_project, create_user
+    from db.models.paper import ClaimEntailmentCache, PaperProject
+    from sqlalchemy import delete, select
+
+    user = await create_user(
+        session, email=f"{uuid.uuid4()}@example.test", password_hash="!test", verified=True
+    )
+    projects = [
+        await create_project(
+            session, title=f"P{i}", paper_type="review", language="en", owner_id=user.id
+        )
+        for i in range(2)
+    ]
+    key = "a" * 64
+    await store_claim_entailment_cache(session, [_entry()])
+    assert await get_claim_entailment_cache(session, {key}, project_id=projects[0].id) == {}
+    await store_claim_entailment_cache(session, [_entry()], project_id=projects[0].id)
+    assert key in await get_claim_entailment_cache(session, {key}, project_id=projects[0].id)
+    assert await get_claim_entailment_cache(session, {key}, project_id=projects[1].id) == {}
+    deleted_id = projects[0].id
+    await session.execute(delete(PaperProject).where(PaperProject.id == deleted_id))
+    assert not list(
+        (
+            await session.scalars(
+                select(ClaimEntailmentCache).where(ClaimEntailmentCache.project_id == deleted_id)
+            )
+        ).all()
+    )
+    assert key in await get_claim_entailment_cache(session, {key})  # draining legacy namespace
+
+
 @pytest.mark.asyncio
 async def test_cache_survives_sessions_and_is_immutable_on_conflict(session_factory):
     async with session_factory() as session:
@@ -34,10 +66,13 @@ async def test_cache_survives_sessions_and_is_immutable_on_conflict(session_fact
         assert cached["a" * 64]["verdict"] == "supported"
         assert cached["a" * 64]["cache_scope"] == "persistent"
         assert cached["a" * 64]["model"] == "deepseek-v4-flash"
-        assert await store_claim_entailment_cache(
-            session,
-            [_entry(verdict="unsupported", confidence=0.99)],
-        ) == 0
+        assert (
+            await store_claim_entailment_cache(
+                session,
+                [_entry(verdict="unsupported", confidence=0.99)],
+            )
+            == 0
+        )
         await session.commit()
 
     async with session_factory() as session:
@@ -135,9 +170,7 @@ async def _project_with_anchor(session, *, claim_hash: str, evidence_hash: str |
         password_hash="!test-only",
         verified=True,
     )
-    project = await create_project(
-        session, title="Purge", paper_type="review", owner_id=owner.id
-    )
+    project = await create_project(session, title="Purge", paper_type="review", owner_id=owner.id)
     document = PaperDocument(project_id=project.id, version=1, status="draft")
     session.add(document)
     await session.flush()

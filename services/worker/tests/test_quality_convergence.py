@@ -28,7 +28,13 @@ class _Context:
         self.warnings: list[tuple[str, str, dict[str, Any]]] = []
         # 轮数现在来自部署配置（QUALITY_REPAIR_ROUNDS）；默认值就是原先写死的 2，
         # 所以这些用例断言的行为不变。
-        self.settings = SimpleNamespace(quality_repair_rounds=quality_repair_rounds)
+        # writer_repair_concurrency 是修复轮章节重写的波宽。它必须在这里出现：
+        # 缺字段会在 `_converge_scholarly_quality` 的 try 里抛 AttributeError，
+        # 被那层兜底吞成「这一轮修复失败」——测试于是绿着跑，却什么都没测到。
+        self.settings = SimpleNamespace(
+            quality_repair_rounds=quality_repair_rounds,
+            writer_repair_concurrency=1,
+        )
 
     async def emit(self, event: str, payload: dict[str, Any], **_kwargs: Any) -> None:
         self.events.append((event, payload))
@@ -514,3 +520,24 @@ async def test_republish_after_rollback_refuses_when_the_body_does_not_match(mon
     assert result is None
     assert published == []
     assert report.report_id == "best-so-far"
+
+
+async def test_user_pause_is_not_swallowed_by_quality_repair(monkeypatch):
+    from paperforge_worker.context import JobStopped
+
+    async def failing(*args):
+        return {"s1"}
+
+    async def snapshot(*args):
+        return {"s1": "original"}
+
+    async def stopped(*args, **kwargs):
+        raise JobStopped("pause")
+
+    monkeypatch.setattr(worker, "_quality_failing_sections", failing)
+    monkeypatch.setattr(worker, "snapshot_document_sections", snapshot)
+    monkeypatch.setattr(worker, "repair_document_sections", stopped)
+    with pytest.raises(JobStopped):
+        await worker._converge_scholarly_quality(
+            _Context(), initial_report=_report(1), language="en",
+            paper_type="review", review_style="narrative")

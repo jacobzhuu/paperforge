@@ -84,6 +84,7 @@ from paperforge_api.deps import (
 from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.jobs import reconcile_abandoned_jobs, start_job
 from paperforge_api.llm_accounting import accounted_runner
+from paperforge_api.repair_response import RepairResponse, consume_response, validate_response
 from paperforge_api.schemas import (
     CostResponse,
     CreateProjectRequest,
@@ -114,7 +115,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["projects"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 
@@ -1132,6 +1133,7 @@ async def resume_job(
     job_id: str,
     session: SessionDep,
     queue: QueueDep,
+    response: RepairResponse | None = None,
 ) -> JobResponse:
     """从断点继续：新建一个 job，播种上一轮的 checkpoint，已完成的阶段直接跳过。
 
@@ -1139,6 +1141,9 @@ async def resume_job(
     续跑另起一条，前端的进度流和历史记录才对得上。
     """
     job = await _require_project_job(session, project_id, job_id)
+    # Lock the source through dispatch so repeated submissions cannot fork a resume chain.
+    await session.refresh(job, with_for_update=True)
+    response_checkpoint = await validate_response(session, job, response)
     if job.status != "paused":
         raise HTTPException(status_code=409, detail="only a paused job can be resumed")
     spec = job_resume_spec(job)
@@ -1156,9 +1161,10 @@ async def resume_job(
         project_id=job.project_id,
         kind=job.kind,
         function=spec["function"],
-        checkpoint=resume_checkpoint(job),
+        checkpoint={**resume_checkpoint(job), **response_checkpoint},
         **spec["kwargs"],
     )
+    await consume_response(session, job, resumed)
     return _job_response(resumed)
 
 
@@ -1480,6 +1486,7 @@ def _project_response(
         ],
         keywords=project.keywords_json or [],
         metadata_confirmed=project.metadata_confirmed_at is not None,
+        web_research_enabled=project.web_research_enabled,
         library_count=counters.get("library_count", 0),
         section_count=counters.get("section_count", 0),
         created_at=project.created_at,

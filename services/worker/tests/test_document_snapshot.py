@@ -144,6 +144,12 @@ async def test_a_whole_manuscript_matches_its_snapshot(session_factory, monkeypa
     # `JobContext.llm_runner` 每次都新建一个带记账回调的 runner，没有自己的注入点，
     # 所以只能在类上换掉它（先例：test_write_recovery.py 的恢复用例）。
     monkeypatch.setattr(JobContext, "llm_runner", lambda self: _recorded_runner())
+    # This archived recording predates full-body frame context. Keep its exact
+    # prompt contract to test IR assembly without inventing a new model response.
+    # V2 frame input and serial/parallel identity are covered in test_agent_writing.
+    from paperforge_worker.pipelines.writing import WritingContext
+
+    monkeypatch.setattr(WritingContext, "section_summary", WritingContext.preceding_summary)
 
     outcome = await write_document(
         context,

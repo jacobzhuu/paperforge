@@ -8,6 +8,10 @@ import { makeSection, makeToastSpy, mockProjectContext, ok } from './helpers';
 const projectCtx = { current: mockProjectContext() };
 const toastSpy = makeToastSpy();
 
+vi.mock('@/components/library/web-research-panel', () => ({
+  WebResearchPanel: () => null,
+}));
+
 vi.mock('@/components/project/project-context', () => ({
   useProject: () => projectCtx.current,
   useProjectData: () => projectCtx.current,

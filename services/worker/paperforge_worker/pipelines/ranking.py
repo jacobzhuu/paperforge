@@ -15,6 +15,8 @@ from typing import Any
 from llm_runtime import LLMRunner
 from scholar_gateway import ScholarlyWorkCandidate
 
+from paperforge_worker.concurrency import bounded_map
+
 _LATIN_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-]+")
 _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 
@@ -264,6 +266,7 @@ async def rerank_with_llm(
     scope: dict[str, Any],
     runner: LLMRunner | None,
     top_n: int = 40,
+    concurrency: int = 1,
 ) -> list[RankedCandidate]:
     """对确定性 top-N 做 LLM 重排（reranker 角色，便宜档）。
 
@@ -278,14 +281,21 @@ async def rerank_with_llm(
     tail = ranked[len(head) :]
     question = scope.get("research_question") or scope.get("topic") or ""
     remapped: list[RankedCandidate | None] = [None] * len(head)
-    for batch_start in range(0, len(head), RERANK_BATCH_SIZE):
-        batch = head[batch_start : batch_start + RERANK_BATCH_SIZE]
+    # 每批的 LLM 调用彼此独立，写入的 `remapped` 下标也互不相交。并发只改变调用
+    # 什么时候发出：解析与写入仍在 on_ready 里按批次序串行做，重排结果逐位不变。
+    batches = [
+        (batch_start, head[batch_start : batch_start + RERANK_BATCH_SIZE])
+        for batch_start in range(0, len(head), RERANK_BATCH_SIZE)
+    ]
+
+    async def _rerank_batch(entry: tuple[int, list[RankedCandidate]]) -> Any:
+        batch_start, batch = entry
         lines = []
         for local_index, item in enumerate(batch):
             abstract = (item.candidate.abstract or "").replace("\n", " ")[:400]
             year = item.candidate.publication_year or "n.d."
             lines.append(f"[{local_index}] ({year}) {item.candidate.title}\n{abstract}")
-        result = await runner.agenerate_json(
+        return await runner.agenerate_json(
             "reranker",
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=(f"Research question: {question}\n\nCandidates:\n" + "\n\n".join(lines)),
@@ -297,14 +307,24 @@ async def rerank_with_llm(
                 "batch_start": batch_start,
             },
         )
+
+    async def _apply_batch(
+        _index: int,
+        entry: tuple[int, list[RankedCandidate]],
+        result: Any,
+    ) -> None:
+        batch_start, batch = entry
+        # 一批失败只损失这一批的重排：下面的补位循环会把它们按确定性顺序放回去。
+        if isinstance(result, BaseException):
+            return
         seen: set[int] = set()
         if result.ok and isinstance(result.value, dict):
             entries = result.value.get("ranking")
             if isinstance(entries, list):
-                for entry in entries:
-                    if not isinstance(entry, dict):
+                for ranking_entry in entries:
+                    if not isinstance(ranking_entry, dict):
                         continue
-                    local_index = entry.get("index")
+                    local_index = ranking_entry.get("index")
                     if (
                         not isinstance(local_index, int)
                         or not 0 <= local_index < len(batch)
@@ -313,7 +333,7 @@ async def rerank_with_llm(
                         continue
                     seen.add(local_index)
                     base = batch[local_index]
-                    score = entry.get("score")
+                    score = ranking_entry.get("score")
                     llm_score = float(score) if isinstance(score, int | float) else base.score
                     llm_score = min(1.0, max(0.0, llm_score))
                     blended = round((llm_score + base.score) / 2, 4)
@@ -324,14 +344,23 @@ async def rerank_with_llm(
                             **base.reason,
                             "method": "deterministic_v1+llm_rerank",
                             "llm_score": round(llm_score, 4),
-                            "llm_reason": str(entry.get("reason") or "")[:300],
+                            "llm_reason": str(ranking_entry.get("reason") or "")[:300],
                             "llm_model": result.model,
                         },
                     )
-        for local_index, item in enumerate(batch):
-            global_index = batch_start + local_index
-            if remapped[global_index] is None:
-                remapped[global_index] = item
+
+    await bounded_map(
+        batches,
+        _rerank_batch,
+        limit=max(1, int(concurrency)),
+        on_ready=_apply_batch,
+    )
+
+    # 没有被 LLM 覆盖到的位置按确定性顺序补回。原来这一步在每批之后做，
+    # 移到全部批次之后是等价的：它只填 None 槽。
+    for global_index, item in enumerate(head):
+        if remapped[global_index] is None:
+            remapped[global_index] = item
     reranked = [item for item in remapped if item is not None]
     reranked.sort(key=_sort_key, reverse=True)
     reranked.extend(tail)

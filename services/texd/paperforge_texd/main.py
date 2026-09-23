@@ -7,11 +7,12 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, model_validator
 
 # Tectonic 编译沙箱（方案 §4.6）：独立容器、无外网、只读模板、资源限额。
 # 接收 LaTeX 工程（多文件），Tectonic 编译为 PDF，返回 PDF + 日志。
 # 沙箱隔离由 compose 保证（internal 网络、read_only、mem/cpu limit、tmpfs）。
+from observability.admission import AdmissionMiddleware
+from pydantic import BaseModel, Field, model_validator
 
 app = FastAPI(title="PaperForge texd", version="0.1.0")
 
@@ -36,6 +37,9 @@ class CompileResult(BaseModel):
     ok: bool
     log: str
     pdf_base64: str | None = None
+
+
+app.add_middleware(AdmissionMiddleware, limit=1)
 
 
 @app.get("/healthz")

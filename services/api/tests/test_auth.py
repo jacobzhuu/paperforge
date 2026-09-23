@@ -439,3 +439,66 @@ def test_foreign_project_is_hidden_across_all_routers(
     response = getattr(auth_client, method)(f"/api/v1/projects/{project['id']}{suffix}")
     assert response.status_code == 404, response.text
     assert auth_client.get("/api/v1/projects").json() == []
+
+
+def test_registration_allowlist_does_not_send_mail_to_outside_accounts(auth_client, monkeypatch):
+    import paperforge_api.config as config
+
+    monkeypatch.setattr(config.get_settings(), "auth_registration_restricted", True)
+    monkeypatch.setattr(config.get_settings(), "auth_registration_allowlist", "allowed@example.com")
+    response = auth_client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "outside@example.com",
+            "password": "Strong-test-pass-123!",
+        },
+    )
+    assert response.status_code == 202
+    assert not auth_client.outbox
+
+
+def test_password_only_registration_and_existing_unverified_login(auth_client, monkeypatch):
+    import paperforge_api.config as config
+
+    settings = config.get_settings()
+    monkeypatch.setattr(settings, "auth_registration_restricted", False)
+    # An account created before disabling delivery can also sign in.
+    auth_client.post(
+        "/api/v1/auth/register", json={"email": "old@example.com", "password": PASSWORD}
+    )
+    auth_client.outbox.clear()
+    monkeypatch.setattr(settings, "auth_email_mode", "disabled")
+    for email in ("new@example.com", "old@example.com"):
+        response = auth_client.post(
+            "/api/v1/auth/register", json={"email": email, "password": PASSWORD}
+        )
+        assert response.status_code == 202
+        assert response.json()["message"] == "Registration complete. You can sign in."
+        login = auth_client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
+        assert login.status_code == 200
+        assert login.json()["user"]["email_verified"] is False
+        assert auth_client.get("/api/v1/auth/me").status_code == 200
+        auth_client.post("/api/v1/auth/logout")
+    # Re-registering must never replace an existing account's password.
+    auth_client.post(
+        "/api/v1/auth/register", json={"email": "new@example.com", "password": NEW_PASSWORD}
+    )
+    assert (
+        auth_client.post(
+            "/api/v1/auth/login", json={"email": "new@example.com", "password": NEW_PASSWORD}
+        ).status_code
+        == 401
+    )
+    for route in ("forgot-password", "resend-verification"):
+        response = auth_client.post(f"/api/v1/auth/{route}", json={"email": "new@example.com"})
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "email_delivery_disabled"
+    assert not auth_client.outbox
+    monkeypatch.setattr(settings, "auth_registration_restricted", True)
+    monkeypatch.setattr(settings, "auth_registration_allowlist", "allowed@example.com")
+    assert (
+        auth_client.post(
+            "/api/v1/auth/register", json={"email": "outside@example.com", "password": PASSWORD}
+        ).status_code
+        == 403
+    )

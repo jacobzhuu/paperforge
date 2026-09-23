@@ -58,6 +58,14 @@ def _verdict(section_key: str, **overrides: Any) -> SectionVerdict:
     return SectionVerdict(**{**base, **overrides})
 
 
+@pytest.fixture(autouse=True)
+def snapshot_identity(monkeypatch):
+    async def current(_context):
+        return "document-1", "body-1"
+
+    monkeypatch.setattr(worker, "_current_document_snapshot", current)
+
+
 @pytest.fixture
 def harness(monkeypatch):
     """把三条修复路都换成记录器，只观察编排决策。"""
@@ -84,7 +92,7 @@ def harness(monkeypatch):
     async def _resynth(context):
         calls["resynthesize"].append(True)
 
-    async def _rewrite(context, *, section_keys, language, paper_type, notes=None):
+    async def _rewrite(context, *, section_keys, language, paper_type, notes=None, concurrency=1):
         calls["rewrite"].append(sorted(section_keys))
         calls["notes"].append(notes or {})
 
@@ -435,3 +443,31 @@ async def test_retrieval_is_told_which_questions_failed(monkeypatch, harness) ->
     await worker._converge_section_semantics(_context(), language="zh", paper_type="review")
 
     assert harness["retrieve"][0]["question_ids"] == {"q-s4", "q-s5"}
+
+
+async def test_resume_preserves_attempt_budget_and_does_not_repeat_rewrite(monkeypatch, harness):
+    from paperforge_worker.context import JobStopped
+    from paperforge_worker.orchestration.semantic_repair import CHECKPOINT_KEY
+
+    context = _context()
+    monkeypatch.setattr(worker, "_section_review_inputs", lambda ctx: _ok(_inputs("s1")))
+
+    async def review(**kwargs):
+        return _verdict("s1", calibration="overclaimed", diagnosis="writing_gap")
+
+    calls = []
+
+    async def interrupted(*args, **kwargs):
+        calls.append("rewrite")
+        raise JobStopped("pause")
+
+    monkeypatch.setattr(worker, "review_section", review)
+    monkeypatch.setattr(worker, "repair_document_sections", interrupted)
+    with pytest.raises(JobStopped):
+        await worker._converge_section_semantics(context, language="en", paper_type="review")
+    assert context.checkpoint[CHECKPOINT_KEY]["rounds_used"] == 1
+    result = await worker._converge_section_semantics(context, language="en", paper_type="review")
+    assert calls == ["rewrite"]
+    assert result["rounds_used"] == 2
+    assert result["stop_reason"] == "no_untried_route"
+    assert result["unresolved"] == ["s1"]

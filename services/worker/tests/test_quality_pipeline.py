@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
-from llm_runtime import LLMConfig, LLMRunner
+from llm_runtime import DecisionResult, LLMConfig, LLMRunner
 from llm_runtime.types import LLMResponse
 from paperforge_worker.pipelines.quality import (
     CLAIM_DEMOTION_CONFIDENCE,
@@ -150,6 +150,93 @@ async def test_soft_check_survives_unparsable_output() -> None:
         runner=_runner("<html>not json</html>"),
     )
     assert findings == []
+
+
+class _DecisionStub:
+    enabled = True
+
+    async def decide(self, *, state, questions, metadata=None):
+        return DecisionResult(
+            answers={
+                key: {
+                    "type": "score",
+                    "score": 4.0 if key.endswith("0") else 1.0,
+                    "confidence": 0.97,
+                    "probabilities": {"0": 0.0, "1": 0.0, "2": 0.0, "3": 0.0, "4": 1.0},
+                }
+                for key in questions
+            },
+            model="jev-1.13.0",
+            usage={"input_tokens": 20, "output_tokens": 4},
+        )
+
+
+async def test_soft_check_jev_on_uses_typed_scores_without_llm_fallback() -> None:
+    findings = await soft_check_citations(
+        usages=[
+            {"cite_key": "a", "section_key": "s", "context_snippet": "supported"},
+            {"cite_key": "b", "section_key": "s", "context_snippet": "weak"},
+        ],
+        abstracts={"a": "evidence a", "b": "evidence b"},
+        runner=None,
+        decision_runner=_DecisionStub(),
+        decision_mode="on",
+    )
+    assert [item.cite_key for item in findings] == ["a", "b"]
+    assert findings[0].score == 1.0
+    assert findings[1].weak
+
+
+async def test_jev_shadow_preserves_duplicate_citations_and_binds_each_question():
+    class RecordingDecision(_DecisionStub):
+        async def decide(self, *, state, questions, metadata=None):
+            assert "pairs[0].context" in questions["item_0"]["instructions"]
+            assert "pairs[1].evidence" in questions["item_1"]["instructions"]
+            result = await super().decide(state=state, questions=questions, metadata=metadata)
+            result.answers["item_1"]["confidence"] = 0.0
+            return result
+
+    class Trace:
+        events = []
+
+        async def emit(self, event, payload, **kwargs):
+            self.events.append((event, payload))
+
+    trace = Trace()
+    findings = await soft_check_citations(
+        usages=[{"cite_key": "same", "context_snippet": text} for text in ["first", "second"]],
+        abstracts={"same": "source"},
+        runner=_runner('{"judgements":[{"index":0,"score":1},{"index":1,"score":0.1}]}'),
+        decision_runner=RecordingDecision(),
+        decision_mode="shadow",
+        trace_context=trace,
+    )
+    assert [f.score for f in findings] == [1.0, 0.1]
+    event = trace.events[-1][1]
+    assert event["comparable_count"] == 2
+    assert event["weak_agreement_count"] == 2
+    assert not event["accepted"]
+    assert event["items"][1]["confidence"] == 0
+    assert event["confidence_summary"]["zero_count"] == 1
+    assert event["items"][0]["pair_hash"] != event["items"][1]["pair_hash"]
+    assert "context" not in event["items"][0]
+
+
+async def test_jev_failure_does_not_change_shadow_baseline():
+    class FailedDecision:
+        enabled = True
+
+        async def decide(self, **kwargs):
+            return DecisionResult(error="timeout")
+
+    findings = await soft_check_citations(
+        usages=[{"cite_key": "x", "context_snippet": "a"}],
+        abstracts={"x": "b"},
+        runner=_runner('{"judgements":[{"index":0,"score":0.2}]}'),
+        decision_runner=FailedDecision(),
+        decision_mode="shadow",
+    )
+    assert len(findings) == 1 and findings[0].score == 0.2
 
 
 # ---- 跨语言硬证据核验 ----

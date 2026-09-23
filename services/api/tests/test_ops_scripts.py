@@ -200,3 +200,78 @@ def test_offline_image_loader_verifies_before_loading() -> None:
     assert source.index("bundle SHA-256 mismatch") < source.index("docker load")
     assert "image archive verification failed" in source
     assert "unexpected architecture" in source
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["--socket=/run/user/test/tailscaled.sock", "--socket /run/user/test/tailscaled.sock"],
+)
+def test_tailscale_discovery_ignores_its_own_command_line(tmp_path, argument):
+    source = DEV.read_text()
+    function = source[source.index("tailscale_socket() {") : source.index("tailscale_cli() {")]
+    listing = tmp_path / "processes"
+    listing.write_text(
+        "bash /bin/bash -c tailscaled --socket=wrong-parent\n"
+        "sed sed -n s/.*tailscaled .*--socket=wrong-regex/\n"
+        f"tailscaled /home/test/bin/tailscaled --tun=userspace-networking {argument}\n"
+    )
+    result = _bash(
+        'ps() { cat "$PROCESS_LIST"; }\n' + function + "\ntailscale_socket",
+        env={"PROCESS_LIST": str(listing)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/run/user/test/tailscaled.sock"
+
+
+def test_tailscale_discovery_defaults_when_no_daemon_is_listed():
+    source = DEV.read_text()
+    function = source[source.index("tailscale_socket() {") : source.index("tailscale_cli() {")]
+    result = _bash("ps() { :; }\n" + function + "\ntailscale_socket")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/var/run/tailscale/tailscaled.sock"
+
+
+@pytest.mark.asyncio
+async def test_reaper_keeps_running_jobs_but_ignores_completed_shadow_cron_markers():
+    import ast
+
+    # Exercise the exact helper sent into older containers, not a second implementation.
+    source = DEV.read_text()
+    helper = source[
+        source.index("async def active_progress(") : source.index(
+            "\n\nasync def check():", source.index("async def active_progress(")
+        )
+    ]
+    namespace = {}
+    exec(compile(ast.parse(helper), "deployment_drain_state", "exec"), namespace)
+
+    class Redis:
+        def __init__(self, exists, ttl):
+            self.values = [exists, ttl]
+
+        def pipeline(self, **kwargs):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        def exists(self, key):
+            return self
+
+        def pttl(self, key):
+            return self
+
+        async def execute(self):
+            return self.values
+
+    active = namespace["active_progress"]
+    cron = [b"arq:in-progress:cron:shadow_tick:123"]
+    assert await active(Redis(0, 1000), cron) == 0
+    assert await active(Redis(1, 1000), cron) == 1
+    assert await active(Redis(0, 10_000_000), cron) == 1
+    assert await active(Redis(0, -1), cron) == 1
+    assert await active(Redis(0, 1000), [b"arq:in-progress:user-job"]) == 1
+    assert await active(Redis(0, 1000), [b"arq:in-progress:cron:unknown:123"]) == 1

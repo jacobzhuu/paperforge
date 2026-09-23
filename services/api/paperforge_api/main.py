@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
@@ -12,6 +13,7 @@ from observability import configure_logging, get_logger
 from paperforge_api.config import get_settings
 from paperforge_api.deps import create_arq_pool, dispose_engine
 from paperforge_api.routers import (
+    agent,
     assets,
     auth,
     events,
@@ -19,6 +21,7 @@ from paperforge_api.routers import (
     library_pdf,
     projects,
     visuals,
+    web_research,
     writing,
 )
 
@@ -39,9 +42,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             extra={"error": type(error).__name__},
         )
         app.state.arq_pool = None
+    from paperforge_api.dispatch import dispatch_loop
+
+    dispatcher = asyncio.create_task(dispatch_loop(app))
     try:
         yield
     finally:
+        dispatcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await dispatcher
         pool = getattr(app.state, "arq_pool", None)
         if pool is not None:
             await pool.aclose()
@@ -57,8 +66,8 @@ def create_app() -> FastAPI:
         raise RuntimeError(
             "AUTH_DEV_LOGIN_ENABLED is only allowed for an insecure localhost development site"
         )
-    if settings.auth_cookie_secure and settings.auth_email_mode != "smtp":
-        raise RuntimeError("secure authentication requires AUTH_EMAIL_MODE=smtp")
+    if settings.auth_cookie_secure and settings.auth_email_mode not in {"smtp", "disabled"}:
+        raise RuntimeError("secure authentication requires AUTH_EMAIL_MODE=smtp or disabled")
     if settings.auth_cookie_secure and not settings.public_app_url.startswith("https://"):
         raise RuntimeError("secure authentication requires an HTTPS PUBLIC_APP_URL")
     cors_origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
@@ -72,6 +81,12 @@ def create_app() -> FastAPI:
         description="成稿优先、引用真实、流程宽松的科研论文生成系统",
         lifespan=lifespan,
     )
+    from observability.http import HttpMetricsMiddleware
+
+    from paperforge_api.request_limits import RequestLimitsMiddleware
+
+    app.add_middleware(HttpMetricsMiddleware)
+    app.add_middleware(RequestLimitsMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
@@ -100,11 +115,13 @@ def create_app() -> FastAPI:
                 )
         return await call_next(request)
 
+    app.include_router(agent.router)
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(projects.router)
     app.include_router(library_pdf.router)
     app.include_router(writing.router)
+    app.include_router(web_research.router)
     app.include_router(assets.router)
     app.include_router(visuals.router)
     app.include_router(settings_router.router)

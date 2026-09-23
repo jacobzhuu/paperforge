@@ -298,6 +298,7 @@ async def update_project(
     author_details: list[dict[str, Any]] | None = _UNSET,
     keywords: list[str] | None = _UNSET,
     metadata_confirmed: bool | None = _UNSET,
+    web_research_enabled: bool = _UNSET,
 ) -> PaperProject:
     """
     局部更新项目元数据。枚举值非法时抛 ValueError（API 转 422）。
@@ -313,6 +314,10 @@ async def update_project(
     """
     # title 与 topic 不同：topic=None 是「清空主题」，title=None 是非法的——
     # 论文永远得有个题目。两者都会走到这里，所以必须分别判。
+    if web_research_enabled is not _UNSET:
+        if not isinstance(web_research_enabled, bool):
+            raise ValueError("web_research_enabled must be a boolean")
+        project.web_research_enabled = web_research_enabled
     if title is not _UNSET:
         if title is None or not title.strip():
             raise ValueError("project title must not be empty")

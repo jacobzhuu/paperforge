@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from llm_runtime import LLMConfig
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from visuals import ImageProviderConfig
 
@@ -11,6 +13,13 @@ from visuals import ImageProviderConfig
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    mcp_web_enabled: bool = True
+
+    evidence_retrieval_mode: Literal["legacy", "hybrid", "hybrid_rerank"] = "legacy"
+
+    writer_polish_policy: Literal["legacy", "full_parallel", "selective_parallel"] = "legacy"
+    writer_polish_concurrency: int = Field(default=2, ge=1, le=2)
+    semantic_repair_engine: Literal["legacy", "langgraph"] = "legacy"
 
     database_url: str = "postgresql+asyncpg://paperforge:paperforge@localhost:5432/paperforge"
     redis_url: str = "redis://localhost:6379/0"
@@ -64,6 +73,15 @@ class Settings(BaseSettings):
     yunwu_image_model: str = ""
     yunwu_image_timeout_seconds: float | None = None
 
+    request_limits_enabled: bool = False
+    job_dispatch_enabled: bool = True
+    job_pending_limit: int = Field(default=100, ge=1, le=1000)
+    job_user_pending_limit: int = Field(default=3, ge=1, le=100)
+    job_dispatch_slots: int = Field(default=4, ge=1, le=32)
+    job_short_slots: int = Field(default=0, ge=0, le=16)
+    auth_registration_allowlist: str = ""
+    auth_registration_restricted: bool = False
+
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     cors_allow_origins: str = "http://localhost:3000"
@@ -78,7 +96,8 @@ class Settings(BaseSettings):
     # Local-only escape hatch for development before real email delivery is enabled.
     # create_app() refuses to start with this enabled outside a localhost HTTP setup.
     auth_dev_login_enabled: bool = True
-    auth_email_mode: str = "file"  # file (local development) | smtp
+    # disabled allows password login without email verification or delivery.
+    auth_email_mode: str = "file"  # file (local development) | smtp | disabled
     auth_email_outbox_dir: str = "./data/auth-outbox"
     public_app_url: str = "http://localhost:3000"
     smtp_host: str = ""

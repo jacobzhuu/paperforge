@@ -68,7 +68,7 @@ from paperforge_api.schemas import (
 router = APIRouter(
     prefix="/api/v1", tags=["visuals"], dependencies=[Depends(authorize_project_request)]
 )
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 

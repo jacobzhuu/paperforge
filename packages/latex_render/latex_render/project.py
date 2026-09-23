@@ -55,12 +55,32 @@ def is_two_column(template: str | None) -> bool:
 
 
 # 引用样式 → BibTeX 书目风格（模板内可再降级）。
+#
+# `apa` 曾映射到 `apalike`：那个 .bst **不在 Tectonic 缓存里**（预热文档没有
+# 用过它），于是 apa 项目每次都走「BibTeX 取不到 .bst → 内联书目兜底」，
+# 拿到的排版和 author_year 并无二致，却多绕一圈。`plainnat` 是同一族的
+# 作者-年份风格、已随 warmup-article.tex 烤进缓存，且与 natbib 兼容。
 BIBSTYLE_BY_CITATION_STYLE = {
     "ieee": "IEEEtran",
-    "apa": "apalike",
+    "apa": "plainnat",
     "author_year": "plainnat",
     "gbt7714": "unsrt",
 }
+
+# 引用样式 → natbib 宏包选项（只有 article 模板用得上；IEEEtran 走 `cite` 宏包，
+# gbt7714 由 `gbt7714` 宏包自己以 `super` 加载 natbib）。
+#
+# 关键在于**必须和 .bst 对齐**：`plainnat` 写的是带作者-年份标签的 `\bibitem`，
+# 只有 authoryear 模式读得懂；`IEEEtran`/`unsrt` 写的是无标签 `\bibitem`，
+# 在 authoryear 模式下会触发 natbib 的
+# 「Bibliography not compatible with author-year citations」并让编译直接失败。
+NATBIB_OPTIONS_BY_CITATION_STYLE = {
+    "ieee": "square,numbers,sort&compress",
+    "gbt7714": "square,numbers,sort&compress",
+    "apa": "round,authoryear",
+    "author_year": "round,authoryear",
+}
+DEFAULT_NATBIB_OPTIONS = "round,authoryear"
 
 
 @dataclass
@@ -184,6 +204,9 @@ def build_latex_project(
             body=body,
             has_bibliography=bool(refs),
             bibstyle=BIBSTYLE_BY_CITATION_STYLE.get(style, "plainnat"),
+            natbib_options=NATBIB_OPTIONS_BY_CITATION_STYLE.get(
+                style, DEFAULT_NATBIB_OPTIONS
+            ),
         )
     )
     project.with_file("main.tex", main)
@@ -294,7 +317,9 @@ def _safe_stem(value: str) -> str:
 
 __all__ = [
     "BIBSTYLE_BY_CITATION_STYLE",
+    "DEFAULT_NATBIB_OPTIONS",
     "DEFAULT_TEMPLATE",
+    "NATBIB_OPTIONS_BY_CITATION_STYLE",
     "TEMPLATES",
     "LatexProject",
     "build_latex_project",

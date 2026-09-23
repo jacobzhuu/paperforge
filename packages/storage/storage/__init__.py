@@ -74,7 +74,12 @@ class MinioObjectStore:
         )
         self.bucket = bucket
         if not self.client.bucket_exists(bucket):
-            self.client.make_bucket(bucket)
+            try:
+                self.client.make_bucket(bucket)
+            except S3Error as error:
+                # Another API/worker can win the same first-use bucket creation.
+                if error.code != "BucketAlreadyOwnedByYou":
+                    raise
         # S3 buckets are private without a bucket policy. Remove any policy left by an
         # earlier development setup so authenticated API downloads remain the only path.
         try:

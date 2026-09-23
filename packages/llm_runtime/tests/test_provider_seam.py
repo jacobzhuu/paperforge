@@ -389,8 +389,15 @@ def test_runner_retries_once_with_doubled_budget_on_truncation():
     # 两次调用都记账：失败那次带 error_code，成本面板才看得见。
     assert [c.error_code for c in calls] == ["output_truncated", None]
     assert [c.provider for c in calls] == ["openai", "openai-compatible"]
-    assert calls[0].metadata == {"role": "planner", "stage": "scope"}
-    assert calls[1].metadata == {
+    for call in calls:
+        events = call.metadata["provider_admission_events"]
+        assert [e["event"] for e in events] == ["http_attempt_started", "http_attempt_finished"]
+        assert events[0]["timestamp_ms"] <= events[1]["timestamp_ms"]
+    assert {k: v for k, v in calls[0].metadata.items() if k != "provider_admission_events"} == {
+        "role": "planner",
+        "stage": "scope",
+    }
+    assert {k: v for k, v in calls[1].metadata.items() if k != "provider_admission_events"} == {
         "role": "planner",
         "stage": "scope",
         "retry": "output_truncated",
@@ -591,9 +598,7 @@ def test_a_retry_that_cannot_grow_the_budget_is_never_sent():
     """
     runner, budgets, calls = _truncating_runner("deepseek-v4-pro")
 
-    result = runner.generate(
-        "writer", system_prompt="s", user_prompt="u", max_output_tokens=8000
-    )
+    result = runner.generate("writer", system_prompt="s", user_prompt="u", max_output_tokens=8000)
 
     assert result is None
     assert budgets == [8000], "重试不可能改变结果时，第二次请求不该发出"

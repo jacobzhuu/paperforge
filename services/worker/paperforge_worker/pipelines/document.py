@@ -9,8 +9,11 @@ Draft-first：单章失败只影响该章（留占位 + 告警），其余章节
 
 from __future__ import annotations
 
+import time
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Sequence
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from db import (
@@ -33,7 +36,7 @@ from db import (
     replace_sentence_downgrades,
     upsert_section,
 )
-from db.models.paper import PaperDocument, PaperSection
+from db.models.paper import Outline, PaperDocument, PaperSection
 from ingest.numlint import lint_sections
 from observability import get_logger
 from paper_ir import (
@@ -44,8 +47,20 @@ from paper_ir import (
     render_markdown,
 )
 from paper_ir.schema import Section as IRSection
+from sqlalchemy import select
 
-from paperforge_worker.context import JobContext
+from paperforge_worker.concurrency import bounded_map
+from paperforge_worker.context import JobContext, JobStopped
+from paperforge_worker.orchestration.tracing import traced
+from paperforge_worker.orchestration.writing_graph import (
+    WRITING_VERSION,
+    descendants,
+    fingerprint,
+    is_frame,
+    layers,
+    merge_terms,
+    section_graph,
+)
 from paperforge_worker.pipelines.publication_metadata import generate_publication_metadata
 from paperforge_worker.pipelines.writing import (
     SectionDefect,
@@ -58,6 +73,7 @@ from paperforge_worker.pipelines.writing import (
     section_evidence_for,
     sentence_downgrade_events,
     write_section,
+    writer_policy,
 )
 
 logger = get_logger(__name__)
@@ -69,7 +85,8 @@ FRAME_ORDER = {"abstract": -2, "introduction": -1, "conclusion": 999}
 # 分节写作与连贯性润色各占一段：润色是独立阶段名（polish），界面上不能再叫「分节写作」——
 # 那会让人对着一屏「已生成」的章节以为系统卡死了。
 _WRITE_PROGRESS_START = 0.65
-_POLISH_PROGRESS_START = 0.82
+_POLISH_PROGRESS_START = 0.78
+_POLISH_PROGRESS_END = 0.85
 _WRITE_PROGRESS_END = 0.90
 
 WRITE_STAGE = "write"
@@ -137,6 +154,7 @@ class WriteOutcome:
         }
 
 
+@traced("coordinator", "write_document")
 async def write_document(
     context: JobContext,
     *,
@@ -149,6 +167,7 @@ async def write_document(
     """按大纲逐章写作并落库，返回统计。"""
     outcome = WriteOutcome()
     runner = context.llm_runner()
+    outline_id = outline_id or context.checkpoint.get("writer_outline_id")
 
     async with context.session() as session:
         if outline_id is not None:
@@ -174,6 +193,12 @@ async def write_document(
             )
             return outcome
         outline = dict(outline_row.tree_json or {})
+        if (context.checkpoint.get("writer_outline_hash") and
+                fingerprint(outline) != context.checkpoint["writer_outline_hash"]):
+            raise JobStopped("pause", reason="writing_inputs_changed")
+        if (outline.get("dependency_contract", {}).get("requires_confirmation", False)
+                and outline_row.status != "confirmed"):
+            raise JobStopped("pause", reason="outline_confirmation_required")
         whitelist = await get_writing_whitelist(session, context.project_id)
         cards = await _card_context(session, context.project_id)
         assets = await grounded_asset_payloads(session, context.project_id)
@@ -185,8 +210,9 @@ async def write_document(
         return outcome
 
     writing_context = WritingContext(outline=outline, language=language, paper_type=paper_type)
-    body_sections = [s for s in sections if s.get("kind") != "frame"]
-    frame_sections = [s for s in sections if s.get("kind") == "frame"]
+    body_sections = [s for s in sections if not is_frame(s)]
+    frame_sections = [s for s in sections if is_frame(s)]
+    frame_waves = _frame_waves(sections)  # Validate before any paid generation.
     order_by_key = {str(s.get("key") or ""): index for index, s in enumerate(sections)}
 
     # 建档提前到写作之前。write 是全管线最长的一段（本地实测 7 节约 18 分钟），
@@ -198,6 +224,24 @@ async def write_document(
     # 续跑先认上一轮的 document：用户在第 6 节按了暂停，「继续」必须从第 7 节接着写，
     # 否则新建 document 从头重写，暂停就等于没暂停。
     document_id, resumed = await _resume_document(context)
+    mode = str(
+        context.checkpoint.get("writer_execution_mode")
+        or ("legacy" if document_id is not None else context.settings.writer_execution_mode)
+    )
+    frame_width = int(
+        context.checkpoint.get("writer_frame_concurrency")
+        or (
+            1
+            if document_id is not None or mode != "dag_parallel"
+            else context.settings.writer_frame_concurrency
+        )
+    )
+    if "writer_polish_policy" not in context.checkpoint:
+        await context.emit("polish.policy", {}, checkpoint={
+            "writer_polish_policy": "legacy" if document_id is not None else
+                context.settings.writer_polish_policy,
+            "writer_polish_concurrency": context.settings.writer_polish_concurrency,
+        })
     if document_id is None:
         async with context.session() as session:
             document = await create_document(
@@ -206,13 +250,29 @@ async def write_document(
                 outline_id=outline_id,
             )
             document_id = document.id
+            document.writing_state_json = {
+                "version": WRITING_VERSION,
+                "mode": mode,
+                "project_id": str(context.project_id),
+                "document_id": str(document_id),
+                "outline_id": str(outline_id),
+                "nodes": {},
+                "glossary": dict(outline.get("glossary") or {}),
+                "source_hash": fingerprint(
+                    {"outline": outline, "cards": cards, "whitelist": whitelist, "assets": assets}
+                ),
+            }
         # 单独落一次 checkpoint：write 阶段跑完才有阶段 checkpoint，
         # 而暂停恰恰发生在「没跑完」的时候。update_job 是合并语义，安全。
         await context.emit(
             "write.document",
             {"document_id": str(document_id)},
             stage=WRITE_STAGE,
-            checkpoint={WRITE_DOCUMENT_KEY: str(document_id)},
+            checkpoint={
+                WRITE_DOCUMENT_KEY: str(document_id),
+                "writer_execution_mode": mode,
+                "writer_frame_concurrency": frame_width,
+            },
         )
     outcome.document_id = str(document_id)
 
@@ -220,10 +280,16 @@ async def write_document(
     # 用户看到的百分比因此和「写到第几节 / 润到第几节」对得上。
     written = len(resumed)
     total_sections = len(sections)
+    frames_started = False
 
     def _write_progress() -> float:
+        if frames_started:
+            fraction = (written - len(body_sections)) / max(1, len(frame_sections))
+            return _POLISH_PROGRESS_END + (_WRITE_PROGRESS_END - _POLISH_PROGRESS_END) * min(
+                1.0, max(0.0, fraction)
+            )
         span = _POLISH_PROGRESS_START - _WRITE_PROGRESS_START
-        return _WRITE_PROGRESS_START + span * min(1.0, written / max(1, total_sections))
+        return _WRITE_PROGRESS_START + span * min(1.0, written / max(1, len(body_sections)))
 
     async def _emit_section(draft: SectionDraft) -> None:
         await context.emit(
@@ -249,6 +315,22 @@ async def write_document(
         if key in resumed:
             drafts[key] = resumed[key]
             writing_context.register(key, resumed[key])
+
+    if mode in {"dag_serial", "dag_parallel"}:
+        await _write_body_graph(
+            context,
+            document_id=document_id,
+            sections=sections,
+            drafts=drafts,
+            writing_context=writing_context,
+            cards=cards,
+            whitelist=whitelist,
+            assets=assets,
+            outcome=outcome,
+            mode=mode,
+        )
+        resumed.update(drafts)
+        written = len(drafts)
 
     for section in body_sections:
         if str(section.get("key") or "") in resumed:
@@ -280,39 +362,76 @@ async def write_document(
         # 等于用户点了取消要干等十几分钟。
         await context.raise_if_stopped()
 
-    # 框架章节后写：此时滚动摘要已覆盖全部正文。
-    for section in frame_sections:
-        if str(section.get("key") or "") in resumed:
-            continue
-        draft = await _write_one(
-            section={**section, "summary": _frame_goal(section, outline, language)},
-            cards=cards,
-            whitelist=set(whitelist),
-            writing_context=writing_context,
-            runner=runner,
-            context=context,
-            outcome=outcome,
-            assets=assets,
-        )
-        drafts[draft.section_key] = draft
-        await _persist_draft(
+    # Recover and integrate BODY first. Frames must summarize the accepted body,
+    # never an earlier pre-repair/pre-polish snapshot.
+    await _recover_incomplete_sections(
+        context,
+        sections=body_sections,
+        drafts=drafts,
+        document_id=document_id,
+        order_by_key=order_by_key,
+        cards=cards,
+        whitelist=whitelist,
+        language=language,
+        writing_context=writing_context,
+        runner=runner,
+        outcome=outcome,
+        assets=assets,
+    )
+    if coherence:
+        body_drafts = {s["key"]: drafts[s["key"]] for s in body_sections if s["key"] in drafts}
+        await _integrate_body(context, body_drafts, writing_context)
+        await _polish_all(
             context,
+            drafts=body_drafts,
             document_id=document_id,
-            draft=draft,
-            order_no=order_by_key.get(draft.section_key, len(drafts) - 1),
+            order_by_key=order_by_key,
             whitelist=whitelist,
             language=language,
+            writing_context=writing_context,
+            runner=runner,
+            outcome=outcome,
         )
+        drafts.update(body_drafts)
+        for key, draft in body_drafts.items():
+            writing_context.register(key, draft)
+
+    # Frame input identity includes ALL accepted body sections, not the preceding window.
+    body_hash = fingerprint(
+        {s["key"]: drafts[s["key"]].expected_body_hash for s in body_sections if s["key"] in drafts}
+    )
+    frames_started = True
+
+    async def frame_emitted(draft):
+        nonlocal written
         written += 1
-        # 框架章节此前不发事件：摘要/引言/结论那几分钟前端完全没有进度可看。
         await _emit_section(draft)
-        await context.raise_if_stopped()
+
+    await _write_frames(
+        context,
+        frame_sections=frame_sections,
+        waves=frame_waves,
+        width=frame_width,
+        drafts=drafts,
+        resumed=resumed,
+        body_hash=body_hash,
+        body_keys=[str(s["key"]) for s in body_sections],
+        document_id=document_id,
+        order_by_key=order_by_key,
+        cards=cards,
+        whitelist=whitelist,
+        writing_context=writing_context,
+        runner=runner,
+        outcome=outcome,
+        assets=assets,
+        on_committed=frame_emitted,
+    )
 
     # 交付前的补写：润色之前先把没写成的章节救回来。放在润色之前是因为润色只
     # 处理已有正文，先润后补等于新补的那几节永远没被打磨过。
     await _recover_incomplete_sections(
         context,
-        sections=sections,
+        sections=frame_sections,
         drafts=drafts,
         document_id=document_id,
         order_by_key=order_by_key,
@@ -325,18 +444,7 @@ async def write_document(
         assets=assets,
     )
 
-    if coherence:
-        await _polish_all(
-            context,
-            drafts=drafts,
-            document_id=document_id,
-            order_by_key=order_by_key,
-            whitelist=whitelist,
-            language=language,
-            writing_context=writing_context,
-            runner=runner,
-            outcome=outcome,
-        )
+    # Frames are not globally rewritten after their snapshot has been fixed.
 
     ordered = _ordered_drafts(sections, drafts)
     ir = _build_paper_ir(
@@ -448,7 +556,191 @@ async def write_document(
     for _key, draft in ordered:
         kind = draft.generator.split(":")[0]
         outcome.generator_mix[kind] = outcome.generator_mix.get(kind, 0) + 1
+    await context.emit(
+        "write.assembled", outcome.to_payload(), stage=WRITE_STAGE, progress=_WRITE_PROGRESS_END
+    )
+    await context.raise_if_stopped()
     return outcome
+
+
+def _frame_waves(sections: list[dict]) -> list[list[str]]:
+    """Only known independent frames fan out; custom frames retain serial barriers."""
+    keys = [str(s.get("key") or "") for s in sections]
+    if len(set(keys)) != len(keys) or not all(keys):
+        raise ValueError("writing sections require unique keys")
+    frames = [s for s in sections if is_frame(s)]
+    frame_keys = [str(s["key"]) for s in frames]
+    graph = {}
+    for s in frames:
+        key = str(s["key"])
+        deps = s.get("depends_on", [])
+        if not isinstance(deps, list) or any(
+            not isinstance(d, str) or d not in keys or d == key for d in deps
+        ):
+            raise ValueError(f"invalid frame dependencies: {key}")
+        graph[key] = [d for d in deps if d in frame_keys]
+    waves = layers(graph)
+    if any(k not in FRAME_ORDER for k in frame_keys):
+        return [[k] for wave in waves for k in wave]
+    return waves
+
+
+async def _write_frames(
+    context,
+    *,
+    frame_sections,
+    waves,
+    width,
+    drafts,
+    resumed,
+    body_hash,
+    body_keys,
+    document_id,
+    order_by_key,
+    cards,
+    whitelist,
+    writing_context,
+    runner,
+    outcome,
+    assets,
+    on_committed,
+):
+    if not frame_sections:
+        return
+    frozen = deepcopy(writing_context)
+    by_key = {str(s["key"]): s for s in frame_sections}
+    source_hash = fingerprint(
+        {"outline": frozen.outline, "cards": cards, "whitelist": whitelist, "assets": assets}
+    )
+    saved = context.checkpoint.get("frame_context") or {}
+    if saved.get("body_hash") == body_hash and saved.get("source_hash") == source_hash:
+        frozen = WritingContext(
+            outline=deepcopy(writing_context.outline), **deepcopy(saved["context"])
+        )
+    else:
+        await context.emit(
+            "frame.context_frozen",
+            {
+                "body_snapshot": body_hash,
+                "source_hash": source_hash,
+            },
+            checkpoint={
+                "frame_context": {
+                    "body_hash": body_hash,
+                    "source_hash": source_hash,
+                    "context": {k: v for k, v in asdict(frozen).items() if k != "outline"},
+                }
+            },
+        )
+    for wave in waves:
+        ready = [
+            k
+            for k in wave
+            if not (
+                k in resumed
+                and drafts.get(k)
+                and drafts[k].generation.get("body_snapshot") == body_hash
+                and drafts[k].generation.get("source_snapshot", source_hash) == source_hash
+            )
+        ]
+        queued_at = time.monotonic()
+
+        async def generate(key, queued_at=queued_at):
+            await context.raise_if_stopped()
+            started = time.monotonic()
+            events, warnings = [], []
+
+            async def emit(*args, **kwargs):
+                events.append((args, kwargs))
+
+            section = {
+                **by_key[key],
+                "summary": _frame_goal(by_key[key], frozen.outline, frozen.language),
+            }
+            identity = fingerprint(
+                {
+                    "section": section,
+                    "context": asdict(frozen),
+                    "source_hash": source_hash,
+                    "body_snapshot": body_hash,
+                    "writer_policy": writer_policy(frozen.language, frozen.paper_type),
+                    "model": context.settings.llm_config().model_for_role("writer"),
+                }
+            )
+            local = WriteOutcome()
+            async with context.span(
+                "subagent",
+                "frame",
+                node_id=key,
+                input_hash=identity,
+                body_snapshot=body_hash,
+                admission_wait_ms=(started - queued_at) * 1000,
+            ):
+                draft = await _write_one(
+                    section=section,
+                    cards=cards,
+                    whitelist=set(whitelist),
+                    writing_context=deepcopy(frozen),
+                    runner=runner,
+                    context=context,
+                    outcome=local,
+                    assets=assets,
+                    emit=emit,
+                    warn=lambda *args: warnings.append(args),
+                )
+            draft.generation.update(
+                {"body_snapshot": body_hash, "input_hash": identity, "source_snapshot": source_hash}
+            )
+            return draft, local, events, warnings, time.monotonic()
+
+        failures = []
+
+        async def commit(_index, key, result, failures=failures):
+            if isinstance(result, BaseException):
+                failures.append(key)
+                await context.emit("frame.failed", {"section": key, "error": type(result).__name__})
+                return
+            draft, local, events, warnings, finished = result
+            previous = drafts.get(key)
+            draft.expected_body_hash = previous.expected_body_hash if previous else None
+            commit_start = time.monotonic()
+            await _persist_draft(
+                context,
+                document_id=document_id,
+                draft=draft,
+                order_no=order_by_key[key],
+                whitelist=whitelist,
+                language=frozen.language,
+                frame_guard={
+                    "body_hash": body_hash,
+                    "body_keys": body_keys,
+                    "source_hash": source_hash,
+                },
+            )
+            drafts[key] = draft
+            outcome.warnings.extend(local.warnings)
+            outcome.recovered_sections.extend(local.recovered_sections)
+            for args in warnings:
+                context.warn(*args)
+            for args, kwargs in events:
+                await context.emit(*args, **kwargs)
+            await context.emit(
+                "frame.committed",
+                {
+                    "section": key,
+                    "body_snapshot": body_hash,
+                    "input_hash": draft.generation["input_hash"],
+                    "ordered_commit_wait_ms": (commit_start - finished) * 1000,
+                    "persist_ms": (time.monotonic() - commit_start) * 1000,
+                },
+            )
+            await on_committed(draft)
+
+        await bounded_map(
+            ready, generate, limit=width, on_ready=commit, stop_check=context.raise_if_stopped
+        )
+        if failures:
+            raise JobStopped("pause", reason="frame_generation_failed")
 
 
 async def _polish_all(
@@ -472,6 +764,12 @@ async def _polish_all(
     # 续跑的章节（generator="resumed"）也要润色：暂停发生在写作途中时，先写好的
     # 那几节还没轮到润色，排除它们等于让「继续」出来的稿子前半段永远没被打磨。
     # 上一轮已经润过的靠 checkpoint 记名单排除，不重复付钱。
+    if context.checkpoint.get("writer_polish_policy", "legacy") != "legacy":
+        from paperforge_worker.pipelines.parallel_polish import polish
+
+        return await polish(context, drafts=drafts, document_id=document_id,
+                            order_by_key=order_by_key, whitelist=whitelist, language=language,
+                            writing_context=writing_context, runner=runner, outcome=outcome)
     polished_before = {str(key) for key in (context.checkpoint.get(WRITE_POLISHED_KEY) or [])}
     polishable = [
         key
@@ -484,7 +782,7 @@ async def _polish_all(
     if not total:
         return
 
-    span = _WRITE_PROGRESS_END - _POLISH_PROGRESS_START
+    span = _POLISH_PROGRESS_END - _POLISH_PROGRESS_START
     await context.emit(
         "polish.started",
         {"total": total},
@@ -493,6 +791,7 @@ async def _polish_all(
     )
 
     done = 0
+    polish_results = {"accepted": 0, "changed": 0, "rejected": 0}
     for key in polishable:
         # 取消/暂停优先于「跳过润色」：跳过是「别润了，直接交稿」，
         # 停止是「整个任务先别跑了」，两者的收尾完全不同。
@@ -512,13 +811,19 @@ async def _polish_all(
             )
             break
         draft = drafts[key]
+        polish_started = time.monotonic()
         polished = await coherence_pass(
             draft=draft,
             context=writing_context,
             whitelist=set(whitelist),
             runner=runner,
         )
+        result = polished.generation.get("polish_result")
+        if result:
+            polish_results["accepted" if result["accepted"] else "rejected"] += 1
+            polish_results["changed"] += int(result["changed"])
         drafts[key] = polished
+        writing_context.register(key, polished)
         await _persist_draft(
             context,
             document_id=document_id,
@@ -535,6 +840,8 @@ async def _polish_all(
             {
                 "section": key,
                 "title": polished.title,
+                "result": polished.generation.get("polish_result"),
+                "elapsed_ms": (time.monotonic() - polish_started) * 1000,
                 "done": done,
                 "total": total,
             },
@@ -547,9 +854,14 @@ async def _polish_all(
     outcome.polish_pending_count = total - done
     await context.emit(
         "polish.completed",
-        {"done": done, "total": total, "skipped": outcome.polish_skipped},
+        {
+            "done": done,
+            "total": total,
+            "skipped": outcome.polish_skipped,
+            "results": polish_results,
+        },
         stage=POLISH_STAGE,
-        progress=_WRITE_PROGRESS_END,
+        progress=_POLISH_PROGRESS_END,
     )
 
 
@@ -577,8 +889,7 @@ def _draft_from_section(section: PaperSection) -> SectionDraft:
     只还原 text + cite_keys 两样，但这两样必须准：收尾的全量 upsert 会拿
     `draft.to_ir_section()` 重建 body_ir，而它只在 paragraph 带 `sentences` 时才发
     CiteRun——还原成纯文本段落会把续跑章节的引用**全部抹掉**。
-    术语表（`terms`）无法从 IR 还原，续跑后的章节因此不再贡献 glossary，
-    这是可接受的降级：正文与引用不受影响。
+    新稿的术语与生成版本从 generation_json 恢复；旧稿保留兼容降级。
     """
     paragraphs: list[dict[str, Any]] = []
     for block in (section.body_ir_json or {}).get("blocks") or []:
@@ -627,7 +938,13 @@ def _draft_from_section(section: PaperSection) -> SectionDraft:
         title=section.title,
         paragraphs=paragraphs,
         model=section.model,
-        generator="resumed",
+        generator=("resumed" if section.status != "needs_rewrite" else "failed"),
+        terms=dict((section.generation_json or {}).get("terms") or {}),
+        generation=dict(section.generation_json or {}),
+        expected_body_hash=fingerprint(section.body_ir_json),
+        level=int((section.body_ir_json or {}).get("level") or 1),
+        parent_key=section.parent_key,
+        inline_tables=list((section.generation_json or {}).get("inline_tables") or []),
     )
 
 
@@ -644,7 +961,8 @@ async def _resume_document(
         return None, {}
     try:
         async with context.session() as session:
-            if await session.get(PaperDocument, document_id) is None:
+            document = await session.get(PaperDocument, document_id)
+            if document is None or document.project_id != context.project_id:
                 return None, {}
             rows = await list_sections(session, document_id)
     except Exception:  # noqa: BLE001 - 读不出上一轮的稿子就当没有，从头写
@@ -661,6 +979,9 @@ async def _persist_draft(
     order_no: int,
     whitelist: dict[str, uuid.UUID],
     language: str,
+    graph_state: dict | None = None,
+    frame_guard: dict | None = None,
+    polish_guard: dict | None = None,
 ) -> None:
     """单节落库（写完一节存一节）。
 
@@ -670,23 +991,66 @@ async def _persist_draft(
     single = _build_paper_ir(title="", language=language, drafts=[(draft.section_key, draft)])
     single.enforce_cite_key_whitelist(set(whitelist), strip=True)
     ir_section = single.sections[0] if single.sections else None
-    try:
-        async with context.session() as session:
-            await _upsert_draft(
-                session,
-                project_id=context.project_id,
-                document_id=document_id,
-                draft=draft,
-                order_no=order_no,
-                body_ir=ir_section.model_dump(mode="json") if ir_section else None,
-                whitelist=whitelist,
-                job_id=context.job_id,
+    async with context.session() as session:
+        if any(g is not None for g in (graph_state, frame_guard, polish_guard)):
+            guard = next(g for g in (graph_state, frame_guard, polish_guard) if g is not None)
+            doc = await session.get(PaperDocument, document_id)
+            source_outline = await session.scalar(
+                select(Outline).where(Outline.id == doc.outline_id).with_for_update()
             )
-    except Exception as error:  # noqa: BLE001 - 中途落库失败不该毁掉整轮写作
-        logger.warning(
-            "incremental section persist failed",
-            extra={"section": draft.section_key, "error": type(error).__name__},
+            current_sources = {
+                "outline": source_outline.tree_json if source_outline else None,
+                "cards": await _card_context(session, context.project_id),
+                "whitelist": await get_writing_whitelist(session, context.project_id),
+                "assets": await grounded_asset_payloads(session, context.project_id),
+            }
+            if fingerprint(current_sources) != guard["source_hash"]:
+                raise JobStopped("pause", reason="writing_inputs_changed")
+        if frame_guard is not None:
+            await session.scalar(
+                select(PaperDocument).where(PaperDocument.id == document_id).with_for_update()
+            )
+            rows = await list_sections(session, document_id)
+            current = {
+                r.section_key: fingerprint(r.body_ir_json)
+                for r in rows
+                if r.section_key in frame_guard["body_keys"]
+            }
+            if fingerprint(current) != frame_guard["body_hash"]:
+                raise JobStopped("pause", reason="writing_inputs_changed")
+        if polish_guard is not None:
+            await session.scalar(select(PaperDocument).where(
+                PaperDocument.id == document_id).with_for_update())
+            rows = await list_sections(session, document_id)
+            current = {r.section_key: fingerprint(r.body_ir_json) for r in rows
+                       if r.section_key in polish_guard["expected"]}
+            if current != polish_guard["expected"]:
+                raise JobStopped("pause", reason="polish_inputs_changed")
+        await _upsert_draft(
+            session,
+            project_id=context.project_id,
+            document_id=document_id,
+            draft=draft,
+            order_no=order_no,
+            body_ir=ir_section.model_dump(mode="json") if ir_section else None,
+            whitelist=whitelist,
+            job_id=context.job_id,
         )
+        if polish_guard is not None:
+            polish_guard["expected"][draft.section_key] = draft.expected_body_hash
+            polish_guard["results"][draft.section_key] = {
+                "rewrite": draft.generation["polish_decision"]["rewrite"],
+                "accepted": draft.generation["polish_result"]["accepted"],
+                "output_hash": draft.expected_body_hash,
+            }
+            document = await session.get(PaperDocument, document_id)
+            saved_state = deepcopy(document.writing_state_json or {})
+            saved_state["polish"] = deepcopy(polish_guard)
+            document.writing_state_json = saved_state
+        if graph_state is not None:
+            document = await session.get(PaperDocument, document_id)
+            graph_state["nodes"][draft.section_key]["output_hash"] = draft.expected_body_hash
+            document.writing_state_json = deepcopy(graph_state)
 
 
 # 这几个 generator 的含义是「这一节没有正文」：模型没给出可用输出，降级只留下一句说明。
@@ -715,6 +1079,22 @@ async def _upsert_draft(
         asset_refs = sorted(
             PaperIR(meta=PaperMeta(title=""), sections=[section_ir]).collect_asset_refs()
         )
+    document = await session.scalar(
+        select(PaperDocument).where(PaperDocument.id == document_id).with_for_update()
+    )
+    if document is None or document.project_id != project_id:
+        raise JobStopped("pause", reason="writing_inputs_changed")
+    previous = await session.scalar(
+        select(PaperSection)
+        .where(
+            PaperSection.document_id == document_id, PaperSection.section_key == draft.section_key
+        )
+        .with_for_update()
+    )
+    if fingerprint(previous.body_ir_json if previous else None) != (
+        draft.expected_body_hash or fingerprint(None)
+    ):
+        raise JobStopped("pause", reason="writing_inputs_changed")
     row = await upsert_section(
         session,
         document_id=document_id,
@@ -725,9 +1105,30 @@ async def _upsert_draft(
         body_ir=body_ir,
         cite_keys=cite_keys,
         asset_refs=asset_refs,
-        status=("needs_rewrite" if draft.generator in _NOT_GENERATED_GENERATORS else "generated"),
+        status=(
+            previous.status
+            if previous and fingerprint(body_ir) == fingerprint(previous.body_ir_json)
+            else "needs_rewrite"
+            if draft.generator in _NOT_GENERATED_GENERATORS
+            else "generated"
+        ),
         model=draft.model,
     )
+    draft.generation.update(
+        {
+            "version": WRITING_VERSION,
+            "terms": dict(draft.terms),
+            "inline_tables": draft.inline_tables,
+        }
+    )
+    row.generation_json = deepcopy(draft.generation)
+    draft.expected_body_hash = fingerprint(body_ir)
+    if document.writing_state_json:
+        state = deepcopy(document.writing_state_json)
+        node = state.get("nodes", {}).get(draft.section_key)
+        if node:
+            node["output_hash"] = draft.expected_body_hash
+            document.writing_state_json = state
     usages = [
         {
             "work_id": whitelist[key],
@@ -757,6 +1158,331 @@ async def _upsert_draft(
     )
 
 
+async def _integrate_body(context, drafts, writing_context) -> None:
+    """Use existing coherence editor with full-body findings and deterministic term ownership."""
+    glossary, conflicts = merge_terms(
+        dict(writing_context.outline.get("glossary") or {}),
+        [(key, draft.terms) for key, draft in drafts.items()],
+    )
+    writing_context.glossary = glossary
+    seen: dict[str, str] = {}
+    duplicates = []
+    for key, draft in drafts.items():
+        for paragraph in draft.paragraphs:
+            text = str(paragraph.get("text") or "").strip()
+            if len(text) > 80 and text in seen:
+                duplicates.append({"section": key, "other_section": seen[text]})
+            seen[text] = key
+    from paperforge_worker.orchestration.writing_graph import findings_snapshot
+
+    writing_context.integration_notes = (
+        "Check cross-section contradictions and repeated arguments against these findings; "
+        "do not change factual claims or sentence provenance.\n"
+        + findings_snapshot(
+            writing_context.outline.get("sections", []), writing_context.rolling_summaries
+        )
+        + f"\nTerm conflicts: {conflicts}\nDuplicate paragraphs: {duplicates}"
+    )
+    await context.emit(
+        "integration.findings",
+        {
+            "term_conflicts": conflicts,
+            "duplicate_paragraphs": duplicates,
+            "body_snapshot": fingerprint({k: d.expected_body_hash for k, d in drafts.items()}),
+        },
+    )
+
+
+async def _write_body_graph(
+    context,
+    *,
+    document_id,
+    sections,
+    drafts,
+    writing_context,
+    cards,
+    whitelist,
+    assets,
+    outcome,
+    mode,
+) -> None:
+    graph = section_graph(sections)
+    bodies = {str(s["key"]): s for s in sections if not is_frame(s)}
+    body_graph = {key: deps for key, deps in graph.items() if key in bodies}
+    order = {str(s["key"]): index for index, s in enumerate(sections)}
+    async with context.session() as session:
+        document = await session.get(PaperDocument, document_id)
+        state = deepcopy(document.writing_state_json or {})
+    if state and state.get("version") != WRITING_VERSION:
+        raise ValueError("unsupported writing state version")
+    if not state:
+        state = {
+            "version": WRITING_VERSION,
+            "mode": mode,
+            "graph": graph,
+            "nodes": {},
+            "project_id": str(context.project_id),
+            "document_id": str(document_id),
+            "glossary": dict(writing_context.outline.get("glossary") or {}),
+        }
+    if state["project_id"] != str(context.project_id) or state["document_id"] != str(document_id):
+        raise ValueError("writing state scope mismatch")
+    edited = [
+        key
+        for key, draft in drafts.items()
+        if key in state["nodes"]
+        and state["nodes"][key].get("output_hash", state["nodes"][key].get("base_output_hash"))
+        != draft.expected_body_hash
+    ]
+    if edited:
+        await context.emit(
+            "writing_dag.input_conflict", {"sections": edited, "reason": "document_changed"}
+        )
+        raise JobStopped("pause", reason="writing_inputs_changed")
+    state["source_hash"] = fingerprint(
+        {
+            "outline": writing_context.outline,
+            "cards": cards,
+            "whitelist": whitelist,
+            "assets": assets,
+        }
+    )
+    # Exclude unrelated evidence from each node identity; include every value its prompt reads.
+    inputs = {
+        key: fingerprint(
+            {
+                "version": WRITING_VERSION,
+                "section": section,
+                "evidence": section_evidence_for(section, writing_context.outline),
+                "cards": {k: cards.get(k) for k in section.get("cite_keys", [])},
+                "whitelist": sorted(set(section.get("cite_keys", [])) & set(whitelist)),
+                "assets": assets,
+                "glossary": state["glossary"],
+                "language": writing_context.language,
+                "paper_type": writing_context.paper_type,
+                "outline_titles": [s.get("title") for s in sections],
+                "topic": writing_context.outline.get("topic"),
+                "question": writing_context.outline.get("research_question"),
+                "model": context.settings.llm_config().model_for_role("writer"),
+                "policy": writer_policy(writing_context.language, writing_context.paper_type),
+                "provider": context.settings.llm_config().provider,
+                "thinking": context.settings.llm_role_thinking,
+                "retry": context.settings.llm_role_retry,
+                "dependencies": body_graph[key],
+            }
+        )
+        for key, section in bodies.items()
+    }
+    changed = {
+        key
+        for key in bodies
+        if state["nodes"].get(key, {}).get("input_hash") != inputs[key]
+        or (
+            key in drafts
+            and state["nodes"].get(key, {}).get("output_hash") != drafts[key].expected_body_hash
+        )
+    }
+    invalid = descendants(graph, changed)
+    if invalid:
+        await context.emit(
+            "writing_dag.invalidated",
+            {"sections": sorted(invalid)},
+            checkpoint={
+                WRITE_POLISHED_KEY: [
+                    k for k in context.checkpoint.get(WRITE_POLISHED_KEY, []) if k not in invalid
+                ],
+            },
+        )
+    for key in invalid:
+        state["nodes"].pop(key, None)
+    state["graph"] = graph
+    for key in invalid:
+        if key in drafts and key not in bodies:
+            drafts[key].generation.pop("body_snapshot", None)
+    # Persist the frozen context and interrupted identities before issuing calls.
+    async with context.session() as session:
+        document = await session.scalar(
+            select(PaperDocument).where(PaperDocument.id == document_id).with_for_update()
+        )
+        document.writing_state_json = deepcopy(state)
+
+    for wave in layers(body_graph):
+        ready = [
+            key
+            for key in wave
+            if not (state["nodes"].get(key, {}).get("status") == "completed" and key in drafts)
+        ]
+        if not ready:
+            continue
+        # A failed dependency blocks downstream generation rather than inventing its findings.
+        blocked = [
+            key
+            for key in ready
+            if any(
+                state["nodes"].get(dep, {}).get("status") != "completed" for dep in body_graph[key]
+            )
+        ]
+        if blocked:
+            await context.emit("writing_dag.blocked", {"sections": blocked})
+            raise JobStopped("pause", reason="writing_dependency_failed")
+        await context.raise_if_stopped()
+        for key in ready:
+            old = state["nodes"].get(key, {})
+            state["nodes"][key] = {
+                "status": "started",
+                "input_hash": inputs[key],
+                "attempt": int(old.get("attempt", 0)) + 1,
+                "base_output_hash": drafts[key].expected_body_hash if key in drafts else None,
+            }
+        async with context.session() as session:
+            document = await session.scalar(
+                select(PaperDocument).where(PaperDocument.id == document_id).with_for_update()
+            )
+            document.writing_state_json = deepcopy(state)
+        await context.emit(
+            "writing_dag.wave",
+            {
+                "sections": ready,
+                "mode": mode,
+                "ready_nodes": len(ready),
+                "local_window_limit": context.settings.writer_concurrency
+                if mode == "dag_parallel"
+                else 1,
+                "note": "Local window includes provider waiters; not actual HTTP concurrency.",
+            },
+        )
+
+        async def generate(key):
+            events, warnings = [], []
+
+            async def emit(*args, **kwargs):
+                events.append((args, kwargs))
+
+            view = WritingContext(
+                outline=deepcopy(writing_context.outline),
+                language=writing_context.language,
+                paper_type=writing_context.paper_type,
+                glossary=dict(state["glossary"]),
+                dependency_summaries={
+                    dep: writing_context.rolling_summaries.get(dep, "") for dep in body_graph[key]
+                },
+            )
+            local = WriteOutcome()
+            async with context.span(
+                "subagent",
+                "section",
+                node_id=key,
+                input_hash=inputs[key],
+                attempt=state["nodes"][key]["attempt"],
+            ):
+                draft = await _write_one(
+                    section=bodies[key],
+                    cards=cards,
+                    whitelist=set(whitelist),
+                    writing_context=view,
+                    runner=context.llm_runner(),
+                    context=context,
+                    outcome=local,
+                    assets=assets,
+                    emit=emit,
+                    warn=lambda *args: warnings.append(args),
+                )
+            return draft, local, events, warnings
+
+        async def commit(_index, key, result):
+            if isinstance(result, BaseException):
+                state["nodes"][key]["status"] = "failed"
+                await context.emit(
+                    "writing_dag.failed", {"section": key, "error": type(result).__name__}
+                )
+                return
+            draft, local, events, warnings = result
+            previous = drafts.get(key)
+            draft.expected_body_hash = previous.expected_body_hash if previous else None
+            draft.generation.update({"input_hash": inputs[key], "dependencies": body_graph[key]})
+            state["nodes"][key]["status"] = "completed" if draft.has_body else "failed"
+            state["nodes"][key]["output_hash"] = fingerprint(
+                draft.to_ir_section().model_dump(mode="json")
+            )
+            await _persist_draft(
+                context,
+                document_id=document_id,
+                draft=draft,
+                order_no=order[key],
+                whitelist=whitelist,
+                language=writing_context.language,
+                graph_state=state,
+            )
+            drafts[key] = draft
+            writing_context.register(key, draft)
+            outcome.warnings.extend(local.warnings)
+            outcome.recovered_sections.extend(local.recovered_sections)
+            for args in warnings:
+                context.warn(*args)
+            for args, kwargs in events:
+                await context.emit(*args, **kwargs)
+            await context.emit(
+                "write.section",
+                {
+                    "section": key,
+                    "title": draft.title,
+                    "words": draft.word_count,
+                    "generator": draft.generator,
+                    "index": sum(n["status"] == "completed" for n in state["nodes"].values()),
+                    "total": len(sections),
+                },
+                stage=WRITE_STAGE,
+                progress=_WRITE_PROGRESS_START
+                + (_POLISH_PROGRESS_START - _WRITE_PROGRESS_START)
+                * sum(n["status"] == "completed" for n in state["nodes"].values())
+                / max(1, len(bodies)),
+            )
+
+        await bounded_map(
+            ready,
+            generate,
+            limit=context.settings.writer_concurrency if mode == "dag_parallel" else 1,
+            on_ready=commit,
+            stop_check=context.raise_if_stopped,
+        )
+        if any(state["nodes"][key]["status"] != "completed" for key in ready):
+            raise JobStopped("pause", reason="writing_node_failed")
+
+
+def _repair_levels(outline_keys: Sequence[str], targets: set[str]) -> dict[str, int]:
+    """把修复目标按「前文摘要」依赖分层：同一层的目标互相读不到对方的重写结果。
+
+    ``WritingContext.preceding_summary`` 只读 outline 里**前两节**的滚动摘要
+    （``keys[max(0, index - 2):index]``），所以依赖是一条窄窗口关系，而不是全前缀。
+    分层规则就是这条关系的传递闭包：
+
+        level[i] = 0                                       若 i-1、i-2 处都不是目标
+                 = 1 + max(level[j] for j in {i-1, i-2} 且 j 是目标)
+
+    于是层内任意两个目标在 outline 上至少相隔 3 个位置，谁也读不到谁的
+    ``rolling_summaries`` 条目——把它们并发跑，喂给模型的提示词与串行**逐字节相同**。
+
+    首轮写作用不上这个：那里每个正文小节都是目标，``i → i-1, i-2`` 构成稠密链条，
+    分层会退化成 ``level[i] = i``（即完全串行）。修复轮的目标是稀疏子集，才有并行度。
+
+    注意 ``abstract`` 与 ``introduction`` 永远是目标（见 ``repair_document_sections``），
+    而它们在 outline 里就排在最前两位，所以 outline 序号 2、3 上的目标被强制到
+    第 2、3 层。实际每次分出 3-4 层是正常的，不是 1 层。
+    """
+    levels: dict[str, int] = {}
+    for index, key in enumerate(outline_keys):
+        if key not in targets:
+            continue
+        dependencies = [
+            levels[outline_keys[position]]
+            for position in (index - 1, index - 2)
+            if position >= 0 and outline_keys[position] in targets
+        ]
+        levels[key] = 1 + max(dependencies) if dependencies else 0
+    return levels
+
+
+@traced("repair", "sections")
 async def repair_document_sections(
     context: JobContext,
     *,
@@ -764,6 +1490,7 @@ async def repair_document_sections(
     language: str,
     paper_type: str,
     notes: dict[str, str] | None = None,
+    concurrency: int = 1,
 ) -> WriteOutcome:
     """Rewrite only quality-failing sections against the latest evidence/outline.
 
@@ -774,8 +1501,12 @@ async def repair_document_sections(
     """
     outcome = WriteOutcome()
     async with context.session() as session:
-        outline_row = await latest_outline(session, context.project_id)
         document = await latest_document(session, context.project_id)
+        outline_row = (
+            await get_outline(session, document.outline_id)
+            if document and document.outline_id
+            else None
+        )
         if outline_row is None or document is None:
             return outcome
         outline = dict(outline_row.tree_json or {})
@@ -795,73 +1526,197 @@ async def repair_document_sections(
     # to claims that were removed in a prior round.
     targets = set(section_keys) | {"abstract", "introduction", "conclusion"}
     order_by_key = {str(item.get("key") or ""): index for index, item in enumerate(sections)}
-    for section in sections:
-        key = str(section.get("key") or "")
-        if key not in targets:
-            continue
-        repair_section = {
-            **section,
-            "summary": (
-                str(section.get("summary") or "")
-                + "\nQUALITY REPAIR: omit every claim that is not directly supported by the "
-                "provided evidence/source refs; split non-comparable results and copy no "
-                "number without an exact locator."
-                # 只说「删掉」会让每一轮修复都把这一节削短一点。实测（项目 ff6b9983
-                # 第 2 版）结论 351 → 136 → 137 字、引言 274 → 179 → 171 字：三轮下来
-                # 框架章节被削掉六成。修复是**重写**，不是删除——删掉超证据的说法之后，
-                # 还要把这一节该覆盖的内容用站得住的证据重新写完整。
-                + "\nThis is a rewrite, not a deletion: after removing the unsupported "
-                "claims, still cover this section's stated goal in full using the evidence "
-                "that does hold, and keep the section's target length."
-                + (f"\n{(notes or {}).get(key, '')}" if (notes or {}).get(key) else "")
-            ),
+    outline_keys = [str(item.get("key") or "") for item in sections]
+    section_by_key = {key: item for key, item in zip(outline_keys, sections, strict=True)}
+    explicit_graph = (
+        section_graph(sections)
+        if (document.writing_state_json or {}).get("mode") in {"dag_serial", "dag_parallel"}
+        else None
+    )
+    if explicit_graph is not None:
+        targets = descendants(explicit_graph, targets)
+    body_targets = {
+        key for key in targets if key in section_by_key and not is_frame(section_by_key[key])
+    }
+    levels = _repair_levels(outline_keys, body_targets)
+    if explicit_graph is not None:
+        repair_graph = {
+            key: [dep for dep in deps if dep in body_targets]
+            for key, deps in explicit_graph.items()
+            if key in body_targets
         }
-        draft = await _write_one(
-            section=repair_section,
-            cards=cards,
-            whitelist=set(whitelist),
-            writing_context=writing_context,
-            runner=context.llm_runner(),
-            context=context,
-            outcome=outcome,
-            assets=assets,
-        )
-        previous = existing.get(key)
-        if _is_thinner_refresh(section, previous, draft):
-            # 框架章节不是因为自己有问题才被重写的——它们每一轮都跟着正文刷新一遍，
-            # 为的是不停留在已经被删掉的论断上。既然不是在修缺陷，那么「刷完之后
-            # 短了一大截」就只是这一次采样偏短，不是修复。实测（项目 ff6b9983 第 3 版）
-            # 四轮修复下来引言 264→364→361→315→235、结论 207→240→174→214→284：
-            # 每一轮都是一次全新生成，长度上下摆动 ±50%，最后交付的是**最后一次**
-            # 而不是最好的一次。这里给刷新加一道棘轮，正文小节不受影响（它们的重写
-            # 是冲着具体缺陷去的，变短可能正是修复本身）。
+        levels = {key: index for index, wave in enumerate(layers(repair_graph)) for key in wave}
+    frame_level = max(levels.values(), default=-1) + 1
+    levels.update(
+        {
+            key: frame_level
+            for key in targets
+            if key in section_by_key and is_frame(section_by_key[key])
+        }
+    )
+
+    # glossary 冻结（并发正确性的前提）。
+    #
+    # `WritingContext.glossary` 被插进**每一个** writer 提示词（`_build_prompt`），
+    # 而 `register()` 会往里加词。串行执行下，第 i 个目标因此看得到前面**所有**目标
+    # 新造的术语——这是一条隐蔽的全序依赖，比「前两节摘要」那条宽得多，按它分层
+    # 会让每个目标都依赖所有更早的目标，调度直接退化成串行。
+    #
+    # 所以这里把它冻住：整轮修复共用进入时的那一份。代价很小——修复路径的基础
+    # glossary 已经由**全部已有章节**播种（上面那个预填充循环），而 `register` 用的是
+    # `setdefault`，所以唯一丢掉的是「某次重写新造的词泄漏给同一轮里更晚的一节」。
+    # 换来的是一条可证明、可测试的顺序无关性：并发与串行喂给模型的提示词逐字节相同。
+    frozen_glossary = dict(writing_context.glossary)
+    wave_width = max(1, int(concurrency))
+
+    for level in sorted(set(levels.values())):
+        wave = [key for key in outline_keys if levels.get(key) == level]
+        if not wave:
+            continue
+        # 本层开始时的滚动摘要。由分层保证：本层任一目标的前两节都不在本层，
+        # 所以这份快照与串行执行到该目标时看到的内容完全一致。
+        wave_summaries = dict(writing_context.rolling_summaries)
+
+        async def _repair_one(
+            key: str,
+            *,
+            wave_summaries: dict[str, str] = wave_summaries,
+        ) -> tuple[SectionDraft, WriteOutcome, list[tuple[Any, Any]], list[Any]]:
+            section = section_by_key[key]
+            repair_section = {
+                **section,
+                "summary": (
+                    str(section.get("summary") or "")
+                    + "\nQUALITY REPAIR: omit every claim that is not directly supported by the "
+                    "provided evidence/source refs; split non-comparable results and copy no "
+                    "number without an exact locator."
+                    # 只说「删掉」会让每一轮修复都把这一节削短一点。实测（项目 ff6b9983
+                    # 第 2 版）结论 351 → 136 → 137 字、引言 274 → 179 → 171 字：三轮下来
+                    # 框架章节被削掉六成。修复是**重写**，不是删除——删掉超证据的说法之后，
+                    # 还要把这一节该覆盖的内容用站得住的证据重新写完整。
+                     + "\nThis is a rewrite, not a deletion: after removing the unsupported "
+                    "claims, still cover this section's stated goal in full using the evidence "
+                    "that does hold, and keep the section's target length."
+                    + (f"\n{(notes or {}).get(key, '')}" if (notes or {}).get(key) else "")
+                ),
+            }
+            # 每个任务拿自己的视图与自己的 outcome：并发期间不碰任何共享可变量。
+            view = WritingContext(
+                outline=writing_context.outline,
+                language=language,
+                paper_type=paper_type,
+                glossary=frozen_glossary,
+                rolling_summaries=dict(wave_summaries),
+                dependency_summaries=(
+                    {dep: wave_summaries.get(dep, "") for dep in explicit_graph[key]}
+                    if explicit_graph is not None
+                    else None
+                ),
+            )
+            local_outcome = WriteOutcome()
+            events: list[tuple[Any, Any]] = []
+            warns: list[Any] = []
+
+            async def _buffer_emit(*args: Any, **kwargs: Any) -> None:
+                events.append((args, kwargs))
+
+            def _buffer_warn(*args: Any) -> None:
+                warns.append(args)
+
+            draft = await _write_one(
+                section=repair_section,
+                cards=cards,
+                whitelist=set(whitelist),
+                writing_context=view,
+                runner=context.llm_runner(),
+                context=context,
+                outcome=local_outcome,
+                assets=assets,
+                emit=_buffer_emit,
+                warn=_buffer_warn,
+            )
+            previous = existing.get(key)
+            draft.expected_body_hash = previous.expected_body_hash if previous else None
+            if is_frame(section):
+                draft.generation["body_snapshot"] = fingerprint(
+                    {
+                        k: d.expected_body_hash
+                        for k, d in existing.items()
+                        if k in section_by_key and not is_frame(section_by_key[k])
+                    }
+                )
+            return draft, local_outcome, events, warns
+
+        async def _commit(_index: int, key: str, result: Any) -> None:
+            if isinstance(result, BaseException):
+                # 一节修复失败只损失这一节：保留库里原来的正文，记降级标记。
+                context.warn(
+                    "quality_repair",
+                    type(result).__name__,
+                    {"section": key, "message": str(result)[:300]},
+                )
+                outcome.warnings.append(
+                    {
+                        "stage": "quality_repair",
+                        "section": key,
+                        "reason": type(result).__name__,
+                    }
+                )
+                return
+            draft, local_outcome, events, warns = result
+            # 缓冲的告警与事件按 outline 顺序重放，事件流与串行时一致。
+            for warn_args in warns:
+                context.warn(*warn_args)
+            for args, kwargs in events:
+                await context.emit(*args, **kwargs)
+            outcome.warnings.extend(local_outcome.warnings)
+            outcome.recovered_sections.extend(local_outcome.recovered_sections)
+            outcome.incomplete_sections.extend(local_outcome.incomplete_sections)
+            outcome.rewrite_count += local_outcome.rewrite_count
+
+            section = section_by_key[key]
+            previous = existing.get(key)
+            if _is_thinner_refresh(section, previous, draft):
+                # 框架章节不是因为自己有问题才被重写的——它们每一轮都跟着正文刷新一遍，
+                # 为的是不停留在已经被删掉的论断上。既然不是在修缺陷，那么「刷完之后
+                # 短了一大截」就只是这一次采样偏短，不是修复。实测（项目 ff6b9983 第 3 版）
+                # 四轮修复下来引言 264→364→361→315→235、结论 207→240→174→214→284：
+                # 每一轮都是一次全新生成，长度上下摆动 ±50%，最后交付的是**最后一次**
+                # 而不是最好的一次。这里给刷新加一道棘轮，正文小节不受影响（它们的重写
+                # 是冲着具体缺陷去的，变短可能正是修复本身）。
+                await context.emit(
+                    "quality_repair.refresh_rejected",
+                    {
+                        "section": key,
+                        "kept_words": previous.word_count if previous else 0,
+                        "rejected_words": draft.word_count,
+                    },
+                    stage="quality_repair",
+                )
+                return
+            await _persist_draft(
+                context,
+                document_id=document.id,
+                draft=draft,
+                order_no=order_by_key.get(key, 0),
+                whitelist=whitelist,
+                language=language,
+            )
+            # `existing[key]` 与 `register` 留在有序 pass 里：outline key 唯一，
+            # 任务写不到别人的槽，所以 `_is_thinner_refresh` 的比较与串行逐位一致。
+            existing[key] = draft
+            writing_context.register(key, draft)
+            outcome.section_count += 1
+            outcome.word_count += draft.word_count
             await context.emit(
-                "quality_repair.refresh_rejected",
-                {
-                    "section": key,
-                    "kept_words": previous.word_count if previous else 0,
-                    "rejected_words": draft.word_count,
-                },
+                "quality_repair.section",
+                {"section": key, "words": draft.word_count},
                 stage="quality_repair",
             )
-            continue
-        await _persist_draft(
-            context,
-            document_id=document.id,
-            draft=draft,
-            order_no=order_by_key.get(key, 0),
-            whitelist=whitelist,
-            language=language,
-        )
-        existing[key] = draft
-        writing_context.register(key, draft)
-        outcome.section_count += 1
-        outcome.word_count += draft.word_count
-        await context.emit(
-            "quality_repair.section",
-            {"section": key, "words": draft.word_count},
-            stage="quality_repair",
-        )
+
+        await bounded_map(wave, _repair_one, limit=wave_width, on_ready=_commit)
+        # 停止检查放在**层边界**，不放在任务里：层中途抛出会丢弃兄弟任务已经付过钱
+        # 的草稿，违反「已完成的调用不丢弃」这条不变量。
         await context.raise_if_stopped()
     outcome.document_id = str(document.id)
     return outcome
@@ -913,6 +1768,7 @@ async def snapshot_document_sections(context: JobContext) -> dict[str, dict[str,
             "asset_refs": row.asset_refs_json or [],
             "status": row.status,
             "model": row.model,
+            "generation": row.generation_json,
             "usages": usages_by_section.get(row.id, []),
         }
         for row in rows
@@ -944,6 +1800,7 @@ async def restore_document_sections(
                 status=item["status"],
                 model=item["model"],
             )
+            row.generation_json = item.get("generation")
             await replace_citation_usage(
                 session,
                 project_id=context.project_id,
@@ -1142,7 +1999,8 @@ async def _recover_incomplete_sections(
     pending = [
         key
         for key, draft in drafts.items()
-        if inspect_section_draft(
+        if key in by_key
+        and inspect_section_draft(
             draft,
             language=language,
             evidence=section_evidence_for(by_key.get(key) or {}, writing_context.outline),
@@ -1182,6 +2040,8 @@ async def _recover_incomplete_sections(
         )
         if not retried.has_body and previous.has_body:
             continue
+        retried.expected_body_hash = previous.expected_body_hash
+        retried.generation = dict(previous.generation)
         drafts[key] = retried
         writing_context.register(key, retried)
         await _persist_draft(
@@ -1197,13 +2057,16 @@ async def _recover_incomplete_sections(
     # 只是没够着本节的篇幅目标；它已经在写作回路里驱动过一次重写，不该再让交付判定
     # 说出「这一节仍然没有正文」这种与事实相反的话。
     outcome.incomplete_sections = [
+        item for item in outcome.incomplete_sections if item["section"] not in by_key
+    ] + [
         {
             "section": key,
             "defects": blocking,
             "generator": drafts[key].generator,
         }
         for key in sorted(drafts)
-        if (
+        if key in by_key
+        and (
             blocking := [
                 defect.code
                 for defect in inspect_section_draft(
@@ -1227,6 +2090,7 @@ async def _recover_incomplete_sections(
     )
 
 
+@traced("subagent", "section_writer")
 async def _write_one(
     *,
     section: dict[str, Any],
@@ -1238,6 +2102,8 @@ async def _write_one(
     outcome: WriteOutcome,
     assets: list[dict[str, Any]] | None = None,
     max_attempts: int = MAX_SECTION_ATTEMPTS,
+    emit: Callable[..., Awaitable[None]] | None = None,
+    warn: Callable[..., None] | None = None,
 ) -> SectionDraft:
     """写一节，并在这一节内部完成恢复。
 
@@ -1252,6 +2118,12 @@ async def _write_one(
       3. 紧凑档 + 纠正指令一起上。
     仍然不成才落 needs_rewrite，交给交付前的补写扫描与质量修复闭环。
     """
+    # 事件与告警走可注入的出口。串行调用方不传，行为与引入前逐字节相同；
+    # 修复轮的波调度并发跑这个函数，那里传入缓冲区，等回到有序 pass 再按
+    # outline 顺序重放——`context.emit` 要占一条数据库连接，并发发事件既会打乱
+    # 事件流，也会把连接池吃穿。
+    _emit = emit if emit is not None else context.emit
+    _warn = warn if warn is not None else context.warn
     section_key = str(section.get("key") or "section")
     is_frame = section.get("kind") == "frame"
     section_evidence = section_evidence_for(section, writing_context.outline)
@@ -1272,12 +2144,14 @@ async def _write_one(
                 compact=compact,
                 corrections=corrections or None,
             )
+        except JobStopped:
+            raise
         except Exception as error:  # noqa: BLE001 - 单章失败不阻断整篇（draft-first）
             logger.warning(
                 "section writing failed",
                 extra={"section": section_key, "error": type(error).__name__, "attempt": attempt},
             )
-            context.warn("write", type(error).__name__, {"section": section_key})
+            _warn("write", type(error).__name__, {"section": section_key})
             outcome.warnings.append(
                 {"stage": "write", "section": section_key, "reason": type(error).__name__}
             )
@@ -1302,7 +2176,7 @@ async def _write_one(
                 outcome.recovered_sections.append(
                     {"section": section_key, "attempts": attempt, "recovered_from": corrections[:1]}
                 )
-                await context.emit(
+                await _emit(
                     "write.section_recovered",
                     {"section": section_key, "attempts": attempt},
                     stage=WRITE_STAGE,
@@ -1334,7 +2208,7 @@ async def _write_one(
                 "compact": compact,
             },
         )
-        await context.emit(
+        await _emit(
             "write.section_retry",
             {
                 "section": section_key,
@@ -1355,7 +2229,7 @@ async def _write_one(
             "attempts": best.attempts,
         }
     )
-    context.warn(
+    _warn(
         "write",
         "section_not_matured",
         {"section": section_key, "defects": [defect.code for defect in best_defects]},

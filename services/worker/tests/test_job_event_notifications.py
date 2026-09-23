@@ -64,7 +64,7 @@ async def test_emit_publishes_only_after_the_event_transaction_commits(monkeypat
     async def fake_append(*_args: Any, **_kwargs: Any) -> None:
         order.append("append")
 
-    monkeypatch.setattr(context_module, "_load_job", fake_load_job)
+    monkeypatch.setattr(context_module, "_lock_job", fake_load_job)
     monkeypatch.setattr(context_module, "update_job", fake_update)
     monkeypatch.setattr(context_module, "append_job_event", fake_append)
     context = JobContext(

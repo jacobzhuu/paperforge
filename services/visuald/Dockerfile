@@ -9,6 +9,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY packages/observability /app/packages/observability
 COPY packages/visuals /app/packages/visuals
 COPY services/visuald /app/services/visuald
 # pip 的 wheel 缓存挂成 buildkit cache mount，而不是 `--no-cache-dir`。
@@ -18,7 +19,7 @@ COPY services/visuald /app/services/visuald
 # fastapi、pydantic……实测一次约 60 秒——开发期每次 `./scripts/dev restart`
 # 都在下载，正是这么来的。cache mount 跨构建持久，重跑也只是从本地缓存装。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /app/packages/visuals /app/services/visuald
+    pip install /app/packages/observability /app/packages/visuals /app/services/visuald
 
 USER 65534:65534
 EXPOSE 8082

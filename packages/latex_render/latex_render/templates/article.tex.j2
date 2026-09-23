@@ -8,6 +8,19 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{longtable}
+
+%% natbib 必须与 plainnat/IEEEtran 这类「带标签的 .bst」成对出现。
+%%
+%% 少了它，plainnat 写进 .bbl 的 `\bibitem[Wang et al.(2023)Wang, Li, ...]{key}`
+%% 会被 LaTeX 原样当成引用标签打印出来——正文里出现的是
+%% `[Wang et al.(2023)Wang, Li, Zhang, and Chen]` 这样一整行、且不可断行的盒子，
+%% 实测单个引用就有 124pt 的 Overfull hbox，直接溢出版心
+%% （连 hyperref 的链接热区都跑到 MediaBox 之外）。
+%% natbib 接管后同一条引用是 `(Wang et al., 2023)`。
+%% natbib.sty 与 plainnat.bst 都已烤进 texd 镜像的 Tectonic 缓存（实测：断网、
+%% 不挂缓存卷的 paperforge-texd:local 也能编出来），不需要重建 texd 镜像。
+\usepackage[{{ natbib_options }}]{natbib}
+
 \usepackage{hyperref}
 \hypersetup{hidelinks}
 \usepackage{xcolor}
@@ -27,6 +40,15 @@
 \renewcommand{\bottomfraction}{0.7}
 \renewcommand{\textfraction}{0.1}
 \renewcommand{\floatpagefraction}{0.75}
+
+%% 渲染器只会发 `\cite{...}`（见 latex_render/renderer.py 的 CiteRun 分支）。
+%% natbib 在作者-年份模式下把 `\cite` 解释为 `\citet`，排出来是
+%% 「Wang et al. (2023) 指出……」的正文式引用；而 PaperForge 的引用一律挂在
+%% 句末，需要的是括注式的 `\citep`。`\let` 是完全等价的别名（可选参数
+%% `\cite[见][§3]{k}` 照常生效），比 `\renewcommand` 安全。
+%% 放进 `\AtBeginDocument`：hyperref 会在导言区末尾给 natbib 的引用命令打补丁，
+%% 早于它取别名会把补丁前的版本固定下来。
+\AtBeginDocument{\let\cite\citep}
 
 %% 未补充实验数据的显式占位（学术诚信红线：不编造数据）。
 \providecommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
