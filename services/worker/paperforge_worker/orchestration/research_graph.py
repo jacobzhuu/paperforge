@@ -176,19 +176,29 @@ async def run_research(context, analysis_id, checkpointer):
                 if (
                     cached.get("version") == VERSION
                     and cached.get("source_hash") == inputs["source_hash"]
+                    and cached.get("spec") == inputs["spec"]
+                    and cached.get("chart_sha256")
                 ):
+                    try:
+                        cached_image = await asyncio.to_thread(store.get, cached["chart_key"])
+                    except (FileNotFoundError, KeyError):
+                        raise ValueError("恢复时分析图已删除，请重新分析") from None
+                    if hashlib.sha256(cached_image).hexdigest() != cached["chart_sha256"]:
+                        raise ValueError("恢复时分析图已变化，请重新分析")
                     computed = cached
                 else:
                     computed = await compute_process(content, filename, inputs["spec"])
                     image = base64.b64decode(computed.pop("chart_base64"))
+                    chart_sha256 = hashlib.sha256(image).hexdigest()
                     key = (
                         f"users/{context.owner_id}/projects/{context.project_id}/"
-                        f"analysis/{identifier}/chart.png"
+                        f"analysis/{identifier}/chart-{chart_sha256}.png"
                     )
                     await asyncio.to_thread(store.put, key, image, content_type="image/png")
                     computed.update(
                         {
                             "chart_key": key,
+                            "chart_sha256": chart_sha256,
                             "source_hash": inputs["source_hash"],
                             "source_asset_id": inputs["asset_id"],
                             "validation": "deterministic",
@@ -216,11 +226,16 @@ async def run_research(context, analysis_id, checkpointer):
                             "print(json.dumps(result,ensure_ascii=False,indent=2))\n"
                             "Path('chart.png').write_bytes(chart_png(result))\n",
                         )
-                    bundle_key = key.replace("chart.png", "reproducibility.zip")
+                    bundle_bytes = archive.getvalue()
+                    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+                    bundle_key = key.replace(
+                        f"chart-{chart_sha256}.png", f"reproducibility-{bundle_sha256}.zip"
+                    )
                     await asyncio.to_thread(
-                        store.put, bundle_key, archive.getvalue(), content_type="application/zip"
+                        store.put, bundle_key, bundle_bytes, content_type="application/zip"
                     )
                     computed["bundle_key"] = bundle_key
+                    computed["bundle_sha256"] = bundle_sha256
                     await save(result=computed)
             completed_tools.add(name)
             return computed
@@ -298,6 +313,11 @@ async def run_research(context, analysis_id, checkpointer):
                 "result_hash": digest(computed),
             },
         }
+        figure_payload = {
+            "type": "figure",
+            "figure_path": f"figures/{figure_id}.png",
+            "provenance": parsed["provenance"],
+        }
         async with context.session() as session:
             for asset_id, kind, title, payload, key in (
                 (table_id, "result_table", "描述统计结果", parsed, None),
@@ -305,15 +325,20 @@ async def run_research(context, analysis_id, checkpointer):
                     figure_id,
                     "figure",
                     "描述统计均值图.png",
-                    {
-                        "type": "figure",
-                        "figure_path": f"figures/{figure_id}.png",
-                        "provenance": parsed["provenance"],
-                    },
+                    figure_payload,
                     computed["chart_key"],
                 ),
             ):
-                if await session.get(UserAsset, asset_id) is None:
+                existing_asset = await session.get(UserAsset, asset_id)
+                if existing_asset is not None:
+                    if (
+                        existing_asset.project_id != context.project_id
+                        or existing_asset.kind != kind
+                        or existing_asset.object_key != key
+                        or digest(existing_asset.parsed_json) != digest(payload)
+                    ):
+                        raise ValueError("恢复时派生产物已变化，请重新分析")
+                else:
                     session.add(
                         UserAsset(
                             id=asset_id,
@@ -391,6 +416,17 @@ async def run_research(context, analysis_id, checkpointer):
                     "body": body,
                     "body_hash": digest(body),
                     "asset_refs": refs,
+                    "derived_hashes": {
+                        str(table_id): {
+                            "kind": "result_table", "key": None,
+                            "parsed": digest(parsed), "object": None,
+                        },
+                        str(figure_id): {
+                            "kind": "figure", "key": computed["chart_key"],
+                            "parsed": digest(figure_payload),
+                            "object": computed["chart_sha256"],
+                        },
+                    },
                     "summary": "在目标章节追加来源可追溯的描述统计表与均值图；现有文字和数字保留。",
                 }
             row.proposal_json = proposal

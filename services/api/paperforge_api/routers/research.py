@@ -21,6 +21,7 @@ from db import (
 from db.models.paper import CitationUsage, GenerationJob, PaperDocument, UserAsset
 from db.models.research import ResearchAnalysis
 from fastapi import APIRouter, Depends, HTTPException, Response
+from minio.error import S3Error
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,7 +58,7 @@ class ResearchRequest(BaseModel):
     asset_id: uuid.UUID
     section_key: str | None = Field(default=None, max_length=128)
     spec: AnalysisSpec = Field(default_factory=AnalysisSpec)
-    engine: Literal["pi", "deterministic"] = "pi"
+    engine: Literal["pi", "deterministic"] = "deterministic"
 
 
 class ResearchResponse(BaseModel):
@@ -81,6 +82,17 @@ async def get_analysis(session, project_id, analysis_id, *, lock=False):
     if item is None:
         raise HTTPException(404, "analysis not found")
     return item
+
+
+async def read_checked_object(store, key, *, missing_status, missing_detail):
+    try:
+        return await asyncio.to_thread(store.get, key)
+    except (FileNotFoundError, KeyError):
+        raise HTTPException(missing_status, missing_detail) from None
+    except S3Error as error:
+        if error.code == "NoSuchKey":
+            raise HTTPException(missing_status, missing_detail) from None
+        raise
 
 
 def payload(item):
@@ -118,7 +130,11 @@ async def start_research(project_id: str, body: ResearchRequest, session: Sessio
         "snapshot_hash": document_snapshot_hash(sections) if document else None,
         "graph_version": "research-v1",
         "model_calls": 0,
-        "model": get_settings().llm_config().model_for_role("planner"),
+        "model": (
+            get_settings().llm_config().model_for_role("planner")
+            if body.engine == "pi"
+            else None
+        ),
     }
     job = await start_job(
         session,
@@ -209,9 +225,15 @@ async def chart(project_id: str, result_id: uuid.UUID, session: Session):
     key = (item.result_json or {}).get("chart_key")
     if not key:
         raise HTTPException(404, "chart not available")
+    expected = (item.result_json or {}).get("chart_sha256")
     store = await asyncio.to_thread(make_object_store, get_settings())
+    image = await read_checked_object(
+        store, key, missing_status=404, missing_detail="chart not available"
+    )
+    if expected and hashlib.sha256(image).hexdigest() != expected:
+        raise HTTPException(409, "分析图已变化，请重新分析")
     return Response(
-        await asyncio.to_thread(store.get, key),
+        image,
         media_type="image/png",
         headers={"Cache-Control": "private, no-store"},
     )
@@ -260,10 +282,34 @@ async def decide(
     whitelist = set(await get_writing_whitelist(session, project.id))
     if any(key not in whitelist for section in sections for key in (section.cite_keys_json or [])):
         raise HTTPException(409, "引用白名单已变化，请重新核验")
+    derived_hashes = proposal.get("derived_hashes")
+    if not isinstance(derived_hashes, dict) or len(derived_hashes) != 2:
+        raise HTTPException(409, "提案缺少派生产物哈希，请重新分析")
+    if not set(derived_hashes).issubset(set(proposal["asset_refs"])):
+        raise HTTPException(409, "提案产物引用不一致")
     for ref in proposal["asset_refs"]:
-        derived = await session.get(UserAsset, uuid.UUID(ref))
+        derived = await session.scalar(
+            select(UserAsset).where(UserAsset.id == uuid.UUID(ref)).with_for_update()
+        )
         if derived is None or derived.project_id != project.id:
             raise HTTPException(409, "分析产物已删除，请重新分析")
+        if ref in derived_hashes:
+            expected = derived_hashes[ref]
+            if (
+                derived.kind != expected.get("kind")
+                or derived.object_key != expected.get("key")
+                or digest(derived.parsed_json) != expected.get("parsed")
+            ):
+                raise HTTPException(409, "分析产物已变化，请重新分析")
+            if expected.get("object"):
+                if not derived.object_key:
+                    raise HTTPException(409, "分析图已删除，请重新分析")
+                image = await read_checked_object(
+                    store, derived.object_key,
+                    missing_status=409, missing_detail="分析图已删除，请重新分析",
+                )
+                if hashlib.sha256(image).hexdigest() != expected["object"]:
+                    raise HTTPException(409, "分析图已变化，请重新分析")
     document = await create_document(
         session, project_id=project.id, outline_id=base.outline_id if base else None
     )

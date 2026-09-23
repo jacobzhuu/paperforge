@@ -2,7 +2,7 @@
 2026-09-23 增量：新增交互式实验分析、Pi 工具循环和版本化修改提案，见 [Research Agent 架构](research-agent-architecture.md)。
 
 这是当前能力说明；之前的架构审计、写作升级和部署报告保留为各自时点的历史记录。
-工程上线与科研质量验收分别记录，见 [本次验收](acceptance/agent-platform-20260918.md)。新框架、成功部署和测试数量均不代表质量提升实验通过。
+工程上线与科研质量验收分别记录，见 [已提交的 Research Agent 验收](acceptance/research-agent-20260923.md)。新框架、成功部署和测试数量均不代表质量提升实验通过。
 
 ## 架构与已实现能力
 

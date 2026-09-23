@@ -16,7 +16,7 @@ export function ResearchPanel({projectId}: {projectId: string}) {
   const [goal,setGoal] = React.useState('按实验分组汇总描述统计，并核对论文中的结果');
   const [assetId,setAssetId] = React.useState('');
   const [section,setSection] = React.useState('');
-  const [engine,setEngine] = React.useState('pi');
+  const [engine,setEngine] = React.useState('deterministic');
   const [error,setError] = React.useState('');
   const [busy,setBusy] = React.useState(false);
   const base = `${API_BASE}/api/v1/projects/${projectId}`;
@@ -41,7 +41,7 @@ export function ResearchPanel({projectId}: {projectId: string}) {
     <div className="grid gap-3 md:grid-cols-3">
       <label className="text-sm">数据素材<select className="mt-1 w-full rounded border bg-background p-2" value={assetId} onChange={e=>setAssetId(e.target.value)}><option value="">选择已上传的表格</option>{assets.map(a=><option key={a.id} value={a.id}>{a.title}</option>)}</select></label>
       <label className="text-sm">修改目标<select className="mt-1 w-full rounded border bg-background p-2" value={section} onChange={e=>setSection(e.target.value)}><option value="">仅查看分析结果</option>{sections.map(s=><option key={s.section_key} value={s.section_key}>{s.title}</option>)}</select></label>
-      <label className="text-sm">执行方式<select className="mt-1 w-full rounded border bg-background p-2" value={engine} onChange={e=>setEngine(e.target.value)}><option value="pi">Agent 分析（使用模型额度）</option><option value="deterministic">直接计算（不调用模型）</option></select></label>
+      <label className="text-sm">执行方式<select className="mt-1 w-full rounded border bg-background p-2" value={engine} onChange={e=>setEngine(e.target.value)}><option value="deterministic">直接计算（不调用模型）</option><option value="pi">Pi Agent 分析（实验功能，使用模型额度）</option></select></label>
     </div>
     <Button disabled={busy || !assetId || !goal.trim()} onClick={()=>void action(()=>request('/research-runs',{goal,asset_id:assetId,section_key:section||null,engine}))}>开始分析</Button>
     {runs.map(run=><article className="space-y-3 rounded border p-3" key={run.id}>

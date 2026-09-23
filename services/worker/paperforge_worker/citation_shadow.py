@@ -13,6 +13,32 @@ from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.citation_decisions import decision_request
 
 
+async def expire_uncertain_attempts(session, *, now=None):
+    now = now or datetime.now(UTC)
+    await session.execute(
+        update(CitationShadow)
+        .where(
+            CitationShadow.status == "running",
+            (CitationShadow.started_at < now - timedelta(hours=1))
+            | (CitationShadow.started_at.is_(None)),
+        )
+        .values(status="interrupted", result_json={"error": "execution_uncertain"})
+    )
+
+
+async def finish_attempt(session, identifier, attempt_id, status, result):
+    updated = await session.execute(
+        update(CitationShadow)
+        .where(
+            CitationShadow.id == identifier,
+            CitationShadow.status == "running",
+            CitationShadow.attempt_id == attempt_id,
+        )
+        .values(status=status, result_json=result)
+    )
+    return bool(updated.rowcount)
+
+
 async def enqueue(context, pairs, observation):
     state, questions = decision_request(pairs)
     frozen = {
@@ -51,14 +77,7 @@ async def citation_shadow_tick(ctx):
     factory = ctx["session_factory"]
     # Keep a small, bounded background cohort. Do not compete with queued/running foreground work.
     async with factory() as session:
-        await session.execute(
-            update(CitationShadow)
-            .where(
-                CitationShadow.status == "running",
-                CitationShadow.created_at < datetime.now(UTC) - timedelta(hours=1),
-            )
-            .values(status="interrupted", result_json={"error": "execution_uncertain"})
-        )
+        await expire_uncertain_attempts(session)
         await session.execute(
             update(CitationShadow)
             .where(
@@ -84,7 +103,10 @@ async def citation_shadow_tick(ctx):
         )
         if row is None:
             return
+        attempt_id = uuid.uuid4()
         row.status = "running"
+        row.started_at = datetime.now(UTC)
+        row.attempt_id = attempt_id
         identifier, project_id, job_id, frozen = (
             row.id,
             row.project_id,
@@ -131,15 +153,15 @@ async def citation_shadow_tick(ctx):
         except Exception as error:
             status, result = "failed", {"error": type(error).__name__}
         async with factory() as session:
-            row = await session.get(CitationShadow, identifier)
-            row.status, row.result_json = status, result
+            updated = await finish_attempt(session, identifier, attempt_id, status, result)
             await session.commit()
-        await context.emit(
-            "quality.jev_shadow",
-            {
-                "shadow_id": str(identifier),
-                "status": status,
-                "version": "citation-shadow-v3",
-                "latency_ms": result.get("latency_ms"),
-            },
-        )
+        if updated:
+            await context.emit(
+                "quality.jev_shadow",
+                {
+                    "shadow_id": str(identifier),
+                    "status": status,
+                    "version": "citation-shadow-v3",
+                    "latency_ms": result.get("latency_ms"),
+                },
+            )
