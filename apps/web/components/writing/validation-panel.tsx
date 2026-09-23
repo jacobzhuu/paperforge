@@ -751,7 +751,7 @@ function QualityTab({
       {report.soft_check.length > 0 && (
         <section>
           <header className="pb-2">
-            <h3 className="text-body">语义引用软校验（弱相关）</h3>
+            <h3 className="text-body">语义引用软校验（弱相关 / 未核验）</h3>
           </header>
           <div className="space-y-1.5 text-meta">
             {report.soft_check.map((finding, index) => (

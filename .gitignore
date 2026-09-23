@@ -67,3 +67,5 @@ apps/web/_probe_*
 # Browser verification artifacts
 apps/web/test-results/
 apps/web/playwright-report/
+
+services/pi/node_modules/

@@ -592,6 +592,51 @@ async def run_qdecomp_pipeline(
         return {"project_id": project_id, "questions": outcome.to_payload() if outcome else None}
 
 
+async def run_research_pipeline(ctx: dict, project_id: str, job_id: str, analysis_id: str):
+    from db.models.research import ResearchAnalysis
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg import AsyncConnection
+    from psycopg.rows import dict_row
+
+    from paperforge_worker.orchestration.research_graph import run_research
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await context.raise_if_stopped()
+        await _mark_running(context)
+        url = context.settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+        try:
+            async with await AsyncConnection.connect(
+                url,
+                autocommit=True,
+                prepare_threshold=0,
+                row_factory=dict_row,
+                options="-csearch_path=paperforge_graph",
+            ) as connection:
+                await run_research(context, analysis_id, AsyncPostgresSaver(connection))
+        except JobStopped:
+            raise
+        except Exception as error:
+            message = (
+                str(error) if isinstance(error, ValueError | TimeoutError) else type(error).__name__
+            )
+            logger.exception("research analysis failed")
+            async with context.session() as session:
+                row = await session.get(ResearchAnalysis, uuid.UUID(analysis_id))
+                row.status = "failed"
+                row.result_json = {**(row.result_json or {}), "error": message}
+            await _finish(context, delivered=False)
+            return {"error": str(error)}
+        await _finish(context, delivered=True)
+        return {"analysis_id": analysis_id}
+
+
 async def run_evidence_index_pipeline(ctx: dict, project_id: str, job_id: str) -> dict:
     from retrieval.search import index_project
 
@@ -4419,6 +4464,7 @@ async def shutdown(ctx: dict) -> None:
         await engine.dispose()
 
 
+from paperforge_worker.citation_shadow import citation_shadow_tick  # noqa: E402
 from paperforge_worker.evaluator_shadow import after_job_end, shadow_tick  # noqa: E402
 
 
@@ -4427,9 +4473,13 @@ class WorkerSettings:
     cron_jobs = (
         []
         if get_settings().worker_queue_name == "arq:short"
-        else [cron(shadow_tick, minute=set(range(60)), second=35, timeout=1800, max_tries=1)]
+        else [
+            cron(shadow_tick, minute=set(range(60)), second=35, timeout=1800, max_tries=1),
+            cron(citation_shadow_tick, minute=set(range(60)), second=10, timeout=120, max_tries=1),
+        ]
     )
     functions = [
+        run_research_pipeline,
         run_web_research_pipeline,
         run_library_pipeline,
         run_import_pipeline,

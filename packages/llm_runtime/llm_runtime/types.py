@@ -16,6 +16,8 @@ class LLMRequest:
     json_output: bool = False
     thinking_mode: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class LLMResponse:
     # when it has already spent the one allowed larger-budget truncation retry. Structured JSON
     # parsing uses the marker to avoid starting a second, nested retry sequence.
     truncation_retries: int = 0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class LLMError(RuntimeError):

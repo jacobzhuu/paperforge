@@ -330,6 +330,7 @@ export interface ScopePayload {
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
 export type JobKind =
+  | 'research'
   | 'web_research'
   | 'search'
   | 'ingest'
@@ -846,6 +847,7 @@ export interface QualityHint {
 }
 
 export interface SoftCheckFinding {
+  status?: 'completed' | 'unverified';
   cite_key: string;
   section_key: string;
   score: number;

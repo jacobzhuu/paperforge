@@ -97,10 +97,11 @@ class SoftCheckFinding:
     score: float
     reason: str = ""
     context: str = ""
+    status: str = "completed"
 
     @property
     def weak(self) -> bool:
-        return self.score < SOFT_CHECK_THRESHOLD
+        return self.status == "completed" and self.score < SOFT_CHECK_THRESHOLD
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -110,6 +111,7 @@ class SoftCheckFinding:
             "reason": self.reason,
             "context": self.context[:200],
             "weak": self.weak,
+            "status": self.status,
         }
 
 
@@ -2377,7 +2379,12 @@ async def soft_check_citations(
     jev_findings: list[SoftCheckFinding] = []
     jev_accepted = False
     jev_reason: str | None = None
-    if decision_mode in {"shadow", "on"}:
+    deferred_shadow = (
+        decision_mode == "shadow"
+        and trace_context is not None
+        and getattr(trace_context, "session_factory", None) is not None
+    )
+    if decision_mode in {"shadow", "on"} and not deferred_shadow:
         jev_findings, jev_accepted, jev_reason = await run_jev()
 
     if decision_mode == "on" and jev_accepted:
@@ -2397,47 +2404,85 @@ async def soft_check_citations(
                 },
                 stage="quality",
             )
-        return []
-
-    result = await runner.agenerate_json(
-        "verifier",
-        system_prompt=_SOFT_CHECK_PROMPT,
-        user_prompt=verifier_prompt(pairs),
-        max_output_tokens=2000,
-        temperature=0.0,
-        metadata={"stage": "soft_check"},
-    )
-    observation["baseline_model"] = result.model
-    observation["baseline_error"] = result.error
-    if not result.ok or not isinstance(result.value, dict):
-        llm_findings: list[SoftCheckFinding] = []
-    else:
-        llm_findings = []
-
-        for item in result.value.get("judgements") or []:
-            if not isinstance(item, dict):
-                continue
-            judgement_index = item.get("index")
-            if not isinstance(judgement_index, int) or not 0 <= judgement_index < len(checkable):
-                continue
-            raw_score = item.get("score")
-            score = float(raw_score) if isinstance(raw_score, int | float) else 0.5
-            usage = checkable[judgement_index]
-            llm_findings.append(
-                SoftCheckFinding(
-                    cite_key=str(usage["cite_key"]),
-                    section_key=str(usage.get("section_key") or ""),
-                    score=min(1.0, max(0.0, score)),
-                    reason=str(item.get("reason") or "")[:200],
-                    context=str(usage.get("context_snippet") or ""),
-                )
+        return [
+            SoftCheckFinding(
+                cite_key=str(u["cite_key"]),
+                section_key=str(u.get("section_key") or ""),
+                score=0.5,
+                status="unverified",
+                reason="核验服务不可用",
+                context=str(u.get("context_snippet") or ""),
             )
-            observation["items"][judgement_index].update(
-                {
-                    "baseline_score": llm_findings[-1].score,
-                    "baseline_weak": llm_findings[-1].weak,
-                }
+            for u in checkable
+        ]
+
+    checked = {}
+    missing = list(range(len(checkable)))
+    observation["baseline_version"] = "soft-verifier-v3"
+    for attempt in range(2):
+        subset = [pairs[i] for i in missing]
+        result = await runner.agenerate_json(
+            "verifier",
+            system_prompt=_SOFT_CHECK_PROMPT,
+            user_prompt=verifier_prompt(subset),
+            max_output_tokens=2000,
+            temperature=0.0,
+            metadata={"stage": "soft_check", "completion_attempt": attempt},
+        )
+        observation["baseline_model"] = result.model
+        observation["baseline_error"] = result.error
+        valid = {}
+        duplicates = set()
+        if result.ok and isinstance(result.value, dict):
+            for item in result.value.get("judgements") or []:
+                if not isinstance(item, dict):
+                    continue
+                index, score = item.get("index"), item.get("score")
+                if type(index) is not int or not 0 <= index < len(missing):
+                    continue
+                if index in valid:
+                    duplicates.add(index)
+                if type(score) not in (int, float) or not 0 <= score <= 1:
+                    duplicates.add(index)
+                    continue
+                valid[index] = item
+            for index, item in valid.items():
+                if index not in duplicates:
+                    checked[missing[index]] = item
+        missing = [i for i in range(len(checkable)) if i not in checked]
+        if not missing:
+            break
+    llm_findings = []
+    for index, usage in enumerate(checkable):
+        item = checked.get(index)
+        finding = SoftCheckFinding(
+            cite_key=str(usage["cite_key"]),
+            section_key=str(usage.get("section_key") or ""),
+            score=float(item["score"]) if item else 0.5,
+            reason=str(item.get("reason") or "")[:200] if item else "核验未完成，不能视为通过",
+            context=str(usage.get("context_snippet") or ""),
+            status="completed" if item else "unverified",
+        )
+        llm_findings.append(finding)
+        observation["items"][index]["baseline_status"] = finding.status
+        if item:
+            observation["items"][index].update(
+                {"baseline_score": finding.score, "baseline_weak": finding.weak}
             )
+    if deferred_shadow:
+        from paperforge_worker.citation_shadow import enqueue
+
+        await enqueue(trace_context, pairs, observation)
+        await trace_context.emit(
+            "quality.soft_check_coverage",
+            {
+                "version": "soft-verifier-v3",
+                "total": len(checkable),
+                "checked": len(checked),
+                "unverified": len(missing),
+            },
+        )
+        return llm_findings
 
     if trace_context is not None and decision_mode == "shadow":
         for item in observation["items"]:
@@ -2595,7 +2640,9 @@ def build_quality_report(
             and s.get("section_key") != "abstract"
             and not (s.get("cite_keys") or [])
         ],
-        soft_check=[f.to_payload() for f in (soft_check or []) if f.weak],
+        soft_check=[
+            f.to_payload() for f in (soft_check or []) if f.weak or f.status != "completed"
+        ],
         generated_at=clock.isoformat(),
     )
     report.hints = coverage_hints(

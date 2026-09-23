@@ -110,3 +110,30 @@ test('dependency rebuild submits the loaded version and source hash', async ({ p
   await page.getByRole('button', { name: '优化章节依赖' }).click();
   await expect.poll(() => submitted).toEqual({ outline_id: 'o2', content_hash: 'a'.repeat(64) });
 });
+
+for (const width of [1280, 390]) {
+  test(`research proposal is explicit and fits ${width}px`, async ({ page }) => {
+    await page.setViewportSize({width,height:900});
+    await page.route('**/api/v1/projects/p1', route=>route.fulfill({json:{...project,paper_type:'original'}}));
+    await page.route('**/api/v1/projects/p1/assets/preflight', route=>route.fulfill({json:{ready:true,issues:[]}}));
+    await page.route('**/api/v1/projects/p1/assets', route=>route.fulfill({json:[]}));
+    await page.route('**/api/v1/projects/p1/numlint', route=>route.fulfill({json:{consistent:true,checked_count:0,unsourced_count:0,unsourced:[]}}));
+    let accepted=false;
+    await page.route('**/api/v1/projects/p1/research-runs', route=>route.fulfill({json:[{
+      id:'r1',job_id:'j1',status:accepted?'accepted':'proposed',input:{goal:'检查实验均值',spec:{}},
+      result:{records:[{group:'实验组',column:'耗时',unit:'ms',n:2,missing:0,mean:2,median:2,min:1,max:3,std:1.41421356}]},
+      proposal:{summary:'追加描述统计表和图，保留原有文字和数字'},document_id:accepted?'d2':null,
+    }]}));
+    await page.route('**/api/v1/projects/p1/artifact-proposals/r1/decision',async route=>{
+      expect(route.request().postDataJSON()).toEqual({choice:'accept'});accepted=true;
+      await route.fulfill({json:{status:'accepted',document_id:'d2'}});
+    });
+    await page.goto('/projects/p1/assets');
+    await expect(page.getByRole('heading',{name:'实验数据分析'})).toBeVisible();
+    await expect(page.getByText('修改预览：追加描述统计表和图，保留原有文字和数字')).toBeVisible();
+    expect(accepted).toBe(false);
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.getByRole('button',{name:'确认并提交新版本'}).click();
+    await expect(page.getByRole('link',{name:'查看新版本文稿'})).toBeVisible();
+  });
+}

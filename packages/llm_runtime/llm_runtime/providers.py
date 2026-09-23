@@ -110,6 +110,10 @@ class OpenAICompatibleLLMProvider:
             ),
             "temperature": request.temperature,
         }
+        if request.messages is not None:
+            payload["messages"] = request.messages
+        if request.tools:
+            payload["tools"] = request.tools
         if request.json_output:
             payload["response_format"] = {"type": "json_object"}
         if request.thinking_mode in {"enabled", "disabled"}:
@@ -335,7 +339,10 @@ class OpenAICompatibleLLMProvider:
             )
         message = first_choice.get("message")
         text = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(text, str) or not text.strip():
+        tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+        if tool_calls and isinstance(tool_calls, list):
+            text = text if isinstance(text, str) else ""
+        if not tool_calls and (not isinstance(text, str) or not text.strip()):
             # 推理型模型（deepseek-v4-*、o 系列等）把思维链算进 max_tokens：
             # 预算被推理吃光时 content 会是空的。这与「响应结构非法」是两回事——
             # 前者加预算重试就能救，因此给出独立的 error_code。
@@ -374,6 +381,7 @@ class OpenAICompatibleLLMProvider:
         usage = payload.get("usage")
         return LLMResponse(
             text=text,
+            tool_calls=tool_calls,
             model=str(payload.get("model") or self.model),
             provider=self.name,
             usage=usage if isinstance(usage, dict) else None,

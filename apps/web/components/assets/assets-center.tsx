@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import { ResearchPanel } from './research-panel';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
@@ -158,6 +159,7 @@ export function AssetsCenter() {
 
   return (
     <div className="space-y-6" data-testid="assets-center">
+      <ResearchPanel projectId={projectId} />
       <WorkbenchHeader
         title="素材中心"
         description="结果表格 / 图 / 方法笔记 / 代码 / BibTeX —— 确定性解析后作为正文数字的唯一出处"

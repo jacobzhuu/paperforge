@@ -24,3 +24,5 @@ progress.md
 .DS_Store
 _tmp_*
 **/_tmp_*
+
+services/pi/node_modules

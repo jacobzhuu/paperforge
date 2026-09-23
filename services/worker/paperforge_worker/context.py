@@ -308,7 +308,7 @@ class JobContext:
             )
             return fields
 
-    def llm_runner(self, *, config: LLMConfig | None = None) -> LLMRunner:
+    def llm_runner(self, *, config: LLMConfig | None = None, provider=None) -> LLMRunner:
         """构造带记账回调的 runner；所有管线只能通过它调用 LLM（设计 §4.9）。"""
         if self._loop is None:
             with suppress(RuntimeError):
@@ -338,6 +338,7 @@ class JobContext:
             config or self.settings.llm_config(),
             on_call=record,
             before_call=reserve,
+            provider=provider,
         )
 
     async def _record_decision_call(self, record: LLMCallRecord) -> None:

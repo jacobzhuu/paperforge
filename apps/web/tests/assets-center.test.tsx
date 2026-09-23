@@ -7,6 +7,8 @@ const projectCtx = { current: mockProjectContext({ paperType: 'original' }) };
 const replaceSpy = vi.fn();
 const toastSpy = makeToastSpy();
 
+vi.mock('@/components/assets/research-panel', () => ({ ResearchPanel: () => null }));
+
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ replace: replaceSpy, push: vi.fn() }),
   usePathname: () => '/projects/p1/assets',

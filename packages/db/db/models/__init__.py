@@ -114,4 +114,5 @@ __all__ = [
     "WorkVersionRelation",
 ]
 
+from db.models.research import CitationShadow, ResearchAnalysis  # noqa: F401
 from db.models.retrieval import EvidenceEmbedding  # noqa: F401

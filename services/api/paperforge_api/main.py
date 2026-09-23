@@ -115,6 +115,9 @@ def create_app() -> FastAPI:
                 )
         return await call_next(request)
 
+    from paperforge_api.routers import research
+
+    app.include_router(research.router)
     app.include_router(agent.router)
     app.include_router(health.router)
     app.include_router(auth.router)

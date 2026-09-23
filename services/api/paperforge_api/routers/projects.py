@@ -1141,6 +1141,8 @@ async def resume_job(
     续跑另起一条，前端的进度流和历史记录才对得上。
     """
     job = await _require_project_job(session, project_id, job_id)
+    if job.kind == "research":
+        raise HTTPException(409, "请在素材中心确认分析口径后继续研究任务")
     # Lock the source through dispatch so repeated submissions cannot fork a resume chain.
     await session.refresh(job, with_for_update=True)
     response_checkpoint = await validate_response(session, job, response)

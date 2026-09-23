@@ -131,7 +131,9 @@ async def test_soft_check_ignores_out_of_range_indexes() -> None:
         abstracts={"a2020x": "abs"},
         runner=_runner({"judgements": [{"index": 99, "score": 0.1}]}),
     )
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].status == "unverified"
+    assert not findings[0].weak
 
 
 async def test_soft_check_without_runner_is_empty_not_failing() -> None:
@@ -140,7 +142,9 @@ async def test_soft_check_without_runner_is_empty_not_failing() -> None:
         abstracts={"a": "abs"},
         runner=None,
     )
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].status == "unverified"
+    assert not findings[0].weak
 
 
 async def test_soft_check_survives_unparsable_output() -> None:
@@ -149,7 +153,9 @@ async def test_soft_check_survives_unparsable_output() -> None:
         abstracts={"a": "abs"},
         runner=_runner("<html>not json</html>"),
     )
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].status == "unverified"
+    assert not findings[0].weak
 
 
 class _DecisionStub:
@@ -974,3 +980,42 @@ def test_quality_report_never_blocks_on_empty_document() -> None:
 def test_count_words_matches_writing_pipeline() -> None:
     assert count_words("检索增强生成") == 6
     assert count_words("retrieval augmented generation") == 3
+
+
+async def test_soft_check_retries_only_missing_and_rejects_duplicate_indexes():
+    calls = []
+    runner = _sequence_runner([
+        {"judgements": [{"index": 0, "score": 0.9}, {"index": 1, "score": 0.1},
+                         {"index": 1, "score": 0.9}]},
+        {"judgements": [{"index": 0, "score": 0.2}]},
+    ], calls=calls)
+    findings = await soft_check_citations(
+        usages=[{"cite_key": "a", "context_snippet": "first"},
+                {"cite_key": "b", "context_snippet": "second"}],
+        abstracts={"a": "alpha", "b": "beta"}, runner=runner)
+    assert len(calls) == 2
+    assert "first" not in calls[1].user_prompt
+    assert [f.score for f in findings] == [0.9, 0.2]
+    assert all(f.status == "completed" for f in findings)
+
+
+async def test_production_shadow_does_not_call_jev_inline(monkeypatch):
+    from paperforge_worker import citation_shadow
+    queued = []
+    async def enqueue(context, pairs, observation):
+        queued.append((pairs, observation))
+    monkeypatch.setattr(citation_shadow, "enqueue", enqueue)
+    class Trace:
+        session_factory = True
+        async def emit(self, *args, **kwargs):
+            pass
+    class Never:
+        enabled = True
+        async def decide(self, **kwargs):
+            raise AssertionError("foreground must not call Jev")
+    findings = await soft_check_citations(
+        usages=[{"cite_key": "a", "context_snippet": "first"}], abstracts={"a": "alpha"},
+        runner=_runner({"judgements": [{"index": 0, "score": 0.9}]}),
+        decision_runner=Never(), decision_mode="shadow", trace_context=Trace())
+    assert findings[0].score == 0.9
+    assert len(queued) == 1
