@@ -171,9 +171,8 @@ def test_failed_model_is_retryable_and_does_not_claim_understanding(
     project = create(client)
     path = f"/api/v1/projects/{project['id']}"
     job = client.post(path + "/intake", json={"version": 0}).json()
-    monkeypatch.setattr(
-        intake_job, "understand", AsyncMock(side_effect=ValueError("invalid model"))
-    )
+    failed_model = AsyncMock(side_effect=ValueError("invalid model"))
+    monkeypatch.setattr(intake_job, "understand", failed_model)
     run_async(
         run_intake_pipeline(
             {"settings": WorkerSettings(_env_file=None, database_url=clean_pg_database_url)},
@@ -182,8 +181,21 @@ def test_failed_model_is_retryable_and_does_not_claim_understanding(
             version=1,
         )
     )
+    failed_model.assert_awaited_once()
     assert client.get(path + "/intake").json()["status"] == "failed"
-    assert client.post(path + "/intake", json={"version": 1}).status_code == 202
+    assert client.post(path + "/intake", json={"version": 0}).status_code == 409
+    retry = client.post(path + "/intake", json={"version": 1})
+    assert retry.status_code == 202, retry.text
+    assert retry.json()["id"] != job["id"]
+    duplicate = client.post(path + "/intake", json={"version": 1})
+    assert duplicate.status_code == 202
+    assert duplicate.json()["id"] == retry.json()["id"]
+    assert len(client.queue.calls) == 2
+    successful_model = run_worker(
+        clean_pg_database_url, project, retry.json(), monkeypatch, understood(paper_type="review")
+    )
+    successful_model.assert_awaited_once()
+    assert client.get(path + "/intake").json()["status"] == "ready"
 
 
 def test_stale_result_does_not_overwrite_new_version(client, clean_pg_database_url, monkeypatch):

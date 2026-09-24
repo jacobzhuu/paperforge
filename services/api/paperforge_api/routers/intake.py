@@ -64,7 +64,11 @@ async def submit_intake(
         else None
     )
     submitted = request.model_dump(mode="json")
-    if previous and state.get("last_request") == submitted:
+    if (
+        previous
+        and previous.status in {"queued", "running"}
+        and state.get("last_request") == submitted
+    ):
         return _job_response(previous)
     if request.version != state.get("version", 0):
         raise HTTPException(409, "研究需求已更新，请刷新后再试")

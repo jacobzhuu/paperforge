@@ -387,7 +387,7 @@ export function PromptCanvas() {
               setLanguagePinned(e.target.value !== 'auto');
               setLanguage(e.target.value === 'auto' ? 'zh' : e.target.value as Language);
             }}>
-              <option value="auto">按描述判断，默认中文</option>
+              <option value="auto">按描述和材料判断，无法判断时默认中文</option>
               <option value="zh">中文</option><option value="en">English</option>
             </Select>
           </Field>

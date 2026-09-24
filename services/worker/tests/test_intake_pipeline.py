@@ -65,8 +65,22 @@ async def test_unspecified_language_uses_chinese_and_ambiguity_has_no_fake_ready
         assets=[],
     )
     assert result["language"] == "zh"
+    assert result["sources"]["language"] == "default"
     assert result["paper_type"] is None
     assert result["questions"]
+
+
+async def test_english_input_without_explicit_language_can_be_inferred():
+    result = await understand(
+        runner(output(language_explicit=False, language_inferred=True)),
+        topic="Survey methods for measuring factual consistency in scientific writing",
+        overrides={},
+        answers=[],
+        assets=[],
+    )
+    assert result["language"] == "en"
+    assert result["scope"]["language"] == "en"
+    assert result["sources"]["language"] == "inferred"
 
 
 async def test_invalid_or_failed_model_does_not_become_successful_fallback():
