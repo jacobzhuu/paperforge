@@ -51,6 +51,7 @@ from paperforge_api.deps import (
 )
 from paperforge_api.deps import get_authorized_project as _require_project
 from paperforge_api.jobs import start_job
+from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.schemas import (
     ApproveVisualRequest,
     CreateVisualRequest,
@@ -67,7 +68,7 @@ from paperforge_api.schemas import (
 router = APIRouter(
     prefix="/api/v1", tags=["visuals"], dependencies=[Depends(authorize_project_request)]
 )
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 
@@ -222,7 +223,6 @@ async def draft_visual(
     project = await _require_project(session, project_id)
     _require_visuals_enabled()
 
-    from llm_runtime import LLMRunner
 
     from paperforge_api.config import get_settings as api_settings
 
@@ -277,6 +277,8 @@ async def draft_visual(
             context_excerpt=excerpt,
         )
         analyzed_spec, analysis = await _analyze_ai_spec(
+            session=session,
+            project_id=project.id,
             project_title=project.title,
             rows=rows,
             user_intent=intent,
@@ -290,10 +292,10 @@ async def draft_visual(
             spec=analyzed_spec.model_dump(mode="json"),
             target_section_key=target_key,
             suggested_block_index=suggested_block_index,
-            reason=f"DeepSeek 已结合论文全文分析本次意图；{reason}",
-            context_summary=_full_paper_context_summary(rows),
+            reason=f"模型已结合论文分节上下文分析本次意图；{reason}",
+            context_summary=_full_paper_context_summary(project.title, rows),
             warnings=warnings,
-            generator=f"llm:{analysis.model or 'deepseek'}",
+            generator=f"llm:{analysis.model or 'unknown'}",
         )
 
     section_list = "\n".join(
@@ -305,53 +307,55 @@ async def draft_visual(
         else "No paper body is available yet."
     )
 
-    runner = LLMRunner(api_settings().llm_config())
-    if runner.enabled:
-        try:
-            result = await asyncio.wait_for(
-                runner.agenerate_json(
-                    "planner",
-                    system_prompt=_DRAFT_PROMPT,
-                    user_prompt=(
-                        f"Paper title: {project.title}\n"
-                        f"Requested kind: {selected_kind}\n"
-                        f"Target section: {target_key or 'unspecified'}\n"
-                        f"Paper context:\n{context}\n\n"
-                        f"What the author wants to show: {intent}"
+    async with accounted_runner(
+        session, api_settings().llm_config(), project_id=project_id
+    ) as runner:
+        if runner.enabled:
+            try:
+                result = await asyncio.wait_for(
+                    runner.agenerate_json(
+                        "planner",
+                        system_prompt=_DRAFT_PROMPT,
+                        user_prompt=(
+                            f"Paper title: {project.title}\n"
+                            f"Requested kind: {selected_kind}\n"
+                            f"Target section: {target_key or 'unspecified'}\n"
+                            f"Paper context:\n{context}\n\n"
+                            f"What the author wants to show: {intent}"
+                        ),
+                        max_output_tokens=1200,
+                        temperature=0.3,
+                        metadata={"stage": "visual_draft"},
                     ),
-                    max_output_tokens=1200,
-                    temperature=0.3,
-                    metadata={"stage": "visual_draft"},
-                ),
-                timeout=8,
-            )
-        except Exception:
-            result = None
-        if result is not None and result.ok and isinstance(result.value, dict):
-            drafted = _draft_from(
-                result.value,
-                selected_kind,
-                target_section_key=target_key,
-                suggested_block_index=suggested_block_index,
-                reason=reason,
-                context_summary=context_summary,
-                warnings=warnings,
-            )
-            if drafted is not None:
-                drafted.generator = f"llm:{result.model}"
-                return drafted
+                    timeout=8,
+                )
+            except Exception:
+                result = None
+            if result is not None and result.ok and isinstance(result.value, dict):
+                drafted = _draft_from(
+                    result.value,
+                    selected_kind,
+                    target_section_key=target_key,
+                    suggested_block_index=suggested_block_index,
+                    reason=reason,
+                    context_summary=context_summary,
+                    warnings=warnings,
+                )
+                if drafted is not None:
+                    drafted.generator = f"llm:{result.model}"
+                    return drafted
 
-    # 模型不可用时仍然给一份能提交的草稿——用户的意图原样落进描述里，
-    # 而不是把他弹回一张空表单。
-    return _deterministic_draft(
-        selected_kind,
-        intent,
-        target_section_key=target_key,
-        suggested_block_index=suggested_block_index,
-        reason=reason,
-        context_summary=context_summary,
-        warnings=[*warnings, "智能规格暂不可用，已提供可编辑的确定性草稿。"],
-    )
+        # 模型不可用时仍然给一份能提交的草稿——用户的意图原样落进描述里，
+        # 而不是把他弹回一张空表单。
+        return _deterministic_draft(
+            selected_kind,
+            intent,
+            target_section_key=target_key,
+            suggested_block_index=suggested_block_index,
+            reason=reason,
+            context_summary=context_summary,
+            warnings=[*warnings, "智能规格暂不可用，已提供可编辑的确定性草稿。"],
+        )
 
 
 def _draft_from(
@@ -645,24 +649,34 @@ def _section_excerpt(row: Any | None) -> str:
 
 
 def _full_paper_context(project_title: str, rows: list[Any]) -> str:
-    """把当前文稿完整交给 DeepSeek；不按章节数或字符数截断。"""
-    parts = [f"Paper title: {project_title}"]
-    if not rows:
-        parts.append("The paper body is currently empty.")
-        return "\n\n".join(parts)
-    for row in rows:
-        key = str(getattr(row, "section_key", "") or "")
-        title = str(getattr(row, "title", "") or key)
-        body = _section_excerpt(row)
-        parts.append(f"[{key}] {title}\n{body}")
-    return "\n\n".join(parts)
+    """Build the same section-balanced context used by background visual planning."""
+    from paperforge_worker.pipelines.image_prompt import build_paper_context
+
+    return build_paper_context(
+        project_title,
+        [
+            (
+                str(getattr(row, "section_key", "") or ""),
+                str(getattr(row, "title", "") or ""),
+                _section_excerpt(row),
+            )
+            for row in rows
+        ],
+    )
 
 
-def _full_paper_context_summary(rows: list[Any]) -> str:
+def _full_paper_context_summary(project_title: str, rows: list[Any]) -> str:
     if not rows:
-        return "DeepSeek 已读取当前项目题目；论文正文尚为空。"
-    characters = sum(len(_section_excerpt(row)) for row in rows)
-    return f"DeepSeek 已读取当前论文全部 {len(rows)} 个章节（约 {characters} 字符）。"
+        return "模型已读取当前项目题目；论文正文尚为空。"
+    source_characters = sum(len(_section_excerpt(row)) for row in rows)
+    context = _full_paper_context(project_title, rows)
+    sent_characters = len(context)
+    if "middle content omitted" not in context:
+        return f"模型已读取当前论文全部 {len(rows)} 个章节（约 {source_characters} 字符）。"
+    return (
+        f"模型已读取全部 {len(rows)} 个章节的均衡上下文"
+        f"（原文约 {source_characters} 字符，本次发送 {sent_characters} 字符）。"
+    )
 
 
 def _image_intent_from_spec(spec: dict[str, Any], fallback: str = "") -> str:
@@ -683,55 +697,58 @@ def _image_intent_from_spec(spec: dict[str, Any], fallback: str = "") -> str:
 
 async def _analyze_ai_spec(
     *,
+    session: AsyncSession,
+    project_id: uuid.UUID,
     project_title: str,
     rows: list[Any],
     user_intent: str,
     spec: dict[str, Any],
 ) -> tuple[AIImageSpec, Any]:
-    """强制通过 DeepSeek 全文分析；失败时阻止未润色提示词进入 Yunwu。"""
-    from llm_runtime import LLMRunner
+    """强制通过模型的论文上下文分析；失败时阻止未润色提示词进入 Yunwu。"""
     from paperforge_worker.pipelines.image_prompt import analyze_image_prompt
 
-    runner = LLMRunner(get_settings().llm_config())
-    analysis = await analyze_image_prompt(
-        user_intent=user_intent,
-        full_paper=_full_paper_context(project_title, rows),
-        runner=runner,
-        current_spec=spec,
-    )
-    if analysis is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "deepseek_image_prompt_failed",
-                "message": (
-                    "DeepSeek 未能完成论文全文分析，请稍后重试；"
-                    "系统不会把未分析的提示词直接发送给生图服务。"
-                ),
-            },
+    async with accounted_runner(
+        session, get_settings().llm_config(), project_id=project_id
+    ) as runner:
+        analysis = await analyze_image_prompt(
+            user_intent=user_intent,
+            full_paper=_full_paper_context(project_title, rows),
+            runner=runner,
+            current_spec=spec,
         )
-    payload = deepcopy(spec)
-    payload["prompt"] = analysis.prompt
-    payload["refined_prompt"] = analysis.prompt
-    payload.pop("prompt_override", None)
-    payload["quality"] = payload.get("quality") or "high"
-    payload["semantics"] = {
-        "subject": analysis.subject,
-        "composition": analysis.composition,
-        "elements": list(analysis.elements),
-        "text_policy": analysis.text_policy,
-        "aspect_ratio": "3:2",
-    }
-    try:
-        return AIImageSpec.model_validate(payload), analysis
-    except ValueError as error:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "deepseek_image_prompt_invalid",
-                "message": "DeepSeek 返回的生图规格未通过安全校验，请重试。",
-            },
-        ) from error
+        if analysis is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "image_prompt_analysis_failed",
+                    "message": (
+                        "模型未能完成论文上下文分析，请稍后重试；"
+                        "系统不会把未分析的提示词直接发送给生图服务。"
+                    ),
+                },
+            )
+        payload = deepcopy(spec)
+        payload["prompt"] = analysis.prompt
+        payload["refined_prompt"] = analysis.prompt
+        payload.pop("prompt_override", None)
+        payload["quality"] = payload.get("quality") or "high"
+        payload["semantics"] = {
+            "subject": analysis.subject,
+            "composition": analysis.composition,
+            "elements": list(analysis.elements),
+            "text_policy": analysis.text_policy,
+            "aspect_ratio": "3:2",
+        }
+        try:
+            return AIImageSpec.model_validate(payload), analysis
+        except ValueError as error:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "image_prompt_invalid",
+                    "message": "模型返回的生图规格未通过安全校验，请重试。",
+                },
+            ) from error
 
 
 def _context_summary(row: Any | None, excerpt: str) -> str:
@@ -777,7 +794,7 @@ async def create_visual_endpoint(
         target_section_key=request.target_section_key,
         suggested_block_index=request.suggested_block_index,
         document_version=document.version if document else None,
-        # 只有经过 DeepSeek 的提示词才能声明自己绑定了当前全文；未润色的直接
+        # 只有经过模型分析的提示词才能声明自己绑定了当前全文；未润色的直接
         # API 草稿会在生成前由 prepare 端点补分析。
         paper_snapshot_hash=snapshot
         if isinstance(spec, AIImageSpec) and spec.refined_prompt
@@ -810,6 +827,8 @@ async def update_visual_endpoint(
             document = await latest_document(session, project.id)
             rows = await list_sections(session, document.id) if document else []
             spec, analysis = await _analyze_ai_spec(
+                session=session,
+                project_id=project.id,
                 project_title=project.title,
                 rows=rows,
                 user_intent=_image_intent_from_spec(request.spec, visual.caption),
@@ -864,9 +883,9 @@ async def prepare_ai_generation(
     visual_id: str,
     session: SessionDep,
 ) -> VisualResponse:
-    """为旧草稿或正文已变化的草稿补做 DeepSeek 全文分析。
+    """为旧草稿或正文已变化的草稿补做论文上下文分析。
 
-    前端在打开付费确认框前调用；这样确认框里展示的已经是 DeepSeek 结合当前全文
+    前端在打开付费确认框前调用；这样确认框里展示的已经是模型结合当前分节上下文
     生成的最终提示词，而不是在用户确认以后再偷偷改写。
     """
     project = await _require_project(session, project_id)
@@ -890,6 +909,8 @@ async def prepare_ai_generation(
     )
     if not already_current:
         analyzed, analysis = await _analyze_ai_spec(
+            session=session,
+            project_id=project.id,
             project_title=project.title,
             rows=rows,
             user_intent=_image_intent_from_spec(visual.spec_json, visual.caption),
@@ -938,8 +959,8 @@ async def generate(
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": "ai_prompt_requires_deepseek",
-                    "message": "请先让 DeepSeek 结合当前论文全文生成最终提示词。",
+                    "code": "ai_prompt_requires_analysis",
+                    "message": "请先让模型结合当前论文全文生成最终提示词。",
                 },
             )
     visual.generation_status = "queued"
@@ -1095,6 +1116,8 @@ async def regenerate(
             else _image_intent_from_spec(payload, old.caption)
         )
         spec, analysis = await _analyze_ai_spec(
+            session=session,
+            project_id=project.id,
             project_title=project.title,
             rows=rows,
             user_intent=user_intent,

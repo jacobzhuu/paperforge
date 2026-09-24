@@ -27,7 +27,8 @@ RUN set -eu; \
 
 WORKDIR /app
 COPY services/texd/paperforge_texd /app/paperforge_texd
-RUN pip install --no-cache-dir "fastapi>=0.115" "uvicorn[standard]>=0.30"
+COPY packages/observability /app/packages/observability
+RUN pip install --no-cache-dir /app/packages/observability "fastapi>=0.115" "uvicorn[standard]>=0.30"
 
 # Build-time warmup. Toy documents are not enough: Tectonic caches per *file*,
 # so class options (size11.clo), packages, fonts and .bst files only land in the

@@ -320,7 +320,7 @@ function AIImageInspector({
     typeof spec.refined_prompt === 'string' ? spec.refined_prompt : '';
   // 描述一改，服务端润色出来的 refined_prompt 就配不上它了。删掉它，
   // 最终提示词退回可预测的拼接式版本——绝不能让确认框展示一句与描述无关的旧提示词。
-  // prompt_override 保留为用户本轮提交给 DeepSeek 的明确要求；后端会结合全文
+  // prompt_override 保留为用户本轮提交给模型的明确要求；后端会结合全文
   // 重新生成 refined_prompt，不会把这段未经分析的文字直接交给 Yunwu。
   const editStructured = (next: Record<string, unknown>) => {
     const { refined_prompt: _dropped, ...rest } = { ...spec, ...next };
@@ -462,7 +462,7 @@ function AIImageInspector({
       ) : null}
       <div className="space-y-2 rounded-md bg-muted/50 px-3 py-3">
         <div className="flex items-center justify-between gap-3">
-          <Label htmlFor={`${fieldId}-final-prompt`}>给 DeepSeek 的生图要求</Label>
+          <Label htmlFor={`${fieldId}-final-prompt`}>给模型的生图要求</Label>
           {hasPromptOverride ? (
             <Button type="button" variant="ghost" size="sm" onClick={resetFinalPrompt}>
               <RotateCcw /> 恢复自动同步
@@ -477,10 +477,10 @@ function AIImageInspector({
         />
         <p className="text-xs text-muted-foreground">
           {hasPromptOverride
-            ? '已记录本轮手动要求；保存后 DeepSeek 会结合论文全文重新生成最终提示词。'
+            ? '已记录本轮手动要求；保存后模型会结合论文全文重新生成最终提示词。'
             : refinedPrompt
-              ? '这里显示当前 DeepSeek 成品提示词；直接编辑可提出下一轮修改要求。'
-              : '当前与主题、构图、元素和风格同步；保存时会交给 DeepSeek 结合全文分析。'}
+              ? '这里显示当前的成品提示词；直接编辑可提出下一轮修改要求。'
+              : '当前与主题、构图、元素和风格同步；保存时会交给模型结合全文分析。'}
         </p>
       </div>
       <p className="text-xs text-muted-foreground">

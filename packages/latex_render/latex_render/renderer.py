@@ -4,6 +4,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from paper_ir.mathematics import valid_math
 from paper_ir.schema import (
     AlgorithmBlock,
     CiteRun,
@@ -33,6 +34,75 @@ _SECTION_CMD = {1: "section", 2: "subsection", 3: "subsubsection"}
 MAX_TABLE_ROWS_IN_PDF = 40
 MAX_TABLE_COLUMNS_IN_PDF = 8
 _TABLE_SOFT_BREAK_CHARS = frozenset(r"\/._-:;,+|=()[]{}")
+
+# 列宽分配。
+#
+# 此前的规则是「除第一列外一律等宽」，外加一条 `len(headers) == 4` 的硬编码
+# 布局。实测代价：一张 16 行 × 6 列的文献矩阵占了 **5 页**——等宽把
+# 0.117\linewidth（约 1.9cm）分给了「未报告」这种三个字的列，也分给了
+# 60 字的研究标题列，于是每一行都被撑成七八行高。
+#
+# 现在按各列的实际内容长度按比例分配：短列只拿够用的宽度，长列拿走剩下的。
+# `_TABLE_DEMAND_CAP` 让超长列不至于吞掉整张表（超过它的部分反正都要折行，
+# 多给宽度的边际收益很小）；上下限保证没有一列窄到连表头都排不下。
+_TABLE_DEMAND_CAP = 48.0
+# 下限 0.085\linewidth ≈ 1.36cm，刚好放得下 4 个 \footnotesize 汉字
+# （「未结构化」「证据等级」这类枚举值/表头恰好是这个长度）。取 0.07 时它们会
+# 断成「未结构 / 化」。
+_MIN_COLUMN_FRACTION = 0.085
+# `p{}` 宽度不含列间的 2\tabcolsep。渲染时把 \tabcolsep 显式压到 3pt
+# （宽表的通行做法），每个列间距因此是 6pt；\linewidth 在 A4 + 2.5cm 页边距
+# 下是 455pt，6/455 ≈ 0.0132，留 0.016 的余量。
+_TABLE_COLSEP_PT = 3
+_INTERCOLUMN_FRACTION = 0.016
+_TABLE_CONTENT_FRACTION = 0.98
+# 列数多的表格降一档字号：宽度压力随列数增长，\footnotesize 大约再省 20%。
+_WIDE_TABLE_COLUMNS = 5
+
+
+def _display_width(text: str) -> float:
+    """CJK 与全角标点按两个西文字符宽度计。"""
+    return sum(2.0 if ord(ch) > 0x2E7F else 1.0 for ch in text)
+
+
+def _column_fractions(headers: list[str], rows: list[Any]) -> list[float]:
+    r"""按内容长度给每列分配 ``\linewidth`` 的份额。
+
+    需求量取该列**第 85 百分位**的单元格宽度（而非最大值）：证据台账里偶尔
+    一条特别长的 locator 不该把整列撑宽，让其余几十行都变窄。
+    """
+    count = len(headers)
+    available = max(0.4, _TABLE_CONTENT_FRACTION - _INTERCOLUMN_FRACTION * (count - 1))
+    if count == 1:
+        return [available]
+    # 上限 = 其余各列都退到下限时剩下的宽度。用固定常数（曾是 0.34）会在窄表上
+    # 白白丢掉版面：两列表的两列都顶到 0.34，加起来只占了 0.68\linewidth。
+    ceiling = available - _MIN_COLUMN_FRACTION * (count - 1)
+
+    demands: list[float] = []
+    for index, header in enumerate(headers):
+        widths = sorted(_display_width(str(row[index])) for row in rows if index < len(row))
+        cell_demand = widths[min(len(widths) - 1, int(len(widths) * 0.85))] if widths else 0.0
+        demands.append(min(_TABLE_DEMAND_CAP, max(_display_width(header), cell_demand)))
+
+    total = sum(demands) or float(count)
+    fractions = [available * demand / total for demand in demands]
+
+    # 夹到上下限后，缺口/余量只在还没被夹住的列之间按比例调整——直接整体
+    # 归一化会把刚夹上的列又推回界外。
+    for _ in range(count):
+        free = [
+            index for index, value in enumerate(fractions) if _MIN_COLUMN_FRACTION < value < ceiling
+        ]
+        fractions = [min(ceiling, max(_MIN_COLUMN_FRACTION, value)) for value in fractions]
+        drift = available - sum(fractions)
+        if abs(drift) < 1e-4 or not free:
+            break
+        free_total = sum(fractions[index] for index in free)
+        for index in free:
+            fractions[index] += drift * fractions[index] / free_total
+    return fractions
+
 
 # 浮动体位置说明符。
 #
@@ -64,9 +134,13 @@ def _render_run(run: TextRun | CiteRun | GroundingRun | MathInlineRun | XRefRun)
     if isinstance(run, GroundingRun):
         return ""
     if isinstance(run, MathInlineRun):
+        if not valid_math(run.v):
+            raise ValueError("Invalid or unsafe inline mathematical expression")
         return f"${run.v}$"
     if isinstance(run, XRefRun):
-        return f"\\ref{{{latex_identifier(run.target, prefix='fig')}}}"
+        prefix = "eq" if run.kind == "equation" else "fig"
+        command = "eqref" if run.kind == "equation" else "ref"
+        return f"\\{command}{{{latex_identifier(run.target, prefix=prefix)}}}"
     return ""
 
 
@@ -78,6 +152,8 @@ def _render_block(
     if isinstance(block, ParagraphBlock):
         return "".join(_render_run(r) for r in block.runs)
     if isinstance(block, EquationBlock):
+        if not valid_math(block.latex):
+            raise ValueError("Invalid or unsafe mathematical expression")
         label = f"\n\\label{{{latex_identifier(block.label, prefix='eq')}}}" if block.label else ""
         return f"\\begin{{equation}}{label}\n{block.latex}\n\\end{{equation}}"
     if isinstance(block, FigureBlock):
@@ -188,10 +264,14 @@ def _render_table(
     caption = latex_escape(block.caption)
     label = f"\\label{{{latex_identifier(block.label, prefix='tab')}}}" if block.label else ""
     ref = block.source.ref or ""
-    asset = block.source.data if block.source.kind == "inline" else assets.get(ref)
-    asset = asset or {}
+    # ``TableSource.data`` 声明为 ``dict[str, object]``，直接取值会得到 ``object``，
+    # 既不可迭代也不可索引。表格素材本来就是无模式的 JSON，这里统一按
+    # ``Mapping[str, Any]`` 消费。
+    asset: Mapping[str, Any] = (
+        block.source.data if block.source.kind == "inline" else assets.get(ref)
+    ) or {}
     headers = [str(h) for h in (asset.get("headers") or [])][:MAX_TABLE_COLUMNS_IN_PDF]
-    rows = asset.get("rows") or []
+    rows: list[Any] = list(asset.get("rows") or [])
 
     if not headers or not rows:
         return (
@@ -200,30 +280,9 @@ def _render_table(
             f"  \\todo{{缺少表格素材：{latex_escape(ref or 'inline')}}}\n\\end{{table}}"
         )
 
-    if len(headers) == 1:
-        column_spec = "@{}p{0.94\\linewidth}@{}"
-        use_tabularx = False
-    elif len(headers) == 4:
-        # 文献矩阵常见的「研究/年份/方法/证据」布局：年份最窄、方法最宽，
-        # 避免等宽 p 列把方法描述挤成大量断行。
-        column_spec = (
-            "@{}p{0.270\\linewidth}p{0.100\\linewidth}p{0.340\\linewidth}p{0.210\\linewidth}@{}"
-        )
-        use_tabularx = False
-    else:
-        # ``p{}`` widths do not include the 2\tabcolsep inserted between
-        # columns.  Reserve ~3.5% of \linewidth per gap; the old 0.92 sum
-        # overflowed every six-column row by 20–35pt.
-        content_width = max(0.55, 0.96 - 0.035 * (len(headers) - 1))
-        first_width = min(0.28 if len(headers) <= 4 else 0.2, content_width * 0.30)
-        other_width = (content_width - first_width) / max(1, len(headers) - 1)
-        column_spec = (
-            f"@{{}}p{{{first_width:.3f}\\linewidth}}"
-            + "".join(f"p{{{other_width:.3f}\\linewidth}}" for _ in headers[1:])
-            + "@{}"
-        )
-        # Wide twocolumn tables prefer tabularx so leftover width is shared (N6).
-        use_tabularx = len(headers) > 4
+    fractions = _column_fractions(headers, rows)
+    column_spec = "@{}" + "".join(f"p{{{value:.3f}\\linewidth}}" for value in fractions) + "@{}"
+    body_size = "\\footnotesize" if len(headers) >= _WIDE_TABLE_COLUMNS else "\\small"
     header_row = (
         "    "
         + " & ".join(f"{{\\raggedright\\bfseries {_escape_table_cell(h)}\\par}}" for h in headers)
@@ -247,7 +306,8 @@ def _render_table(
     if not twocolumn:
         lines = [
             "\\begingroup",
-            "  \\small",
+            f"  {body_size}",
+            f"  \\setlength{{\\tabcolsep}}{{{_TABLE_COLSEP_PT}pt}}",
             f"  \\begin{{longtable}}{{{column_spec}}}",
             f"    \\caption{{{caption}}}{label} \\\\",
             "    \\toprule",
@@ -269,18 +329,31 @@ def _render_table(
         return "\n".join(lines)
 
     # IEEE 双栏模式不支持 longtable；保留单栏内的表格浮动体行为。
-    # Wide tables use tabularx so columns share leftover width.
-    if use_tabularx:
-        x_spec = "@{}" + "X" * len(headers) + "@{}"
-        begin_env = f"  \\begin{{tabularx}}{{\\linewidth}}{{{x_spec}}}"
-        end_env = "  \\end{tabularx}"
-    else:
-        begin_env = f"  \\begin{{tabular}}{{{column_spec}}}"
-        end_env = "  \\end{tabular}"
+    #
+    # 这里曾对 5 列以上的表改用 `tabularx`——但 **没有任何模板加载 tabularx**
+    # （见 templates/*.tex.j2 与 warmup/*.tex），运行时必然
+    # `Environment tabularx undefined` 而编译失败。它当初的用意是「让各列分享
+    # 剩余宽度」，而 `_column_fractions` 现在已经按内容把宽度分完了，
+    # 普通 `tabular` 就够。
+    begin_env = f"  \\begin{{tabular}}{{{column_spec}}}"
+    end_env = "  \\end{tabular}"
+    # 列多的表在 IEEE 单栏里放不下：正文栏宽只有 ~8.8cm，六列平均下来每列不到
+    # 1.5cm，实测每页几十个 Overfull hbox。跨栏浮动体是 LaTeX 给这种表准备的
+    # 出口（栏宽 8.8cm → 版心 17.8cm），而且 `\linewidth` 在 `table*` 里就等于
+    # `\textwidth`，上面按 `\linewidth` 算出的列宽不用改。
+    #
+    # 图片刻意**不**走这条路（见 `_float_env`：带星浮动体只能上页顶或浮动页，
+    # 会漂到文末）。但一张单栏放不下的表根本没有别的选择：不跨栏就是溢出版心。
+    environment, placement = (
+        ("table*", _DOUBLE_FLOAT_PLACEMENT)
+        if len(headers) >= _WIDE_TABLE_COLUMNS
+        else ("table", FLOAT_PLACEMENT)
+    )
     lines = [
-        f"\\begin{{table}}[{FLOAT_PLACEMENT}]",
+        f"\\begin{{{environment}}}[{placement}]",
         "  \\centering",
-        "  \\small",
+        f"  {body_size}",
+        f"  \\setlength{{\\tabcolsep}}{{{_TABLE_COLSEP_PT}pt}}",
         f"  \\caption{{{caption}}}{label}",
         begin_env,
         "    \\toprule",
@@ -289,7 +362,7 @@ def _render_table(
         *row_lines,
         "    \\bottomrule",
         end_env,
-        "\\end{table}",
+        f"\\end{{{environment}}}",
     ]
     if len(rows) > MAX_TABLE_ROWS_IN_PDF:
         lines.insert(

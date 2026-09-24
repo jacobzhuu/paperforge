@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import socket
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urljoin, urlsplit
@@ -107,6 +108,10 @@ class SafeHttpClient:
         self._client = client
         self._owns_client = client is None
         self.trust_env_proxy = trust_env_proxy
+        # 懒初始化必须加锁：OA 全文抓取现在按文献并发（线程池），两个线程同时撞上
+        # 空的 `_client` 会各建一个 httpx.Client，其中一个永远不会被 close() 回收。
+        # httpx.Client 本身对并发请求是安全的，不安全的只有这段构造。
+        self._client_lock = threading.Lock()
 
     def __enter__(self) -> SafeHttpClient:
         return self
@@ -122,11 +127,13 @@ class SafeHttpClient:
     @property
     def client(self) -> httpx.Client:
         if self._client is None:
-            self._client = httpx.Client(
-                follow_redirects=False,
-                trust_env=self.trust_env_proxy,
-                timeout=self.timeout_seconds,
-            )
+            with self._client_lock:
+                if self._client is None:
+                    self._client = httpx.Client(
+                        follow_redirects=False,
+                        trust_env=self.trust_env_proxy,
+                        timeout=self.timeout_seconds,
+                    )
         return self._client
 
     def fetch(self, url: str, *, accept: str | None = None) -> HttpFetchResult:

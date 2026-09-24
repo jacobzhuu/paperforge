@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -109,10 +110,14 @@ class OpenAICompatibleLLMProvider:
             ),
             "temperature": request.temperature,
         }
+        if request.messages is not None:
+            payload["messages"] = request.messages
+        if request.tools:
+            payload["tools"] = request.tools
         if request.json_output:
             payload["response_format"] = {"type": "json_object"}
-        if request.thinking_mode in {"enabled", "disabled"} and _is_deepseek_v4(model_name):
-            payload["thinking"] = {"type": request.thinking_mode}
+        if request.thinking_mode in {"enabled", "disabled"}:
+            _apply_thinking_controls(payload, model_name, request.thinking_mode)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -163,12 +168,35 @@ class OpenAICompatibleLLMProvider:
         delay += random.uniform(0.0, delay * 0.25)
         time.sleep(delay)
 
-    def _post_chat_completions(
+    def _post_chat_completions(self, *, payload, headers):
+        # Gate actual HTTP attempts, including sync export/preflight callers.
+        # The calling HTTP thread owns the lease until the attempt returns.
+        from types import SimpleNamespace
+
+        from llm_runtime.limits import provider_slot
+
+        with provider_slot(
+            SimpleNamespace(
+                provider=self.name,
+                base_url=self.base_url,
+                api_key=self.api_key,
+            )
+        ):
+            return self._post_chat_completions_admitted(payload=payload, headers=headers)
+
+    def _post_chat_completions_admitted(
         self,
         *,
         payload: dict[str, Any],
         headers: dict[str, str],
     ) -> httpx.Response:
+        from llm_runtime.limits import reserve_attempt
+
+        reserve_attempt(self, payload)
+        from llm_runtime.telemetry import admission_event, check_admission_cancelled
+
+        check_admission_cancelled()
+        admission_event("http_attempt_started")
         try:
             if self.client is not None:
                 return self._send_with_deadline(
@@ -210,6 +238,8 @@ class OpenAICompatibleLLMProvider:
                 message=_sanitize_message(str(error), self.api_key),
                 retryable=True,
             ) from error
+        finally:
+            admission_event("http_attempt_finished")
 
     def _send_with_deadline(
         self,
@@ -257,12 +287,15 @@ class OpenAICompatibleLLMProvider:
 
     def _parse_response(self, response: httpx.Response) -> LLMResponse:
         if response.status_code >= 400:
-            error_code, retryable = _classify_http_status(response.status_code)
+            # 分类要看正文，不只看状态码：服务商用来表达「余额耗尽」的状态码并不统一
+            # （DeepSeek 用 402，也有用 429 的），而措辞是稳定的。
+            message = _sanitize_message(_error_message(response), self.api_key)
+            error_code, retryable = _classify_http_status(response.status_code, message)
             raise LLMError(
                 provider=self.name,
                 error_code=error_code,
                 status_code=response.status_code,
-                message=_sanitize_message(_error_message(response), self.api_key),
+                message=message,
                 retryable=retryable,
             )
 
@@ -306,7 +339,10 @@ class OpenAICompatibleLLMProvider:
             )
         message = first_choice.get("message")
         text = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(text, str) or not text.strip():
+        tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+        if tool_calls and isinstance(tool_calls, list):
+            text = text if isinstance(text, str) else ""
+        if not tool_calls and (not isinstance(text, str) or not text.strip()):
             # 推理型模型（deepseek-v4-*、o 系列等）把思维链算进 max_tokens：
             # 预算被推理吃光时 content 会是空的。这与「响应结构非法」是两回事——
             # 前者加预算重试就能救，因此给出独立的 error_code。
@@ -322,21 +358,30 @@ class OpenAICompatibleLLMProvider:
                         "(reasoning models spend the same budget on thinking)."
                     ),
                     # Repeating the same max_tokens budget deterministically
-                    # truncates again.  Let LLMRunner double the budget once
-                    # instead of spending provider retries on identical calls.
+                    # truncates again, so provider-level retries are pure waste.
+                    # LLMRunner owns the only useful response — raising the
+                    # budget — and skips even that when the model ceiling is
+                    # already reached.
                     retryable=False,
+                    finish_reason=str(finish_reason) if finish_reason else None,
                 )
+            # 结构合法、正常终止、却一个 content 块都没有：这是服务商偶发的退化
+            # 完成，不是「响应结构非法」。这次尝试没有产生任何持久副作用，重复它
+            # 是安全的，所以标 retryable——`_parse_response` 在下面的重试循环内部，
+            # 翻转这个 flag 就直接拿到已有的指数退避 + 抖动。
             raise LLMError(
                 provider=self.name,
-                error_code="invalid_response",
+                error_code="empty_response",
                 status_code=response.status_code,
-                message="LLM response did not include message content.",
-                retryable=False,
+                message="LLM completed normally but returned no content.",
+                retryable=True,
+                finish_reason=str(finish_reason) if finish_reason else None,
             )
 
         usage = payload.get("usage")
         return LLMResponse(
             text=text,
+            tool_calls=tool_calls,
             model=str(payload.get("model") or self.model),
             provider=self.name,
             usage=usage if isinstance(usage, dict) else None,
@@ -349,7 +394,42 @@ class OpenAICompatibleLLMProvider:
         )
 
 
-def _classify_http_status(status_code: int) -> tuple[str, bool]:
+#: 账户余额或配额耗尽。与 ``rate_limited`` 是两件事：限流等一会儿就好，余额耗尽
+#: 在有人去充值之前，重试多少次都是同一个回答。也与 ``auth_error`` 不同——凭证是
+#: 好的，只是没钱了，修法是充值而不是换 key。
+QUOTA_EXHAUSTED = "quota_exhausted"
+
+#: 服务商表达「没钱了 / 配额用完了」的措辞。状态码不统一（DeepSeek 余额不足返回
+#: 402，另一些返回 429），措辞反而稳定，所以两个信号都认。
+_QUOTA_PHRASES = re.compile(
+    r"insufficient\s+(?:balance|quota|credits?|funds?)"
+    r"|(?:quota|usage\s+limit)\s+(?:exceeded|exhausted|reached)"
+    r"|exceed(?:ed|s)?\s+(?:(?:your|the)\s+)?(?:current\s+)?quota"
+    r"|(?:balance|credits?)\s+(?:(?:are|is|have|has)\s+(?:been\s+)?)?(?:exhausted|depleted)"
+    r"|out\s+of\s+(?:credits?|budget)"
+    r"|billing\s+(?:hard\s+)?limit"
+    r"|余额不足|额度不足|配额不足|欠费",
+    re.IGNORECASE,
+)
+
+
+def is_quota_exhausted(status_code: int | None, detail: str = "") -> bool:
+    """这次失败是不是「账户没钱 / 配额用完」。
+
+    :param status_code: HTTP 状态码；402 Payment Required 本身就够定性。
+    :param detail: 服务商返回的错误正文（已脱敏）。
+    :returns: 判定结果。
+    """
+    if status_code == 402:
+        return True
+    return bool(_QUOTA_PHRASES.search(detail or ""))
+
+
+def _classify_http_status(status_code: int, detail: str = "") -> tuple[str, bool]:
+    # 余额判定放在最前：一个正文写着 "Insufficient Balance" 的 429 是余额耗尽，
+    # 不是限流，把它当限流去重试只会一直撞同一堵墙。
+    if is_quota_exhausted(status_code, detail):
+        return QUOTA_EXHAUSTED, False
     if status_code in {401, 403}:
         return "auth_error", False
     if status_code == 429:
@@ -361,6 +441,53 @@ def _classify_http_status(status_code: int) -> tuple[str, bool]:
 
 def _is_deepseek_v4(model: str) -> bool:
     return model.strip().lower().startswith("deepseek-v4-")
+
+
+def _is_glm_5(model: str) -> bool:
+    """GLM-5 系整体（glm-5.2 / glm-5.3 / glm-5.3-flash …）。"""
+    return model.strip().lower().startswith("glm-5")
+
+
+def _is_glm_5_3(model: str) -> bool:
+    """GLM-5.3 系（``glm-5.3`` / ``glm-5.3-flash`` 及其带日期的快照）。
+
+    与系内更早的版本分开判定：思考开关的契约在 5.3 这一代变了，见
+    ``_apply_thinking_controls()``。
+    """
+    return model.strip().lower().startswith("glm-5.3")
+
+
+def _apply_thinking_controls(payload: dict[str, Any], model: str, thinking_mode: str) -> None:
+    """把角色的 enabled/disabled 档位翻译成**这个服务商实际接受的**参数。
+
+    每家把「少想一点」放在不同的键上，而传错的键不会报错——它会被静默忽略。
+    于是一份用生产截断数据调出来的思考策略，会在换模型那天悄无声息地失效，
+    表现为「新模型质量莫名其妙变差」而不是一个配置错误。
+    """
+    if _is_deepseek_v4(model):
+        payload["thinking"] = {"type": thinking_mode}
+        return
+    if _is_glm_5_3(model):
+        # GLM-5.3 起**不再支持关闭思考**：官方文档写明 `thinking.type` 传 `disabled`
+        # 会报错，且 `reasoning_effort` 在这一代只接受 `max` / `high` / `low`——
+        # 5.2 上可用的 `none` / `minimal` 在 5.3 上同样报错。于是有两个陷阱：
+        #   照搬 deepseek 的 {"type": "disabled"} → 请求被服务商拒绝；
+        #   什么都不传          → 每个角色都跑在**默认的 max** 推理档上，而那正是
+        #                        DEFAULT_ROLE_THINKING 里那批 "disabled" 用生产
+        #                        截断数据（writer 21 次调用 11 次零内容返回）
+        #                        换来的、要极力避开的档位。
+        # 所以这里降档而不是关闭：low 是这一代给出的、最接近「别把输出预算烧在
+        # 推理上」的**合法**档位。
+        payload["thinking"] = {"type": "enabled"}
+        payload["reasoning_effort"] = "low" if thinking_mode == "disabled" else "max"
+        return
+    if _is_glm_5(model):
+        # GLM-5.2 及更早：`thinking.type` 仍然接受 `disabled`，形状与 deepseek 相同。
+        # **不要**把这个分支并进上面那个：在 5.2 上 `disabled` 是真的关掉推理，翻成
+        # `reasoning_effort=low` 只会让它继续拿输出预算去想。
+        payload["thinking"] = {"type": thinking_mode}
+        return
+    # 其余服务商未声明思考开关：不传，保持其默认档位。
 
 
 def sanitize_openai_compatible_base_url(base_url: str) -> str:
@@ -385,6 +512,11 @@ _MODEL_MAX_OUTPUT_TOKENS_CAPS: dict[str, int] = {
     "gpt-4.1": 32768,
     "gpt-4.1-mini": 32768,
     "o4-mini": 100000,
+    # 官方文档：单次最大输出 128K，请求参数 `max_tokens` 上限 131072。这里取一半
+    # （65536）而不是顶格：本管线最大的一次请求是 writer 的 16000，截断重试加倍到
+    # 32000 也还在这个数以下，所以保守取值不损失任何一次重试的余量。
+    "glm-5.3": 65536,
+    "glm-5.3-flash": 65536,
 }
 
 
@@ -406,6 +538,10 @@ def clamp_max_output_tokens(requested: int, *, model: str | None) -> int:
         cap = 16384
     elif model_key not in _MODEL_MAX_OUTPUT_TOKENS_CAPS and model_key.startswith("deepseek"):
         cap = 8192
+    elif model_key not in _MODEL_MAX_OUTPUT_TOKENS_CAPS and model_key.startswith("glm-5"):
+        # 未列名的 GLM-5 快照不该掉回 8192：那个上限是 deepseek 的，套在 GLM 上
+        # 会让截断重试策略误判「加预算没余量」而直接放弃重试。
+        cap = 65536
     return min(value, cap)
 
 

@@ -20,13 +20,15 @@ from db import (
     upsert_question_synthesis,
 )
 
-from paperforge_worker.context import JobContext, JobStopped
+from paperforge_worker.concurrency import bounded_map
+from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.synthesis_llm import (
     CORE_DIMENSIONS,
     FULLTEXT_GRADES,
     QuestionSynthesisResult,
     bundle_fingerprint,
     should_synthesize,
+    synthesis_policy,
     synthesize_bundle,
 )
 
@@ -157,6 +159,24 @@ async def load_synthesis_bundles(context: JobContext) -> SynthesisOutcome:
     return outcome
 
 
+async def _bind_synthesis_policy(context: JobContext, outcome: SynthesisOutcome) -> None:
+    async with context.session() as session:
+        project = await get_project(session, context.project_id)
+        specs = await list_project_task_specs(
+            session,
+            context.project_id,
+            fallback=context.settings.task_profile_fallback,
+        )
+    dimensions = frozenset(str(v).casefold() for spec in specs for v in spec.dimensions)
+    policy = synthesis_policy(
+        model=context.settings.llm_config().model_for_role("synthesizer"),
+        language=str(getattr(project, "language", "en") or "en"),
+        dimensions=dimensions | frozenset(CORE_DIMENSIONS),
+    )
+    for bundle in outcome.bundles:
+        bundle["_synthesis_policy"] = policy
+
+
 async def _attach_persisted_synthesis(context: JobContext, outcome: SynthesisOutcome) -> None:
     """把已存在的综合挂回 bundle。纯读，不会产生任何调用。
 
@@ -165,9 +185,8 @@ async def _attach_persisted_synthesis(context: JobContext, outcome: SynthesisOut
     """
     if not context.settings.synthesis_llm_enabled:
         return
-    fingerprints = {
-        bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles
-    }
+    await _bind_synthesis_policy(context, outcome)
+    fingerprints = {bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles}
     for bundle in outcome.bundles:
         bundle["synthesis"] = None
     if not fingerprints:
@@ -203,9 +222,8 @@ async def enrich_with_synthesis(context: JobContext, outcome: SynthesisOutcome) 
     """
     if not context.settings.synthesis_llm_enabled or not outcome.bundles:
         return
-    fingerprints = {
-        bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles
-    }
+    await _bind_synthesis_policy(context, outcome)
+    fingerprints = {bundle["question_id"]: bundle_fingerprint(bundle) for bundle in outcome.bundles}
 
     async with context.session() as session:
         project = await get_project(session, context.project_id)
@@ -230,6 +248,12 @@ async def enrich_with_synthesis(context: JobContext, outcome: SynthesisOutcome) 
     budget = max(0, int(context.settings.synthesis_llm_max_questions))
     language = str(getattr(project, "language", "en") or "en")
 
+    # 复用判定、should_synthesize、预算切分**都不依赖 LLM 结果**，所以先按串行的
+    # 原顺序把该跑的挑出来，再并发跑。选中的是同一批 bundle、同一个预算切法，
+    # 计数器也在这一趟按原顺序累加——并发只改变这些调用什么时候发出。
+    #
+    # 实测（job 1b6ba10a）：18 次 synthesizer 调用、6.1 分钟，全部首尾相接。
+    selected: list[dict[str, Any]] = []
     for bundle in outcome.bundles:
         if (bundle["question_id"], fingerprints[bundle["question_id"]]) in stored:
             outcome.synthesis_reused += 1
@@ -241,23 +265,37 @@ async def enrich_with_synthesis(context: JobContext, outcome: SynthesisOutcome) 
             outcome.synthesis_skipped += 1
             continue
         budget -= 1
-        await context.raise_if_stopped()
-        try:
-            result = await synthesize_bundle(
-                bundle=bundle,
-                runner=runner,
-                allowed_dimensions=dimensions,
-                language=language,
-            )
-        except JobStopped:
-            raise
-        except Exception:  # noqa: BLE001 - 综合是增补，失败绝不能拖垮 SYNTH 阶段
+        selected.append(bundle)
+    if not selected:
+        return
+
+    async def _synthesize_one(bundle: dict[str, Any]) -> Any:
+        return await synthesize_bundle(
+            bundle=bundle,
+            runner=runner,
+            allowed_dimensions=dimensions,
+            language=language,
+        )
+
+    async def _persist_one(_index: int, bundle: dict[str, Any], result: Any) -> None:
+        if isinstance(result, BaseException):
+            # 综合是增补，失败绝不能拖垮 SYNTH 阶段。
             context.warn("synth", "llm_call_failed", {"question_id": bundle["question_id"]})
-            continue
+            return
         if result is None:
             outcome.synthesis_skipped += 1
-            continue
+            return
         await _persist_synthesis(context, bundle=bundle, result=result, outcome=outcome)
+
+    # 落库与计数只在 on_ready 里做，按输入序串行——`_persist_synthesis` 要占一条
+    # 数据库连接，并发落库既会打乱顺序也会吃池子。
+    await bounded_map(
+        selected,
+        _synthesize_one,
+        limit=context.settings.synthesis_concurrency,
+        on_ready=_persist_one,
+        stop_check=context.raise_if_stopped,
+    )
 
 
 async def _persist_synthesis(
@@ -343,6 +381,9 @@ def _synthesize_bundle(
             "confidence": link.confidence,
             "measurements": measurement_rows,
         }
+        from paperforge_worker.pipelines.scholarly_content import enrich_evidence
+
+        row = enrich_evidence(row)
         evidence_rows.append(row)
         eligible_count += int(unit.grade in FULLTEXT_GRADES)
         if unit.grade in FULLTEXT_GRADES:

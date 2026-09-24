@@ -9,6 +9,15 @@
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{xcolor}
+%% IEEE 模板**不需要** natbib——它下面的 `\bibliographystyle` 是写死的
+%% `IEEEtran`，不走模板的 bibstyle 槽位（IEEE 投稿一律编号引用，这是格式要求，
+%% 不随项目的 citation_style 变化）。IEEEtran.bst 产出的是无标签 `\bibitem`，
+%% `cite` 宏包排出的就是 [1]、[2]--[4]，正确且是 IEEE 推荐组合。
+%%
+%% 反过来在这里加 natbib 会直接编译失败：实测 `ieeetran × author_year` 报
+%% `Package natbib Error: Bibliography not compatible with author-year citations`
+%% ——natbib 处于作者-年份模式，而 .bbl 里根本没有作者-年份元数据。
+%% article 模板的情况不同：它确实按 citation_style 切换 .bst，所以必须配 natbib。
 \usepackage{cite}
 {% if language == 'zh' %}\usepackage{ctex}{% endif %}
 

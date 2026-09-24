@@ -172,7 +172,17 @@ async def acquire_fulltexts(
             outcome.coverage = outcome.reused / selected_count if selected_count else 0.0
             await context.emit("ingest.fulltext", outcome.to_payload(), stage="ingest")
             return outcome, texts
-        result = await asyncio.to_thread(acquire_oa_fulltext, plan, http_client=http)
+        # 进线程池之前先把懒建的 httpx.Client 摸出来：`SafeHttpClient.client` 内部
+        # 虽然已经加了锁，但在这里预热一次可以让所有抓取线程共用同一条连接池，
+        # 少一次锁竞争，也让「这个客户端是谁建的」在时序上不含糊。
+        _ = http.client
+        result = await asyncio.to_thread(
+            acquire_oa_fulltext,
+            plan,
+            http_client=http,
+            concurrency=context.settings.fulltext_download_concurrency,
+            per_host_concurrency=context.settings.fulltext_per_host_concurrency,
+        )
     finally:
         http.close()
 
@@ -311,7 +321,7 @@ async def _persist_one_document(
         outcome.parsed += 1
 
 
-PARSER_VERSION = "ingest_fulltext_v2"
+PARSER_VERSION = "ingest_fulltext_v3_math"
 
 
 async def parse_document_file(
@@ -699,12 +709,15 @@ def _coerce_uuid(value: Any):
 def _located_chunk_text(chunk: Any, metadata: dict[str, Any]) -> str:
     """把可靠页码/章节标记注入全文上下文，供证据锚点确定性回存。"""
     chunk_metadata = dict(chunk.metadata or {})
-    start = int(chunk_metadata.get("char_start") or 0)
+    raw_start = chunk_metadata.get("char_start")
+    start = raw_start if isinstance(raw_start, int) else None
+    # 段落匹配沿用旧语义（缺失当 0），但发标记时要能分辨「没有」和「第 0 个字符」。
+    segment_start = start or 0
     segments = metadata.get("structure_segments") or []
     matching = [
         segment
         for segment in segments
-        if int(segment.get("char_start") or 0) <= start < int(segment.get("char_end") or 0)
+        if int(segment.get("char_start") or 0) <= segment_start < int(segment.get("char_end") or 0)
     ]
     located: dict[str, Any] = {
         key: value
@@ -739,5 +752,12 @@ def _located_chunk_text(chunk: Any, metadata: dict[str, Any]) -> str:
         }.get(kind.casefold())
         if marker_name and value:
             markers.append(f"{marker_name}={value[:64]}")
+    # 精确字符区间。解析器算出来了（27,451 个 chunk 全部有值），但它此前从没被
+    # 放进标记里，于是 evidence_unit.char_start/char_end 一行都没有过。
+    # 放的是**原文档内的绝对偏移**，不是拼接后字符串里的位置——所以
+    # `sanitize_pg_text` 截断全文时它仍然有效。
+    end = chunk_metadata.get("char_end")
+    if isinstance(start, int) and isinstance(end, int) and end > start:
+        markers.append(f"CHAR={start}-{end}")
     prefix = f"[[{' | '.join(markers)}]]\n" if markers else ""
     return prefix + chunk.text

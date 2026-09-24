@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from uuid import uuid4
 
+from llm_runtime.runner import JsonResult
 from paperforge_worker.pipelines.qmatrix import (
     MAX_COMPARABILITY_BRIDGE,
+    _classify_question,
     _deterministic_links,
     _diverse_ranked_candidates,
     _link_set_score,
@@ -153,6 +155,14 @@ def test_synthesis_detects_conflict_only_within_same_comparability_key():
 # 的词一个都对不上。可比簇因此只能靠巧合形成。
 
 
+#: 这一组用例测的是**可比簇桥接**，不是全局候选上限。它们的 filler 数量原本是
+#: 按 `MAX_CANDIDATES_PER_QUESTION` 的当时取值（24）配的：多出来的那条表格证据
+#: 要落在词面名额之外，才能证明只有桥接能把它捞进来。把上限调到 48 之后它自己
+#: 就挤进来了，六个用例一起失败——不是产品回归，是用例隐式耦合了一个可调参数。
+#: 显式钉住，这些用例从此与该常量无关。
+_LEXICAL_LIMIT = 24
+
+
 def _measurement(key: str, *, metric: str = "NDCG@10"):
     return SimpleNamespace(
         comparability_key=key, metric_name=metric, dataset="Beauty", split="test"
@@ -173,6 +183,7 @@ def test_a_comparable_sibling_is_pulled_into_the_candidate_pool():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, table),
         measurements={anchor.id: [_measurement("k1")], table.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert any(item[0] is table for item in selected)
@@ -185,7 +196,9 @@ def test_without_measurements_the_same_table_stays_out():
     filler = [_unit(text=f"filler {index}") for index in range(30)]
     table = _unit(text="Table 4 | 0.4471")
 
-    selected = _diverse_ranked_candidates(_ranked(anchor, *filler, table))
+    selected = _diverse_ranked_candidates(
+        _ranked(anchor, *filler, table), limit=_LEXICAL_LIMIT
+    )
 
     assert not any(item[0] is table for item in selected)
 
@@ -198,6 +211,7 @@ def test_a_different_comparability_key_does_not_bridge():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, other),
         measurements={anchor.id: [_measurement("k1")], other.id: [_measurement("k2")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is other for item in selected)
@@ -218,6 +232,7 @@ def test_a_salted_key_can_never_bridge():
             anchor.id: [_measurement(f"unknown:{anchor.id}")],
             table.id: [_measurement(f"unknown:{table.id}")],
         },
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is table for item in selected)
@@ -232,6 +247,7 @@ def test_an_abstract_only_sibling_is_not_bridged():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, weak),
         measurements={anchor.id: [_measurement("k1")], weak.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is weak for item in selected)
@@ -248,6 +264,7 @@ def test_a_cluster_inside_one_paper_does_not_bridge():
     selected = _diverse_ranked_candidates(
         _ranked(*filler, a, b),
         measurements={a.id: [_measurement("k1")], b.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert not any(item[0] is a or item[0] is b for item in selected)
@@ -262,6 +279,7 @@ def test_a_cross_paper_cluster_bridges_even_with_no_selected_anchor():
     selected = _diverse_ranked_candidates(
         _ranked(*filler, a, b),
         measurements={a.id: [_measurement("k1")], b.id: [_measurement("k1")]},
+        limit=_LEXICAL_LIMIT,
     )
 
     assert any(item[0] is a for item in selected)
@@ -279,8 +297,130 @@ def test_the_bridge_is_bounded_and_respects_the_per_work_cap():
     selected = _diverse_ranked_candidates(
         _ranked(anchor, *filler, *siblings),
         measurements=measurements,
+        limit=_LEXICAL_LIMIT,
     )
 
     bridged = [item for item in selected if any(item[0] is unit for unit in siblings)]
     assert len(bridged) <= MAX_COMPARABILITY_BRIDGE
     assert len({id(item[0].work_id) for item in bridged}) == len(bridged)
+
+
+class _ScriptedRunner:
+    """Returns a queued JsonResult per call and records which role was asked."""
+
+    enabled = True
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.roles: list[str] = []
+
+    def model_for(self, role: str) -> str:
+        return "stub-model"
+
+    async def agenerate_json(self, role, **_kwargs):
+        self.roles.append(role)
+        return self._results.pop(0)
+
+
+def _question(text: str):
+    return SimpleNamespace(
+        id=uuid4(),
+        text=text,
+        expected_evidence_kinds_json=["experimental_fact"],
+        task_id=None,
+    )
+
+
+async def test_a_truncated_classifier_is_retried_instead_of_degrading_to_lexical_links():
+    """The common failure was skipping the retry: `ok` is False on truncation, and the old gate
+    required a valid payload, so 31 of 65 production calls fell straight to `_deterministic_links`
+    — which stamps stance="supports" on everything and leaves synthesis nothing to disagree with.
+    """
+    unit = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [
+            # First pass truncated: value is None, so `ok` is False.
+            JsonResult(value=None, error="output_truncated"),
+            JsonResult(
+                value={
+                    "links": [
+                        {"evidence_id": str(unit.id), "stance": "contradicts", "confidence": 0.72}
+                    ]
+                }
+            ),
+        ]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[unit],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+    )
+
+    assert runner.roles == ["evidence_classifier", "evidence_classifier_fallback"]
+    # The recovered semantic judgement must survive: `_deterministic_links` would have
+    # overwritten it with stance="supports" if the fallback flag were not consulted.
+    assert [link["stance"] for link in result.classified] == ["contradicts"]
+    assert result.llm_classified == 1
+    assert result.fallback_classified == 0
+    assert result.diagnostic["fallback_classifier_used"] is True
+
+
+async def test_a_truncated_classifier_still_degrades_to_lexical_when_the_retry_also_fails():
+    """Degrade-never-block: two failed passes must still produce the deterministic links."""
+    unit = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [
+            JsonResult(value=None, error="output_truncated"),
+            JsonResult(value=None, error="output_truncated"),
+        ]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[unit],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+    )
+
+    assert runner.roles == ["evidence_classifier", "evidence_classifier_fallback"]
+    assert [link["stance"] for link in result.classified] == ["supports"]
+    assert result.llm_classified == 0
+    assert result.fallback_classified == 1
+
+
+async def test_deepening_shows_the_classifier_evidence_it_has_never_seen():
+    """「证据薄」不等于「没检索到」。
+
+    实测（项目 ff6b9983，2026-08-19 首轮全流程）：库里抽出 848 条证据单元，每个子问题
+    只看排名前 24 条（MAX_CANDIDATES_PER_QUESTION），5 个问题合计 120 条进分类器、最终
+    挂上 26 条——97% 的证据从没被任何问题看过一眼。这种情况下补检索买回来的新文献照样
+    挤不进那 24 个位置。加挂模式把已经挂上的单元从池子里拿掉，第二梯队才有机会被看见。
+    """
+    linked = _unit(text="On MovieLens the poisoning attack reduces HR@20 by 12 points.")
+    unseen = _unit(text="A second MovieLens poisoning study reports HR@20 recovery after defence.")
+    question = _question("How does poisoning affect recommendation metrics on MovieLens?")
+    runner = _ScriptedRunner(
+        [JsonResult(value={"links": [{"evidence_id": str(unseen.id), "stance": "supports"}]})]
+    )
+
+    result = await _classify_question(
+        question,
+        evidence=[linked, unseen],
+        measurements={},
+        work_context={},
+        runner=runner,
+        language="en",
+        exclude_unit_ids={linked.id},
+    )
+
+    assert [str(link["evidence_id"]) for link in result.classified] == [str(unseen.id)]
+    # 已挂的那条必须彻底离开候选池：留着它只会再占一个名额，加挂就白做了。
+    assert result.candidate_count == 1

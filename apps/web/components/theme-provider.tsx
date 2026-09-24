@@ -1,10 +1,9 @@
 'use client';
 
 import * as React from 'react';
+import { THEME_STORAGE_KEY } from '@/lib/theme';
 
 export type Theme = 'light' | 'dark' | 'system';
-
-export const THEME_STORAGE_KEY = 'paperforge-theme';
 
 interface ThemeContextValue {
   theme: Theme;
@@ -61,6 +60,3 @@ export function useTheme(): ThemeContextValue {
   if (!ctx) throw new Error('useTheme 必须在 <ThemeProvider> 内使用');
   return ctx;
 }
-
-/** 注入到 <head> 的同步脚本：在 hydration 前打好 class，避免深色下先闪一屏白。 */
-export const THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem('${THEME_STORAGE_KEY}');var d=t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.classList.toggle('dark',d)}catch(e){}})()`;

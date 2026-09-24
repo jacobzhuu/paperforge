@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from observability.http import post_when_available
 
 from latex_render.escape import latex_escape
 from latex_render.renderer import FLOAT_PLACEMENT
@@ -347,7 +348,8 @@ class TexdClient:
         binary_files: dict[str, bytes] | None = None,
     ) -> CompileOutcome:
         try:
-            response = self.client.post(
+            response = post_when_available(
+                self.client,
                 f"{self.base_url}/compile",
                 json={
                     "text_files": files,

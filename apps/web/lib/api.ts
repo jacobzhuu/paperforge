@@ -304,6 +304,7 @@ export function createProject(body: CreateProjectRequest): Promise<ApiResult<Pro
     title: body.title,
     paper_type: body.paper_type,
     writing_mode: body.writing_mode,
+    execution_profile: body.execution_profile ?? 'standard',
     language: body.language,
     status: 'draft',
     venue_template: body.venue_template ?? null,
@@ -363,6 +364,42 @@ export function restoreProject(id: string): Promise<Project> {
 }
 
 // ---- Library ----
+
+export interface WebResearchSource {
+  id: string;
+  url: string;
+  title: string;
+  snippet: string;
+  body: string;
+  status: string;
+  fetched_at: string | null;
+  verification: { identifiers: { verified: number; doi?: string; arxiv_id?: string }[] } | null;
+}
+
+export interface WebResearchRun {
+  id: string;
+  status: string;
+  queries: string[];
+  calls: number;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+  sources?: WebResearchSource[];
+}
+
+export function listWebResearch(projectId: string, offset = 0) {
+  return request<{ available: boolean; runs: WebResearchRun[] }>(
+    `/projects/${projectId}/web-research/runs?offset=${offset}`,
+  );
+}
+
+export function getWebResearch(projectId: string, runId: string) {
+  return request<WebResearchRun>(`/projects/${projectId}/web-research/runs/${runId}`);
+}
+
+export function refreshWebResearch(projectId: string) {
+  return request<Job>(`/projects/${projectId}/web-research/runs`, { method: 'POST' });
+}
 
 export function listLibrary(
   projectId: string,
@@ -509,13 +546,16 @@ export function updateScope(
 
 // ---- Jobs（检索 / 导入 / 卡片都是异步任务） ----
 
+const retryQuery = (retryOf?: string) => retryOf ? `?retry_of=${encodeURIComponent(retryOf)}` : '';
+
 export function startSearch(
   projectId: string,
   options: { providers?: string[]; regenerateScope?: boolean } = {},
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/search/runs`, {
+      request<Job>(`/projects/${projectId}/search/runs${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({
           providers: options.providers ?? null,
@@ -540,9 +580,9 @@ export function importReferences(
   );
 }
 
-export function generateCards(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function generateCards(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/cards/generate`, { method: 'POST' }),
+    () => request<Job>(`/projects/${projectId}/cards/generate${retryQuery(retryOf)}`, { method: 'POST' }),
     undefined,
   );
 }
@@ -846,9 +886,15 @@ export function getOutline(projectId: string): Promise<ApiResult<OutlinePayload 
   return withFallback(() => request<OutlinePayload>(`/projects/${projectId}/outline`), undefined);
 }
 
-export function generateOutline(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function rebuildDependencies(projectId: string, outlineId: string, contentHash: string): Promise<ApiResult<Job | undefined>> {
+  return withFallback(() => request<Job>(`/projects/${projectId}/outline/dependencies/rebuild`, {
+    method: 'POST', body: JSON.stringify({ outline_id: outlineId, content_hash: contentHash }),
+  }), undefined);
+}
+
+export function generateOutline(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/outline/generate`, { method: 'POST' }),
+    () => request<Job>(`/projects/${projectId}/outline/generate${retryQuery(retryOf)}`, { method: 'POST' }),
     undefined,
   );
 }
@@ -880,12 +926,14 @@ export function updateOutline(
 export function generateSections(
   projectId: string,
   coherence = true,
+  polishPolicy?: import("./types").PolishPolicy,
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/sections/generate`, {
+      request<Job>(`/projects/${projectId}/sections/generate${retryQuery(retryOf)}`, {
         method: 'POST',
-        body: JSON.stringify({ coherence }),
+        body: JSON.stringify({ coherence, polish_policy: polishPolicy }),
       }),
     undefined,
   );
@@ -978,10 +1026,11 @@ export function startExport(
   projectId: string,
   formats?: RequestableExportFormat[],
   qualityProfile: QualityProfile = 'scholarly',
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/exports`, {
+      request<Job>(`/projects/${projectId}/exports${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({
           formats: formats ?? ALL_EXPORT_FORMATS,
@@ -1205,7 +1254,7 @@ export function generateVisual(
 }
 
 /**
- * 在付费确认框出现前，让 DeepSeek 读取当前论文全文并生成最终生图提示词。
+ * 在付费确认框出现前，让模型读取当前论文全文并生成最终生图提示词。
  * 已经绑定当前正文快照的提示词由后端直接复用；旧草稿或正文变化后会重新分析。
  */
 export function prepareVisualGeneration(
@@ -1293,10 +1342,11 @@ export function getNumLint(projectId: string, signal?: AbortSignal): Promise<Api
 export function startSnowball(
   projectId: string,
   direction: 'both' | 'forward' | 'backward' = 'both',
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/snowball`, {
+      request<Job>(`/projects/${projectId}/snowball${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({ direction, max_seeds: 8 }),
       }),
@@ -1304,10 +1354,10 @@ export function startSnowball(
   );
 }
 
-export function startIngest(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function startIngest(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/ingest`, {
+      request<Job>(`/projects/${projectId}/ingest${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({ max_works: 12 }),
       }),
@@ -1333,10 +1383,11 @@ export function getQuality(
 export function generateQuality(
   projectId: string,
   options: { quality_profile?: QualityProfile; review_style?: ReviewStyle } = {},
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/quality/generate`, {
+      request<Job>(`/projects/${projectId}/quality/generate${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify(options),
       }),
@@ -1570,4 +1621,32 @@ export function restoreDocumentVersion(
   return request<DocumentVersion>(`/projects/${projectId}/versions/${documentId}/restore`, {
     method: 'POST',
   });
+}
+
+export function getAgentTrace(projectId: string, jobId: string, signal?: AbortSignal) {
+  return request<import('./types').AgentTrace>(`/projects/${projectId}/jobs/${jobId}/trace`, { signal });
+}
+
+export function searchEvidence(projectId: string, query: string, signal?: AbortSignal) {
+  return request<import('./types').EvidenceSearch>(
+    `/projects/${projectId}/evidence/search?q=${encodeURIComponent(query)}&mode=hybrid_rerank`, { signal });
+}
+
+export function indexEvidence(projectId: string) {
+  return request<Job>(`/projects/${projectId}/evidence/index`, { method: 'POST' });
+}
+
+export function respondToRepair(projectId: string, jobId: string,
+  response: { interrupt_id: string; choice: 'continue' | 'finish' }) {
+  return request<Job>(`/projects/${projectId}/jobs/${jobId}/resume`, {
+    method: 'POST', body: JSON.stringify(response),
+  });
+}
+
+/** Intent writes must never fall back to optimistic sample data. */
+export function getIntake(projectId: string): Promise<import('./types').IntakeState> {
+  return request(`/projects/${projectId}/intake`);
+}
+export function submitIntake(projectId: string, body: import('./types').IntakeRequest): Promise<Job> {
+  return request(`/projects/${projectId}/intake`, { method: 'POST', body: JSON.stringify(body) });
 }

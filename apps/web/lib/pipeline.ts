@@ -117,6 +117,7 @@ export function pipelineNeighbors(
  * 阶段集合见 services/worker/paperforge_worker/worker.py::_STAGE_PROGRESS。
  */
 const STAGE_TO_STEP: Record<string, PipelineStepId> = {
+  web_research: 'library',
   scope: 'scope',
   search: 'library',
   screen: 'library',

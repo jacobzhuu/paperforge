@@ -286,8 +286,15 @@ def test_search_queries_reject_mixed_cjk() -> None:
     assert any("biosynthetic" in query for query in queries)
 
 
-def test_screen_uncertain_is_isolated(monkeypatch) -> None:
-    """Uncertain decisions must leave the selected set (N3)."""
+def test_screen_retains_search_picks_on_anchor_miss(monkeypatch) -> None:
+    """An anchor miss must not overturn SEARCH's own selection.
+
+    SCREEN's anchors are literal substrings of an LLM's English phrasing, while
+    SEARCH selects with a weighted multi-signal ranker plus an LLM reranker.
+    Demoting SEARCH's picks on a substring miss let the crudest stage overrule
+    the most informed one, and starved one real review down to 9 works out of
+    764 candidates.  Only ``exclude`` removes a work from the corpus now.
+    """
 
     class _Entry:
         def __init__(self) -> None:
@@ -339,7 +346,9 @@ def test_screen_uncertain_is_isolated(monkeypatch) -> None:
         )
     )
     assert outcome.uncertain == 1
-    assert statuses == ["candidate_uncertain"]
+    assert outcome.uncertain_retained == 1
+    assert statuses == ["selected"]
+    assert entry.status == "selected"
 
 
 def test_screen_requires_every_anchor_group(monkeypatch) -> None:
@@ -403,7 +412,168 @@ def test_screen_requires_every_anchor_group(monkeypatch) -> None:
     assert outcome.included == 1
     assert outcome.uncertain == 1
     assert relevant_entry.status == "selected"
-    assert irrelevant_entry.status == "candidate_uncertain"
+    # The conjunction still governs the *decision* — the medical-imaging paper
+    # matched only the topic group, so it is never an `include`.  It keeps its
+    # place in the corpus only because SEARCH had already selected it.
+    assert irrelevant_entry.status == "selected"
+    assert outcome.uncertain_retained == 1
+
+
+def test_screen_leaves_an_uncertain_candidate_alone(monkeypatch) -> None:
+    """A candidate that misses the anchors is not promoted, and not rewritten.
+
+    Backfill is off here (the floor is already met), so the only correct
+    outcome is that SCREEN does not touch the row at all.
+    """
+
+    class _Entry:
+        def __init__(self) -> None:
+            self.user_pinned = False
+            self.literature_role = "general"
+            self.status = "candidate"
+            self.relevance_score = 0.9
+
+    entry = _Entry()
+    work = SimpleNamespace(
+        id=uuid4(),
+        canonical_title="Adversarial Defense for Medical Imaging",
+        abstract="A poisoning defense for breast cancer classification.",
+    )
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def _list_entries(session, project_id, status="selected", **kwargs):
+        return [(entry, work)] if status == "candidate" else []
+
+    async def _upsert(*args, **kwargs):
+        return None
+
+    statuses: list[str] = []
+
+    async def _set_status(session, row, status):
+        statuses.append(status)
+        row.status = status
+
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.list_entries", _list_entries)
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.upsert_eligibility_decision", _upsert)
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.set_entry_status", _set_status)
+    outcome = asyncio.run(
+        screen_eligibility(
+            SimpleNamespace(
+                project_id=uuid4(),
+                session=lambda: _Session(),
+                settings=SimpleNamespace(
+                    search_auto_select_top_k=30,
+                    library_backfill_floor=0,
+                    library_backfill_min_relevance=0.28,
+                ),
+            ),
+            scope={
+                "eligibility_criteria": {
+                    "required_anchor_groups": [
+                        {"name": "domain", "terms": ["sequential recommendation"]},
+                        {"name": "topic", "terms": ["poisoning", "defense"]},
+                    ]
+                }
+            },
+        )
+    )
+    assert outcome.uncertain == 1
+    assert outcome.uncertain_retained == 0
+    assert outcome.backfilled == 0
+    assert statuses == []
+    assert entry.status == "candidate"
+
+
+def test_screen_backfills_to_the_corpus_floor_by_relevance(monkeypatch) -> None:
+    """Near-misses top the corpus up to the floor, best-ranked first.
+
+    Guards the two bounds that make this safe: a work must hit *some* anchor
+    group, and it must clear ``library_backfill_min_relevance``.
+    """
+
+    class _Entry:
+        def __init__(self, score: float) -> None:
+            self.user_pinned = False
+            self.literature_role = "general"
+            self.status = "candidate"
+            self.relevance_score = score
+
+    # Partial anchor hit (topic only), descending relevance.
+    strong, weak = _Entry(0.55), _Entry(0.30)
+    # Below the relevance floor despite a partial hit.
+    too_weak = _Entry(0.05)
+    # No anchor group at all — must never be backfilled, however it ranks.
+    off_topic = _Entry(0.99)
+    def _work(title: str) -> SimpleNamespace:
+        return SimpleNamespace(id=uuid4(), canonical_title=title, abstract="")
+
+    rows = [
+        (strong, _work("Poisoning Attacks on Graphs")),
+        (weak, _work("A Defense for Federated Learning")),
+        (too_weak, _work("Shilling Attack Detection")),
+        (off_topic, _work("Diagnosis of Heart Failure")),
+    ]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def _list_entries(session, project_id, status="selected", **kwargs):
+        return rows if status == "candidate" else []
+
+    decided: list[tuple[str, str]] = []
+
+    async def _upsert(session, *, work_id, decision, decided_by="deterministic", **kwargs):
+        decided.append((decision, decided_by))
+        return None
+
+    async def _set_status(session, row, status):
+        row.status = status
+
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.list_entries", _list_entries)
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.upsert_eligibility_decision", _upsert)
+    monkeypatch.setattr("paperforge_worker.pipelines.screen.set_entry_status", _set_status)
+    outcome = asyncio.run(
+        screen_eligibility(
+            SimpleNamespace(
+                project_id=uuid4(),
+                session=lambda: _Session(),
+                settings=SimpleNamespace(
+                    search_auto_select_top_k=30,
+                    library_backfill_floor=2,
+                    library_backfill_min_relevance=0.28,
+                ),
+            ),
+            scope={
+                "eligibility_criteria": {
+                    "required_anchor_groups": [
+                        {"name": "domain", "terms": ["sequential recommendation"]},
+                        {"name": "topic", "terms": ["poisoning", "defense", "shilling"]},
+                    ]
+                }
+            },
+        )
+    )
+    assert outcome.backfilled == 2
+    # Backfilled is not retained.  Every entry here started as `candidate`, so
+    # SEARCH had picked none of them and rank alone pulled these two in; adding
+    # them to `uncertain_retained` too would report the same two works twice and
+    # leave a reader unable to tell the two provenances apart.
+    assert outcome.uncertain_retained == 0
+    assert (strong.status, weak.status) == ("selected", "selected")
+    assert too_weak.status == "candidate"
+    assert off_topic.status == "candidate"
+    # Provenance stays honest: the anchors really did not all match.
+    assert ("uncertain", "deterministic_backfill") in decided
 
 
 def test_screen_promotes_matching_search_candidate(monkeypatch) -> None:

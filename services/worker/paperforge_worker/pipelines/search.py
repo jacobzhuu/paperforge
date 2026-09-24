@@ -179,6 +179,7 @@ async def run_search(
         scope=scope,
         runner=context.llm_runner(),
         top_n=settings.rerank_top_n,
+        concurrency=settings.rerank_concurrency,
     )
 
     top_k = settings.search_auto_select_top_k if auto_select_top_k is None else auto_select_top_k
@@ -203,7 +204,27 @@ async def run_search(
                 "candidates_reviewed": len(ranked),
             }
         )
+    elif ranked and outcome.selected_count < _corpus_floor(context):
+        # 「零篇」不是唯一的失败模式。一次真实运行 764 篇候选只选中 9 篇，前端
+        # 不报任何异常，而写作阶段把这个由筛选造成的空档当成了领域的真实空白，
+        # 花了近四成篇幅去描述它。库容偏小必须和库容为零一样显式。
+        outcome.warnings.append(
+            {
+                "stage": "search",
+                "reason": "library_undersized",
+                "selected": outcome.selected_count,
+                "floor": _corpus_floor(context),
+                "candidates_reviewed": len(ranked),
+            }
+        )
     return outcome
+
+
+def _corpus_floor(context: JobContext) -> int:
+    return max(
+        0,
+        int(getattr(getattr(context, "settings", None), "library_backfill_floor", 36) or 0),
+    )
 
 
 async def _discover_all(

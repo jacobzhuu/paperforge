@@ -249,7 +249,11 @@ async def test_persisted_chunks_restore_page_and_section_markers(
             [work_id],
         )
     )[str(work_id)]
-    assert "[[PAGE=3 | SECTION=Results]]" in source.text
+    # 标记从落库的 chunk 还原；CHAR 是 Step 3 新增的一项，所以逐项断言而不是钉死
+    # 整串——再加一个标记不该让这条用例红。
+    assert "PAGE=3" in source.text
+    assert "SECTION=Results" in source.text
+    assert f"CHAR=0-{len(passage)}" in source.text
     assert passage in source.text
 
 
@@ -379,7 +383,11 @@ async def test_card_generation_uses_configured_bounded_concurrency(
         nonlocal active, peak
         active += 1
         peak = max(peak, active)
-        await asyncio.sleep(0.01)
+        # 这里必须明显长于每篇卡片前后那两段数据库往返。cards 已经从「批次栅栏」
+        # 换成「滑动窗口」：栅栏会让一批 3 篇同时起跑，窗口则是谁跑完就补一个，
+        # 各任务的 DB 阶段因此天然错开。观测窗太短（原来是 10ms）就只能看到 2，
+        # 那测的是栅栏的同步起跑，不是并发上限本身。
+        await asyncio.sleep(0.2)
         active -= 1
         return (
             {
@@ -404,6 +412,7 @@ async def test_card_generation_uses_configured_bounded_concurrency(
 
     assert outcome.requested == 7
     assert outcome.generated == 7
+    # 窗口宽度就是配置值：既真的并发，也绝不越过上限（上限是数据库连接池，不是 provider）。
     assert peak == 3
 
 

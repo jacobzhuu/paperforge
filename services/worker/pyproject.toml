@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "PaperForge ARQ worker：各生成管线任务"
 requires-python = ">=3.12"
 dependencies = [
+    "paperforge-mcp-runtime",
+    "paperforge-retrieval",
     "arq>=0.26",
+    "langgraph>=1.0,<2",
+    "langgraph-checkpoint-postgres>=3,<4",
     "httpx>=0.27",
     "pydantic-settings>=2.3",
     "paperforge-db",
@@ -26,6 +30,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
+paperforge-retrieval = { workspace = true }
+paperforge-mcp-runtime = { workspace = true }
 paperforge-db = { workspace = true }
 paperforge-observability = { workspace = true }
 scholar-gateway = { workspace = true }

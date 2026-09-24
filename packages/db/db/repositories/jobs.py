@@ -10,13 +10,16 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.paper import GenerationJob, JobEvent, LlmCallLog
 
 JOB_KINDS = frozenset(
     {
+        "intake",
+        "web_research",
+        "research",
         "search",
         "ingest",
         "cards",
@@ -38,6 +41,116 @@ JOB_STATUSES = frozenset(
 # 「这一轮运行已经结束」的状态。paused 也在内：任务本身没做完，但这一轮确实停了，
 # SSE 流要关、前端进度条要收，续跑靠新建一个 job（见 JOB_RESUME_KEY）。
 FINISHED_JOB_STATUSES = frozenset({"paused", "succeeded", "failed", "cancelled", "needs_input"})
+JOB_EVENT_CHANNEL_PREFIX = "paperforge:job-events:"
+
+# ---- 活着的证明 ---------------------------------------------------------------
+#
+# 正常的收尾路径已经有人守着：用户点停止走 `_mark_stopped`，arq 超时和 worker 停机
+# 走 `_mark_interrupted`。这些都要求进程还能执行代码。**硬杀**不给这个机会——蓝绿
+# 发布把旧 worker 容器整个换掉、OOM、SIGKILL 之后，行就永远停在 running。后果有两个：
+# 前端的进度卡一直在走（实测见过 6476 分钟），以及 `ensure_project_job_slot` 会因为
+# 这条僵尸行对该项目的每一个新任务返回 409——项目被自己的鬼魂锁死。
+#
+# 心跳是补上的那个信号：持有任务的 worker 定期盖章，于是「跑得慢」和「没人在跑」
+# 第一次可以分辨。
+
+#: worker 持有任务期间的盖章间隔。
+JOB_HEARTBEAT_INTERVAL_SECONDS = 30
+#: 心跳停了多久算没人在跑。取盖章间隔的 20 倍：单次数据库抖动、GC、一次长 LLM 调用
+#: 都不该被误判，而真的被杀掉的进程永远等不到下一次盖章。
+JOB_STALE_AFTER_SECONDS = 600
+#: 排队中的任务没有任何进程持有它，也就没人盖章。这是留给调度的宽限：入队到被
+#: worker 领走之间的这段时间里，「队列里没有它」还不足以下结论。
+JOB_DISPATCH_GRACE_SECONDS = 180
+
+#: 判定为无人认领时写进 error_json 的原因码。前端据此把它和真正跑失败的任务区分开。
+JOB_ABANDONED_CODE = "job_abandoned"
+
+
+def job_last_seen(job: GenerationJob) -> datetime:
+    """最后一次有证据表明这条任务被人拿着的时刻。
+
+    没有心跳列的老行（或刚入队还没被领走的行）退回 ``created_at``——它同样是一个
+    「从这一刻起开始计时」的下界，不会把陈年僵尸行当成刚刚还活着。
+    """
+    return job.heartbeat_at or job.created_at
+
+
+def job_is_abandoned(
+    job: GenerationJob,
+    *,
+    queue_knows: bool | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """这条任务是不是已经没有任何进程在跑了。
+
+    两种状态的判据**不同**，因为可信的信号不同：
+
+    - ``running``：worker 一定在盖章，所以心跳停了就是进程没了。队列怎么说不重要——
+      arq 的 in-progress 记录在容器被删掉之后依然留在 Redis 里，信它等于永远不判。
+    - ``queued``：还没有人持有它，心跳只是入队时刻，不能作为判据。唯一可信的是
+      「它还在不在这个部署的队列里」。``queue_knows=None`` 表示队列此刻问不到
+      （Redis 不可用），这时**不下结论**——问不到不等于不存在。
+
+    宽限期对两者都适用：刚入队的一瞬间队列可能还没可见，刚被领走的一瞬间也还没盖章。
+    """
+    if job.status not in {"queued", "running"}:
+        return False
+    now = now or datetime.now(UTC)
+    if (now - job_last_seen(job)).total_seconds() <= JOB_DISPATCH_GRACE_SECONDS:
+        return False
+    if job.status == "running":
+        return (now - job_last_seen(job)).total_seconds() > JOB_STALE_AFTER_SECONDS
+    if queue_knows is None:
+        return False
+    return not queue_knows
+
+
+async def touch_job_heartbeat(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """盖一次心跳。
+
+    只写这一列、且不加载行：心跳和任务本身的进度更新是两条独立的写，走 ORM 会把
+    整行读出来再写回去，凭空制造出与阶段更新互相覆盖的窗口。
+    """
+    await session.execute(
+        update(GenerationJob)
+        .where(GenerationJob.id == job_id)
+        .values(heartbeat_at=now or datetime.now(UTC))
+    )
+
+
+async def abandon_job(
+    session: AsyncSession,
+    job: GenerationJob,
+    *,
+    detail: dict[str, Any] | None = None,
+) -> GenerationJob:
+    """把一条无人认领的任务收进终态。
+
+    记成 ``failed`` 而不是 ``cancelled``：它既没跑完也没交付，而且不是用户的决定。
+    """
+    return await update_job(
+        session,
+        job,
+        status="failed",
+        error={
+            "code": JOB_ABANDONED_CODE,
+            "message": "任务在运行中被中断（进程已不存在），未能完成",
+            "last_seen_at": job_last_seen(job).isoformat(),
+            "stage": job.stage,
+            **(detail or {}),
+        },
+    )
+
+
+def job_event_channel(job_id: uuid.UUID) -> str:
+    """Return the shared Redis wake-up channel for one durable DB event stream."""
+    return f"{JOB_EVENT_CHANNEL_PREFIX}{job_id}"
 
 
 async def create_job(
@@ -193,6 +306,9 @@ def resume_checkpoint(job: GenerationJob) -> dict[str, Any]:
         # 润色跳过也不继承：那是针对上一轮的一次性决定。
         if key not in {JOB_CONTROL_KEY, POLISH_SKIP_KEY}
     }
+    from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
+
+    seeded[EXECUTION_PROFILE_KEY] = source_execution_profile(job)
     seeded[JOB_RESUMED_FROM_KEY] = str(job.id)
     return seeded
 
@@ -290,6 +406,11 @@ async def record_llm_call(
     cost_estimate: float | None = None,
     latency_ms: int | None = None,
     error_code: str | None = None,
+    max_output_tokens: int | None = None,
+    finish_reason: str | None = None,
+    prompt_sha256: str | None = None,
+    prompt_chars: int | None = None,
+    output_chars: int | None = None,
     metadata: dict[str, Any] | None = None,
     occurred_at: datetime | None = None,
 ) -> LlmCallLog:
@@ -305,6 +426,11 @@ async def record_llm_call(
         cost_estimate=cost_estimate,
         latency_ms=latency_ms,
         error_code=error_code,
+        max_output_tokens=max_output_tokens,
+        finish_reason=finish_reason,
+        prompt_sha256=prompt_sha256,
+        prompt_chars=prompt_chars,
+        output_chars=output_chars,
         metadata_json=metadata,
         occurred_at=occurred_at or datetime.now(UTC),
     )

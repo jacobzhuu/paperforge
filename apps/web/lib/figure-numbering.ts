@@ -29,6 +29,7 @@ export function buildFigureNumbering(sections: PaperSection[]): FigureNumbering 
   const byAssetRef: Record<string, number> = {};
   const captions: Record<string, string> = {};
   let next = 1;
+  let nextEquation = 1;
 
   // 按 order_no 排序：sections 数组的顺序来自接口，不保证等于正文顺序。
   const ordered = [...sections].sort((a, b) => (a.order_no ?? 0) - (b.order_no ?? 0));
@@ -36,6 +37,11 @@ export function buildFigureNumbering(sections: PaperSection[]): FigureNumbering 
     const body = section.body_ir as SectionIR | undefined;
     for (const block of body?.blocks ?? []) {
       const figure = block as unknown as FigureLike;
+      if (figure.type === 'equation') {
+        if (figure.label) byLabel[figure.label] = nextEquation;
+        nextEquation++;
+        continue;
+      }
       if (figure.type !== 'figure') continue;
       const number = next++;
       if (figure.label) {

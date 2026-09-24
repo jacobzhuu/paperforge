@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from llm_runtime.retry_policy import (
+    DEFAULT_TRUNCATION_RETRY_POLICY,
+    TruncationRetryPolicy,
+)
+
 # PaperForge 扩展：把 DeepSearch 的全局 Settings 依赖解耦为显式注入的配置对象，
 # 并新增「角色 → 模型」路由（见 docs/design.md §4.9）。
 # 角色档位：planner / extractor / reranker / writer / polisher / verifier。
@@ -19,6 +24,7 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
     "evidence_classifier": "gpt-4o-mini",
     "evidence_classifier_fallback": "gpt-4o",
     "experiment_extractor": "gpt-4o-mini",
+    "section_reviewer": "gpt-4o",
     "synthesizer": "gpt-4o-mini",
 }
 
@@ -27,7 +33,15 @@ DEFAULT_ROLE_MODELS: dict[str, str] = {
 # while allowing qmatrix classification to use a different thinking policy
 # from mechanical card extraction.
 ROLE_MODEL_FALLBACKS: dict[str, str] = {
-    "evidence_classifier": "extractor",
+    # 问题—证据判定要的是判断力，不是按 schema 读文本。实测（项目 6a6bbf18 的
+    # 真实候选集，每臂 4 个子问题）：
+    #   flash + 思考开（原配置）：1/4 截断，17 条链接，中位 76.4s
+    #   flash + 思考关：0 截断但**退化**——4 个问题里 3 个返回 0 条，第 4 个把 24 个
+    #                   候选全连上（半数标 not_comparable）。这不是判断，是放弃判断。
+    #   pro   + 思考关：0 截断，34 条链接，中位 6.8s，且**完全覆盖** flash+思考开
+    #                   找到的那 17 条。
+    # 所以这里换档位而不是照搬写作角色的「关思考」——那条路会悄悄毁掉证据链接。
+    "evidence_classifier": "planner",
     "evidence_classifier_fallback": "planner",
     # 结构化实验抽取和卡片抽取一样是「按封闭 schema 读文本」，不是规划或写作，
     # 因此沿用部署已有的 extractor 档位，旧 env 文件无需改动。
@@ -35,20 +49,64 @@ ROLE_MODEL_FALLBACKS: dict[str, str] = {
     # 跨研究综合是推理，不是按 schema 读文本：判断"同一可比条件下这些结果说明了
     # 什么"需要规划档位的模型，因此回退到 planner 而不是 extractor。
     "synthesizer": "planner",
+    # 语义评审（这一节答没答上、这些研究是什么关系）同样是判断题，走 planner 档。
+    "section_reviewer": "planner",
 }
 
-# DeepSeek V4 defaults to high-effort thinking.  That is useful for planning and
-# long-form writing, but it wastes latency/output budget on bounded extraction and
-# reranking tasks whose prompts already define a closed JSON schema.  Keep the
-# quality-critical roles on the provider default unless a deployment opts in.
+# Reasoning models default to high-effort thinking (DeepSeek V4 and GLM-5.3 both do).
+# That is useful for planning, but it wastes latency/output budget on tasks whose
+# prompts already define a closed JSON schema — and on any task whose own output is
+# large enough to compete with the reasoning for the same `max_output_tokens`.  Keep
+# the remaining roles on the provider default unless a deployment opts in.
+#
+# "disabled" is a *policy*, not a wire value: `providers._apply_thinking_controls()`
+# translates it into whatever the provider actually accepts (GLM-5.3 cannot turn
+# thinking off at all, so it becomes `reasoning_effort="low"`).
 DEFAULT_ROLE_THINKING: dict[str, str] = {
     "extractor": "disabled",
     "reranker": "disabled",
+    # Claim entailment is a bounded classification task with a closed JSON schema.  Measured by an
+    # out-of-band replay over a 91-pair cohort (not a pipeline run): with thinking disabled all 91
+    # pairs resolved in 9 calls, against 39 for the same cohort with thinking on, which spent most
+    # of the output budget on hidden reasoning.  Note the pipeline itself caps a single pass at
+    # MAX_CLAIM_EVIDENCE_CHECKS (60), so "91/91" is a property of the replay, not an invariant any
+    # quality job can report.
+    "verifier": "disabled",
     # 结构化实验抽取是按封闭 schema 读文本，和卡片抽取同类。开着思考会把输出预算
     # 烧在推理上：生产实测 26 次调用里 15 次 `output_truncated`，13 篇论文有 6 篇
     # 一条结果都没抽出来。
     "experiment_extractor": "disabled",
+    # 写作是本管线输出最大的一步（目标 1200 字，外加每句回抄 evidence_ids），它和
+    # 推理抢的是同一份 max_output_tokens，而 deepseek 系被 clamp_max_output_tokens()
+    # 压在 8192——加预算这条路没有余量。生产实测（项目 6a6bbf18，2026-08-14）：21 次
+    # writer 调用 11 次零内容返回，截断调用平均 79s 且产出 0 token，11 节里 5 节因此
+    # 从未经过模型，降级路径把证据原文当正文交了出去。
+    "writer": "disabled",
+    # 证据分类同样被推理吃预算：生产历史 77 次调用 39 次 `output_truncated`（51%），
+    # 而截断之后只能回落到词汇匹配——那条路只会输出 stance="supports"，于是整个
+    # 生产库 429 条链接里 **一条 contradicts 都没有**，综述的「冲突识别」形同虚设。
+    # 但这里**不能**照搬写作角色的做法：见 ROLE_MODEL_FALLBACKS 上方的实测，
+    # flash 关掉思考会直接退化成不判断。关思考的前提是同时换到 planner 档。
+    "evidence_classifier": "disabled",
+    "evidence_classifier_fallback": "disabled",
+    # 语义评审输出的是一份闭集 JSON 判定，不需要长推理；而按 evidence_classifier
+    # 那一轮的实测，判断力来自档位（planner）而不是思考开关。
+    "section_reviewer": "disabled",
+    # SCOPE / QDECOMP 也是按封闭 schema 产出一份问题清单，同样和推理抢
+    # max_output_tokens。生产实测（项目 ff6b9983，2026-08-19 首轮全流程）：两次
+    # planner 调用里第一次 `output_truncated`，白烧 44.7 秒零 token，靠加倍预算重试
+    # 才拿到结果——那一次重试本身又花了 44.4 秒。这是整条管线的第一个阶段，它退化
+    # 会把一份糊掉的子问题清单传给后面每一步。
+    "planner": "disabled",
 }
+
+
+# 截断重试策略的按角色覆盖。**故意留空**：默认策略里的 `min_growth_ratio` 已经
+# 按模型上限算出了「这次重试值不值得」，所以 writer 在 deepseek 上（8000 →
+# clamp 到 8192，只涨 2.4%）自动不重试，而它换到 gpt-4.1 上（8000 → 16000）
+# 自动恢复重试。写死一条 `"writer": max_attempts=0` 会把这个模型感知能力换成
+# 一个在换模型时**悄悄变错**的常量。部署仍可用 LLM_ROLE_RETRY 覆盖。
+DEFAULT_ROLE_RETRY: dict[str, TruncationRetryPolicy] = {}
 
 
 @dataclass(frozen=True)
@@ -70,8 +128,7 @@ class ModelPrice:
         if input_tokens is None and output_tokens is None:
             return None
         return (
-            (input_tokens or 0) * self.input_per_mtok
-            + (output_tokens or 0) * self.output_per_mtok
+            (input_tokens or 0) * self.input_per_mtok + (output_tokens or 0) * self.output_per_mtok
         ) / 1_000_000
 
 
@@ -121,18 +178,25 @@ class LLMConfig:
     trust_env_proxy: bool = False
     total_deadline_seconds: float | None = 180.0
     retry_backoff_seconds: float = 1.0
+    # 全进程在飞请求上限。None 表示不限（库的默认，也是非 worker 消费者的行为）。
+    # worker 显式设置它，因为那边的绑定约束是数据库连接池而不是 provider：
+    # 每个并发任务的落库与事件都要占一条连接。闸门在 `runner.agenerate` 上，
+    # 见 `runner._concurrency_gate` 关于「为什么不能放在实例上」的说明。
+    max_concurrency: int | None = None
     # 角色 → 模型 覆盖映射；缺省回退到 DEFAULT_ROLE_MODELS，再回退到 self.model。
     role_models: dict[str, str] = field(default_factory=dict)
     # 角色 → enabled/disabled。未配置的角色保留 provider 默认思考档位。
     role_thinking: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_ROLE_THINKING))
     # 模型 → 单价。空表示这个部署没配价格，于是所有调用都记为未定价。
     model_prices: dict[str, ModelPrice] = field(default_factory=lambda: dict(DEFAULT_MODEL_PRICES))
+    # 角色 → 截断重试策略。未配置的角色回落到 DEFAULT_ROLE_RETRY，再回落到默认策略。
+    role_retry: dict[str, TruncationRetryPolicy] = field(default_factory=dict)
 
     def price_for_model(self, model: str) -> ModelPrice | None:
         """精确匹配优先，其次取最长的前缀匹配。
 
-        服务商经常在模型名后面挂日期或版本后缀（``deepseek-v4-pro-0711``）。
-        配了 ``deepseek-v4-pro`` 就该覆盖它的所有快照，否则每次服务商发新版本，
+        服务商经常在模型名后面挂日期或版本后缀（``glm-5.3-flash-250901``）。
+        配了 ``glm-5.3-flash`` 就该覆盖它的所有快照，否则每次服务商发新版本，
         成本面板都会毫无征兆地退回未定价。
         """
         key = (model or "").strip().casefold()
@@ -178,3 +242,16 @@ class LLMConfig:
             if value in {"enabled", "disabled"}:
                 return value
         return None
+
+    def retry_for_role(self, role: Role) -> TruncationRetryPolicy:
+        """部署显式配置优先，其次本文件的默认档位，最后是策略自身的默认值。
+
+        与 ``thinking_for_role`` 同构，且同样**不**沿用 ``ROLE_MODEL_FALLBACKS``：
+        共用模型档位的两个角色，输出规模可以完全不同（``evidence_classifier``
+        请求 2400，``writer`` 请求 8000），重试策略必须各自决定。
+        """
+        for source in (self.role_retry, DEFAULT_ROLE_RETRY):
+            policy = source.get(role)
+            if policy is not None:
+                return policy
+        return DEFAULT_TRUNCATION_RETRY_POLICY

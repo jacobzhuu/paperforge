@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -51,7 +52,7 @@ ONTOLOGY = [
 
 class _FakeQueue:
     async def enqueue_job(self, *args: Any, **kwargs: Any) -> Any:
-        return None
+        return SimpleNamespace(job_id=kwargs.get("_job_id"))
 
 
 def _seed(database_url: str, coro_factory):

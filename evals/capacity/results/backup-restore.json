@@ -1,0 +1,22 @@
+{
+  "kind": "isolated_quiescent_restore_not_production_RTO",
+  "backup_seconds": 0.7884776659775525,
+  "restore_and_verify_seconds": 4.084945844952017,
+  "object_count": 1,
+  "objects": {
+    "copied": 1,
+    "skipped": 0,
+    "verified": 1
+  },
+  "table_row_counts": {
+    "paper_project": 703,
+    "generation_job": 66,
+    "job_event": 323,
+    "job_dispatch": 66,
+    "alembic_version": 1
+  },
+  "fixture_sha256": "a998a5ddf7af35e8ec6dc0962956f53ead197fd3263e6f26e06cac976c5c07c5",
+  "fixture_bytes": 151552,
+  "migration": "0030_job_dispatch",
+  "passed": true
+}

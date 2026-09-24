@@ -1,0 +1,43 @@
+{
+  "kind": "infrastructure_fixture_not_real_agent_or_llm",
+  "at": "2026-09-14T10:46:55.645165+00:00",
+  "seconds": 121.02700409002136,
+  "accounts": 100,
+  "active_users": 30,
+  "job_fixture_seconds": "10",
+  "request_count": 3455,
+  "request_per_second": 28.547347973929263,
+  "http_statuses": {
+    "200": 3445,
+    "202": 10
+  },
+  "latency_seconds": {
+    "p50": 0.031085824011825025,
+    "p95": 0.05248539906460792,
+    "p99": 1.030679740011692
+  },
+  "accepted_jobs": 10,
+  "completed_jobs": 3,
+  "job_states": {
+    "b8b3775b-5b29-4951-ae91-805db1c0d67f": "failed",
+    "3fc4a910-9e98-4b5c-a090-3ac4eea2a776": "failed",
+    "95ed834f-18c7-441e-8bbc-de56f6c61e2b": "failed",
+    "5b6b1ee5-2fc0-4d4f-94a3-e14c3591fcfb": "failed",
+    "3947a4d6-de80-4176-9be7-a5c8effe10cc": "succeeded",
+    "1a556f61-c604-4045-8301-d9de392e4dfb": "succeeded",
+    "b040e2a5-255f-481b-a1b3-be81c4fbc5ad": "failed",
+    "eeb5ef49-7097-4e8e-a80e-b739c04876f5": "failed",
+    "a30a93ca-329c-4091-ad25-613378ea9d69": "failed",
+    "ff500a24-710a-4ea0-a07e-788de9443ebc": "succeeded"
+  },
+  "observed_completions_per_hour": 89.23628310229698,
+  "queue_wait_seconds": {
+    "p50": 1.038988,
+    "p95": 5.177949,
+    "max": 5.258312
+  },
+  "sse_peak": 10,
+  "sse_unique_events_received": 22,
+  "sse_errors": [],
+  "failure_ratio": 0.0
+}

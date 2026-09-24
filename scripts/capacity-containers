@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Resource-capped variant; shares only the isolated capacity dependencies.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+state="$PWD/.paperforge/capacity"
+mkdir -p "$state"
+case "${1:-}" in
+  start)
+    docker build -f evals/capacity/Dockerfile --target worker -t paperforge-fixture:capacity .
+    docker build -f evals/capacity/Dockerfile --target gateway -t paperforge-fixture-gateway:capacity .
+    cat > "$state/container.env" <<'EOF'
+DATABASE_URL=postgresql+asyncpg://paperforge:paperforge@127.0.0.1:25432/paperforge_capacity
+REDIS_URL=redis://127.0.0.1:26379/1
+STORAGE_BACKEND=minio
+MINIO_ENDPOINT=127.0.0.1:29000
+MINIO_ACCESS_KEY=capacity
+MINIO_SECRET_KEY=capacity-test-only
+MINIO_BUCKET=capacity
+MINIO_SECURE=false
+LLM_DEFAULT_PROVIDER=noop
+LLM_OPENAI_API_KEY=
+YUNWU_API_KEY=
+IMAGE_API_KEY=
+AI_IMAGES_ENABLED=false
+AUTH_COOKIE_SECURE=false
+AUTH_DEV_LOGIN_ENABLED=false
+AUTH_EMAIL_MODE=file
+AUTH_RATE_LIMIT_ENABLED=false
+PUBLIC_APP_URL=http://127.0.0.1:28080
+CORS_ALLOW_ORIGINS=http://127.0.0.1:28080
+JOB_DISPATCH_SLOTS=8
+JOB_SHORT_SLOTS=0
+JOB_DISPATCH_ENABLED=true
+REQUEST_LIMITS_ENABLED=true
+DB_POOL_SIZE=2
+DB_MAX_OVERFLOW=6
+WORKER_MAX_JOBS=4
+PYTHONPATH=/capacity
+CAPACITY_JOB_SECONDS=10
+EOF
+    chmod 600 "$state/container.env"
+    docker update --cpus 2 --memory 4g --memory-swap 4g pf-capacity-test-pg
+    docker update --cpus 1 --memory 1g --memory-swap 1g pf-capacity-test-redis
+    docker update --cpus 2 --memory 4g --memory-swap 4g pf-capacity-test-minio
+    for index in 1 2; do
+      docker run -d --name "pf-capacity-api${index}" --label paperforge.capacity=true \
+        --network host --cpus 1 --memory 1g --read-only --tmpfs /tmp \
+        --env-file "$state/container.env" -e DB_MAX_OVERFLOW=4 \
+        -e "API_HOST=127.0.0.1" -e "API_PORT=2808${index}" paperforge-api:capacity
+      docker run -d --name "pf-capacity-worker${index}" --label paperforge.capacity=true \
+        --network host --cpus 2 --memory 3g --read-only --tmpfs /tmp \
+        --env-file "$state/container.env" \
+        paperforge-fixture:capacity arq worker.WorkerSettings
+    done
+    docker run -d --name pf-capacity-gateway --label paperforge.capacity=true \
+      --network host --cpus 1 --memory 128m \
+      paperforge-fixture-gateway:capacity
+    docker inspect --format '{{.Name}} {{.Image}} cpu={{.HostConfig.NanoCpus}} memory={{.HostConfig.Memory}}' \
+      pf-capacity-api1 pf-capacity-api2 pf-capacity-worker1 pf-capacity-worker2 pf-capacity-gateway \
+      pf-capacity-test-pg pf-capacity-test-redis pf-capacity-test-minio \
+      > "$state/resource-manifest.txt"
+    ;;
+  stop)
+    for name in pf-capacity-api1 pf-capacity-api2 pf-capacity-worker1 pf-capacity-worker2 pf-capacity-gateway; do
+      [ "$(docker inspect --format '{{index .Config.Labels "paperforge.capacity"}}' "$name")" = true ] || exit 1
+      docker stop --time 30 "$name"
+      docker rm "$name"
+    done
+    ;;
+  *) echo 'usage: scripts/capacity-containers start|stop' >&2; exit 2 ;;
+esac

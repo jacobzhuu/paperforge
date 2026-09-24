@@ -22,7 +22,7 @@ import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ModuleError } from '@/components/layout/module-error';
 import { useToast } from '@/components/ui/toast';
-import { useJobFinished, useProject } from './project-context';
+import { useJobEvent, useJobFinished, useProject } from './project-context';
 import {
   exportDownloadUrl,
   generateAll,
@@ -77,6 +77,27 @@ const REVIEW_STYLE_OPTIONS: { value: ReviewStyle; label: string }[] = [
   { value: 'systematic', label: '系统综述' },
 ];
 
+type FastDraftItem = {
+  index: number;
+  pair_hash: string;
+  cite_key: string;
+  status: string;
+  weak?: boolean;
+  score?: number | null;
+};
+type FastDraftPreview = {
+  status: string;
+  paper_snapshot_hash: string;
+  document_version: number;
+  verification_status?: string;
+  items: FastDraftItem[];
+};
+type FastDraftVerification = {
+  status: string;
+  paper_snapshot_hash: string;
+  items: FastDraftItem[];
+};
+
 function optionLabel<T extends string>(
   options: { value: T; label: string }[],
   value: T,
@@ -102,6 +123,7 @@ export function ProjectOverview() {
     paperType,
     progress,
     busy,
+    pausedJob,
     tracked,
     startJob,
     retryStage,
@@ -163,6 +185,11 @@ export function ProjectOverview() {
     readinessModule.reload();
   }, [auditModule.reload, jobsModule.reload, costModule.reload, versionsModule.reload, exportsModule.reload, lintModule.reload, readinessModule.reload]);
   useJobFinished(reloadModules);
+  useJobEvent((event) => {
+    if (event.type === 'fast_draft.ready' || event.type === 'fast_draft.verification_complete') {
+      reloadModules();
+    }
+  });
 
   const action = nextAction(progress, paperType);
   const latestPdf = latestArtifact(exports, 'pdf');
@@ -184,6 +211,16 @@ export function ProjectOverview() {
   );
   const repairFindingCount = Number(qualityRepairJob?.checkpoint?.quality_finding_count ?? 0);
   const latestFullJob = jobs.find((job) => job.kind === 'full');
+  const latestFastDraftJob = jobs.find((job) => job.checkpoint?.fast_draft_preview);
+  const fastPreview = latestFastDraftJob?.checkpoint?.fast_draft_preview as FastDraftPreview | undefined;
+  const fastVerification = latestFastDraftJob?.checkpoint?.fast_draft_verification as FastDraftVerification | undefined;
+  const currentSnapshot = versions?.documents.find((document) => document.is_current)?.paper_snapshot_hash;
+  const previewIsCurrent = Boolean(fastPreview && currentSnapshot && fastPreview.paper_snapshot_hash === currentSnapshot);
+  // 一键入口固定跑 draft 档：质检照跑、warnings 一条不少，但发现项不会升级成阻断项。
+  // 不说出来的话，用户看到的就是一份「零阻断」的报告，很容易当成已经达标。
+  const deliveredProfile =
+    ((latestFullJob?.checkpoint?.resume as { kwargs?: { quality_profile?: string } } | undefined)
+      ?.kwargs?.quality_profile ?? 'draft');
 
   const runAll = async () => {
     if (starting || busy) return;
@@ -294,6 +331,7 @@ export function ProjectOverview() {
   const runConfigSummary = [
     optionLabel(QUALITY_OPTIONS, qualityProfile),
     paperType === 'review' ? optionLabel(REVIEW_STYLE_OPTIONS, reviewStyle) : null,
+    project?.execution_profile === 'fast_draft' ? '快速草稿策略' : null,
   ]
     .filter(Boolean)
     .join(' · ');
@@ -311,7 +349,18 @@ export function ProjectOverview() {
   return (
     <div className="space-y-10">
       {/* 下一步：全页唯一的行动召唤，也是唯一保留边框的块。 */}
-      <div className="space-y-4 rounded-lg border border-primary/25 bg-accent/40 px-5 py-4">
+      {busy || pausedJob ? (
+        <section className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-5" aria-label="当前工作">
+          <div className="space-y-1">
+            <h2 className="font-serif text-xl font-semibold">{busy ? '研究正在进行' : '研究已暂停'}</h2>
+            <p className="text-sm text-muted-foreground">{progress.sectionCount > 0
+              ? '已生成的章节可以随时阅读；任务进度和操作见上方。'
+              : '项目与材料已保存，任务进度和操作见上方。'}</p>
+          </div>
+          {!busy && pausedJob && <Link href={`/projects/${projectId}/jobs/${pausedJob.id}`} className={buttonVariants({ variant: 'outline' })}>查看暂停任务</Link>}
+          {progress.sectionCount > 0 && <Link href={projectHref(projectId, 'write')} className={buttonVariants({ variant: 'outline' })}>阅读已有正文 <ArrowRight className="h-4 w-4" /></Link>}
+        </section>
+      ) : <div className="space-y-4 rounded-lg border border-primary/25 bg-accent/40 px-5 py-4">
         {/*
          * 主行只放「下一步」和它自己的那一个按钮。
          *
@@ -413,7 +462,48 @@ export function ProjectOverview() {
             </div>
           )}
         </div>
-      </div>
+      </div>}
+
+      {fastPreview && (
+        <section className="space-y-3 rounded-lg border p-4" aria-label="快速草稿核验">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="font-medium">快速草稿已可阅读</h2>
+              <p className="text-sm text-muted-foreground">
+                {previewIsCurrent
+                  ? fastVerification?.status === 'complete' && fastVerification.paper_snapshot_hash === currentSnapshot
+                    ? '深入核验已完成；下方保留快速筛查与正式结果。'
+                    : fastPreview.status === 'unavailable' || fastPreview.status === 'partial'
+                      ? '草稿已可编辑；引用快速筛查未完成，仍待深入核验。'
+                    : fastVerification?.status === 'unavailable'
+                      ? '深入核验未完成；请在写作工作台重新发起质量检查。'
+                    : latestFastDraftJob?.status === 'succeeded' && latestFastDraftJob.kind !== 'full'
+                      ? '快速筛查已完成；可在写作工作台启动深入核验。'
+                      : '快速筛查已完成；深入核验和 PDF 仍在后台处理。'
+                  : '这份初筛属于旧版正文；当前版本需要重新核验。'}
+              </p>
+            </div>
+            <Link href={projectHref(projectId, 'write')} className={buttonVariants({ size: 'sm' })}>查看并编辑正文</Link>
+          </div>
+          <p className="text-xs text-muted-foreground">快速筛查：{fastPreview.status === 'complete' ? '已完成' : fastPreview.status === 'no_citations' ? '无可检查引用' : '部分或全部待深入核验'} · 深入核验：{fastVerification?.status === 'complete' ? '已完成' : '待完成'} · 正文 v{fastPreview.document_version}</p>
+          {fastPreview.items.length > 0 && (
+            <div className="max-h-56 space-y-1 overflow-y-auto text-sm">
+              {fastPreview.items.map((item) => {
+                const verified = fastVerification?.status === 'complete' &&
+                  fastVerification.paper_snapshot_hash === fastPreview.paper_snapshot_hash
+                  ? fastVerification.items.find((candidate) => candidate.index === item.index && candidate.pair_hash === item.pair_hash)
+                  : undefined;
+                return (
+                  <p key={`${item.index}:${item.pair_hash}`}>
+                    <span className="font-mono">{item.cite_key}</span>：初筛{item.status === 'preliminary' ? item.weak ? '疑似弱相关' : '未提示弱相关' : '待核验'}
+                    {verified ? ` · 正式核验${verified.status === 'completed' ? verified.weak ? '弱相关' : '未提示弱相关' : '未完成'}` : ''}
+                  </p>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
 
       {/*
         质量修复决策卡。刻意不用 destructive 配色：这是「初稿已经在手上，还能再
@@ -435,6 +525,14 @@ export function ProjectOverview() {
               质检已经跑过一遍，这些是论断与证据对应关系上还能收紧的地方。
               修复会重写涉及的章节、重新核对证据并刷新导出件，通常要几分钟；
               当前稿件和 PDF 已经可以直接使用，也可以先读一遍再决定。
+              {deliveredProfile === 'draft' && (
+                <>
+                  {' '}
+                  当前这一稿是<strong className="font-medium text-foreground">初稿档</strong>
+                  产出的：质检跑了完整一轮，但发现项只作提示、不作阻断，
+                  所以「没有阻断项」不等于已经达到投稿标准。
+                </>
+              )}
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
@@ -510,18 +608,10 @@ export function ProjectOverview() {
         )}
         <ModuleError label="导出文件" error={exportsModule.error} onRetry={exportsModule.reload} />
 
-        <p className="text-sm text-muted-foreground">
-          <Figure value={progress.libraryCount} unit="篇文献" />
-          <Sep />
-          <Figure value={progress.sectionCount} unit="章节" />
-          <Sep />
-          <Figure value={progress.wordCount} unit="字" />
-          <Sep />
-          <Figure value={progress.exportCount} unit="个导出产物" />
-        </p>
-
         <p className="text-body text-foreground">
-          {latestDocument ? `文稿 v${latestDocument.version}` : '尚无文稿版本'}
+          {latestDocument ? `文稿 v${latestDocument.version}` : '当前稿件'}
+          {' · '}
+          {progress.sectionCount} 节 · {progress.wordCount.toLocaleString()} 字
           {' · '}
           {progress.libraryCount} 篇文献（{audit?.rows.length ?? 0} 处引用）
           {' · '}
@@ -591,16 +681,18 @@ export function ProjectOverview() {
         )}
       </div>
 
-      <div className="grid gap-10 md:grid-cols-2">
+      <details className="border-t pt-4">
+        <summary className="cursor-pointer text-sm font-medium">任务历史、成本与版本</summary>
+      <div className="mt-5 grid gap-10 md:grid-cols-2">
         <div className="space-y-3">
           <ModuleError label="近期任务" error={jobsModule.error} onRetry={jobsModule.reload} />
           <RecentJobs
             jobs={jobs}
             projectId={projectId}
             paperType={paperType}
-            onRetry={async (stage) => {
+            onRetry={async (stage, sourceJob) => {
               try {
-                await retryStage(stage);
+                await retryStage(stage, sourceJob);
                 toast({ title: '已开始重跑', description: `${stageLabel(stage)}正在重新执行。` });
               } catch (error) {
                 toast({ title: '重跑未能启动', description: describeError(error), variant: 'error' });
@@ -625,6 +717,7 @@ export function ProjectOverview() {
           </div>
         </div>
       </div>
+      </details>
     </div>
   );
 }
@@ -864,7 +957,7 @@ function RecentJobs({
   jobs: Job[];
   projectId: string;
   paperType: Project['paper_type'];
-  onRetry: (stage: RetryableStage) => Promise<void>;
+  onRetry: (stage: RetryableStage, sourceJob: Job) => Promise<void>;
 }) {
   const recent = jobs.slice(0, 5);
   const [expanded, setExpanded] = React.useState<string | null>(null);
@@ -905,7 +998,18 @@ function RecentJobs({
                 </button>
                 {open && (
                   <div className="space-y-3 pb-2 text-meta text-muted-foreground sm:pl-28">
-                    {job.status === 'needs_input' ? (
+                    <Link href={`/projects/${projectId}/jobs/${job.id}`} className="text-foreground underline">查看执行详情与修复记录 →</Link>
+                    {(job.error?.code as string | undefined) === 'job_abandoned' ? (
+                      <div className="space-y-2">
+                        {/* 被硬杀掉的任务（部署换掉了 worker 容器、进程被 OOM）没有任何
+                            收尾代码会运行。此前这种行永远停在「进行中」，进度条一直走，
+                            而且把项目锁着——用户点什么都是「已有任务正在运行」。 */}
+                        <p className="font-medium text-warning-foreground">
+                          这次运行被中断了：执行它的进程已经不存在（通常是服务更新或重启）。
+                          已保留到中断前的产物，可以重新发起。
+                        </p>
+                      </div>
+                    ) : job.status === 'needs_input' ? (
                       <div className="space-y-2">
                         <p className="font-medium text-warning-foreground">
                           {evidenceBlocked
@@ -954,7 +1058,7 @@ function RecentJobs({
                               <Button
                                 variant="outline"
                                 size="xs"
-                                onClick={() => void onRetry(warning.stage as RetryableStage)}
+                                onClick={() => void onRetry(warning.stage as RetryableStage, job)}
                               >
                                 <RotateCw /> 重跑此阶段
                               </Button>
@@ -966,7 +1070,7 @@ function RecentJobs({
                       <Button
                         variant="outline"
                         size="xs"
-                        onClick={() => void onRetry(job.stage as RetryableStage)}
+                        onClick={() => void onRetry(job.stage as RetryableStage, job)}
                       >
                         <RotateCw /> 重跑{stageLabel(job.stage)}
                       </Button>
@@ -1014,6 +1118,14 @@ function jobState(
   return { label: '进行中', state: 'running' };
 }
 
+/** 货币代码 → 金额前缀。未列入的币种直接打代码，猜一个符号比打 'SEK ' 更容易让人看错金额。 */
+function currencySymbol(code: string | undefined): string {
+  const key = (code ?? '').trim().toUpperCase();
+  if (key === 'CNY') return '\u00a5';
+  if (key === 'USD' || key === '') return '$';
+  return `${key} `;
+}
+
 function CostSummary({ cost }: { cost: CostDetail | undefined }) {
   const failed = cost?.totals.failed_call_count ?? 0;
   const spend = cost?.totals.cost_estimate ?? 0;
@@ -1022,6 +1134,8 @@ function CostSummary({ cost }: { cost: CostDetail | undefined }) {
   const unpricedCalls = cost?.totals.unpriced_call_count ?? 0;
   const unpricedImages = cost?.images?.unpriced_call_count ?? 0;
   const complete = (cost?.totals.cost_complete ?? true) && unpricedImages === 0;
+  // 金额的货币由部署配置决定；把人民币印成 `$` 是这里唯一要防的事。
+  const symbol = currencySymbol(cost?.totals.currency);
   return (
     <section className="space-y-3">
       <SectionTitle>成本</SectionTitle>
@@ -1041,7 +1155,9 @@ function CostSummary({ cost }: { cost: CostDetail | undefined }) {
           <>
             <Sep />
             <span className="font-medium tabular-nums text-foreground">
-              {complete ? '' : '≥ '}${spend.toFixed(4)}
+              {complete ? '' : '≥ '}
+              {symbol}
+              {spend.toFixed(4)}
             </span>
           </>
         )}

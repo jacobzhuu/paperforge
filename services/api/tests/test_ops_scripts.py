@@ -165,8 +165,118 @@ def test_blue_green_deploy_rebuilds_and_preflights_the_texd_runtime() -> None:
     )
 
 
+def test_blue_green_deploy_preflights_the_shared_object_store() -> None:
+    """共享 MinIO 不在蓝绿 compose 里；没人断言它，它停了 11 天也照样滚部署。"""
+    source = DEV.read_text(encoding="utf-8")
+    assert 'verify_object_store "${compose_project}"' in source
+    assert "Object storage is unusable from the new worker; refusing to switch Funnel." in source
+    assert source.index('verify_object_store "${compose_project}"') < source.index(
+        'tailscale_cli funnel --bg "${port}"'
+    )
+
+
+def test_worker_healthcheck_covers_the_object_store_not_only_the_queue() -> None:
+    """只探队列的 worker 在对象存储停摆时仍报 healthy，故障就此隐身。"""
+    for compose in ("docker-compose.bluegreen.yml", "docker-compose.prod.yml"):
+        source = (ROOT / "infra" / compose).read_text(encoding="utf-8")
+        assert '"CMD", "python", "-m", "paperforge_worker.healthcheck"' in source, compose
+        assert "socket.create_connection(('redis', 6379)" not in source, compose
+
+
+def test_blue_green_reaper_protects_live_and_active_deployments() -> None:
+    source = DEV.read_text(encoding="utf-8")
+    funnel_guard = "Cannot identify the deployment serving the Funnel; refusing to remove anything."
+    assert 'reap) reap_deployments "${2:---dry-run}"' in source
+    assert funnel_guard in source
+    assert 'match="arq:in-progress:*"' in source
+    assert "await redis.zcard(redis.default_queue_name)" in source
+    assert source.count('deployment_drain_state "${project}"') >= 2
+    assert source.index("sleep 2") < source.index("docker rm -f ${containers}")
+    assert "application images retained for recovery" in source
+
+
 def test_offline_image_loader_verifies_before_loading() -> None:
     source = IMAGE_LOADER.read_text(encoding="utf-8")
     assert source.index("bundle SHA-256 mismatch") < source.index("docker load")
     assert "image archive verification failed" in source
     assert "unexpected architecture" in source
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["--socket=/run/user/test/tailscaled.sock", "--socket /run/user/test/tailscaled.sock"],
+)
+def test_tailscale_discovery_ignores_its_own_command_line(tmp_path, argument):
+    source = DEV.read_text()
+    function = source[source.index("tailscale_socket() {") : source.index("tailscale_cli() {")]
+    listing = tmp_path / "processes"
+    listing.write_text(
+        "bash /bin/bash -c tailscaled --socket=wrong-parent\n"
+        "sed sed -n s/.*tailscaled .*--socket=wrong-regex/\n"
+        f"tailscaled /home/test/bin/tailscaled --tun=userspace-networking {argument}\n"
+    )
+    result = _bash(
+        'ps() { cat "$PROCESS_LIST"; }\n' + function + "\ntailscale_socket",
+        env={"PROCESS_LIST": str(listing)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/run/user/test/tailscaled.sock"
+
+
+def test_tailscale_discovery_defaults_when_no_daemon_is_listed():
+    source = DEV.read_text()
+    function = source[source.index("tailscale_socket() {") : source.index("tailscale_cli() {")]
+    result = _bash("ps() { :; }\n" + function + "\ntailscale_socket")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "/var/run/tailscale/tailscaled.sock"
+
+
+@pytest.mark.asyncio
+async def test_reaper_keeps_running_jobs_but_ignores_completed_shadow_cron_markers():
+    import ast
+
+    # Exercise the exact helper sent into older containers, not a second implementation.
+    source = DEV.read_text()
+    helper = source[
+        source.index("async def active_progress(") : source.index(
+            "\n\nasync def check():", source.index("async def active_progress(")
+        )
+    ]
+    namespace = {}
+    exec(compile(ast.parse(helper), "deployment_drain_state", "exec"), namespace)
+
+    class Redis:
+        def __init__(self, exists, ttl):
+            self.values = [exists, ttl]
+
+        def pipeline(self, **kwargs):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        def exists(self, key):
+            return self
+
+        def pttl(self, key):
+            return self
+
+        async def execute(self):
+            return self.values
+
+    active = namespace["active_progress"]
+    cron = [b"arq:in-progress:cron:shadow_tick:123"]
+    assert await active(Redis(0, 1000), cron) == 0
+    assert await active(Redis(1, 1000), cron) == 1
+    assert await active(Redis(0, 10_000_000), cron) == 1
+    assert await active(Redis(0, -1), cron) == 1
+    assert await active(Redis(0, 1000), [b"arq:in-progress:user-job"]) == 1
+    assert await active(Redis(0, 1000), [b"arq:in-progress:cron:unknown:123"]) == 1
+
+    citation_cron = [b"arq:in-progress:cron:citation_shadow_tick:123"]
+    assert await active(Redis(0, 1000), citation_cron) == 0
+    assert await active(Redis(1, 1000), citation_cron) == 1
+    assert await active(Redis(0, 10_000_000), citation_cron) == 1

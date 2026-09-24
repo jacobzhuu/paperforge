@@ -184,3 +184,87 @@ async def test_normal_exit_does_not_touch_job_status(session_factory) -> None:
     job = await _job_status(session_factory, job_id)
     assert job.status == "running"
     assert job.error_json is None
+
+
+async def test_a_failed_job_records_the_stage_failure_it_already_reported(session_factory) -> None:
+    """20 of 23 production failures had an empty ``error_json`` while the cause sat in the event
+    stream: ``update_job`` skips a ``None`` error, and ``_finish`` passed None whenever the job
+    had no warnings. The diagnosis existed and was dropped."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await context.emit(
+            "visual_generate.completed",
+            {"status": "failed", "error_code": "network_timeout"},
+            stage="visual",
+        )
+        await _finish(context, delivered=False)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.status == "failed"
+    assert job.error_json is not None
+    assert job.error_json["reason"] == "not_delivered"
+    assert job.error_json["failure"]["error_code"] == "network_timeout"
+    assert job.error_json["failure"]["event_type"] == "visual_generate.completed"
+    assert job.error_json["failure"]["stage"] == "visual"
+
+
+async def test_the_generic_terminal_event_does_not_overwrite_the_stage_failure(
+    session_factory,
+) -> None:
+    """``job.finished`` also carries status="failed" but no cause; it must not win."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await context.emit(
+            "search.completed",
+            {"status": "failed", "error_code": "provider_unavailable"},
+            stage="search",
+        )
+        await _finish(context, delivered=False)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.error_json["failure"]["error_code"] == "provider_unavailable"
+
+
+async def test_a_delivered_job_without_warnings_still_records_no_error(session_factory) -> None:
+    """Success must stay clean: only non-delivery gets an explanatory payload."""
+    from paperforge_worker.worker import _finish
+
+    project_id, job_id = await _project_and_job(session_factory)
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)) as context:
+        await _finish(context, delivered=True)
+
+    job = await _job_status(session_factory, job_id)
+    assert job.status == "succeeded"
+    assert job.error_json is None
+
+
+async def test_a_running_job_keeps_stamping_that_its_process_is_alive(session_factory) -> None:
+    """上面三条路都要求进程还能执行代码。硬杀不给这个机会。
+
+    蓝绿发布把 worker 容器整个换掉、OOM、SIGKILL——收尾代码一行都不会跑，行就永远
+    停在 running。心跳是那种情况下唯一还留下的证据：**跑着的时候**一直盖章，于是
+    「盖章停了」才能被读到的人当成「没人在跑了」。
+    """
+    project_id, job_id = await _project_and_job(session_factory)
+
+    before = await _job_status(session_factory, job_id)
+    assert before.heartbeat_at is None
+
+    async with job_context(**_kwargs(project_id, job_id, session_factory)):
+        for _ in range(100):
+            stamped = await _job_status(session_factory, job_id)
+            if stamped.heartbeat_at is not None:
+                break
+            await asyncio.sleep(0.02)
+
+    assert stamped.heartbeat_at is not None
+    # 心跳只写它自己那一列：阶段和进度是别的写路径在管的，不能被顺手覆盖。
+    assert stamped.stage == "write"
+    assert stamped.progress == pytest.approx(0.65)

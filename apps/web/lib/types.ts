@@ -2,6 +2,7 @@
 
 export type PaperType = 'review' | 'original';
 export type WritingMode = 'auto' | 'assisted';
+export type ExecutionProfile = 'standard' | 'fast_draft';
 export type Language = 'zh' | 'en';
 export type CitationStyle = 'author_year' | 'gbt7714' | 'ieee' | 'apa';
 export type QualityProfile = 'draft' | 'scholarly' | 'submission';
@@ -35,11 +36,43 @@ export type ProjectStatus =
   | 'review'
   | 'done';
 
+export interface IntakeOverrides {
+  paper_type?: PaperType;
+  language?: Language;
+  submission_target?: string;
+}
+export interface IntakeState {
+  version: number;
+  status: 'pending' | 'running' | 'needs_input' | 'ready' | 'failed';
+  summary?: string;
+  next_step?: string;
+  submission_target?: string;
+  paper_type?: PaperType;
+  language?: Language;
+  sources?: Record<string, string>;
+  overrides?: IntakeOverrides;
+  questions?: { question: string; options: string[] }[];
+  materials?: { id: string; title: string; parsed: boolean; used: boolean; truncated: boolean; warnings?: string[] }[];
+  material_issues?: { code: string; message: string }[];
+  error?: string;
+  job_id?: string;
+  type_locked?: boolean;
+}
+export interface IntakeRequest {
+  version: number;
+  topic?: string;
+  answer?: string;
+  overrides?: IntakeOverrides;
+}
+
 export interface Project {
+  intake?: IntakeState | null;
+  web_research_enabled?: boolean;
   id: string;
   title: string;
   paper_type: PaperType;
   writing_mode: WritingMode;
+  execution_profile?: ExecutionProfile;
   language: Language;
   status: ProjectStatus;
   venue_template?: string | null;
@@ -90,9 +123,11 @@ export interface SubmissionReadiness {
 }
 
 export interface CreateProjectRequest {
+  intake?: IntakeOverrides;
   title: string;
   paper_type: PaperType;
   writing_mode: WritingMode;
+  execution_profile?: ExecutionProfile;
   language: Language;
   topic?: string;
   venue_template?: string;
@@ -127,12 +162,14 @@ export interface MaterialPreflight {
  * 换类型等于新建项目（详见后端同名 schema 的注释）。
  */
 export interface UpdateProjectRequest {
+  web_research_enabled?: boolean;
   title?: string;
   topic?: string | null;
   venue_template?: string | null;
   language?: Language;
   citation_style?: CitationStyle;
   writing_mode?: WritingMode;
+  execution_profile?: ExecutionProfile;
   contribution_points?: string[];
   publication_title?: string | null;
   authors?: string[];
@@ -160,6 +197,7 @@ export interface EligibilityDecision {
 
 export type LiteratureRole = 'general' | 'core';
 export type AddedVia =
+  | 'mcp_web_verified'
   | 'search'
   | 'snowball'
   | 'doi_import'
@@ -327,6 +365,9 @@ export interface ScopePayload {
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
 export type JobKind =
+  | 'intake'
+  | 'research'
+  | 'web_research'
   | 'search'
   | 'ingest'
   | 'cards'
@@ -420,11 +461,19 @@ export interface ProjectCost {
   unpriced_call_count?: number;
   /** 为假时 cost_estimate 只是下界，界面必须显示为「≥」而不是确定值。 */
   cost_complete?: boolean;
+  /** cost_estimate 的货币代码（部署的 LLM_PRICE_CURRENCY）。金额不换算，界面只据此选符号。 */
+  currency?: string;
 }
 
 // ---- 大纲与章节（设计 §4.3 outline / paper_section） ----
 
+export type PolishPolicy = 'legacy' | 'full_parallel' | 'selective_parallel';
+
 export interface OutlineSection {
+  depends_on?: string[];
+  independent?: boolean;
+  dependency_reason?: string;
+  dependency_source?: string;
   key: string;
   level?: number;
   title: string;
@@ -437,6 +486,7 @@ export interface OutlineSection {
 }
 
 export interface OutlineTree {
+  dependency_contract?: { version: string; content_hash: string; invalidated?: boolean; requires_confirmation?: boolean };
   topic?: string;
   research_question?: string;
   language?: Language;
@@ -445,6 +495,7 @@ export interface OutlineTree {
 }
 
 export interface OutlinePayload {
+  content_hash?: string | null;
   project_id: string;
   outline_id?: string | null;
   version: number;
@@ -466,7 +517,7 @@ export type IRRun =
   | { t: 'cite'; keys: string[]; evidence_ids?: string[] }
   | { t: 'grounding'; source_refs: string[] }
   | { t: 'math_inline'; v: string }
-  | { t: 'xref'; target: string; kind: 'figure' };
+  | { t: 'xref'; target: string; kind: 'figure' | 'equation' };
 
 export interface IRParagraph {
   type: 'paragraph';
@@ -502,6 +553,10 @@ export interface IRList {
 export interface IREquation {
   type: 'equation';
   latex: string;
+  source_ids?: string[];
+  source_latex?: string | null;
+  source_context?: string | null;
+  explanation?: string | null;
   label?: string | null;
 }
 
@@ -580,7 +635,8 @@ export interface PaperSection {
   section_key: string;
   title: string;
   order_no: number;
-  status: 'generated' | 'edited' | 'approved';
+  /** `needs_rewrite`：写作降级留下的缺口，这一节没有正文，只有一句说明。 */
+  status: 'generated' | 'edited' | 'approved' | 'needs_rewrite';
   model?: string | null;
   cite_keys: string[];
   body_ir: SectionIR | Record<string, never>;
@@ -620,6 +676,9 @@ export interface MarkdownPreview {
  * `compile_log` 是编译的**副产物**而非用户请求的格式：它不出现在
  * `ExportRequest.formats` 里，但会作为产物登记以便下载——PDF 编译失败时
  * 它是用户唯一能拿到的诊断材料。
+ *
+ * `evidence_ledger` 同理：逐条证据与定位的审计记录，随综述自动产出，
+ * 但**不进正文**——它比正文本身还长，会把一篇 5000 字的稿子撑成 40 多页。
  */
 export type ExportFormat =
   | 'pdf'
@@ -628,10 +687,14 @@ export type ExportFormat =
   | 'markdown_bundle'
   | 'bibtex'
   | 'docx'
-  | 'compile_log';
+  | 'compile_log'
+  | 'evidence_ledger';
 
-/** 用户可主动勾选的导出格式（不含 compile_log）。 */
-export type RequestableExportFormat = Exclude<ExportFormat, 'compile_log'>;
+/** 用户可主动勾选的导出格式（不含副产物）。 */
+export type RequestableExportFormat = Exclude<
+  ExportFormat,
+  'compile_log' | 'evidence_ledger'
+>;
 
 export interface ExportArtifact {
   id: string;
@@ -824,6 +887,7 @@ export interface QualityHint {
 }
 
 export interface SoftCheckFinding {
+  status?: 'completed' | 'unverified';
   cite_key: string;
   section_key: string;
   score: number;
@@ -1013,6 +1077,14 @@ export interface ClaimEvidence {
   support_status: string;
   support_score?: number | null;
   manual_status: 'unreviewed' | 'confirmed' | 'rejected';
+  entailment_verdict?: 'supported' | 'partial' | 'unsupported' | 'contradicted' | 'uncertain' | null;
+  entailment_confidence?: number | null;
+  entailment_reason?: string | null;
+  entailment_model?: string | null;
+  entailment_verifier_version?: string | null;
+  entailment_cached?: boolean | null;
+  entailment_review?: Record<string, unknown> | null;
+  entailment_checked_at?: string | null;
 }
 
 export type RefineAction = 'polish' | 'expand' | 'shorten' | 'academic_tone';
@@ -1121,6 +1193,7 @@ export interface DocumentVersion {
   status: string;
   section_count?: number | null;
   is_current: boolean;
+  paper_snapshot_hash?: string | null;
   created_at?: string | null;
 }
 
@@ -1158,4 +1231,35 @@ export interface ProjectTaskProfile {
   effective_tasks: TaskDefinitionSummary[];
   fallback_mode: string;
   fallback_note: string | null;
+}
+
+export interface AgentTrace {
+  trace_id: string;
+  engine: string;
+  currency: string;
+  jobs: { id: string; status: string; created_at: string }[];
+  summary: { calls: number; known_cost: number; unpriced_calls: number;
+    input_tokens: number; output_tokens: number; unknown_usage_calls: number;
+    errors: Record<string, number> };
+  budget: { calls?: number; reserved_tokens?: number; started_at?: string };
+  interruption: { id: string; reason: string; sections: string[] } | null;
+  events_truncated: boolean;
+  calls_truncated: boolean;
+  events: { type: string; at: string; job_id: string; name?: string; kind?: string;
+    action?: string; elapsed_ms?: number; status?: string; reason?: string;
+    total?: number; rewritten?: number; skipped?: number; rejected?: number; concurrency?: number; policy?: string }[];
+  calls: { role: string; model: string; latency_ms: number | null;
+    cost_estimate: number | null; error_code: string | null; input_tokens: number | null;
+    output_tokens: number | null; local_queue_wait_ms?: number;
+    provider_slot_wait_ms?: number; rate_limit_wait_ms?: number }[];
+}
+
+export interface EvidenceSearch {
+  version: string; mode: string; vector_backend: string; reranked: boolean;
+  corpus_count: number; indexed_count: number; corpus_truncated: boolean;
+  warnings: string[]; elapsed_ms: number;
+  results: { evidence_id: string; work_id: string; text: string; content_hash: string;
+    page: number | null; section_path: string | null; source_document_file_id: string | null;
+    char_start: number | null; char_end: number | null; grade: string; score: number;
+    verification_status: string }[];
 }

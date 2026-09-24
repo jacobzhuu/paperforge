@@ -2,16 +2,35 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import uuid
 from typing import Any
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.paper import ClaimEvidenceAnchor, QualityReportRecord
+from db.models.paper import ClaimEntailmentCache, ClaimEvidenceAnchor, QualityReportRecord
 
 QUALITY_PROFILES = frozenset({"draft", "scholarly", "submission"})
 REVIEW_STYLES = frozenset({"narrative", "systematic"})
+# The closed verdict set the semantic verifier may emit. Declared here rather than imported from
+# the worker so the persistence layer can reject a malformed verdict on its own authority.
+CLAIM_ENTAILMENT_VERDICTS = frozenset(
+    {"supported", "partial", "unsupported", "contradicted", "uncertain"}
+)
+# String column widths on ``claim_entailment_cache``. A value wider than its column raises
+# DataError for the entire batch, so oversized rows are dropped before the INSERT is built.
+_CACHE_COLUMN_WIDTHS = {
+    "cache_key": 64,
+    "claim_hash": 64,
+    "evidence_hash": 64,
+    "claim_kind": 24,
+    "verifier_version": 32,
+    "model": 128,
+    "verdict": 16,
+}
 READINESS_STATUSES = frozenset(
     {"draft", "needs_revision", "preflight_ready", "submission_ready", "unassessed"}
 )
@@ -131,13 +150,20 @@ async def replace_claim_evidence(
     # dedupe before flush so one repeated anchor cannot roll back the complete
     # quality report.
     unique_anchors = _dedupe_claim_evidence_anchors(anchors)
+    persisted_fields = {
+        column.name
+        for column in ClaimEvidenceAnchor.__table__.columns
+        if column.name not in {"id", "quality_report_id", "project_id", "document_id", "created_at"}
+    }
     for anchor in unique_anchors:
         session.add(
             ClaimEvidenceAnchor(
                 quality_report_id=quality_report_id,
                 project_id=project_id,
                 document_id=document_id,
-                **anchor,
+                # Quality construction may attach private, transient review alternatives. Keep
+                # persistence explicit so those helpers cannot accidentally become schema input.
+                **{key: value for key, value in anchor.items() if key in persisted_fields},
             )
         )
     await session.flush()
@@ -186,6 +212,113 @@ async def list_claim_evidence(
     )
 
 
+def _scoped_cache_key(project_id: uuid.UUID | None, key: str) -> str:
+    if project_id is None:
+        return key  # Legacy callers and draining deployments keep their own namespace.
+    return hashlib.sha256(f"project:{project_id}:{key}".encode()).hexdigest()
+
+
+async def get_claim_entailment_cache(
+    session: AsyncSession,
+    cache_keys: set[str] | list[str] | tuple[str, ...],
+    *,
+    project_id: uuid.UUID | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load durable exact-pair verdicts without exposing cached source text."""
+    keys = list(dict.fromkeys(str(key) for key in cache_keys if key))
+    if not keys:
+        return {}
+    identities = {_scoped_cache_key(project_id, key): key for key in keys}
+    rows = list(
+        (
+            await session.scalars(
+                select(ClaimEntailmentCache).where(
+                    ClaimEntailmentCache.cache_key.in_(identities),
+                    ClaimEntailmentCache.project_id == project_id,
+                )
+            )
+        ).all()
+    )
+    return {
+        identities[row.cache_key]: {
+            "cache_key": identities[row.cache_key],
+            "verdict": row.verdict,
+            "confidence": row.confidence,
+            "reason": row.reason,
+            "model": row.model,
+            "claim_hash": row.claim_hash,
+            "evidence_hash": row.evidence_hash,
+            "claim_kind": row.claim_kind,
+            "verifier_version": row.verifier_version,
+            "cache_scope": "persistent",
+        }
+        for row in rows
+    }
+
+
+async def store_claim_entailment_cache(
+    session: AsyncSession,
+    entries: list[dict[str, Any]],
+    *,
+    project_id: uuid.UUID | None = None,
+) -> int:
+    """Insert immutable verdicts; a verifier-version bump is the invalidation mechanism.
+
+    Rows here are permanent: ``on_conflict_do_nothing`` means a key can never be corrected and
+    there is no TTL.  So every row is validated individually and a bad one is dropped rather than
+    sent — one oversized ``model`` reaching the DB would fail the whole multi-row INSERT and lose
+    every verdict the job just paid for.
+    """
+    values: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        cache_key = str(entry.get("cache_key") or "")
+        if not cache_key or cache_key in seen:
+            continue
+        verdict = str(entry.get("verdict") or "")
+        if verdict not in CLAIM_ENTAILMENT_VERDICTS:
+            continue
+        try:
+            confidence = float(entry.get("confidence"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        # A verdict is only reusable if its confidence is comparable to a threshold; NaN silently
+        # fails every comparison, so it must not become a permanent row.
+        if math.isnan(confidence):
+            continue
+        row = {
+            "cache_key": _scoped_cache_key(project_id, cache_key),
+            "project_id": project_id,
+            "claim_hash": str(entry.get("claim_hash") or ""),
+            "evidence_hash": str(entry.get("evidence_hash") or ""),
+            "claim_kind": str(entry.get("claim_kind") or ""),
+            "verifier_version": str(entry.get("verifier_version") or ""),
+            # Identity is carried by cache_key, which already hashes the full model string, so
+            # clipping the human-readable copy to its column width cannot make a row ambiguous.
+            "model": str(entry.get("model") or "")[:128],
+            "verdict": verdict,
+            "confidence": min(1.0, max(0.0, confidence)),
+            "reason": str(entry.get("reason") or "")[:300],
+        }
+        if any(
+            not row[field] or len(str(row[field])) > _CACHE_COLUMN_WIDTHS[field]
+            for field in _CACHE_COLUMN_WIDTHS
+        ):
+            continue
+        if not row["reason"]:
+            continue
+        seen.add(cache_key)
+        values.append(row)
+    if not values:
+        return 0
+    result = await session.execute(
+        insert(ClaimEntailmentCache)
+        .values(values)
+        .on_conflict_do_nothing(index_elements=[ClaimEntailmentCache.cache_key])
+    )
+    return int(result.rowcount or 0)
+
+
 async def set_claim_manual_status(
     session: AsyncSession,
     anchor: ClaimEvidenceAnchor,
@@ -219,6 +352,7 @@ __all__ = [
     "READINESS_STATUSES",
     "REVIEW_STYLES",
     "create_quality_report",
+    "get_claim_entailment_cache",
     "get_quality_report",
     "invalidate_quality_reports_for_document",
     "invalidate_quality_reports_for_project",
@@ -226,4 +360,5 @@ __all__ = [
     "list_claim_evidence",
     "replace_claim_evidence",
     "set_claim_manual_status",
+    "store_claim_entailment_cache",
 ]

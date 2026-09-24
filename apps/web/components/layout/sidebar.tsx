@@ -17,6 +17,7 @@ import { useAuth } from '@/components/auth/auth-provider';
 import { ProjectSwitcher } from './project-switcher';
 import { ThemeToggle } from './theme-toggle';
 import { cn } from '@/lib/utils';
+import { useFocusTrap } from '@/lib/useFocusTrap';
 
 /**
  * 应用级导航。
@@ -97,11 +98,12 @@ function Brand() {
 
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const { user, signOut } = useAuth();
+  const pathname = usePathname();
 
   return (
     <>
       <Brand />
-      <ProjectSwitcher />
+      {pathname !== '/' && <ProjectSwitcher />}
       <NavList onNavigate={onNavigate} />
       <div className="flex items-center justify-between border-t px-4 py-3">
         <span className="text-xs text-muted-foreground">主题</span>
@@ -136,6 +138,15 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
 export function Sidebar() {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = React.useState(false);
+  const panelRef = React.useRef<HTMLElement>(null);
+  useFocusTrap(mobileOpen, panelRef);
+
+  React.useEffect(() => {
+    const media = window.matchMedia('(min-width: 768px)');
+    const closeOnDesktop = () => { if (media.matches) setMobileOpen(false); };
+    media.addEventListener('change', closeOnDesktop);
+    return () => media.removeEventListener('change', closeOnDesktop);
+  }, []);
 
   // 移动端抽屉在路由变化后自动收起。
   React.useEffect(() => {
@@ -179,12 +190,12 @@ export function Sidebar() {
             className="absolute inset-0 bg-black/50 animate-fade-in dark:bg-black/70"
             onClick={() => setMobileOpen(false)}
           />
-          <aside className="relative flex h-full w-64 flex-col border-r bg-card shadow-xl animate-fade-in">
+          <aside ref={panelRef} role="dialog" aria-modal="true" aria-label="导航菜单" tabIndex={-1} className="relative flex h-[100dvh] w-72 max-w-[85vw] flex-col overflow-y-auto overscroll-contain border-r bg-card shadow-xl animate-fade-in motion-reduce:animate-none">
             <button
               type="button"
               onClick={() => setMobileOpen(false)}
               aria-label="关闭导航"
-              className="absolute right-3 top-4 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="absolute right-2 top-3 flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <X className="h-4 w-4" />
             </button>

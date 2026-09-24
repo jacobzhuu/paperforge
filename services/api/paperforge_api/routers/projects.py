@@ -49,6 +49,7 @@ from db import (
     update_project,
     update_project_scope,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.library import (
     DocumentFile,
     DocumentParse,
@@ -82,7 +83,9 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.jobs import start_job
+from paperforge_api.jobs import reconcile_abandoned_jobs, retry_profile_checkpoint, start_job
+from paperforge_api.llm_accounting import accounted_runner
+from paperforge_api.repair_response import RepairResponse, consume_response, validate_response
 from paperforge_api.schemas import (
     CostResponse,
     CreateProjectRequest,
@@ -113,7 +116,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["projects"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 
@@ -357,11 +360,26 @@ async def create_project_endpoint(
             session,
             title=request.title,
             paper_type=request.paper_type,
-            writing_mode=request.writing_mode,
-            language=request.language,
+            writing_mode=(
+                "assisted"
+                if request.intake is not None and "writing_mode" not in request.model_fields_set
+                else request.writing_mode
+            ),
+            execution_profile=request.execution_profile,
+            language=(
+                request.intake.language
+                or (request.language if "language" in request.model_fields_set else "zh")
+            )
+            if request.intake is not None
+            else request.language,
             topic=request.topic,
-            venue_template=request.venue_template,
-            citation_style=request.citation_style,
+            venue_template=request.venue_template
+            or ("article" if request.intake is not None else None),
+            citation_style=(
+                "gbt7714"
+                if request.intake is not None and "citation_style" not in request.model_fields_set
+                else request.citation_style
+            ),
             contribution_points=request.contribution_points,
             publication_title=request.publication_title,
             authors=request.authors,
@@ -375,13 +393,22 @@ async def create_project_endpoint(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return _project_response(project, {"library_count": 0, "section_count": 0})
+    if request.intake is not None:
+        from db.intake import initial_intake
 
+        project.scope_json = {
+            **(project.scope_json or {}),
+            "intake": initial_intake(request.intake.model_dump(exclude_none=True)),
+        }
+        await session.flush()
+        await session.refresh(project)
+    return _project_response(project, {"library_count": 0, "section_count": 0})
 
 @router.get("/projects", response_model=list[ProjectResponse])
 async def list_projects_endpoint(
     session: SessionDep,
     user: CurrentUserDep,
+    queue: QueueDep,
     deleted: bool = Query(default=False, description="取回收站（只列已删除的项目）"),
 ) -> list[ProjectResponse]:
     projects = await list_projects(session, owner_id=user.id, deleted=deleted)
@@ -390,7 +417,7 @@ async def list_projects_endpoint(
             _project_response(project, {"library_count": 0, "section_count": 0})
             for project in projects
         ]
-    rollups = await _project_attention_rollups(session, projects)
+    rollups = await _project_attention_rollups(session, projects, queue)
     return [
         _project_response(project, rollups[project.id][0], rollups[project.id][1])
         for project in projects
@@ -398,9 +425,11 @@ async def list_projects_endpoint(
 
 
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
-async def get_project_endpoint(project_id: str, session: SessionDep) -> ProjectResponse:
+async def get_project_endpoint(
+    project_id: str, session: SessionDep, queue: QueueDep
+) -> ProjectResponse:
     project = await _require_project(session, project_id)
-    counters, summary = (await _project_attention_rollups(session, [project]))[project.id]
+    counters, summary = (await _project_attention_rollups(session, [project], queue))[project.id]
     return _project_response(project, counters, summary)
 
 
@@ -421,6 +450,7 @@ async def update_project_endpoint(
     前者应当报 422（题目不能为空），后者应当不动。
     """
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
     sent = request.model_fields_set
     if {"authors", "author_details"} <= sent:
         raise HTTPException(status_code=422, detail="send authors or author_details, not both")
@@ -488,9 +518,18 @@ async def put_scope(
 ) -> ScopeResponse:
     """SCOPE 可编辑、可随时重生成（设计 §3.2：去掉协议锁定语义）。"""
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
+    if (project.scope_json or {}).get("intake", {}).get("status", "ready") != "ready":
+        raise HTTPException(409, "请先完成研究方向理解或澄清")
+
     # 打上 generator='user'：SEARCH 会自动重生成确定性回退留下的降级 scope，
     # 手改过的必须豁免，否则用户调好的关键词会被下一次检索悄悄覆盖。
-    await update_project_scope(session, project, {**request.scope, "generator": "user"})
+    scope = {**request.scope, "generator": "user"}
+    # Clients may edit scope, never the protected intake state or pinned preferences.
+    scope.pop("intake", None)
+    if (project.scope_json or {}).get("intake"):
+        scope["intake"] = project.scope_json["intake"]
+    await update_project_scope(session, project, scope)
     return ScopeResponse(project_id=str(project.id), scope=project.scope_json or {})
 
 
@@ -611,23 +650,28 @@ async def generate_scope_endpoint(
     session: SessionDep,
 ) -> ScopeResponse:
     """同步生成 SCOPE：planner 角色调用 + 确定性回退，秒级返回。"""
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.scope import generate_scope as run_generate_scope
 
     from paperforge_api.config import get_settings
 
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
+    if (project.scope_json or {}).get("intake", {}).get("status", "ready") != "ready":
+        raise HTTPException(409, "请先完成研究方向理解或澄清")
+
     topic = (request.topic or (project.scope_json or {}).get("topic") or project.title).strip()
-    runner = LLMRunner(get_settings().llm_config())
-    scope = await run_generate_scope(
-        topic,
-        language=project.language,
-        paper_type=project.paper_type,
-        runner=runner,
-    )
-    merged = {**(project.scope_json or {}), **scope}
-    await update_project_scope(session, project, merged)
-    return ScopeResponse(project_id=str(project.id), scope=merged)
+    async with accounted_runner(
+        session, get_settings().llm_config(), project_id=project.id
+    ) as runner:
+        scope = await run_generate_scope(
+            topic,
+            language=project.language,
+            paper_type=project.paper_type,
+            runner=runner,
+        )
+        merged = {**(project.scope_json or {}), **scope}
+        await update_project_scope(session, project, merged)
+        return ScopeResponse(project_id=str(project.id), scope=merged)
 
 
 # ---- 检索与导入（异步任务） ----
@@ -643,6 +687,7 @@ async def start_search(
     request: SearchRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -651,6 +696,7 @@ async def start_search(
         project_id=project.id,
         kind="search",
         function="run_library_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         providers=request.providers,
         regenerate_scope=request.regenerate_scope,
     )
@@ -700,6 +746,7 @@ async def generate_cards_endpoint(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -708,6 +755,7 @@ async def generate_cards_endpoint(
         project_id=project.id,
         kind="cards",
         function="run_cards_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
     )
     return _job_response(job)
 
@@ -912,15 +960,22 @@ async def get_whitelist(project_id: str, session: SessionDep) -> WhitelistRespon
 
 
 @router.get("/projects/{project_id}/jobs", response_model=list[JobResponse])
-async def get_jobs(project_id: str, session: SessionDep) -> list[JobResponse]:
+async def get_jobs(project_id: str, session: SessionDep, queue: QueueDep) -> list[JobResponse]:
     project = await _require_project(session, project_id)
-    return [_job_response(job) for job in await list_jobs(session, project.id)]
+    jobs = await list_jobs(session, project.id)
+    # 读一次就顺手收一次尸：被硬杀掉的任务没有任何代码能替它收尾，只有来看它的人
+    # 才有机会发现「这条已经没人在跑了」。
+    await reconcile_abandoned_jobs(session, queue, jobs)
+    return [_job_response(job) for job in jobs]
 
 
 @router.get("/projects/{project_id}/jobs/{job_id}", response_model=JobResponse)
-async def get_job_endpoint(project_id: str, job_id: str, session: SessionDep) -> JobResponse:
+async def get_job_endpoint(
+    project_id: str, job_id: str, session: SessionDep, queue: QueueDep
+) -> JobResponse:
     await _require_project(session, project_id)
     job = await _require_job(session, job_id)
+    await reconcile_abandoned_jobs(session, queue, [job])
     return _job_response(job)
 
 
@@ -985,6 +1040,7 @@ async def start_polish(
         checkpoint={
             WRITE_DOCUMENT_KEY: str(document.id),
             POLISH_SOURCE_JOB_KEY: str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
         },
         source_job_id=str(source.id),
         quality_profile=str(options.get("quality_profile") or "scholarly"),
@@ -1056,7 +1112,10 @@ async def start_quality_repair_from_job(
         project_id=source.project_id,
         kind="write",
         function="run_quality_repair_pipeline",
-        checkpoint={QUALITY_REPAIR_SOURCE_JOB_KEY: str(source.id)},
+        checkpoint={
+            QUALITY_REPAIR_SOURCE_JOB_KEY: str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
+        },
         source_job_id=str(source.id),
         quality_profile="scholarly",
         review_style=str(options.get("review_style") or "narrative"),
@@ -1120,6 +1179,7 @@ async def resume_job(
     job_id: str,
     session: SessionDep,
     queue: QueueDep,
+    response: RepairResponse | None = None,
 ) -> JobResponse:
     """从断点继续：新建一个 job，播种上一轮的 checkpoint，已完成的阶段直接跳过。
 
@@ -1127,6 +1187,11 @@ async def resume_job(
     续跑另起一条，前端的进度流和历史记录才对得上。
     """
     job = await _require_project_job(session, project_id, job_id)
+    if job.kind == "research":
+        raise HTTPException(409, "请在素材中心确认分析口径后继续研究任务")
+    # Lock the source through dispatch so repeated submissions cannot fork a resume chain.
+    await session.refresh(job, with_for_update=True)
+    response_checkpoint = await validate_response(session, job, response)
     if job.status != "paused":
         raise HTTPException(status_code=409, detail="only a paused job can be resumed")
     spec = job_resume_spec(job)
@@ -1144,17 +1209,24 @@ async def resume_job(
         project_id=job.project_id,
         kind=job.kind,
         function=spec["function"],
-        checkpoint=resume_checkpoint(job),
+        checkpoint={**resume_checkpoint(job), **response_checkpoint},
         **spec["kwargs"],
     )
+    await consume_response(session, job, resumed)
     return _job_response(resumed)
 
 
 @router.get("/projects/{project_id}/cost", response_model=CostResponse)
 async def get_cost(project_id: str, session: SessionDep) -> CostResponse:
+    from paperforge_api.config import get_settings
+
     project = await _require_project(session, project_id)
     totals = await project_llm_cost(session, project.id)
-    return CostResponse(project_id=str(project.id), **totals)
+    return CostResponse(
+        project_id=str(project.id),
+        currency=get_settings().llm_price_currency,
+        **totals,
+    )
 
 
 # ---- 内部工具 ----
@@ -1260,6 +1332,7 @@ async def _assign_keys_for_selected(session: AsyncSession, project_id: uuid.UUID
 async def _project_attention_rollups(
     session: AsyncSession,
     projects: list[PaperProject],
+    queue: ArqRedis | None = None,
 ) -> dict[uuid.UUID, tuple[dict[str, int], dict[str, Any]]]:
     """固定数量批量查询，项目数增加时不产生逐卡 N+1。"""
     ids = [project.id for project in projects]
@@ -1303,6 +1376,9 @@ async def _project_attention_rollups(
             )
         ).all()
     )
+    # 概览卡上的「进行中」就是从这批行里挑的：不先收尸，一条被硬杀掉的任务会在
+    # 项目列表上一直转圈。
+    await reconcile_abandoned_jobs(session, queue, job_rows)
     quality_rows = list(
         (
             await session.scalars(
@@ -1435,9 +1511,13 @@ def _project_response(
     scope = project.scope_json or {}
     return ProjectResponse(
         id=str(project.id),
+        intake={k: v for k, v in scope["intake"].items()
+                if k in {"version", "status", "paper_type", "language", "summary", "next_step"}}
+        if scope.get("intake") else None,
         title=project.title,
         paper_type=project.paper_type,
         writing_mode=project.writing_mode,
+        execution_profile=project.execution_profile,
         language=project.language,
         status=project.status,
         venue_template=project.venue_template,
@@ -1458,6 +1538,7 @@ def _project_response(
         ],
         keywords=project.keywords_json or [],
         metadata_confirmed=project.metadata_confirmed_at is not None,
+        web_research_enabled=project.web_research_enabled,
         library_count=counters.get("library_count", 0),
         section_count=counters.get("section_count", 0),
         created_at=project.created_at,

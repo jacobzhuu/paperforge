@@ -86,12 +86,12 @@ export function VisualsWorkbench() {
     setPreparingVisualId(visual.id);
     try {
       const prepared = await controller.prepareGeneration(visual);
-      if (!prepared) throw new Error('DeepSeek 未返回可确认的最终提示词');
+      if (!prepared) throw new Error('模型未返回可确认的最终提示词');
       setConfirming(prepared);
       controller.reload();
     } catch (error) {
       toast({
-        title: 'DeepSeek 全文分析失败',
+        title: '论文全文分析失败',
         description: describeError(error),
         variant: 'error',
       });
@@ -160,7 +160,7 @@ export function VisualsWorkbench() {
       {preparingVisualId && (
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm" role="status">
           <Loader2 className="h-4 w-4 animate-spin" />
-          DeepSeek 正在读取论文全文、分析意图并生成最终生图提示词…
+          正在读取论文全文、分析意图并生成最终生图提示词…
         </div>
       )}
       <ModuleError label="章节列表" error={sectionsModule.error} onRetry={sectionsModule.reload} />

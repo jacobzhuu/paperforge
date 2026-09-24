@@ -111,30 +111,26 @@ describe('项目概览的「跑通全管线」按钮', () => {
     expect(button.disabled).toBe(false);
   });
 
-  it('全管线在跑时禁用，并且文案换成运行中 + 当前阶段', async () => {
+  it('全管线运行时突出当前工作，不再提供重复启动入口', async () => {
     projectCtx.current = mockProjectContext({
       progress: freshProgress,
       busy: true,
       tracked: trackedJob('full', '正文写作'),
     });
     await renderOverview();
-    const button = runAllButton();
-    expect(button.textContent).toContain('全管线运行中');
-    expect(button.textContent).toContain('正文写作');
-    expect(button.disabled).toBe(true);
+    expect(screen.getByRole('heading', { name: '研究正在进行' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /跑通全管线/ })).not.toBeInTheDocument();
   });
 
-  it('在跑的是别的任务时不谎称全管线在跑，但同样不可点', async () => {
+  it('其它任务运行时也不显示重复启动入口', async () => {
     projectCtx.current = mockProjectContext({
       progress: freshProgress,
       busy: true,
       tracked: trackedJob('search', '文献检索'),
     });
     await renderOverview();
-    const button = runAllButton();
-    expect(button.textContent).toContain('等待当前任务结束');
-    expect(button.textContent).not.toContain('全管线运行中');
-    expect(button.disabled).toBe(true);
+    expect(screen.getByRole('region', { name: '当前工作' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /跑通全管线/ })).not.toBeInTheDocument();
   });
 
   it('跑完之后文案变成「重跑全管线」，不再假装从没跑过', async () => {
@@ -178,17 +174,16 @@ describe('项目概览的「跑通全管线」按钮', () => {
     expect(screen.getAllByRole('combobox')).toHaveLength(1);
   });
 
-  it('运行中不能改质量模式——那两个下拉只对下一次运行生效', async () => {
+  it('运行中收起下一次运行设置，已有章节提供阅读入口', async () => {
     projectCtx.current = mockProjectContext({
       progress: freshProgress,
       busy: true,
       tracked: trackedJob('full', '正文写作'),
     });
+    projectCtx.current.progress = doneProgress;
     await renderOverview();
-    fireEvent.click(screen.getByRole('button', { name: '调整' }));
-    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    expect(selects).toHaveLength(2);
-    expect(selects.every((el) => el.disabled)).toBe(true);
+    expect(screen.queryByRole('button', { name: '调整' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '阅读已有正文' })).toHaveAttribute('href', '/projects/p1/write');
   });
 
   it('主 CTA 那一排只剩「下一步」自己的按钮，全管线挪到分隔线以下', async () => {

@@ -38,6 +38,9 @@ Commands:
            (`up` skips processes that are already running, so it will NOT
            pick up your edits)
   deploy   Force the deployed-stack roll, even with no deployment running
+  reap     Inspect superseded blue/green deployments and report which ones
+           have no queued or in-progress ARQ jobs. Pass --apply to remove
+           only deployments that remain drained across two checks.
   down     Stop PaperForge services (persistent database volumes are kept)
   status   Show service status and local URLs
   logs     Show recent application and Docker service logs
@@ -305,6 +308,35 @@ print("✓ texd offline longtable preflight passed")
 '
 }
 
+verify_object_store() {
+  local project="$1"
+  # 对象存储是蓝绿栈外部的共享服务，compose 门不住它。健康检查只证明桶还在，
+  # 这里再走一次真实写—读—删：凭据失效或桶策略变成只读同样会让每条生成在
+  # INGEST 崩掉，而那时 SEARCH/SCREEN 的钱已经花掉了。
+  # 2026-08-03 起 MinIO 停了 11 天，中间照常滚了 5 次部署，没有一次发现。
+  docker exec "${project}-worker-1" python -c '
+import os
+
+from paperforge_worker.config import get_settings
+from paperforge_worker.healthcheck import enforce_deadline
+from storage import make_object_store
+
+settings = get_settings()
+# 黑洞掉的端点会让 MinIO 客户端挂十几分钟；部署不能停在那里等。
+enforce_deadline(30)
+store = make_object_store(settings)
+key = "healthcheck/deploy-preflight-%s" % os.urandom(8).hex()
+payload = os.urandom(32)
+store.put(key, payload)
+try:
+    if store.get(key) != payload:
+        raise SystemExit("object store round trip returned different bytes")
+finally:
+    store.delete(key)
+print("✓ object store round trip passed (%s)" % settings.storage_backend)
+'
+}
+
 wait_postgres() {
   local attempt=0
   for attempt in $(seq 1 60); do
@@ -514,8 +546,15 @@ detect_deploy_project() {
 tailscale_socket() {
   # tailscaled 以 userspace 模式跑在用户态，socket 不在默认路径上。
   local socket=""
-  socket="$(ps -eo args= 2>/dev/null \
-    | sed -n 's/.*tailscaled .*--socket=\([^ ]*\).*/\1/p' | head -n 1)"
+  # Filter by executable name first: matching the whole command line also matches
+  # this discovery command (or its parent shell) and can return the regex itself.
+  socket="$(ps -eo comm=,args= 2>/dev/null \
+    | awk '$1 ~ /(^|\/)tailscaled$/ {
+        for (i = 3; i <= NF; i++) {
+          if ($i ~ /^--socket=/) { sub(/^--socket=/, "", $i); print $i; exit }
+          if ($i == "--socket" && i < NF) { print $(i + 1); exit }
+        }
+      }')"
   echo "${socket:-/var/run/tailscale/tailscaled.sock}"
 }
 
@@ -527,6 +566,191 @@ tailscale_cli() {
 funnel_target_port() {
   tailscale_cli funnel status 2>/dev/null \
     | sed -n 's|.*proxy http://127.0.0.1:\([0-9]\{1,\}\).*|\1|p' | head -n 1
+}
+
+deployment_for_web_port() {
+  local wanted_port="$1" container binding project
+  [ -n "${wanted_port}" ] || return 1
+  for container in $(docker ps -q \
+    --filter 'label=com.docker.compose.project' \
+    --filter 'label=com.docker.compose.service=web' 2>/dev/null); do
+    binding="$(docker port "${container}" 3000/tcp 2>/dev/null \
+      | sed -n 's|.*:\([0-9][0-9]*\)$|\1|p' | head -n 1)"
+    [ "${binding}" = "${wanted_port}" ] || continue
+    project="$(docker inspect -f \
+      '{{index .Config.Labels "com.docker.compose.project"}}' "${container}")"
+    case "${project}" in paperforge-deploy-*) echo "${project}"; return 0 ;; esac
+  done
+  return 1
+}
+
+deployment_drain_state() {
+  # Print "queued in_progress" for one deployment-specific Redis database.  Run the
+  # check inside that deployment's worker so host networking and Redis credentials do
+  # not need to be copied or exposed.  Any inspection failure is a hard "do not reap".
+  local project="$1" workers worker_count
+  workers="$(docker ps -q \
+    --filter "label=com.docker.compose.project=${project}" \
+    --filter 'label=com.docker.compose.service=worker' 2>/dev/null)"
+  worker_count="$(wc -w <<<"${workers}" | tr -d '[:space:]')"
+  [ "${worker_count}" -ge "1" ] || return 1
+  workers="$(head -n 1 <<<"${workers}")"
+  docker exec "${workers}" python -c '
+import asyncio
+import os
+
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
+async def active_progress(redis, keys):
+    from arq.constants import keep_cronjob_progress
+
+    active = 0
+    for key in keys:
+        job_id = key.decode().removeprefix("arq:in-progress:")
+        if job_id.startswith(("cron:shadow_tick:", "cron:citation_shadow_tick:")):
+            # ARQ atomically deletes the job and shortens this marker on completion.
+            # The remaining marker prevents duplicate cron scheduling; it is not work.
+            async with redis.pipeline(transaction=True) as pipe:
+                pipe.exists("arq:job:" + job_id)
+                pipe.pttl(key)
+                exists, ttl = await pipe.execute()
+            if not exists and 0 < ttl <= keep_cronjob_progress * 1000:
+                continue
+        active += 1
+    return active
+
+
+async def check():
+    redis = await create_pool(RedisSettings.from_dsn(os.environ["REDIS_URL"]))
+    try:
+        queued = int(await redis.zcard(redis.default_queue_name))
+        queued += int(await redis.zcard("arq:short"))
+        cursor = 0
+        in_progress = 0
+        while True:
+            cursor, keys = await redis.scan(
+                cursor=cursor,
+                match="arq:in-progress:*",
+                count=100,
+            )
+            in_progress += await active_progress(redis, keys)
+            if cursor == 0:
+                break
+        # Pending PostgreSQL intents also own work, even before Redis enqueue.
+        import hashlib
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+        engine = create_async_engine(os.environ["DATABASE_URL"])
+        try:
+            async with engine.connect() as connection:
+                exists = await connection.scalar(text("SELECT to_regclass(:name)"), {"name": "job_dispatch"})
+                if exists:
+                    pending = await connection.scalar(text(
+                        "SELECT count(*) FROM job_dispatch d JOIN generation_job j ON j.id=d.job_id "
+                        "WHERE d.queue_identity=:identity AND "
+                        "(j.status IN (:queued,:running) OR d.lease_until > now())"
+                    ), {"identity": hashlib.sha256(os.environ["REDIS_URL"].encode()).hexdigest(),
+                        "queued": "queued", "running": "running"})
+                    queued += pending
+        finally:
+            await engine.dispose()
+        print(f"{queued} {in_progress}")
+    finally:
+        await redis.aclose()
+
+
+asyncio.run(check())
+'
+}
+
+reap_deployments() {
+  local mode="${1:---dry-run}" state_project="" funnel_project="" funnel_port=""
+  local protected=" " projects project state queued in_progress confirmed containers remaining
+  case "${mode}" in
+    --dry-run|'') mode="--dry-run" ;;
+    --apply) ;;
+    *) echo "Usage: ./scripts/dev reap [--dry-run|--apply]" >&2; return 1 ;;
+  esac
+  ensure_docker
+  prepare_state
+
+  if [ -f "${DEPLOY_STATE}" ]; then
+    # shellcheck disable=SC1090
+    state_project="$(. "${DEPLOY_STATE}" && echo "${PAPERFORGE_DEPLOY_PROJECT:-}")"
+  fi
+  funnel_port="$(funnel_target_port || true)"
+  funnel_project="$(deployment_for_web_port "${funnel_port}" || true)"
+  for project in "${state_project}" "${funnel_project}"; do
+    [ -n "${project}" ] && protected="${protected}${project} "
+  done
+  if [ "${mode}" = "--apply" ] && [ -z "${funnel_project}" ]; then
+    echo "Cannot identify the deployment serving the Funnel; refusing to remove anything." >&2
+    return 1
+  fi
+
+  projects="$(docker ps \
+    --filter 'label=com.docker.compose.project' \
+    --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+    | grep '^paperforge-deploy-' | sort -u || true)"
+  [ -n "${projects}" ] || { echo "No running blue/green deployments found."; return 0; }
+  echo "Protected live deployment(s):${protected}"
+
+  while IFS= read -r project; do
+    [ -n "${project}" ] || continue
+    case "${protected}" in
+      *" ${project} "*) echo "KEEP  ${project} (live)"; continue ;;
+    esac
+    if ! state="$(deployment_drain_state "${project}" 2>/dev/null)"; then
+      echo "KEEP  ${project} (worker/Redis state could not be verified)"
+      continue
+    fi
+    read -r queued in_progress <<EOF
+${state}
+EOF
+    if ! [[ "${queued}" =~ ^[0-9]+$ && "${in_progress}" =~ ^[0-9]+$ ]]; then
+      echo "KEEP  ${project} (unexpected drain-state response)"
+      continue
+    fi
+    if [ "${queued}" -ne 0 ] || [ "${in_progress}" -ne 0 ]; then
+      echo "KEEP  ${project} (queued=${queued}, in_progress=${in_progress})"
+      continue
+    fi
+    if [ "${mode}" = "--dry-run" ]; then
+      echo "READY ${project} (drained; --apply would remove its containers, networks, and caches)"
+      continue
+    fi
+
+    # Close the enqueue/start race without touching the candidate.  A superseded API has no
+    # Funnel traffic, but two independent observations make that assumption verifiable.
+    sleep 2
+    if ! confirmed="$(deployment_drain_state "${project}" 2>/dev/null)" \
+      || [ "${confirmed}" != "0 0" ]; then
+      echo "KEEP  ${project} (became active or could not be reverified: ${confirmed:-unknown})"
+      continue
+    fi
+    containers="$(docker ps -aq \
+      --filter "label=com.docker.compose.project=${project}" 2>/dev/null)"
+    if [ -n "${containers}" ] && ! docker rm -f ${containers} >/dev/null; then
+      echo "KEEP  ${project} (Docker refused container removal)" >&2
+      continue
+    fi
+    remaining="$(docker ps -aq \
+      --filter "label=com.docker.compose.project=${project}" 2>/dev/null)"
+    if [ -n "${remaining}" ]; then
+      echo "KEEP  ${project} (container removal was incomplete)" >&2
+      continue
+    fi
+    docker network rm "${project}_runtime" "${project}_ingress" >/dev/null 2>&1 || true
+    # Blue/green volumes contain only reconstructible Tectonic/font caches. User data lives in
+    # the external PostgreSQL/MinIO stack and is never targeted by this command.
+    docker volume rm "${project}_texdcache" "${project}_texdfontcache" \
+      >/dev/null 2>&1 || true
+    echo "REAPED ${project} (drained twice; application images retained for recovery)"
+  done <<EOF
+${projects}
+EOF
 }
 
 port_is_free() {
@@ -624,14 +848,51 @@ next_deploy_subnets() {
   return 1
 }
 
+verify_capacity_headroom() {
+  local project="$1"
+  [ -n "${project}" ] || return 0
+  docker exec "${project}-worker-1" python -c '
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from paperforge_worker.config import get_settings
+
+async def check():
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        async with engine.connect() as connection:
+            maximum = int(await connection.scalar(text("SHOW max_connections")))
+            used = int(await connection.scalar(text("SELECT count(*) FROM pg_stat_activity")))
+            active = int(await connection.scalar(text(
+                "SELECT count(*) FROM generation_job WHERE status=:status"), {"status": "running"}))
+        # New stack: 2 API * 6 + 3 worker * 8 = 36. Reserve maintenance
+        # connections and conservative overflow for still-running legacy jobs.
+        required = used + 36 + 10 + min(active, 10) * 12
+        print(f"PostgreSQL budget: current={used}, new=36, reserve=10, legacy_jobs={active}, max={maximum}")
+        if required > maximum:
+            raise SystemExit("insufficient PostgreSQL headroom; retain old jobs and defer deployment")
+    finally:
+        await engine.dispose()
+asyncio.run(check())
+'
+}
+
 build_deploy_images() {
   local tag="$1"
   echo "Building images (${tag})..."
+  docker build --progress plain -f "${ROOT_DIR}/services/edge.Dockerfile" --target gateway \
+    -t "paperforge-gateway:${tag}" "${ROOT_DIR}"
+  docker build --progress plain -f "${ROOT_DIR}/services/edge.Dockerfile" --target monitoring \
+    -t "paperforge-monitoring:${tag}" "${ROOT_DIR}"
   # texd 不是静态基础设施：模板新增宏包时，离线 Tectonic 缓存必须随部署更新。
   # Docker 的分层缓存会让未变化的 texd 构建快速命中；显式镜像覆盖仍可跳过构建。
   if [ -z "${PAPERFORGE_DEPLOY_TEXD_IMAGE:-}" ]; then
     docker build --network host --progress plain -f "${ROOT_DIR}/services/texd/Dockerfile" \
       -t "paperforge-texd:${tag}" "${ROOT_DIR}"
+  fi
+  if [ -z "${PAPERFORGE_DEPLOY_VISUALD_IMAGE:-}" ]; then
+    docker build --network host --progress plain -f "${ROOT_DIR}/services/visuald/Dockerfile" \
+      -t "paperforge-visuald:${tag}" "${ROOT_DIR}"
   fi
   docker build --network host --progress plain -f "${ROOT_DIR}/services/Dockerfile" --target api \
     -t "paperforge-api:${tag}" "${ROOT_DIR}"
@@ -653,6 +914,7 @@ deploy() {
     return 1
   fi
   previous="$(detect_deploy_project || true)"
+  verify_capacity_headroom "${previous}"
   tag="deploy-$(date '+%Y%m%d-%H%M%S')"
   port="$(free_web_port)"
   redis_url="$(next_redis_url)"
@@ -664,7 +926,7 @@ deploy() {
   ingress_subnet="${subnets##* }"
   compose_project="paperforge-${tag}"
   texd_image="${PAPERFORGE_DEPLOY_TEXD_IMAGE:-paperforge-texd:${tag}}"
-  visuald_image="${PAPERFORGE_DEPLOY_VISUALD_IMAGE:-$(current_image_of "${previous}" visuald paperforge-visuald:local)}"
+  visuald_image="${PAPERFORGE_DEPLOY_VISUALD_IMAGE:-paperforge-visuald:${tag}}"
 
   echo "Rolling deployment"
   echo "  previous:  ${previous:-none}"
@@ -684,6 +946,8 @@ deploy() {
   PAPERFORGE_DEPLOY_API_IMAGE="paperforge-api:${tag}" \
   PAPERFORGE_DEPLOY_WORKER_IMAGE="paperforge-worker:${tag}" \
   PAPERFORGE_DEPLOY_WEB_IMAGE="paperforge-web:${tag}" \
+  PAPERFORGE_DEPLOY_GATEWAY_IMAGE="paperforge-gateway:${tag}" \
+  PAPERFORGE_DEPLOY_MONITORING_IMAGE="paperforge-monitoring:${tag}" \
   PAPERFORGE_DEPLOY_TEXD_IMAGE="${texd_image}" \
   PAPERFORGE_DEPLOY_VISUALD_IMAGE="${visuald_image}" \
   PAPERFORGE_DEPLOY_WEB_PORT="${port}" \
@@ -694,10 +958,15 @@ deploy() {
   PAPERFORGE_DEPLOY_INGRESS_SUBNET="${ingress_subnet}" \
   PAPERFORGE_PUBLIC_URL="${PUBLIC_URL}" \
     docker compose --progress plain --env-file "${env_file}" \
-      -f "${BLUEGREEN_FILE}" --profile worker up -d --wait --remove-orphans
+      -f "${BLUEGREEN_FILE}" -f "${ROOT_DIR}/infra/docker-compose.monitoring.yml" \
+      --profile worker up -d --wait --remove-orphans
 
   wait_http "new deployment" "http://127.0.0.1:${port}/login"
   verify_texd_runtime "${compose_project}"
+  if ! verify_object_store "${compose_project}"; then
+    echo "Object storage is unusable from the new worker; refusing to switch Funnel." >&2
+    return 1
+  fi
 
   # The public UI must not be switched to a worker that still cannot reach the
   # image provider.  Any HTTP response proves DNS/TLS/proxy connectivity; only
@@ -736,10 +1005,10 @@ deploy() {
   echo "Deployment is live: ${PUBLIC_URL} (local ${port})"
   if [ -n "${previous}" ]; then
     echo
-    echo "The previous deployment (${previous}) is still running: this host's Snap"
-    echo "Docker refuses to stop containers. It no longer receives traffic and its"
-    echo "worker polls a different Redis database, so it is idle. Remove it with"
-    echo "'docker rm -f' once the AppArmor profile is fixed."
+    echo "The previous deployment (${previous}) remains available for in-flight jobs."
+    echo "After it drains, inspect and safely remove superseded deployments with:"
+    echo "  ./scripts/dev reap          # read-only"
+    echo "  ./scripts/dev reap --apply  # verifies twice before removal"
   fi
 }
 
@@ -780,6 +1049,16 @@ status() {
     echo "Deployment: ${project}"
     funnel_port="$(funnel_target_port || true)"
     echo "Funnel:     ${PUBLIC_URL} → 127.0.0.1:${funnel_port:-unknown}"
+    # 共享的 PostgreSQL/Redis/MinIO 不属于这个 compose project，`ps` 看不到它们停了。
+    local dependencies
+    if dependencies="$(docker exec "${project}-worker-1" python -m paperforge_worker.healthcheck 2>&1)"; then
+      echo "✓ shared dependencies: queue and object store reachable"
+    elif [ "${dependencies#*No module named}" != "${dependencies}" ]; then
+      echo "· shared dependencies: not checked (this deployment predates the probe)"
+    else
+      echo "✗ shared dependencies unavailable; generations will fail at INGEST:" >&2
+      echo "  ${dependencies}" >&2
+    fi
     docker compose -p "${project}" ps 2>/dev/null || true
     echo
   fi
@@ -809,6 +1088,7 @@ case "${1:-}" in
   up) up ;;
   restart) restart "${2:-auto}" ;;
   deploy) deploy ;;
+  reap) reap_deployments "${2:---dry-run}" ;;
   down) down ;;
   status) status ;;
   logs) logs ;;

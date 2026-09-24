@@ -1,9 +1,61 @@
 import importlib
+from types import SimpleNamespace
 
 import paperforge_worker.config as worker_config
 import paperforge_worker.worker as worker
 import pytest
 from arq.connections import RedisSettings
+
+
+def test_assisted_prewrite_uses_pinned_profile():
+    assert worker._prewrite_quality_profile(
+        SimpleNamespace(checkpoint={"execution_profile": "fast_draft"})
+    ) == "draft"
+    assert worker._prewrite_quality_profile(
+        SimpleNamespace(checkpoint={"execution_profile": "standard"})
+    ) == "scholarly"
+
+
+def test_submission_and_scholarly_runs_ignore_fast_draft_shortcut():
+    pinned = {"execution_profile": "fast_draft"}
+    assert worker._effective_delivery_mode(pinned, "draft", "standard") == "fast_draft"
+    assert worker._effective_delivery_mode(pinned, "scholarly", "standard") == "standard"
+    assert worker._effective_delivery_mode(pinned, "submission", "standard") == "standard"
+    assert worker._effective_delivery_mode(
+        {"execution_profile": "standard"}, "draft", "fast_draft"
+    ) == "standard"
+
+
+async def test_fast_draft_verification_keeps_preliminary_record_and_snapshot_boundary():
+    class Context:
+        def __init__(self):
+            self.checkpoint = {
+                "fast_draft_preview": {
+                    "paper_snapshot_hash": "original",
+                    "items": [{"index": 0, "weak": True}],
+                },
+                "fast_draft_verifier": {
+                    "paper_snapshot_hash": "original",
+                    "items": [{"index": 0, "weak": False}],
+                },
+            }
+
+        async def emit(self, _event, _payload, *, checkpoint, **_kwargs):
+            self.checkpoint.update(checkpoint)
+
+    context = Context()
+    await worker._publish_fast_draft_verification(
+        context, SimpleNamespace(paper_snapshot_hash="original", report_id="report-1")
+    )
+    assert context.checkpoint["fast_draft_preview"]["items"][0]["weak"] is True
+    assert context.checkpoint["fast_draft_verification"]["items"][0]["weak"] is False
+    assert context.checkpoint["fast_draft_verification"]["status"] == "complete"
+
+    await worker._publish_fast_draft_verification(
+        context, SimpleNamespace(paper_snapshot_hash="edited", report_id="report-2")
+    )
+    assert context.checkpoint["fast_draft_verification"]["status"] == "superseded"
+    assert context.checkpoint["fast_draft_verification"]["items"] == []
 
 
 def test_worker_settings_resolve_yunwu_specific_image_credentials():
@@ -30,10 +82,37 @@ def test_worker_uses_bounded_llm_concurrency_and_role_thinking_defaults():
     settings = worker_config.WorkerSettings(_env_file=None)
     assert settings.card_concurrency == 6
     assert settings.qmatrix_concurrency == 4
+    assert settings.claim_entailment_mode == "shadow"
     llm = settings.llm_config()
     assert llm.thinking_for_role("extractor") == "disabled"
     assert llm.thinking_for_role("reranker") == "disabled"
-    assert llm.thinking_for_role("writer") is None
+    assert llm.thinking_for_role("verifier") == "disabled"
+    # 写作角色的输出（一节正文 + 逐句 evidence_ids）和推理抢同一份 max_output_tokens，
+    # 而 deepseek 系被 clamp 在 8192：开着思考就会零内容返回并降级。
+    assert llm.thinking_for_role("writer") == "disabled"
+
+
+def test_worker_exposes_disabled_typesafe_defaults_and_explicit_rollout_config():
+    defaults = worker_config.WorkerSettings(_env_file=None)
+    assert defaults.typesafe_soft_check_mode == "off"
+    assert defaults.typesafe_api_key == ""
+    assert defaults.typesafe_decision_config()["model"] == "jev-1.13.0"
+
+    settings = worker_config.WorkerSettings(
+        _env_file=None,
+        typesafe_api_key="test-key",
+        typesafe_soft_check_mode="shadow",
+        typesafe_confidence_threshold=0.87,
+    )
+    config = settings.typesafe_decision_config()
+    assert config["api_key"] == "test-key"
+    assert config["soft_check_mode"] == "shadow"
+    assert config["confidence_threshold"] == pytest.approx(0.87)
+
+
+def test_worker_rejects_unknown_claim_entailment_mode():
+    with pytest.raises(ValueError):
+        worker_config.WorkerSettings(_env_file=None, claim_entailment_mode="unsafe")
 
 
 def test_model_prices_reach_the_llm_config_and_default_to_unpriced():
@@ -122,20 +201,37 @@ def test_pdf_workers_wait_for_api_commit_before_emitting_stage_events():
     assert parse_source.index("prepare_uploaded_pdf") < parse_source.index("_mark_running")
 
 
-def test_full_pipeline_gets_a_longer_timeout_than_single_stage_jobs():
-    """一键生成是唯一跑到小时级的任务，不能跟单阶段任务共用默认超时。
+@pytest.mark.parametrize(
+    "function_name",
+    [
+        "run_write_pipeline",
+        "run_draft_rebuild_pipeline",
+        "run_polish_pipeline",
+        "run_quality_repair_pipeline",
+        "run_full_pipeline",
+    ],
+)
+def test_multi_section_pipelines_get_a_longer_timeout(function_name: str):
+    """按章节串行调用模型的任务不能跟有界单阶段任务共用默认超时。
 
-    真实教训：7 节 / 46 篇的一轮跑了 22 分钟，默认 1800 秒只剩 8 分钟余量；
-    超时在 arq 里是直接判失败（asyncio.wait_for 抛 TimeoutError，不重试），
-    撞上就是整轮白跑。
+    真实基线：7 节 / 46 篇的一轮约 22 分钟，其中写作约 18 分钟；章节数、重写轮次
+    与模型延迟叠加后可越过 3600 秒。arq 超时直接失败而不重试，撞上就是整轮白跑。
     """
-    full = next(
-        fn
-        for fn in worker.WorkerSettings.functions
-        if getattr(fn, "name", "") == "run_full_pipeline"
+    registered = next(
+        fn for fn in worker.WorkerSettings.functions if getattr(fn, "name", "") == function_name
     )
-    assert full.timeout_s == worker.FULL_PIPELINE_TIMEOUT_SECONDS
-    assert full.timeout_s > worker.WorkerSettings.job_timeout
+    assert registered.timeout_s == worker.LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS
+    assert registered.timeout_s > worker.WorkerSettings.job_timeout
+
+
+def test_every_pipeline_context_receives_the_worker_event_publisher() -> None:
+    """One forgotten task would silently fall back to high-frequency database polling."""
+    import inspect
+
+    source = inspect.getsource(worker)
+    assert source.count("async with job_context(") == source.count(
+        'event_publisher=ctx.get("redis")'
+    )
 
 
 def test_deterministic_fallback_scope_is_regenerated_before_search():

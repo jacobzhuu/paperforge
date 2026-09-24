@@ -42,6 +42,7 @@ from ingest import classify_content_role, parse_markdown_table
 from sqlalchemy import delete, or_, select
 
 from paperforge_worker.context import JobContext
+from paperforge_worker.locators import is_located, locator_display
 from paperforge_worker.pipelines.experiment_extraction import (
     ExperimentExtraction,
     ExtractedResultCell,
@@ -50,6 +51,7 @@ from paperforge_worker.pipelines.experiment_extraction import (
     reconcile,
 )
 from paperforge_worker.pipelines.fulltext import load_persisted_fulltext_sources
+from paperforge_worker.pipelines.scholarly_content import balanced_evidence, enrich_evidence
 
 MAX_EVIDENCE_UNITS_PER_WORK = 32
 MAX_EVIDENCE_TEXT_CHARS = 1_600
@@ -59,8 +61,9 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
 _RESULT_CUES = re.compile(
     r"\b(?:result|experiment|evaluat|outperform|improv|decreas|increas|"
     r"conclu|find|observ|demonstrat|significant|accuracy|precision|recall|"
-    r"f1|ndcg|auc|dataset|sample|theorem|proof|derive|limitation)\w*\b|"
-    r"(?:结果|实验|评估|优于|提升|下降|增加|结论|发现|观察|证明|数据集|样本|定理|局限)",
+    r"f1|ndcg|auc|dataset|sample|theorem|proof|derive|limitation|method|mechanism|"
+    r"algorithm|assum|constraint|defin|denot|baseline|ablation|where)\w*\b|"
+    r"(?:结果|实验|评估|优于|提升|下降|增加|结论|发现|观察|证明|数据集|样本|定理|局限|方法|机制|算法|假设|约束|定义|变量|其中|消融|基线)",
     re.IGNORECASE,
 )
 # 无本体时的兜底：只用真正跨领域的指标核心。领域指标（NDCG@K、ASR、Tanimoto…）
@@ -87,6 +90,11 @@ class EvidenceCandidate:
     object_ref: str | None = None
     grade: str = "C_fulltext_unlocated"
     anchor_strength: str = "prose_only"
+    #: 原文档内的绝对字符区间。半开区间 ``[char_start, char_end)``，与
+    #: ``document_chunk`` 的口径一致（生产库 27,451 个 chunk 全部满足
+    #: ``char_end - char_start == len(text)``）。定位不到时为 None。
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -307,7 +315,8 @@ async def _extract_work_evidence(
         return outcome
     outcome.works = 1
     source_hash = hashlib.sha256(
-        "\u241f".join((work.canonical_title or "", work.abstract or "", fulltext or "")).encode(
+        "\u241f".join(("scholarly-content-v1", work.canonical_title or "",
+                        work.abstract or "", fulltext or "")).encode(
             "utf-8"
         )
     ).hexdigest()[:40]
@@ -341,6 +350,8 @@ async def _extract_work_evidence(
                 topical_status=ontology_topical_status(candidate.text, tasks),
                 anchor_strength=candidate.anchor_strength,
                 locator_display=_locator_display(candidate),
+                char_start=candidate.char_start,
+                char_end=candidate.char_end,
             )
             unit_ids_by_text[candidate.text] = unit.id
             for measurement in _measurement_candidates(
@@ -787,6 +798,12 @@ async def _persist_structured_experiment_data(
             tasks=tasks,
             dataset_pattern=dataset_pattern,
         )
+        payload['scholarly_content_version'] = 'scholarly-content-v1'
+        payload['method_evidence'] = [enrich_evidence({
+            'text': candidate.text, 'evidence_id': str(evidence_unit_ids.get(candidate.text) or ''),
+            'grade': candidate.grade, 'page': candidate.page,
+            'section_path': candidate.section_path, 'object_ref': candidate.object_ref,
+        }) for candidate in candidates]
         extraction.status = "parsed"
         extraction.payload_json = payload
         extraction.source_hash = source_hash
@@ -1108,8 +1125,8 @@ def _source_location(candidate: EvidenceCandidate) -> str:
 
 
 def _locator_display(candidate: EvidenceCandidate) -> str | None:
-    parts = [f"p.{candidate.page}" if candidate.page else "", candidate.object_ref or ""]
-    return ", ".join(part for part in parts if part) or None
+    """人可读定位；与 `is_located` 同源，所以不会出现「可定位却显示不出来」。"""
+    return locator_display(candidate)
 
 
 def _cue_lookup(text: str, pairs: tuple[tuple[str, str], ...]) -> str | None:
@@ -1197,6 +1214,7 @@ def _evidence_candidates(
 ) -> list[EvidenceCandidate]:
     candidates: list[EvidenceCandidate] = []
     if fulltext_used:
+        chunk_spans = _chunk_spans(fulltext or "")
         for point in quotable_points:
             if not isinstance(point, dict):
                 continue
@@ -1214,15 +1232,19 @@ def _evidence_candidates(
                 strength = "object_mention"
             else:
                 strength = "prose_only"
+            excerpt = text[:MAX_EVIDENCE_TEXT_CHARS]
+            char_start, char_end = _locate_excerpt(fulltext or "", chunk_spans, excerpt)
             candidates.append(
                 EvidenceCandidate(
-                    text=text[:MAX_EVIDENCE_TEXT_CHARS],
+                    text=excerpt,
                     page=page,
                     section_path=section,
                     paragraph_index=paragraph,
                     object_ref=object_ref,
                     grade=_fulltext_grade(page, section, paragraph, object_ref, strength),
                     anchor_strength=strength,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
         candidates.extend(_located_fulltext_candidates(fulltext or ""))
@@ -1237,7 +1259,11 @@ def _evidence_candidates(
                     grade="D_abstract_only",
                 )
             )
-    return _deduplicate(candidates)
+    unique = _deduplicate(candidates)
+    by_text = {c.text: c for c in unique}
+    ordered = balanced_evidence([{'text': c.text, 'object_ref': c.object_ref,
+                                'grade': c.grade} for c in unique])
+    return [by_text[row['text']] for row in ordered]
 
 
 def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
@@ -1246,16 +1272,26 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(fulltext)
         locator = _parse_locator(match.group("locator"))
-        block = fulltext[match.end() : end].strip()
-        if not block or not classify_content_role(block).claim_eligible:
+        raw_block = fulltext[match.end() : end]
+        block = raw_block.strip()
+        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        if not block or (not is_formula and not classify_content_role(block).claim_eligible):
             continue
-        passages = [part.strip() for part in re.split(r"\n{2,}", block) if part.strip()]
-        if not passages:
-            passages = [block]
-        for paragraph_index, passage in enumerate(passages, start=1):
-            if not _RESULT_CUES.search(passage) and not re.search(r"\d", passage):
+        # `[[...]]\s*` 已经被 `_MARKER_RE` 吃掉，所以 raw_block 从 chunk.text 的第一个
+        # 字符开始；再减去 strip 掉的前导空白，就得到 block 在 chunk.text 里的偏移。
+        block_offset = len(raw_block) - len(raw_block.lstrip())
+        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        passages = [(0, block)] if is_formula else _split_passages(block)
+        for paragraph_index, (passage_offset, passage) in enumerate(passages, start=1):
+            if (not is_formula and not _RESULT_CUES.search(passage)
+                    and not re.search(r"\d", passage)):
                 continue
-            text = passage[:MAX_EVIDENCE_TEXT_CHARS]
+            if is_formula and len(passage) > 12000:
+                continue  # Never silently truncate a mathematical expression.
+            text = passage if is_formula else passage[:MAX_EVIDENCE_TEXT_CHARS]
+            char_start, char_end = _passage_span(
+                locator, block_offset + passage_offset, len(text)
+            )
             structured_object_ref = locator.get("object_ref")
             object_ref = structured_object_ref or _object_reference(text)
             if structured_object_ref:
@@ -1279,9 +1315,94 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
                         strength,
                     ),
                     anchor_strength=strength,
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
     return candidates
+
+
+def _chunk_spans(fulltext: str) -> list[tuple[int, int, int, int]]:
+    """每个带 ``CHAR`` 标记的 chunk 在拼接串里的范围，及其原文档偏移。
+
+    :returns: ``(拼接串起点, 拼接串终点, 文档内起点, 文档内终点)`` 列表。
+    """
+    spans: list[tuple[int, int, int, int]] = []
+    matches = list(_MARKER_RE.finditer(fulltext))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(fulltext)
+        locator = _parse_locator(match.group("locator"))
+        chunk_start = locator.get("char_start")
+        chunk_end = locator.get("char_end")
+        if isinstance(chunk_start, int) and isinstance(chunk_end, int):
+            spans.append((match.end(), end, chunk_start, chunk_end))
+    return spans
+
+
+def _locate_excerpt(
+    fulltext: str, chunk_spans: list[tuple[int, int, int, int]], excerpt: str
+) -> tuple[int | None, int | None]:
+    """把模型摘出来的一段原文，映射回文档内的绝对区间。
+
+    只认**唯一一次**逐字出现：模型可能改写、合并或跨 chunk 拼接，出现零次或多次
+    时给不出可信区间，宁可留空——一个指错地方的区间比没有区间更坏。
+    """
+    if not excerpt or not chunk_spans:
+        return None, None
+    first = fulltext.find(excerpt)
+    if first < 0 or fulltext.find(excerpt, first + 1) >= 0:
+        return None, None
+    for joined_start, joined_end, chunk_start, chunk_end in chunk_spans:
+        if joined_start <= first < joined_end:
+            start = chunk_start + (first - joined_start)
+            end = min(start + len(excerpt), chunk_end)
+            return (start, end) if end > start else (None, None)
+    return None, None
+
+
+def _split_passages(block: str) -> list[tuple[int, str]]:
+    """按空行切段，并保留每段在 ``block`` 里的起始偏移。
+
+    旧实现用 ``[part.strip() for part in re.split(...)]``，偏移在 split 和 strip
+    两步里都丢了——而精确区间正需要它。
+    """
+    passages: list[tuple[int, str]] = []
+    cursor = 0
+    for part in re.split(r"(\n{2,})", block):
+        if not part or re.fullmatch(r"\n{2,}", part):
+            cursor += len(part)
+            continue
+        lead = len(part) - len(part.lstrip())
+        stripped = part.strip()
+        if stripped:
+            passages.append((cursor + lead, stripped))
+        cursor += len(part)
+    if passages:
+        return passages
+    stripped = block.strip()
+    return [(len(block) - len(block.lstrip()), stripped)] if stripped else []
+
+
+def _passage_span(
+    locator: dict[str, Any], offset_in_chunk: int, length: int
+) -> tuple[int | None, int | None]:
+    """把「chunk 内偏移」换算成原文档内的绝对区间。
+
+    ``CHAR`` 标记给的是这个 chunk 在原文档里的位置；段落偏移加上去就是这一句证据
+    的精确位置。标记缺失（旧解析产物、或没有可靠偏移）时返回 ``(None, None)``，
+    绝不猜。
+    """
+    chunk_start = locator.get("char_start")
+    chunk_end = locator.get("char_end")
+    if not isinstance(chunk_start, int) or not isinstance(chunk_end, int):
+        return None, None
+    start = chunk_start + offset_in_chunk
+    end = min(start + length, chunk_end)
+    # 截断（MAX_EVIDENCE_TEXT_CHARS）或偏移异常都可能让区间越界；越界就不给，
+    # 而不是给一个指不到原文的区间。
+    if start < chunk_start or start >= chunk_end or end <= start:
+        return None, None
+    return start, end
 
 
 def _parse_locator(value: str) -> dict[str, Any]:
@@ -1298,6 +1419,13 @@ def _parse_locator(value: str) -> dict[str, Any]:
             locator["section"] = cleaned[:300]
         elif normalized_key in {"TABLE", "FIG", "EQ", "ALGO"}:
             locator["object_ref"] = f"{normalized_key.casefold()}:{cleaned}"[:64]
+        elif normalized_key == "CHAR":
+            span_start, separator_found, span_end = cleaned.partition("-")
+            if separator_found and span_start.isdigit() and span_end.isdigit():
+                start, end = int(span_start), int(span_end)
+                if end > start:
+                    locator["char_start"] = start
+                    locator["char_end"] = end
     return locator
 
 
@@ -1390,7 +1518,18 @@ def _fulltext_grade(
     # N4 / M1-9: A-grade only for true structured cells, never prose mentions.
     if anchor_strength == "structured_cell" and object_ref and (page or section):
         return "A_located_structured"
-    if page or section or paragraph:
+    # B/C 的分界就是「引用者能不能查证」，与 R6 判定数字句用的是同一个谓词
+    # （见 paperforge_worker.locators）。此前这里写 `page or section or paragraph`
+    # 而 R6 写 `page or object_ref`，于是 5,256 条被本函数命名为「已定位」的单元
+    # 在写作阶段被当成未定位，引用它们的数字句整句删掉。
+    if is_located(
+        {
+            "page": page,
+            "object_ref": object_ref,
+            "section_path": section,
+            "paragraph_index": paragraph,
+        }
+    ):
         return "B_located_prose"
     return "C_fulltext_unlocated"
 

@@ -7,30 +7,50 @@ from llm_runtime.client import create_llm_provider, preflight_llm_provider
 from llm_runtime.config import (
     DEFAULT_MODEL_PRICES,
     DEFAULT_ROLE_MODELS,
+    DEFAULT_ROLE_RETRY,
     DEFAULT_ROLE_THINKING,
     LLMConfig,
     ModelPrice,
     Role,
     parse_model_prices,
 )
+from llm_runtime.decision import (
+    DecisionResult,
+    DecisionRunner,
+    decision_cache_key,
+    validate_decision_response,
+)
 from llm_runtime.json_utils import CiteKeyViolation, clean_and_parse_json, purify_llm_json
 from llm_runtime.providers import (
+    QUOTA_EXHAUSTED,
     LLMProvider,
     NoopLLMProvider,
     OpenAICompatibleLLMProvider,
     UnsupportedLLMProvider,
     build_chat_completions_url,
     clamp_max_output_tokens,
+    is_quota_exhausted,
     sanitize_openai_compatible_base_url,
 )
-from llm_runtime.runner import JsonResult, LLMCallRecord, LLMRunner
+from llm_runtime.retry_policy import (
+    DEFAULT_TRUNCATION_RETRY_POLICY,
+    TruncationRetryPolicy,
+    parse_role_retry,
+    resolve_truncation_policy,
+)
+from llm_runtime.runner import TRUNCATED_AT_CEILING, JsonResult, LLMCallRecord, LLMRunner
 from llm_runtime.types import LLMError, LLMRequest, LLMResponse
 
 __all__ = [
     "DEFAULT_MODEL_PRICES",
     "DEFAULT_ROLE_MODELS",
+    "DEFAULT_ROLE_RETRY",
     "DEFAULT_ROLE_THINKING",
+    "DEFAULT_TRUNCATION_RETRY_POLICY",
+    "TRUNCATED_AT_CEILING",
     "CiteKeyViolation",
+    "DecisionResult",
+    "DecisionRunner",
     "LLMConfig",
     "LLMError",
     "LLMProvider",
@@ -42,14 +62,21 @@ __all__ = [
     "ModelPrice",
     "NoopLLMProvider",
     "OpenAICompatibleLLMProvider",
+    "QUOTA_EXHAUSTED",
     "Role",
+    "TruncationRetryPolicy",
     "UnsupportedLLMProvider",
     "build_chat_completions_url",
     "clamp_max_output_tokens",
     "clean_and_parse_json",
     "create_llm_provider",
+    "decision_cache_key",
+    "is_quota_exhausted",
     "parse_model_prices",
+    "parse_role_retry",
     "preflight_llm_provider",
     "purify_llm_json",
+    "resolve_truncation_policy",
     "sanitize_openai_compatible_base_url",
+    "validate_decision_response",
 ]

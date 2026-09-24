@@ -182,6 +182,9 @@ def _append_latex_region(
         body = match.group("body")
         kind = _environment_kind(env)
         object_ref = _latex_object_ref(body, kind=kind, fallback=index)
+        if kind == "equation" and env in {"align", "gather"}:
+            inner = "aligned" if env == "align" else "gathered"
+            body = f"\\begin{{{inner}}}{body}\\end{{{inner}}}"
         rendered = _render_environment(body, kind=kind)
         builder.append(
             rendered,
@@ -215,7 +218,7 @@ def _render_environment(body: str, *, kind: str) -> str:
         return f"{caption}\n{table}".strip()
     if kind == "equation":
         equation = re.sub(r"\\label\s*\{[^{}]+\}", "", body)
-        return f"{caption}\n{equation.strip()}".strip()
+        return f"{caption}\n$$\n{equation.strip()}\n$$".strip()
     return f"{caption}\n{_latex_to_text(body)}".strip()
 
 
@@ -274,6 +277,18 @@ def _strip_comments(text: str) -> str:
 
 
 def _latex_to_text(text: str) -> str:
+    math_fragments: list[str] = []
+
+    def keep_math(match: re.Match[str]) -> str:
+        math_fragments.append(match.group(0))
+        return f"PFMATHFRAGMENT{len(math_fragments) - 1}END"
+
+    text = re.sub(
+        r"\$\$.*?\$\$|\\\[.*?\\\]|\\\(.*?\\\)|(?<![\\$])\$(?!\$)[^$\n]+\$(?!\$)",
+        keep_math,
+        text,
+        flags=re.S,
+    )
     value = re.sub(r"\\(?:cite|citep|citet|ref|eqref|label)\s*\{[^{}]*\}", "", text)
     value = re.sub(
         r"\\(?:textbf|textit|emph|mathrm|mathbf|operatorname|url|href)\s*\{([^{}]*)\}",
@@ -284,7 +299,10 @@ def _latex_to_text(text: str) -> str:
     value = value.replace("{", "").replace("}", "")
     value = value.replace("~", " ")
     lines = [" ".join(line.split()) for line in value.splitlines()]
-    return "\n".join(line for line in lines if line).strip()
+    value = "\n".join(line for line in lines if line).strip()
+    for index, fragment in enumerate(math_fragments):
+        value = value.replace(f"PFMATHFRAGMENT{index}END", fragment)
+    return value
 
 
 __all__ = ["extract_latex_source_content"]

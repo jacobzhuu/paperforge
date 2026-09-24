@@ -11,15 +11,13 @@ from urllib.parse import quote
 
 from arq.connections import ArqRedis
 from db import (
-    JOB_RESUME_KEY,
     assign_bibtex_key,
-    create_job,
     get_work_authors,
     reference_metadata_payload,
     set_entry_status,
-    update_job,
     upsert_entry,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.library import DocumentFile, LiteraturePdfUpload, ScholarlyWork
 from db.models.paper import GenerationJob
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -47,7 +45,7 @@ router = APIRouter(
     dependencies=[Depends(authorize_project_request)],
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 MAX_LITERATURE_PDF_BYTES = 64 * 1024 * 1024
@@ -67,7 +65,7 @@ async def upload_literature_pdf(
     """Persist a PDF privately, then asynchronously identify its scholarly work."""
     project = await _require_project(session, project_id)
     await require_queue(queue)
-    await ensure_project_job_slot(session, project.id)
+    await ensure_project_job_slot(session, project.id, queue)
     content = await file.read(MAX_LITERATURE_PDF_BYTES + 1)
     if not content:
         raise HTTPException(status_code=422, detail="uploaded PDF is empty")
@@ -172,6 +170,16 @@ async def confirm_literature_pdf(
     await require_queue(queue)
     await _lock_project_library(session, project.id)
     upload = await _require_upload(session, project.id, upload_id, for_update=True)
+    source_job = await session.scalar(
+        select(GenerationJob)
+        .where(
+            GenerationJob.project_id == project.id,
+            GenerationJob.checkpoint_json["resume"]["kwargs"]["upload_id"].astext
+            == str(upload.id),
+        )
+        .order_by(GenerationJob.created_at.desc())
+        .limit(1)
+    )
     if upload.status != "needs_confirmation" or upload.matched_work_id is None:
         raise HTTPException(status_code=409, detail="PDF upload has no match awaiting confirmation")
     work = await session.get(ScholarlyWork, upload.matched_work_id)
@@ -255,6 +263,9 @@ async def confirm_literature_pdf(
         upload=upload,
         enqueue_failure_status="parse_failed",
         upload_id=str(upload.id),
+        checkpoint=(
+            {EXECUTION_PROFILE_KEY: source_execution_profile(source_job)} if source_job else None
+        ),
     )
     return LiteraturePdfUploadStartedResponse(
         upload=await _upload_response(session, upload),
@@ -303,6 +314,16 @@ async def retry_literature_pdf(
     project = await _require_project(session, project_id)
     await require_queue(queue)
     upload = await _require_upload(session, project.id, upload_id, for_update=True)
+    source_job = await session.scalar(
+        select(GenerationJob)
+        .where(
+            GenerationJob.project_id == project.id,
+            GenerationJob.checkpoint_json["resume"]["kwargs"]["upload_id"].astext
+            == str(upload.id),
+        )
+        .order_by(GenerationJob.created_at.desc())
+        .limit(1)
+    )
     if upload.status == "match_failed":
         upload.status = "matching"
         function = "run_pdf_match_pipeline"
@@ -325,6 +346,9 @@ async def retry_literature_pdf(
             "match_failed" if function == "run_pdf_match_pipeline" else "parse_failed"
         ),
         upload_id=str(upload.id),
+        checkpoint=(
+            {EXECUTION_PROFILE_KEY: source_execution_profile(source_job)} if source_job else None
+        ),
     )
     return LiteraturePdfUploadStartedResponse(
         upload=await _upload_response(session, upload),
@@ -468,53 +492,28 @@ async def _commit_and_enqueue_pdf_job(
     upload: LiteraturePdfUpload,
     enqueue_failure_status: str,
     upload_id: str,
+    checkpoint: dict | None = None,
 ) -> GenerationJob:
-    """Commit domain state and its job before making it visible to ARQ.
+    """Commit upload state and its durable dispatch intent together.
 
-    The general job helper predates an outbox and enqueues inside the request
-    transaction. PDF workers immediately need the just-created upload/document,
-    so that ordering can race. A deterministic ARQ id also makes dispatch safe
-    if an HTTP intermediary retries the enqueue request.
+    Queue transport failure retains queued work for the background dispatcher.
+    The signature remains compatible with upload callers; no private object is
+    deleted merely because Redis is temporarily unavailable.
     """
-    ready = await require_queue(queue)
-    await ensure_project_job_slot(session, project_id)
-    kwargs = {"upload_id": upload_id}
-    job = await create_job(
+    from paperforge_api.dispatch import dispatch_after_commit
+    from paperforge_api.jobs import start_job
+
+    job = await start_job(
         session,
+        queue,
         project_id=project_id,
         kind="ingest",
-        checkpoint={
-            JOB_RESUME_KEY: {
-                "function": function,
-                "kwargs": kwargs,
-            }
-        },
+        function=function,
+        checkpoint=checkpoint,
+        upload_id=upload_id,
     )
     await session.commit()
-    try:
-        await ready.enqueue_job(
-            function,
-            str(project_id),
-            str(job.id),
-            _job_id=str(job.id),
-            upload_id=upload_id,
-        )
-    except Exception as error:
-        failure = {
-            "reason": "task_enqueue_failed",
-            "error_type": type(error).__name__,
-        }
-        try:
-            upload.status = enqueue_failure_status
-            upload.error_json = failure
-            await update_job(session, job, status="failed", error=failure)
-            await session.commit()
-        except Exception:  # noqa: BLE001 - preserve the already committed private object
-            await session.rollback()
-        raise HTTPException(
-            status_code=503,
-            detail="task queue could not accept the PDF job; retry is available",
-        ) from error
+    await dispatch_after_commit(session)
     return job
 
 

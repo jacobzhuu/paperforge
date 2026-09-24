@@ -11,7 +11,8 @@ illustration representing {论文标题}」。它不理解章节内容、构图�
 1. 建议阶段绝不调用 ImageProvider——本模块只产出 proposal，没有任何生图调用；
 2. 文本模型不可用 / 超时 / JSON 不合法时，回退到原有的确定性规划器，
    `visual_plan` 永远有产物（draft-first）；
-3. 送进模型的是当前论文全部章节正文，使规划器能做真正的跨章节综合。
+3. 送进模型的上下文覆盖当前论文全部章节；超长正文按章节均衡压缩，避免成本随
+   文稿长度无界增长，也避免简单尾截断漏掉结论。
 
 注意数据流向：这一层**会**把正文摘要发给文本模型。生成确认框因此只能承诺
 「不会发送给**图像**服务商」，不能笼统写「不会发送论文原文」。
@@ -25,7 +26,7 @@ from typing import Any
 
 from llm_runtime import LLMRunner
 
-from paperforge_worker.pipelines.image_prompt import refine_image_prompt
+from paperforge_worker.pipelines.image_prompt import bound_paper_context, refine_image_prompt
 
 #: 一次规划最多提这么多条，AI 插图另有更严的上限——插图是唯一会花钱的一类。
 MAX_PROPOSALS = 6
@@ -109,10 +110,13 @@ async def plan_visuals(
     outline = "\n\n".join(
         f"[{section.key}] {section.title}\n{section.excerpt}" for section in sections
     )
+    planning_context = bound_paper_context(paper_context or outline)
     result = await runner.agenerate_json(
         "planner",
         system_prompt=_SYSTEM_PROMPT,
-        user_prompt=f"Section keys: {', '.join(sorted(allowed))}\n\nSections:\n{outline}",
+        user_prompt=(
+            f"Section keys: {', '.join(sorted(allowed))}\n\nSections:\n{planning_context}"
+        ),
         max_output_tokens=3000,
         temperature=0.2,
         metadata={"stage": "visual_plan"},
@@ -132,7 +136,7 @@ async def plan_visuals(
         proposals,
         runner=runner,
         sections=sections,
-        paper_context=paper_context or outline,
+        paper_context=planning_context,
     )
     return proposals, f"llm:{result.model}"
 

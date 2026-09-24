@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
 from fastapi import FastAPI, HTTPException  # noqa: E402
+from observability.admission import AdmissionMiddleware
 from PIL import Image, ImageChops, ImageOps, UnidentifiedImageError  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 from visuals import ChartSpec, DiagramSpec  # noqa: E402
@@ -70,6 +71,9 @@ class NormalizeRequest(StrictRequest):
         default=None,
         pattern=r"^(1024x1024|1536x1024|1024x1536)$",
     )
+
+
+app.add_middleware(AdmissionMiddleware, limit=1)
 
 
 @app.get("/healthz")

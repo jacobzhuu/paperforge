@@ -60,6 +60,9 @@ export const STATUS_VARIANT: Record<
  * 阶段集合见 worker.py::_STAGE_PROGRESS。
  */
 export const STAGE_LABEL: Record<string, string> = {
+  intake: '理解研究目标',
+  research: '分析实验数据',
+  web_research: '补充网页资料',
   scope: '生成研究范围',
   qdecomp: '分解研究子问题',
   search: '多源检索与去重',
@@ -79,6 +82,11 @@ export const STAGE_LABEL: Record<string, string> = {
   outline: '生成大纲',
   write: '分节写作',
   polish: '连贯性润色',
+  'polish.started': '开始润色',
+  'polish.completed': '润色完成',
+  'polish.section': '章节润色结果',
+  'polish.policy': '润色策略',
+  'polish.skipped': '跳过剩余润色',
   citecheck: '引用越权校验',
   visual_plan: '生成视觉建议',
   visual_generate: '生成图表与插图',
@@ -143,6 +151,7 @@ export const LIBRARY_ACTION = {
 } as const;
 
 export const ADDED_VIA_LABEL: Record<AddedVia, string> = {
+  mcp_web_verified: '网页发现（已核验）',
   search: '检索',
   snowball: '雪球',
   doi_import: 'DOI 导入',

@@ -180,19 +180,24 @@ def _stub_synthesizer(monkeypatch, result=None, calls: list | None = None):
 
 @pytest.mark.asyncio
 async def test_disabled_leaves_the_bundle_byte_identical(session_factory, monkeypatch) -> None:
+    """关掉开关时必须逐字节回到引入前的行为——这是它作为开关的意义。
+
+    默认值已在 2026-08-15 翻成 True（此前它自落地起从未在生产跑过，
+    `question_synthesis` 全库零行），所以这条用例现在要显式关掉才测得到关态。
+    """
     project_id, _ = await _seed(session_factory)
     calls: list[str] = []
     _stub_synthesizer(monkeypatch, calls=calls)
 
-    outcome = await synthesize_questions(_context(project_id, session_factory))
+    outcome = await synthesize_questions(
+        _context(project_id, session_factory, synthesis_llm_enabled=False)
+    )
 
     assert calls == []
     assert "synthesis" not in outcome.bundles[0]
     assert "synthesis" not in outcome.to_payload()
     async with session_factory() as session:
-        stored = await list_question_syntheses(
-            session, project_id=project_id, bundle_hashes=["x"]
-        )
+        stored = await list_question_syntheses(session, project_id=project_id, bundle_hashes=["x"])
     assert stored == []
 
 
@@ -203,7 +208,10 @@ async def test_enabled_attaches_a_narrative_without_touching_answer_status(
     project_id, question_id = await _seed(session_factory)
     _stub_synthesizer(monkeypatch)
 
-    baseline = await synthesize_questions(_context(project_id, session_factory))
+    # 基线取「关掉综合」的那一版：这条用例要证明的是开启后 answer_status 不变。
+    baseline = await synthesize_questions(
+        _context(project_id, session_factory, synthesis_llm_enabled=False)
+    )
     before = [(b["question_id"], b["answer_status"]) for b in baseline.bundles]
 
     outcome = await synthesize_questions(
@@ -239,9 +247,7 @@ async def test_an_unchanged_bundle_makes_no_second_call(session_factory, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_new_evidence_invalidates_the_stored_synthesis(
-    session_factory, monkeypatch
-) -> None:
+async def test_new_evidence_invalidates_the_stored_synthesis(session_factory, monkeypatch) -> None:
     """bundle 变了就必须重新综合——否则补充轮次后的正文引用的是旧结论。"""
     project_id, question_id = await _seed(session_factory)
     calls: list[str] = []

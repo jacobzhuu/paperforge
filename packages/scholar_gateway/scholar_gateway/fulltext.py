@@ -11,9 +11,11 @@ arXiv PDF、Europe PMC render），不提供任何绕 paywall 能力。
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from scholar_gateway.http import HttpFetchResult, SafeHttpClient
 
@@ -359,31 +361,73 @@ def acquire_oa_fulltext(
     plan: OaFulltextPlan,
     *,
     http_client: SafeHttpClient,
+    concurrency: int = 1,
+    per_host_concurrency: int = 1,
 ) -> OaFulltextAcquisitionResult:
     """按规划抓取全文；每篇最多试 MAX_URLS_PER_WORK 个 URL，首个成功即停。
 
     Draft-first：任一篇失败只记 failure，不影响其他文献，也绝不抛出。
+
+    ``concurrency`` 是**按文献**的并发度。两条边界都不可谈判：
+
+    * **每篇内部的 URL 回退保持串行。** ``MAX_URLS_PER_WORK`` 的「首个成功即停」是一个
+      回退**顺序**（OA 正本优先于落地页），并发发出会改变最终留下哪一个 URL，
+      还白花 5 倍带宽。
+    * **同一 host 默认仍然串行**（``per_host_concurrency``）。``SafeHttpClient`` 自己
+      完全没有限速，而一次抓取计划高度集中在少数几个 host（arXiv/PMC/DOAJ/出版商
+      落地页）。无界扇出会被限流甚至封禁——那不是「慢一点」，那是全文变少、
+      卡片变薄，也就是**质量退化**。
+
+    返回顺序与串行时一致：结果按 work 在计划中出现的顺序展平。``attempts`` 会被
+    调用方按这个顺序写成 ``fulltext_attempt`` 行，完成序会让那张表变得不稳定。
     """
     candidates_by_work: dict[str, list[OaFulltextCandidate]] = {}
     for candidate in plan.candidates:
         candidates_by_work.setdefault(candidate.work_id, []).append(candidate)
 
+    work_ids = list(candidates_by_work)
+    if not work_ids:
+        return OaFulltextAcquisitionResult((), (), ())
+
+    # host 信号量预先建好——懒建会让字典本身成为并发写入点。
+    host_gates: dict[str, threading.Semaphore] = {}
+    per_host = max(1, int(per_host_concurrency))
+    for candidates in candidates_by_work.values():
+        for candidate in candidates[:MAX_URLS_PER_WORK]:
+            host = (urlsplit(candidate.url).hostname or "").casefold()
+            if host not in host_gates:
+                host_gates[host] = threading.Semaphore(per_host)
+
+    def _acquire_one(
+        work_id: str,
+    ) -> tuple[OaFulltextDocument | None, list[OaFulltextAttempt]]:
+        work_attempts: list[OaFulltextAttempt] = []
+        for candidate in candidates_by_work[work_id][:MAX_URLS_PER_WORK]:
+            host = (urlsplit(candidate.url).hostname or "").casefold()
+            with host_gates[host]:
+                result, attempt = _fetch(http_client, candidate)
+            work_attempts.append(attempt)
+            if result is not None:
+                return result, work_attempts
+        return None, work_attempts
+
+    workers = max(1, min(int(concurrency), len(work_ids)))
+    if workers == 1:
+        per_work = [_acquire_one(work_id) for work_id in work_ids]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # `map` 按输入序返回，所以下面的展平与串行执行逐项相同。
+            per_work = list(pool.map(_acquire_one, work_ids))
+
     documents: list[OaFulltextDocument] = []
     failures: list[dict[str, Any]] = []
     attempts: list[OaFulltextAttempt] = []
-
-    for work_id, work_candidates in candidates_by_work.items():
-        acquired = False
-        for candidate in work_candidates[:MAX_URLS_PER_WORK]:
-            result, attempt = _fetch(http_client, candidate)
-            attempts.append(attempt)
-            if result is None:
-                continue
-            documents.append(result)
-            acquired = True
-            break
-        if not acquired:
+    for work_id, (document, work_attempts) in zip(work_ids, per_work, strict=True):
+        attempts.extend(work_attempts)
+        if document is None:
             failures.append({"work_id": work_id, "reason": "all_oa_urls_failed"})
+        else:
+            documents.append(document)
 
     return OaFulltextAcquisitionResult(tuple(documents), tuple(failures), tuple(attempts))
 

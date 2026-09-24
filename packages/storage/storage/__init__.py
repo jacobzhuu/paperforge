@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -15,6 +16,7 @@ class ObjectStore(Protocol):
     def put(self, key: str, data: bytes, *, content_type: str | None = None) -> str: ...
     def get(self, key: str) -> bytes: ...
     def delete(self, key: str) -> None: ...
+    def probe(self) -> None: ...
 
 
 class FilesystemObjectStore:
@@ -42,6 +44,12 @@ class FilesystemObjectStore:
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
 
+    def probe(self) -> None:
+        """后端此刻是否还能收产物。构造函数建过目录，运行期它仍可能被卸载/只读。"""
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not os.access(self.root, os.W_OK):
+            raise RuntimeError(f"object store root is not writable: {self.root}")
+
 
 class MinioObjectStore:
     """Private S3-compatible bucket. Keys are never exposed as public URLs."""
@@ -66,7 +74,12 @@ class MinioObjectStore:
         )
         self.bucket = bucket
         if not self.client.bucket_exists(bucket):
-            self.client.make_bucket(bucket)
+            try:
+                self.client.make_bucket(bucket)
+            except S3Error as error:
+                # Another API/worker can win the same first-use bucket creation.
+                if error.code != "BucketAlreadyOwnedByYou":
+                    raise
         # S3 buckets are private without a bucket policy. Remove any policy left by an
         # earlier development setup so authenticated API downloads remain the only path.
         try:
@@ -95,6 +108,11 @@ class MinioObjectStore:
 
     def delete(self, key: str) -> None:
         self.client.remove_object(self.bucket, key)
+
+    def probe(self) -> None:
+        """一次 HEAD 就能分辨「桶还在」与「服务不可达」，可放进容器健康检查。"""
+        if not self.client.bucket_exists(self.bucket):
+            raise RuntimeError(f"object store bucket is missing: {self.bucket}")
 
 
 def make_object_store(settings: Any) -> ObjectStore:

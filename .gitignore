@@ -63,3 +63,9 @@ apps/web/_probe_*
 
 # Local research notes / tool outputs (not project code)
 本周研究汇报_*.md
+
+# Browser verification artifacts
+apps/web/test-results/
+apps/web/playwright-report/
+
+services/pi/node_modules/

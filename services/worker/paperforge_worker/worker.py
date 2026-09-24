@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
-from arq import func
+from arq import cron, func
 from arq.connections import RedisSettings
 from db import (
     FINISHED_JOB_STATUSES,
@@ -24,15 +25,30 @@ from db import (
     WRITE_DOCUMENT_KEY,
     get_project,
     latest_quality_report,
+    sentence_downgrade_summary,
     update_job,
     update_project_scope,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY
 from db.session import make_engine, make_session_factory
+from llm_runtime import QUOTA_EXHAUSTED
 from observability import configure_logging, get_logger, record_job_stage
 
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.config import WorkerSettings as Settings
 from paperforge_worker.config import get_settings
 from paperforge_worker.context import JobContext, JobStopped, build_scholar_cache, job_context
+from paperforge_worker.intake_job import run_intake_pipeline
+from paperforge_worker.orchestration.semantic_repair import (
+    CHECKPOINT_KEY as SEMANTIC_REPAIR_KEY,
+)
+from paperforge_worker.orchestration.semantic_repair import (
+    RepairAction,
+    RepairState,
+    execute_actions,
+    plan_repairs,
+)
+from paperforge_worker.orchestration.tracing import traced
 from paperforge_worker.pipelines.cards import generate_cards
 from paperforge_worker.pipelines.document import (
     repair_document_sections,
@@ -41,7 +57,7 @@ from paperforge_worker.pipelines.document import (
     write_document,
 )
 from paperforge_worker.pipelines.evidence import extract_evidence_units
-from paperforge_worker.pipelines.export import export_document
+from paperforge_worker.pipelines.export import EVIDENCE_LEDGER_KEY, export_document
 from paperforge_worker.pipelines.fulltext import acquire_fulltexts, parse_document_file
 from paperforge_worker.pipelines.importing import (
     import_references,
@@ -58,14 +74,18 @@ from paperforge_worker.pipelines.pdf_upload import (
 from paperforge_worker.pipelines.qdecomp import persist_question_decomposition
 from paperforge_worker.pipelines.qmatrix import build_question_evidence_matrix
 from paperforge_worker.pipelines.quality import (
+    RECOVERABLE_BLOCKER_CODES,
     apply_readiness_gate,
     build_claim_evidence,
     build_depth_metrics,
     build_original_claim_grounding,
     build_quality_report,
+    claim_verification_cache_keys,
+    preview_citations,
+    recoverable_findings,
     repairable_finding_count,
     soft_check_citations,
-    verify_cross_language_claim_evidence,
+    verify_claim_evidence,
     zh_language_mismatches,
 )
 from paperforge_worker.pipelines.readiness import (
@@ -75,16 +95,26 @@ from paperforge_worker.pipelines.readiness import (
 from paperforge_worker.pipelines.scope import generate_scope
 from paperforge_worker.pipelines.screen import screen_eligibility
 from paperforge_worker.pipelines.search import ensure_bibtex_keys, run_search
+from paperforge_worker.pipelines.semantic_review import (
+    ReviewOutcome,
+    SectionVerdict,
+    review_section,
+)
 from paperforge_worker.pipelines.synthesis import (
     load_synthesis_bundles,
     synthesize_questions,
 )
 from paperforge_worker.pipelines.visuals import generate_visual, suggest_visuals
+from paperforge_worker.pipelines.web_research import run_web_research
+from paperforge_worker.pipelines.writing import dedupe_evidence_by_text
 
 logger = get_logger(__name__)
 
-# 一键生成的单任务超时（秒）。默认 job_timeout 管的是单阶段任务。
-FULL_PIPELINE_TIMEOUT_SECONDS = 7200
+# 多章节写作/重写任务的超时（秒）。检索、导出等有自身有界 I/O 的单阶段任务继续用
+# 默认 job_timeout；write/polish/rebuild/quality-repair/full 都会串行调用多次 LLM，必须
+# 按整篇文档规模给预算。保留旧名供已有运维探针兼容。
+LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS = 7200
+FULL_PIPELINE_TIMEOUT_SECONDS = LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS
 
 # 正文写作前的定向补证轮数上限。每一轮都是一次真实检索 + 全文获取 + 证据抽取，
 # 所以有界；但一轮是不够的——「缺第二个独立来源」往往要换一套术语才够得到。
@@ -156,7 +186,8 @@ async def _run_stage(
     await context.raise_if_stopped()
     await context.emit(f"{stage}.started", {}, stage=stage)
     try:
-        result = await runner()
+        async with context.span("tool", stage):
+            result = await runner()
     except JobStopped:
         # 必须先于下面的兜底 except：否则停止信号会被当成「阶段降级」吞掉，
         # 管线接着跑下一阶段，用户点的停止毫无效果。
@@ -191,6 +222,7 @@ async def _run_stage(
         progress=progress if progress is not None else _STAGE_PROGRESS.get(stage),
         checkpoint={stage: payload or True},
     )
+    await context.raise_if_stopped()
     return result
 
 
@@ -238,6 +270,20 @@ def can_render_after_quality(quality_profile: str, readiness_status: str) -> boo
     return quality_profile == "draft" or readiness_status in RENDERABLE_READINESS
 
 
+def _prewrite_quality_profile(context: JobContext) -> str:
+    """Use the job's pinned strategy for assisted prewrite readiness."""
+    return "draft" if context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft" else "scholarly"
+
+
+def _effective_delivery_mode(
+    checkpoint: dict[str, Any], quality_profile: str, legacy_delivery_mode: str
+) -> str:
+    """A fast project never weakens an explicitly requested formal quality run."""
+    pinned = checkpoint.get(EXECUTION_PROFILE_KEY)
+    fast = pinned == "fast_draft" or (pinned is None and legacy_delivery_mode == "fast_draft")
+    return "fast_draft" if quality_profile == "draft" and fast else "standard"
+
+
 async def run_library_pipeline(
     ctx: dict,
     project_id: str,
@@ -265,6 +311,7 @@ async def run_library_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -316,6 +363,7 @@ async def run_library_pipeline(
             lambda: run_search(context, scope=scope, providers=providers),
             critical=strict_dependencies,
         )
+        await _run_stage(context, "web_research", lambda: run_web_research(context))
         await _run_stage(
             context,
             "screen",
@@ -367,7 +415,7 @@ async def run_library_pipeline(
             qmatrix_outcome = await _run_stage(
                 context,
                 "qmatrix",
-                lambda: build_question_evidence_matrix(context, language=language),
+                lambda: _build_and_deepen_matrix(context, language=language),
                 critical=strict_dependencies,
             )
             synthesis_outcome = await _run_stage(
@@ -427,6 +475,22 @@ async def run_library_pipeline(
         }
 
 
+async def run_web_research_pipeline(ctx: dict, project_id: str, job_id: str) -> dict:
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        outcome = await _run_stage(context, "web_research", lambda: run_web_research(context))
+        outcome = outcome or context.stage_payload("web_research")
+        await _finish(context, delivered=outcome.get("status") in {"completed", "partial"})
+        return outcome
+
+
 async def run_import_pipeline(
     ctx: dict,
     project_id: str,
@@ -446,6 +510,7 @@ async def run_import_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         payloads: list[dict[str, Any]] = []
@@ -493,6 +558,7 @@ async def run_cards_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -521,6 +587,7 @@ async def run_qdecomp_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -543,6 +610,81 @@ async def run_qdecomp_pipeline(
         return {"project_id": project_id, "questions": outcome.to_payload() if outcome else None}
 
 
+async def run_research_pipeline(ctx: dict, project_id: str, job_id: str, analysis_id: str):
+    from db.models.research import ResearchAnalysis
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg import AsyncConnection
+    from psycopg.rows import dict_row
+
+    from paperforge_worker.orchestration.research_graph import run_research
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await context.raise_if_stopped()
+        await _mark_running(context)
+        url = context.settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+        try:
+            async with await AsyncConnection.connect(
+                url,
+                autocommit=True,
+                prepare_threshold=0,
+                row_factory=dict_row,
+                options="-csearch_path=paperforge_graph",
+            ) as connection:
+                await run_research(context, analysis_id, AsyncPostgresSaver(connection))
+        except JobStopped:
+            raise
+        except Exception as error:
+            message = (
+                str(error) if isinstance(error, ValueError | TimeoutError) else type(error).__name__
+            )
+            logger.exception("research analysis failed")
+            async with context.session() as session:
+                row = await session.get(ResearchAnalysis, uuid.UUID(analysis_id))
+                row.status = "failed"
+                row.result_json = {**(row.result_json or {}), "error": message}
+            await _finish(context, delivered=False)
+            return {"error": str(error)}
+        await _finish(context, delivered=True)
+        return {"analysis_id": analysis_id}
+
+
+async def run_evidence_index_pipeline(ctx: dict, project_id: str, job_id: str) -> dict:
+    from retrieval.search import index_project
+
+    from paperforge_worker.execution import fence_commit
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        result = await _run_stage(
+            context,
+            "evidence_index",
+            lambda: index_project(
+                context.session_factory,
+                context.project_id,
+                stop_check=context.raise_if_stopped,
+                before_commit=fence_commit,
+            ),
+            kind="evidence",
+            resumable=False,
+        )
+        await _finish(context, delivered=result is not None)
+        return result or {}
+
+
 async def run_evidence_pipeline(
     ctx: dict,
     project_id: str,
@@ -557,6 +699,7 @@ async def run_evidence_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         fulltext_result = await _run_stage(
@@ -591,6 +734,7 @@ async def run_qmatrix_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -620,6 +764,7 @@ async def run_alignment_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -641,7 +786,7 @@ async def run_alignment_pipeline(
         )
         readiness = await _evaluate_prewrite_evidence(
             context,
-            quality_profile="scholarly",
+            quality_profile=_prewrite_quality_profile(context),
             review_style="narrative",
             matrix_payload=matrix.to_payload() if matrix else None,
         )
@@ -670,6 +815,7 @@ async def run_synthesis_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -681,7 +827,7 @@ async def run_synthesis_pipeline(
         )
         readiness = await _evaluate_prewrite_evidence(
             context,
-            quality_profile="scholarly",
+            quality_profile=_prewrite_quality_profile(context),
             review_style="narrative",
         )
         if readiness.ready:
@@ -693,6 +839,79 @@ async def run_synthesis_pipeline(
             "synthesis": outcome.to_payload() if outcome else None,
             "evidence_readiness": readiness.to_payload(),
         }
+
+
+async def run_dependency_rebuild_pipeline(
+    ctx: dict, project_id: str, job_id: str, outline_id: str, source_hash: str
+) -> dict:
+    from copy import deepcopy
+
+    from db import create_outline, get_outline, latest_outline
+    from db.models.paper import PaperProject
+    from sqlalchemy import select
+
+    from paperforge_worker.orchestration.dependency_contract import propose
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    async with job_context(
+        project_id=uuid.UUID(project_id),
+        job_id=uuid.UUID(job_id),
+        settings=ctx.get("settings") or get_settings(),
+        session_factory=ctx.get("session_factory"),
+        event_publisher=ctx.get("redis"),
+    ) as context:
+        await _mark_running(context)
+        intent = context.checkpoint.get("dependency_rebuild_intent") or job_id
+        await context.emit(
+            "outline.dependencies_started", {}, checkpoint={"dependency_rebuild_intent": intent}
+        )
+        async with context.session() as session:
+            source = await get_outline(session, uuid.UUID(outline_id))
+            if (
+                source is None
+                or source.project_id != context.project_id
+                or fingerprint(source.tree_json) != source_hash
+            ):
+                raise JobStopped("pause", reason="outline_source_changed")
+            tree = deepcopy(source.tree_json)
+        # A retry after the version transaction must reuse that version, even if
+        # the completion event was never delivered. The marker is server-owned.
+        marker = {"job_id": intent, "source_id": outline_id, "source_hash": source_hash}
+        async with context.session() as session:
+            latest = await latest_outline(session, context.project_id)
+            saved = (latest.tree_json or {}).get("dependency_contract", {}) if latest else {}
+            result_id = str(latest.id) if saved.get("rebuild") == marker else None
+            if result_id is None and (latest is None or str(latest.id) != outline_id):
+                raise JobStopped("pause", reason="outline_source_changed")
+        if result_id is None:
+            async with context.span("outline", "dependency_plan"):
+                proposed = await propose(tree, context.llm_runner())
+            proposed["dependency_contract"]["rebuild"] = marker
+            await context.raise_if_stopped()
+            async with context.session() as session:
+                await session.scalar(
+                    select(PaperProject)
+                    .where(PaperProject.id == context.project_id)
+                    .with_for_update()
+                )
+                latest = await latest_outline(session, context.project_id)
+                saved = (latest.tree_json or {}).get("dependency_contract", {}) if latest else {}
+                if saved.get("rebuild") == marker:
+                    result_id = str(latest.id)
+                elif (
+                    latest is None
+                    or str(latest.id) != outline_id
+                    or fingerprint(latest.tree_json) != source_hash
+                ):
+                    raise JobStopped("pause", reason="outline_source_changed")
+                else:
+                    result = await create_outline(
+                        session, project_id=context.project_id, tree=proposed, status="draft"
+                    )
+                    result_id = str(result.id)
+        await context.emit("outline.dependencies_rebuilt", {"outline_id": result_id})
+        await _finish(context, delivered=True)
+        return {"outline_id": result_id}
 
 
 async def run_outline_pipeline(
@@ -709,6 +928,7 @@ async def run_outline_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -716,7 +936,7 @@ async def run_outline_pipeline(
         if project is not None and project.paper_type == "review":
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
-                quality_profile="scholarly",
+                quality_profile=_prewrite_quality_profile(context),
                 review_style="narrative",
                 language=project.language,
             )
@@ -753,6 +973,7 @@ async def run_write_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -763,7 +984,7 @@ async def run_write_pipeline(
         if paper_type == "review":
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
-                quality_profile="scholarly",
+                quality_profile=_prewrite_quality_profile(context),
                 review_style="narrative",
                 language=language,
             )
@@ -786,7 +1007,23 @@ async def run_write_pipeline(
             ),
             critical=True,
         )
-        await _finish(context, delivered=bool(outcome and outcome.section_count))
+        fast_draft = context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
+        if fast_draft and _stage_scalar(context, "write", "section_count", outcome):
+            await _try_publish_fast_draft_preview(context)
+        # 完整性是交付的前提：``section_count`` 只说明有章节行，不说明每一节都有正文。
+        # 补写扫描已经尽过力，到这里还缺的章节必须体现在任务状态上。
+        if not fast_draft and context.checkpoint.get("writer_execution_mode") in {
+            "dag_serial", "dag_parallel"
+        }:
+            # Standalone WRITE has no downstream full-pipeline evaluator. Record
+            # final-snapshot evidence checks here, preserving its draft delivery policy.
+            await _run_stage(
+                context,
+                "quality",
+                lambda: _quality(context, quality_profile="draft"),
+                resumable=False,
+            )
+        await _finish_write_outcome(context, outcome)
         return {"project_id": project_id, "write": outcome.to_payload() if outcome else None}
 
 
@@ -807,6 +1044,7 @@ async def run_draft_rebuild_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -854,16 +1092,22 @@ async def run_draft_rebuild_pipeline(
         )
         quality = None
         if write and write.section_count:
-            quality = await _run_stage(
-                context,
-                "quality",
-                lambda: _quality(
+            if (
+                context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
+                and quality_profile == "draft"
+            ):
+                await _try_publish_fast_draft_preview(context)
+            else:
+                quality = await _run_stage(
                     context,
-                    quality_profile=quality_profile,
-                    review_style=review_style,
-                ),
-                kind="write",
-            )
+                    "quality",
+                    lambda: _quality(
+                        context,
+                        quality_profile=quality_profile,
+                        review_style=review_style,
+                    ),
+                    kind="write",
+                )
         if (
             quality_profile != "draft"
             and quality is not None
@@ -871,7 +1115,7 @@ async def run_draft_rebuild_pipeline(
         ):
             await _finish_needs_input(context, quality)
         else:
-            await _finish(context, delivered=bool(write and write.section_count))
+            await _finish_write_outcome(context, write)
         return {
             "project_id": project_id,
             "outline": outline.to_payload() if outline else None,
@@ -902,6 +1146,7 @@ async def run_polish_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -937,10 +1182,14 @@ async def run_polish_pipeline(
                 ),
                 kind="write",
             )
-            if (
-                quality_profile != "draft"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status != "preflight_ready"
+            # 可恢复的缺陷（整节没写出来、整段照抄证据、语种不一致）在**任何档位**
+            # 都先自动修一轮：只报不修等于把一份自己知道有洞的稿子交出去。
+            if quality_outcome is not None and (
+                (
+                    quality_profile != "draft"
+                    and quality_outcome.readiness_status != "preflight_ready"
+                )
+                or recoverable_findings(quality_outcome)
             ):
                 quality_outcome, repair_history = await _converge_scholarly_quality(
                     context,
@@ -948,7 +1197,15 @@ async def run_polish_pipeline(
                     language=language,
                     paper_type=paper_type,
                     review_style=review_style,
+                    quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
+            # 语义评审放在确定性质量门之后：先修可判定的红线，再问「答没答上」。
+            # 反过来会让评审对着一份还带着引用/数字问题的稿子做判断。
+            semantic_review = await _converge_section_semantics(
+                context,
+                language=language,
+                paper_type=paper_type,
+            )
             if (
                 quality_profile == "submission"
                 and quality_outcome is not None
@@ -967,6 +1224,7 @@ async def run_polish_pipeline(
                     checkpoint={
                         "quality": quality_outcome.to_payload(),
                         "quality_repair_history": repair_history,
+                        "section_review": semantic_review,
                     },
                 )
             readiness = (
@@ -1053,6 +1311,7 @@ async def run_ingest_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -1098,6 +1357,7 @@ async def run_pdf_match_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         # PDF dispatch commits before enqueue. Keep a short visibility wait as
         # defence for cross-session scheduling and independently invoked jobs.
@@ -1142,6 +1402,7 @@ async def run_uploaded_pdf_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         # Confirmation, DocumentFile binding and job creation commit together.
         # This also waits out the previously committed needs_confirmation state.
@@ -1305,6 +1566,7 @@ async def run_snowball_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -1401,6 +1663,7 @@ async def run_quality_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         report = await _run_stage(
@@ -1451,6 +1714,7 @@ async def run_quality_repair_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         async with context.session() as session:
             project = await get_project(session, project_uuid)
@@ -1471,10 +1735,9 @@ async def run_quality_repair_pipeline(
             kind="write",
         )
         repair_history: list[dict[str, Any]] = []
-        if (
-            quality_profile != "draft"
-            and report is not None
-            and report.readiness_status != "preflight_ready"
+        if report is not None and (
+            (quality_profile != "draft" and report.readiness_status != "preflight_ready")
+            or recoverable_findings(report)
         ):
             report, repair_history = await _converge_scholarly_quality(
                 context,
@@ -1482,7 +1745,15 @@ async def run_quality_repair_pipeline(
                 language=language,
                 paper_type=paper_type,
                 review_style=review_style,
+                quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
             )
+        # 用户点「质量修复」时同样跑语义评审：这条路径正是「帮我把稿子修好」，
+        # 只修可判定的红线而不问「答没答上」是把最重要的一半留在门外。
+        semantic_review = await _converge_section_semantics(
+            context,
+            language=language,
+            paper_type=paper_type,
+        )
         if (
             quality_profile == "submission"
             and report is not None
@@ -1501,6 +1772,7 @@ async def run_quality_repair_pipeline(
                 checkpoint={
                     "quality": report.to_payload(),
                     "quality_repair_history": repair_history,
+                    "section_review": semantic_review,
                 },
             )
         # 收敛器接受了改写就意味着正文变了，此前那份导出件已经对不上稿子。
@@ -1543,6 +1815,7 @@ async def run_quality_repair_pipeline(
         }
 
 
+@traced("evaluator", "quality")
 async def _quality(
     context: JobContext,
     *,
@@ -1553,6 +1826,7 @@ async def _quality(
     from db import (
         document_snapshot_hash,
         evidence_payload,
+        get_claim_entailment_cache,
         get_project,
         get_writing_whitelist,
         grounded_asset_payloads,
@@ -1566,6 +1840,7 @@ async def _quality(
         list_research_questions,
         list_search_runs,
         list_sections,
+        store_claim_entailment_cache,
     )
 
     async with context.session() as session:
@@ -1596,11 +1871,6 @@ async def _quality(
             if previous_report is not None
             else []
         )
-        abstracts = {
-            entry.bibtex_key: work.abstract
-            for entry, work in entries
-            if entry.bibtex_key and work.abstract
-        }
         years = [work.publication_year for _e, work in entries if work.publication_year]
         fulltext_used = sum(1 for card in cards if card.fulltext_used)
         scope = dict((project.scope_json or {}) if project else {})
@@ -1627,24 +1897,9 @@ async def _quality(
         assets_by_ref = {
             str(item.get("_asset_ref")): item for item in grounded_assets if item.get("_asset_ref")
         }
-        cite_key_by_work_id = {
-            str(work.id): entry.bibtex_key for entry, work in entries if entry.bibtex_key
-        }
-        evidence_excerpts: dict[str, list[str]] = {}
-        for item in evidence_units.values():
-            cite_key = cite_key_by_work_id.get(str(item.get("work_id") or ""))
-            if cite_key and item.get("text"):
-                evidence_excerpts.setdefault(cite_key, []).append(str(item["text"]))
-        semantic_sources = {
-            cite_key: "\n".join(excerpts)[:4000] for cite_key, excerpts in evidence_excerpts.items()
-        }
-        semantic_sources.update(
-            {
-                cite_key: abstract
-                for cite_key, abstract in abstracts.items()
-                if cite_key not in semantic_sources
-            }
-        )
+        from paperforge_worker.pipelines.citation_decisions import semantic_sources as sources_for
+
+        semantic_sources = sources_for(entries, list(evidence_units.values()))
 
     frame_keys = {"abstract", "introduction", "conclusion"}
     sections = [
@@ -1653,7 +1908,16 @@ async def _quality(
             "title": row.title,
             "word_count": _section_words(row.body_ir_json or {}),
             "cite_keys": row.cite_keys_json or [],
-            "kind": "frame" if row.section_key in frame_keys else "body",
+            # The evidence ledger is an audit record that no longer ships inside
+            # the manuscript.  Counting it as a body section let a 5,250-word
+            # paper report a length and a citation count it did not have.
+            "kind": (
+                "frame"
+                if row.section_key in frame_keys
+                else "appendix"
+                if row.section_key == EVIDENCE_LEDGER_KEY
+                else "body"
+            ),
         }
         for row in rows
     ]
@@ -1665,11 +1929,52 @@ async def _quality(
         }
         for item in usage_rows
     ]
+    fast_preview = context.checkpoint.get("fast_draft_preview")
+    preview_matches_snapshot = (
+        isinstance(fast_preview, dict)
+        and document is not None
+        and fast_preview.get("paper_snapshot_hash") == document_snapshot_hash(rows)
+    )
+    soft_decision_mode = (
+        "off"
+        if preview_matches_snapshot
+        else getattr(context.settings, "typesafe_soft_check_mode", "off")
+    )
     findings = await soft_check_citations(
         usages=usages,
         abstracts=semantic_sources,
         runner=context.llm_runner(),
+        decision_runner=(context.decision_runner() if soft_decision_mode != "off" else None),
+        decision_mode=soft_decision_mode,
+        decision_confidence_threshold=getattr(
+            context.settings, "typesafe_confidence_threshold", 0.90
+        ),
+        trace_context=context,
     )
+    if isinstance(context.checkpoint.get("fast_draft_preview"), dict):
+        from paperforge_worker.pipelines.citation_decisions import citation_pairs
+
+        pairs = citation_pairs(usages, semantic_sources)
+        observed = {
+            "paper_snapshot_hash": document_snapshot_hash(rows) if document else None,
+            "items": [
+                {
+                    "index": index,
+                    "pair_hash": pair["pair_hash"],
+                    "cite_key": finding.cite_key,
+                    "status": finding.status,
+                    "weak": finding.weak,
+                    "score": round(finding.score, 3) if finding.status == "completed" else None,
+                }
+                for index, (pair, finding) in enumerate(zip(pairs, findings, strict=False))
+            ],
+        }
+        await context.emit(
+            "fast_draft.verifier_observed",
+            observed,
+            stage="quality",
+            checkpoint={"fast_draft_verifier": observed},
+        )
     report = build_quality_report(
         sections=sections,
         whitelist_size=len(whitelist),
@@ -1683,6 +1988,14 @@ async def _quality(
     report.quality_profile = quality_profile
     report.review_style = review_style
     report.layout_checks = layout_checks or {"status": "not_run", "passed": None}
+    # 写作阶段规则删了多少句、为什么删。此前这个数字在系统里根本不存在：线索死在
+    # Draft→IR，质检报告只统计**幸存**句子，一份被删掉三成论述的稿子和一份完好的
+    # 稿子在报告上长得一模一样。
+    if document is not None:
+        async with context.session() as downgrade_session:
+            report.sentence_downgrades = await sentence_downgrade_summary(
+                downgrade_session, document_id=document.id
+            )
     unused_core_literature = (
         _unused_core_literature(entries, usage_rows) if document is not None else []
     )
@@ -1705,14 +2018,61 @@ async def _quality(
             (anchor["claim_hash"], anchor["cite_key"], anchor["evidence_hash"]),
             "unreviewed",
         )
-    cross_language_verification = await verify_cross_language_claim_evidence(
+    claim_entailment_mode = getattr(context.settings, "claim_entailment_mode", "shadow")
+    verifier_runner = context.llm_runner()
+    if claim_entailment_mode != "off" and verifier_runner.enabled:
+        verifier_model = verifier_runner.model_for("verifier")
+        cache_keys = claim_verification_cache_keys(
+            report.claim_evidence,
+            model=verifier_model,
+        )
+        missing_cache_keys = cache_keys.difference(context.claim_verification_cache)
+        if missing_cache_keys:
+            try:
+                async with context.session() as session:
+                    context.claim_verification_cache.update(
+                        await get_claim_entailment_cache(
+                            session, missing_cache_keys, project_id=context.project_id
+                        )
+                    )
+            except Exception:  # noqa: BLE001 - cache outages must not fail quality verification
+                logger.warning(
+                    "failed to load claim entailment cache",
+                    extra={"project_id": str(context.project_id)},
+                    exc_info=True,
+                )
+    claim_verification = await verify_claim_evidence(
         anchors=report.claim_evidence,
-        runner=context.llm_runner(),
+        runner=verifier_runner,
+        cache=context.claim_verification_cache,
+        mode=claim_entailment_mode,
+        verifier_concurrency=context.settings.verifier_concurrency,
     )
-    if cross_language_verification["candidate_count"]:
+    if (
+        claim_verification["model_checked_count"]
+        or claim_verification["alternative_model_checked_count"]
+    ):
+        try:
+            async with context.session() as session:
+                await store_claim_entailment_cache(
+                    session,
+                    [
+                        entry
+                        for entry in context.claim_verification_cache.values()
+                        if entry.get("cache_key")
+                    ],
+                    project_id=context.project_id,
+                )
+        except Exception:  # noqa: BLE001 - a cache write failure cannot invalidate verdicts
+            logger.warning(
+                "failed to persist claim entailment cache",
+                extra={"project_id": str(context.project_id)},
+                exc_info=True,
+            )
+    if claim_verification["candidate_count"]:
         await context.emit(
-            "quality.cross_language_verification",
-            cross_language_verification,
+            "quality.claim_evidence_verification",
+            claim_verification,
             stage="quality",
         )
     if project is not None:
@@ -1722,7 +2082,35 @@ async def _quality(
             project=project,
             whitelist=set(whitelist),
             search_runs=search_runs,
+            evidence_units=evidence_units,
+            references=entries,
         )
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    body_hash = fingerprint(
+        {
+            row.section_key: fingerprint(row.body_ir_json)
+            for row in rows
+            if row.section_key not in frame_keys
+        }
+    )
+    stale_frames = [
+        row.section_key
+        for row in rows
+        if row.section_key in frame_keys
+        and (getattr(row, "generation_json", None) or {}).get("body_snapshot")
+        not in {None, body_hash}
+    ]
+    if stale_frames:
+        issue = {
+            "code": "frame_snapshot_stale",
+            "sections": stale_frames,
+            "message": "框架章节尚未与最终正文同步，需要重新生成",
+        }
+        report.warnings.append(issue)
+        if quality_profile != "draft":
+            report.blockers.append(issue)
+            report.readiness_status = "needs_revision"
     if project is not None and project.paper_type == "original":
         from ingest.numlint import lint_sections
 
@@ -1800,23 +2188,41 @@ async def _quality(
         selected_work_count=len(entries),
         questions=questions,
     )
-    if cross_language_verification["candidate_count"]:
-        depth_metrics["cross_language_verification"] = {
-            key: cross_language_verification[key]
+    if claim_verification["candidate_count"]:
+        depth_metrics["claim_evidence_verification"] = {
+            key: claim_verification[key]
             for key in (
+                "mode",
                 "status",
                 "candidate_count",
+                "scheduled_count",
                 "checked_count",
+                "would_promote_count",
+                "raw_would_demote_count",
+                "would_demote_count",
                 "promoted_count",
+                "demoted_count",
                 "failed_count",
+                "unverified_count",
+                "cache_hit_count",
+                "persistent_cache_hit_count",
+                "job_cache_hit_count",
+                "model_checked_count",
+                "alternative_checked_count",
+                "alternative_failed_count",
+                "alternative_cache_hit_count",
+                "alternative_model_checked_count",
+                "unsafe_demotion_avoided_count",
+                "demotion_unconfirmed_count",
+                "review_incomplete_count",
             )
         }
-        if cross_language_verification["failed_count"]:
+        if claim_verification["mode"] == "enforce" and claim_verification["failed_count"]:
             report.warnings.append(
                 {
-                    "code": "cross_language_verification_incomplete",
-                    "message": "部分跨语言论断未完成语义核验，质量门已按未通过处理",
-                    "count": cross_language_verification["failed_count"],
+                    "code": "claim_evidence_verification_incomplete",
+                    "message": "部分核心论断未完成语义证据核验；既有确定性判定保持不变，需复查",
+                    "count": claim_verification["failed_count"],
                 }
             )
     report.depth_metrics = {**depth_metrics, **report.depth_metrics}
@@ -2000,6 +2406,7 @@ async def run_export_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         # Independent exports previously trusted caller-supplied readiness and
@@ -2065,6 +2472,7 @@ async def run_visual_suggest_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         # 单阶段任务：这一阶段跑完任务就结束了，进度就是 1.0。
@@ -2095,6 +2503,7 @@ async def run_visual_generate_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
         await _mark_running(context)
         outcome = await _run_stage(
@@ -2115,7 +2524,25 @@ def _object_store(settings: Settings):
 
 
 def _blocker_instances(report: Any) -> int:
-    return sum(max(1, int(item.get("count") or 1)) for item in (report.blockers or []))
+    """修复轮的改善判据：它必须看得见触发修复的那些发现项。
+
+    只数 blockers 在 draft 档是瞎的——那一档把几乎所有码降级成了 warning，于是
+    「修复前 0 条、修复后 0 条」，``0 < 0`` 永远为假，每一次重写都被判为没有改善并
+    回滚。生产实测（项目 6a6bbf18）：conclusion_overreach 被正确检出并触发了两轮
+    重写，两轮全部 accepted=false，稿子原样退回——花了钱，什么都没修。
+
+    所以计数覆盖 blockers ∪ 可恢复的 warning：scholarly/submission 下这些码本来就是
+    blocker，取并集不改变那两档的行为。
+    """
+    counted = list(getattr(report, "blockers", None) or [])
+    blocker_codes = {str(item.get("code")) for item in counted}
+    counted.extend(
+        item
+        for item in (getattr(report, "warnings", None) or [])
+        if str(item.get("code")) in RECOVERABLE_BLOCKER_CODES
+        and str(item.get("code")) not in blocker_codes
+    )
+    return sum(max(1, int(item.get("count") or 1)) for item in counted)
 
 
 _NON_DEGENERATION_CODES = frozenset(
@@ -2128,14 +2555,93 @@ _NON_DEGENERATION_CODES = frozenset(
 )
 
 
-def _repair_candidate_improves(previous: Any, candidate: Any) -> bool:
-    if candidate.readiness_status == "preflight_ready":
-        return True
+async def _unresolved_anchor_counts(context: JobContext, report: Any) -> dict[str, int]:
+    """每个章节还有多少条待修的 claim anchor。
+
+    与 ``_quality_failing_sections`` 用**同一个** ``_claim_anchor_requires_repair``
+    判据，这不是巧合：选择和验收必须数同一批东西，否则修复轮就是在为一个它动不了的
+    计数付钱。
+    """
+    from db import list_claim_evidence
+
+    if not report.report_id:
+        return {}
+    async with context.session() as session:
+        anchors = await list_claim_evidence(
+            session,
+            context.project_id,
+            quality_report_id=uuid.UUID(str(report.report_id)),
+            core_only=True,
+        )
+    counts: dict[str, int] = {}
+    for anchor in anchors:
+        if _claim_anchor_requires_repair(anchor):
+            key = str(anchor.section_key or "")
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+async def _roll_back_worsened_sections(
+    context: JobContext,
+    *,
+    snapshot: dict[str, dict[str, Any]],
+    before: dict[str, int],
+    after: dict[str, int],
+) -> list[str]:
+    """只退回未解决锚点**变多**的那些章节，其余保留重写结果。
+
+    ``restore_document_sections`` 会删掉快照里没有的章节，所以这里**不能**传一份过滤过
+    的快照——那会把要保留的章节一起删掉。改为构造一份完整快照：以重写后的现状为底，
+    把要退回的那几节换成修复前的版本。
+
+    :returns: 实际退回的章节 key，按字典序。
+    """
+    worsened = sorted(key for key in snapshot if after.get(key, 0) > before.get(key, 0))
+    if not worsened:
+        return []
+    current_state = await snapshot_document_sections(context)
+    merged: dict[str, dict[str, Any]] = dict(current_state)
+    for key in worsened:
+        merged[key] = snapshot[key]
+    # 重写把某一节整个弄丢时，现状里没有它——补回修复前的版本，别让它消失。
+    for key, item in snapshot.items():
+        merged.setdefault(key, item)
+    await restore_document_sections(context, merged)
+    return worsened
+
+
+def _repair_objective(report: Any, unresolved_anchors: int) -> int:
+    """修复轮真正要压小的那个数：可计数的发现项 + 未解决的 claim anchor。
+
+    生产实测（项目 aaa9a5b1，2026-09-06）：报告里可计数的发现项只有 1 条，而触发
+    重写的是 56 条未定位的 claim anchor，摊在 9 个章节上。于是修复去修锚点、验收却数
+    发现项——两轮 29 次重写全部判为「没有改善」并整体回滚，37 分钟（全程 56%）产出为零。
+    把锚点计入目标函数，改善才看得见。
+
+    锚点数由调用方查好后传进来，这个判据保持无 I/O：它要能在不接数据库的情况下被断言。
+    """
+    return _blocker_instances(report) + max(0, unresolved_anchors)
+
+
+def _introduces_degeneration(previous: Any, candidate: Any) -> bool:
     previous_codes = {str(item.get("code")) for item in previous.blockers or []}
     candidate_codes = {str(item.get("code")) for item in candidate.blockers or []}
-    introduced_degeneration = (candidate_codes - previous_codes) & _NON_DEGENERATION_CODES
-    return not introduced_degeneration and _blocker_instances(candidate) < _blocker_instances(
-        previous
+    return bool((candidate_codes - previous_codes) & _NON_DEGENERATION_CODES)
+
+
+def _repair_candidate_improves(
+    previous: Any,
+    candidate: Any,
+    *,
+    previous_unresolved: int = 0,
+    candidate_unresolved: int = 0,
+) -> bool:
+    if candidate.readiness_status == "preflight_ready":
+        return True
+    if _introduces_degeneration(previous, candidate):
+        return False
+    return _repair_objective(candidate, candidate_unresolved) < _repair_objective(
+        previous, previous_unresolved
     )
 
 
@@ -2159,6 +2665,665 @@ def _claim_anchor_requires_repair(anchor: Any) -> bool:
     return not resolved
 
 
+#: 语义评审的收敛轮数。一轮走一条修复路，两轮足以让「先补证据、再收回论断」这条
+#: 最常见的组合走完；再多就是对着同一个病因反复付钱。
+MAX_SEMANTIC_ROUNDS = 2
+
+
+def _cited_evidence_ids(body: dict[str, Any]) -> set[str]:
+    """正文里真正引到的证据 ID——用来区分「没检索到」和「检索到了没用上」。"""
+    found: set[str] = set()
+    for block in body.get("blocks") or []:
+        for runs in (
+            [block.get("runs") or []]
+            if block.get("type") == "paragraph"
+            else [item.get("runs") or [] for item in block.get("items") or []]
+        ):
+            for run in runs:
+                if isinstance(run, dict):
+                    found.update(str(value) for value in run.get("evidence_ids") or [])
+    return found
+
+
+async def _section_review_inputs(
+    context: JobContext, *, include_unlinked: bool = False
+) -> list[dict[str, Any]]:
+    """凑齐评审要看的三样东西：子问题、这一节的正文、这一节能用的证据。"""
+    from db import (
+        get_outline,
+        get_writing_whitelist,
+        grounded_asset_payloads,
+        latest_document,
+        list_evidence_units,
+        list_question_evidence_links,
+        list_research_questions,
+        list_sections,
+    )
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        if document is None:
+            return []
+        rows = await list_sections(session, document.id)
+        outline = await get_outline(session, document.outline_id) if document.outline_id else None
+        questions = {
+            str(item.id): item
+            for item in await list_research_questions(session, context.project_id, kind="sub")
+        }
+        links = await list_question_evidence_links(session, context.project_id)
+        units = {unit.id: unit for unit in await list_evidence_units(session, context.project_id)}
+        whitelist = await get_writing_whitelist(session, context.project_id)
+        assets = await grounded_asset_payloads(session, context.project_id)
+
+    from db import evidence_payload
+
+    from paperforge_worker.pipelines.review_inputs import build_review_input
+
+    all_evidence = [evidence_payload(unit) for unit in units.values()]
+
+    evidence_by_question: dict[str, list[dict[str, Any]]] = {}
+    for link in links:
+        unit = units.get(link.evidence_unit_id)
+        if unit is None:
+            continue
+        evidence_by_question.setdefault(str(link.research_question_id), []).append(
+            {
+                "evidence_id": str(unit.id),
+                "work_id": str(unit.work_id),
+                "grade": unit.grade,
+                "text": unit.text,
+                "page": unit.page,
+                "section_path": unit.section_path,
+            }
+        )
+    outline_sections = ((outline.tree_json or {}).get("sections") or []) if outline else []
+    question_by_section = {
+        str(item.get("key")): str(item.get("question_id"))
+        for item in outline_sections
+        if isinstance(item, dict) and item.get("question_id")
+    }
+
+    inputs: list[dict[str, Any]] = []
+    for row in rows:
+        question_id = question_by_section.get(row.section_key)
+        question = questions.get(question_id or "")
+        if question is None and not include_unlinked:
+            continue
+        question_text = (
+            question.text
+            if question
+            else str((row.body_ir_json or {}).get("title", row.section_key))
+        )
+        # 评审器看到的证据要和写作器看到的一致：重复文本只算一条，否则「有多少证据
+        # 没用上」会虚高，那道不再检索的闸就会因为重复条目误触发。
+        pool = dedupe_evidence_by_text(evidence_by_question.get(question_id or "", []))
+        cited = _cited_evidence_ids(row.body_ir_json or {})
+        inputs.append(
+            {
+                "section_key": row.section_key,
+                "question_id": question_id,
+                "question": question_text,
+                "prose": _body_text_for_quality(row.body_ir_json or {}),
+                "evidence": pool,
+                "review_input": build_review_input(
+                    section_key=row.section_key,
+                    question=question_text,
+                    prose=_body_text_for_quality(row.body_ir_json or {}),
+                    body=row.body_ir_json or {},
+                    evidence=all_evidence,
+                    whitelist=whitelist,
+                    assets=assets,
+                    scope={"project_id": str(context.project_id), "document_id": str(document.id)},
+                ),
+                "pool_size": len(pool),
+                "unused_evidence": sum(1 for item in pool if item["evidence_id"] not in cited),
+            }
+        )
+    return inputs
+
+
+def _repair_note(verdict: SectionVerdict, item: dict[str, Any]) -> str:
+    """把这一节**具体哪里不合格**说给写作器听。
+
+    没有这段话，三条修复路最后都落到同一句泛泛的「去掉没证据的论断」上——罗列型的
+    章节被重写之后还是罗列。实测 s5 就是这样连续两轮判定一字未变。
+    """
+    notes: list[str] = []
+    if verdict.synthesis_mode == "listed":
+        notes.append(
+            "SYNTHESIS: 本节上一稿是逐条罗列（一条证据一句话）。这次要把多篇证据归到"
+            "同一条论断下比较——指出它们一致、互补还是受条件调节，并说明条件差异；"
+            "不要为每条证据单写一句。"
+        )
+    # 这里**不要**加一条「还有 N 条证据没用上，请用起来」。试过，实测有害：s5 那 18 条
+    # 没被引用的证据里，是生长素生理、AMF 耐盐、玉米年产量、两条图题、以及扩增子测序的
+    # 建库/测序流程——对「天然产物信号的方法学」这个子问题基本不可用，还有 3 条是重复条目。
+    # 写作器跳过它们是对的；催它「用起来」等于让它灌水，而灌水正是要防的东西。
+    # 证据池里有没用上的条目，只用来决定**不要再去检索**（见 repair_route），不进指令。
+    if verdict.unanswered_aspects:
+        notes.append(
+            "UNANSWERED: 子问题里这些方面还没答上：" + "；".join(verdict.unanswered_aspects)
+        )
+    if verdict.unsupported_claims:
+        notes.append(
+            "UNSUPPORTED: 这些论断超出了证据，改写到证据能支撑的范围或删掉："
+            + "；".join(verdict.unsupported_claims)
+        )
+    return "\n".join(notes)
+
+
+async def _current_document_snapshot(context: JobContext) -> tuple[str | None, str | None]:
+    from db import document_snapshot_hash, latest_document, list_sections
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        rows = await list_sections(session, document.id) if document else []
+    return (str(document.id), document_snapshot_hash(rows)) if document else (None, None)
+
+
+async def _quality_after_semantics(
+    context: JobContext,
+    report: Any,
+    *,
+    quality_profile: str,
+    review_style: str,
+) -> Any:
+    """Never let a pre-rewrite report authorize the current manuscript's export."""
+    _document_id, snapshot = await _current_document_snapshot(context)
+    if (
+        quality_profile != "submission"
+        and report is not None
+        and snapshot
+        and snapshot == report.paper_snapshot_hash
+    ):
+        # Persisting an identical rewrite still invalidates the DB row. Re-publish the
+        # matching verdict without another model call so UI/export see a live report.
+        if report.report_id:
+            from db.models.paper import QualityReportRecord
+
+            async with context.session() as session:
+                record = await session.get(QualityReportRecord, uuid.UUID(report.report_id))
+            if record is None or record.stale:
+                reused = await _republish_after_rollback(
+                    context,
+                    report,
+                    quality_profile=quality_profile,
+                    review_style=review_style,
+                )
+                if reused is not None:
+                    return reused
+            else:
+                return report
+        else:
+            return report
+    # Invalidate the resume fallback before attempting a potentially failing reassessment.
+    await context.emit(
+        "quality.invalidated",
+        {"reason": "semantic_reassessment", "snapshot": snapshot},
+        stage="quality_recheck",
+        checkpoint={"quality": {"readiness_status": "unassessed"}},
+    )
+    try:
+        return await _quality(context, quality_profile=quality_profile, review_style=review_style)
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - retain manuscript, never reuse stale clearance
+        from paperforge_worker.pipelines.quality import QualityReport
+
+        context.warn("quality_recheck", type(error).__name__, {"message": str(error)[:300]})
+        return QualityReport(
+            readiness_status="needs_revision",
+            quality_profile=quality_profile,
+            review_style=review_style,
+            paper_snapshot_hash=snapshot,
+            blockers=[{"code": "quality_reassessment_failed", "message": "请重新运行质量检查"}],
+        )
+
+
+@traced("planner", "converge_section_semantics")
+async def _converge_section_semantics(
+    context: JobContext,
+    *,
+    language: str,
+    paper_type: str,
+) -> dict[str, Any]:
+    """语义评审 → 按病因分流修复 → 重评。有明确验收判据、有轮数上限。
+
+    与既有的质量收敛互补而不重叠：那一条看的是引用、数字、可比性这些**可判定**的
+    红线；这一条问的是「这一节到底答没答上它的子问题」。后者写不成词表，只能让
+    模型判——但修复动作由确定性规则分流，模型的病因只是输入之一。
+    """
+    runner = context.llm_runner()
+    # Read the actual document identity; never share attempts across manuscript replacements.
+    document_id, _ = await _current_document_snapshot(context)
+    from paperforge_worker.pipelines.review_inputs import REVIEW_INPUT_VERSION
+
+    state = RepairState.load(
+        context.checkpoint.get(SEMANTIC_REPAIR_KEY),
+        scope=f"{context.project_id}:{document_id}:{REVIEW_INPUT_VERSION}",
+    )
+    history = state.history
+    verdict_payloads = state.verdicts
+
+    async def save(event: str, payload: dict[str, Any]) -> None:
+        await context.emit(
+            event,
+            {"attempt": state.rounds_used, **payload},
+            stage="quality_repair",
+            checkpoint={SEMANTIC_REPAIR_KEY: state.payload()},
+        )
+
+    async def execute(action: RepairAction) -> dict[str, Any]:
+        async with context.span(
+            "repair", action.kind, sections=action.sections, attempt=state.rounds_used
+        ):
+            return await _execute_action(action)
+
+    async def _execute_action(action: RepairAction) -> dict[str, Any]:
+        questions: set[Any] = set()
+        for value in action.questions:
+            try:
+                questions.add(uuid.UUID(value))
+            except ValueError:
+                questions.add(value)
+        result: Any = None
+        if action.kind == "deepen":
+            result = await _deepen_question_evidence(
+                context,
+                question_ids=questions,
+                language=language,
+                attempt=state.rounds_used,
+            )
+        elif action.kind == "retrieve":
+            result = await _supplement_review_evidence(
+                context,
+                language=language,
+                round_index=state.rounds_used,
+                question_ids=questions,
+            )
+        elif action.kind == "matrix":
+            await _rebuild_question_matrix(context, language=language)
+        elif action.kind == "resynthesize":
+            await _resynthesize_questions(context)
+        elif action.kind == "rewrite":
+            result = await repair_document_sections(
+                context,
+                section_keys=set(action.sections),
+                language=language,
+                paper_type=paper_type,
+                notes={key: state.notes[key] for key in action.sections if key in state.notes},
+                concurrency=context.settings.writer_repair_concurrency,
+            )
+        else:
+            raise ValueError(f"unknown semantic repair action: {action.kind}")
+        payload = result.to_payload() if hasattr(result, "to_payload") else result
+        # Keep checkpoint results small; detailed provenance is in the existing domain events.
+        return {
+            key: value
+            for key, value in (payload or {}).items()
+            if isinstance(value, (str, int, float, bool, type(None)))
+        }
+
+    if context.checkpoint.get("semantic_repair_engine") == "langgraph":
+        from paperforge_worker.orchestration.semantic_graph import run_graph
+
+        async def graph_review(items, repair_state):
+            verdicts = []
+
+            async def review_one(item):
+                return await review_section(
+                    section_key=item["section_key"],
+                    question=item["question"],
+                    prose=item["prose"],
+                    evidence=item["evidence"],
+                    review_input=item.get("review_input"),
+                    trace_context=context,
+                    runner=runner,
+                    language=language,
+                )
+
+            async def collect(_index, item, verdict):
+                if isinstance(verdict, BaseException) or verdict is None:
+                    repair_state.unassessed.append(item["section_key"])
+                else:
+                    verdicts.append(verdict)
+
+            await bounded_map(
+                items,
+                review_one,
+                limit=context.settings.section_review_concurrency,
+                on_ready=collect,
+                stop_check=context.raise_if_stopped,
+            )
+            return verdicts
+
+        return await run_graph(
+            context=context,
+            state=state,
+            review=graph_review,
+            inputs=lambda: _section_review_inputs(context),
+            execute=execute,
+            note_for=_repair_note,
+            save=save,
+            snapshot=lambda: _current_document_snapshot(context),
+            max_rounds=MAX_SEMANTIC_ROUNDS,
+        )
+
+    if state.actions and state.stop_reason is None:
+        await execute_actions(
+            state, execute=execute, save=save, stop_check=context.raise_if_stopped
+        )
+    for attempt in range(state.rounds_used + 1, MAX_SEMANTIC_ROUNDS + 1):
+        if state.stop_reason is not None:
+            break
+        inputs = await _section_review_inputs(context)
+        if not inputs:
+            state.stop_reason = "no_sections"
+            break
+        state.unassessed = []
+        outcome = ReviewOutcome()
+
+        # 每次 `review_section` 只吃自己的 item，不共享任何状态——这是全流程里最干净的
+        # 一处扇出。计数与 verdicts 仍按输入序在 on_ready 里累加：`ReviewOutcome.to_payload`
+        # 按位置读 verdicts，完成序会让同一批评审产出不同的 payload。
+        async def _review_one(item: dict[str, Any]) -> Any:
+            return await review_section(
+                section_key=item["section_key"],
+                question=item["question"],
+                prose=item["prose"],
+                evidence=item["evidence"],
+                review_input=item.get("review_input"),
+                trace_context=context,
+                runner=runner,
+                language=language,
+            )
+
+        async def _collect_verdict(
+            _index: int,
+            _item: dict[str, Any],
+            verdict: Any,
+            *,
+            outcome: ReviewOutcome = outcome,
+        ) -> None:
+            outcome.calls += 1
+            if isinstance(verdict, BaseException) or verdict is None:
+                # 评审器不可用不能变成「不合格」：保持既有交付判断。
+                outcome.failed_calls += 1
+                state.unassessed.append(_item["section_key"])
+                return
+            outcome.verdicts.append(verdict)
+            verdict_payloads[verdict.section_key] = verdict.to_payload()
+
+        await bounded_map(
+            inputs,
+            _review_one,
+            limit=context.settings.section_review_concurrency,
+            on_ready=_collect_verdict,
+            stop_check=context.raise_if_stopped,
+        )
+
+        failing = [item for item in outcome.verdicts if not item.acceptable]
+        await context.emit(
+            "section_review.completed",
+            {"attempt": attempt, **outcome.to_payload()},
+            stage="quality",
+        )
+        if not failing:
+            history.append({"attempt": attempt, "failing": [], "routes": {}})
+            state.stop_reason = "reviewer_unavailable" if state.unassessed else "acceptable"
+            break
+
+        routes = plan_repairs(state, failing, inputs, _repair_note)
+        await save("semantic_repair.planned", state.history[-1])
+        if not routes:
+            state.stop_reason = "no_untried_route"
+            break
+        await context.emit(
+            "section_review.repairing",
+            {"attempt": attempt, "routes": routes},
+            stage="quality_repair",
+        )
+        await execute_actions(
+            state, execute=execute, save=save, stop_check=context.raise_if_stopped
+        )
+
+    # 最后一轮的修复必须再评一次，否则 ``unresolved`` 报的是**修之前**的判定——
+    # 一个刚被修好的章节会被永远记成未解决，而验收判据也就不再是判据。
+    repaired = {key for round_ in history for key in (round_.get("routes") or {})}
+    if repaired:
+        recheck = [
+            item
+            for item in await _section_review_inputs(context)
+            if item["section_key"] in repaired
+        ]
+
+        async def _recheck_one(item: dict[str, Any]) -> Any:
+            return await review_section(
+                section_key=item["section_key"],
+                question=item["question"],
+                prose=item["prose"],
+                evidence=item["evidence"],
+                review_input=item.get("review_input"),
+                trace_context=context,
+                runner=runner,
+                language=language,
+            )
+
+        async def _record_recheck(_index: int, _item: dict[str, Any], verdict: Any) -> None:
+            # 评审器失败保持原语义：不覆盖上一轮的判定，不记成「不合格」。
+            if isinstance(verdict, BaseException) or verdict is None:
+                if _item["section_key"] not in state.unassessed:
+                    state.unassessed.append(_item["section_key"])
+                return
+            if verdict.section_key in state.unassessed:
+                state.unassessed.remove(verdict.section_key)
+            verdict_payloads[verdict.section_key] = verdict.to_payload()
+
+        await bounded_map(
+            recheck,
+            _recheck_one,
+            limit=context.settings.section_review_concurrency,
+            on_ready=_record_recheck,
+            stop_check=context.raise_if_stopped,
+        )
+
+    if state.unassessed:
+        state.stop_reason = "reviewer_unavailable"
+    elif verdict_payloads and all(item.get("acceptable") for item in verdict_payloads.values()):
+        state.stop_reason = "acceptable"
+    else:
+        state.stop_reason = state.stop_reason or "budget_exhausted"
+    payload = state.result()
+    await context.emit(
+        "section_review.converged",
+        payload,
+        stage="quality",
+        checkpoint={SEMANTIC_REPAIR_KEY: state.payload()},
+    )
+    return payload
+
+
+async def _review_fast_draft_sections(context: JobContext, *, language: str) -> dict[str, Any]:
+    """Review the delivered snapshot once, without rewriting a user's editable draft."""
+    inputs = await _section_review_inputs(context)
+    outcome = ReviewOutcome()
+    unassessed: list[str] = []
+    runner = context.llm_runner()
+
+    async def review_one(item: dict[str, Any]) -> Any:
+        return await review_section(
+            section_key=item["section_key"],
+            question=item["question"],
+            prose=item["prose"],
+            evidence=item["evidence"],
+            review_input=item.get("review_input"),
+            trace_context=context,
+            runner=runner,
+            language=language,
+        )
+
+    async def collect(_index: int, item: dict[str, Any], verdict: Any) -> None:
+        outcome.calls += 1
+        if isinstance(verdict, BaseException) or verdict is None:
+            outcome.failed_calls += 1
+            unassessed.append(item["section_key"])
+        else:
+            outcome.verdicts.append(verdict)
+
+    await bounded_map(
+        inputs,
+        review_one,
+        limit=context.settings.section_review_concurrency,
+        on_ready=collect,
+        stop_check=context.raise_if_stopped,
+    )
+    result = {
+        **outcome.to_payload(),
+        "status": "reviewed" if not unassessed else "partial",
+        "unassessed": unassessed,
+        "repair_deferred": True,
+    }
+    await context.emit("section_review.completed", result, stage="quality")
+    return result
+
+
+async def _rebuild_question_matrix(context: JobContext, *, language: str) -> None:
+    """补检索之后重建问题—证据矩阵，否则新文献永远进不了任何一节。"""
+    try:
+        await build_question_evidence_matrix(context, language=language)
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - 补证据失败不该毁掉已有稿子
+        context.warn("section_review", type(error).__name__, {"stage": "qmatrix_rebuild"})
+
+
+async def _build_and_deepen_matrix(context: JobContext, *, language: str):
+    """建矩阵，然后立刻把第二梯队的证据也挂一遍。
+
+    每个子问题只看排名前 24 条候选（``MAX_CANDIDATES_PER_QUESTION``）。实测
+    （项目 ff6b9983，2026-08-19 真实全流程）：库里 848 条证据单元，5 个问题合计 120 条
+    进分类器、最终挂上 26 条——97% 的证据从没被任何问题看过。正文薄不是因为写作器
+    惜字如金（它引用了给它的 23 条里的 22 条），是因为它手上只有那么多。加挂一轮实测
+    多挂 18 条（+37%），代价是每个子问题一次分类调用（约 6 秒）。
+
+    **必须在 synth 之前**：叙述性综合按 bundle 指纹缓存，链接集变了指纹就变，
+    综合挂不回去，写作器会连 ``[SYNTHESIS]`` 块一起丢掉。
+    """
+    outcome = await build_question_evidence_matrix(context, language=language)
+    await _deepen_question_evidence(
+        context,
+        question_ids=await _sub_question_ids(context),
+        language=language,
+        attempt=0,
+        stage="qmatrix",
+    )
+    return outcome
+
+
+async def _sub_question_ids(context: JobContext) -> set[uuid.UUID]:
+    from db import list_research_questions
+
+    async with context.session() as session:
+        questions = await list_research_questions(session, context.project_id, kind="sub")
+    return {question.id for question in questions}
+
+
+async def _deepen_question_evidence(
+    context: JobContext,
+    *,
+    question_ids: set[Any],
+    language: str,
+    attempt: int,
+    stage: str = "quality_repair",
+) -> dict[str, Any]:
+    """先把**已经在库里、却从没被这个问题看过**的证据挂上去，再谈补检索。
+
+    「证据薄」在这条管线里有两种截然不同的成因，此前被同一个词盖住了：
+
+    * 真的没检索到——补检索是对的；
+    * 检索到了、也抽成了证据单元，但从没进过这个问题的候选池。
+
+    实测（项目 ff6b9983 首轮全流程）：库里 848 条证据单元，每个子问题只看排名前 24
+    条，5 个问题合计 120 条进分类器、挂上 26 条——97% 的证据没有任何问题看过。
+    这种情况下补检索买回来的新文献照样挤不进那 24 个位置，等于白花钱。所以先加挂：
+    候选池排除已挂单元，让第二梯队的证据有一次被看见的机会。一个问题一次分类调用，
+    实测约 6 秒。
+    """
+    targets: set[uuid.UUID] = set()
+    for raw in question_ids:
+        try:
+            targets.add(raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not targets:
+        return {"deepened": 0}
+    before = await _question_link_counts(context, targets)
+    try:
+        await build_question_evidence_matrix(
+            context,
+            language=language,
+            deepen_question_ids=targets,
+        )
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - 加挂失败不该毁掉已有稿子
+        context.warn("section_review", type(error).__name__, {"stage": "qmatrix_deepen"})
+        return {"deepened": 0, "error": type(error).__name__}
+    after = await _question_link_counts(context, targets)
+    payload = {
+        "attempt": attempt,
+        "questions": {
+            str(qid): {"before": before.get(qid, 0), "after": after.get(qid, 0)} for qid in targets
+        },
+        "added": sum(after.get(qid, 0) - before.get(qid, 0) for qid in targets),
+    }
+    # 修复动作有没有真的改变输入，必须留在事件流里。此前「补检索」这一路在
+    # 没有可补的缺口时静默返回，事件流里只看得到 routes: retrieve，看不到它
+    # 什么都没做——于是一轮修复看起来是按病因分流的，实际退化成了纯重写。
+    await context.emit("section_review.evidence_deepened", payload, stage=stage)
+    return payload
+
+
+async def _question_link_counts(
+    context: JobContext, question_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    from db.models.paper import QuestionEvidenceLink
+    from sqlalchemy import func as sql_func
+    from sqlalchemy import select as sql_select
+
+    if not question_ids:
+        return {}
+    async with context.session() as session:
+        rows = (
+            await session.execute(
+                sql_select(
+                    QuestionEvidenceLink.research_question_id,
+                    sql_func.count(),
+                )
+                .where(QuestionEvidenceLink.research_question_id.in_(list(question_ids)))
+                .group_by(QuestionEvidenceLink.research_question_id)
+            )
+        ).all()
+    return {row[0]: int(row[1]) for row in rows}
+
+
+async def _resynthesize_questions(context: JobContext) -> None:
+    """丢掉旧的综合缓存并重跑：``bundle_hash`` 没变时 enrich 会直接跳过。"""
+    from db.models.paper import QuestionSynthesis
+    from sqlalchemy import delete
+
+    async with context.session() as session:
+        await session.execute(
+            delete(QuestionSynthesis).where(QuestionSynthesis.project_id == context.project_id)
+        )
+    try:
+        await synthesize_questions(context)
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001
+        context.warn("section_review", type(error).__name__, {"stage": "resynthesize"})
+
+
 async def _quality_failing_sections(context: JobContext, report: Any) -> set[str]:
     from db import latest_document, list_claim_evidence, list_sections
 
@@ -2174,9 +3339,12 @@ async def _quality_failing_sections(context: JobContext, report: Any) -> set[str
         section_keys.update(
             anchor.section_key for anchor in anchors if _claim_anchor_requires_repair(anchor)
         )
-    for blocker in report.blockers or []:
-        section_keys.update(str(key) for key in blocker.get("section_keys") or [])
-        section_keys.update(str(key) for key in blocker.get("sections") or [])
+    # 提示也要读：draft 档把大部分阻断项降级成了提示，只读 blockers 会让这一档的
+    # 修复轮拿到一个空的章节集合，然后回落到「重写除框架章节外的所有章节」——
+    # 既贵又不对症。
+    for finding in list(report.blockers or []) + recoverable_findings(report):
+        section_keys.update(str(key) for key in finding.get("section_keys") or [])
+        section_keys.update(str(key) for key in finding.get("sections") or [])
     if section_keys:
         return section_keys
     async with context.session() as session:
@@ -2195,6 +3363,7 @@ async def _supplement_review_evidence(
     language: str,
     report: EvidenceReadinessReport | None = None,
     round_index: int = 1,
+    question_ids: set[Any] | None = None,
 ) -> dict[str, Any]:
     """One bounded, gap-typed retrieval pass for under-evidenced sub-questions.
 
@@ -2228,10 +3397,15 @@ async def _supplement_review_evidence(
         scope = dict(project.scope_json or {}) if project else {}
         linked_work_ids = await _question_linked_work_ids(session, context.project_id)
 
-    gaps = _classify_evidence_gaps(questions, report)
+    gaps = _classify_evidence_gaps(questions, report, question_ids=question_ids)
     if not gaps:
         # 没有可定向补的缺口（例如唯一的降级项是分类器异常）。再检索一轮只会
         # 把同一批文献重新买一遍。
+        await context.emit(
+            "repair_search.skipped",
+            {"round": round_index, "reason": "no_targetable_gap"},
+            stage="quality_repair",
+        )
         return {"round": round_index, "gaps": [], "skipped": "no_targetable_gap"}
     repair_questions = [
         {
@@ -2384,13 +3558,36 @@ async def _question_linked_work_ids(
 def _classify_evidence_gaps(
     questions: list[Any],
     report: EvidenceReadinessReport | None,
+    *,
+    question_ids: set[Any] | None = None,
 ) -> list[tuple[Any, str]]:
     """把「哪些问题缺证」翻译成「缺的是哪一种证」。
 
-    没有 readiness 报告时（独立管线的首轮）退回按 ``answer_status`` 判断。
+    ``question_ids`` 是调用方**已经知道**哪些问题缺证时的直接入口——语义评审就是
+    这种情况：它刚刚判完这一节答没答上，缺口就在它手里。此前这个入口不存在，
+    评审器的判断被丢掉、改用 ``answer_status`` 重新推一遍，而那个字段是问题级的、
+    上一次矩阵重建时写的。实测（项目 ff6b9983）：评审判 s4/s5 证据不足并分流到
+    ``retrieve``，两个问题的 ``answer_status`` 都是 ``partial`` 而不是
+    ``insufficient_evidence``，于是缺口列表为空、补检索一个请求都没发——事件流里
+    只留下一条 ``routes: retrieve``，看起来是按病因修的，实际只跑了重写。
+
+    没有 readiness 报告、也没有指定问题时（独立管线的首轮）退回按
+    ``answer_status`` 判断。
     """
     by_id = {str(question.id): question for question in questions if question.search_query}
     gaps: list[tuple[Any, str]] = []
+    if question_ids:
+        wanted = {str(item) for item in question_ids}
+        return [
+            (
+                question,
+                "no_candidates"
+                if question.answer_status == "insufficient_evidence"
+                else "needs_second_source",
+            )
+            for key, question in by_id.items()
+            if key in wanted
+        ]
     if report is not None and report.question_details:
         for detail in report.question_details:
             question = by_id.get(str(detail.get("question_id") or ""))
@@ -2601,6 +3798,7 @@ async def _prewrite_evidence_gate(
     return report, enrichments
 
 
+@traced("repair", "converge_scholarly_quality")
 async def _converge_scholarly_quality(
     context: JobContext,
     *,
@@ -2608,13 +3806,25 @@ async def _converge_scholarly_quality(
     language: str,
     paper_type: str,
     review_style: str,
+    quality_profile: str = "scholarly",
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """At most two monotonic local rewrite rounds after the pre-write evidence gate."""
+    """Monotonic local rewrite rounds after the pre-write evidence gate.
+
+    ``quality_profile`` 必须跟着调用方走。此前这里写死 scholarly，于是 draft 档的
+    任务一旦进来，重新评估出的是一份 scholarly 报告，和用户选的档位对不上；更实际的
+    后果是 draft 根本没被允许进来过——可恢复的缺陷因此永远只是提示。
+
+    轮数由部署配置（``QUALITY_REPAIR_ROUNDS``，默认仍是设计值 2）。这里是全流程最大
+    的一块墙钟，但降轮数是拿质量换时间，不是免费的：见 WorkerSettings 上的注释。
+    """
     current = initial_report
     history: list[dict[str, Any]] = []
-    for attempt in range(1, 3):
+    rounds = max(0, int(context.settings.quality_repair_rounds))
+    for attempt in range(1, rounds + 1):
         section_keys = await _quality_failing_sections(context, current)
         before = _blocker_instances(current)
+        # 修复前的锚点分布：既是验收的基线，也是按节回滚的依据。查一次，两处用。
+        before_anchors = await _unresolved_anchor_counts(context, current)
         snapshot = await snapshot_document_sections(context)
         await context.emit(
             "quality_repair.started",
@@ -2628,12 +3838,15 @@ async def _converge_scholarly_quality(
                 section_keys=section_keys,
                 language=language,
                 paper_type=paper_type,
+                concurrency=context.settings.writer_repair_concurrency,
             )
             candidate = await _quality(
                 context,
-                quality_profile="scholarly",
+                quality_profile=quality_profile,
                 review_style=review_style,
             )
+        except JobStopped:
+            raise
         except Exception as error:  # noqa: BLE001 - restore the last known-good manuscript
             await restore_document_sections(context, snapshot)
             context.warn(
@@ -2652,22 +3865,59 @@ async def _converge_scholarly_quality(
             )
             break
         after = _blocker_instances(candidate)
-        accepted = _repair_candidate_improves(current, candidate)
+        after_anchors = await _unresolved_anchor_counts(context, candidate)
+        accepted = _repair_candidate_improves(
+            current,
+            candidate,
+            previous_unresolved=sum(before_anchors.values()),
+            candidate_unresolved=sum(after_anchors.values()),
+        )
+        # 净改善被接受时，允许个别章节变差（整体目标优先）。但那一节必须留下痕迹：
+        # 最后一轮之后没有下一轮能补救它，而锚点信号与 report.blockers 基本脱钩，
+        # 交付的 readiness_status 不会说出「有一节比进来时更差」。
+        regressed_kept = sorted(
+            key for key, count in after_anchors.items() if count > before_anchors.get(key, 0)
+        )
+        rolled_back: list[str] = []
         if not accepted:
-            await restore_document_sections(context, snapshot)
+            # 全有全无的回滚是这一段最大的浪费：9 个章节里 8 个改好了、1 个没改好，
+            # 整轮一起退回。所以能**归因到具体章节**时改成按节结算。
+            #
+            # 但按节结算是一个优化，不是新的安全边界：不变量始终是「被判为更差的
+            # 候选绝不留在库里」。归因不成立时必须整轮退回，有三种情况——
+            #   1. 引入了退化码（删掉综述核心也能让计数变小，那是安全属性）；
+            #   2. 报告级阻断项自己变差了（它和任何单一章节的锚点数都不对应，
+            #      按节回滚会一节都不退，把更差的稿子留在库里）；
+            #   3. 重写新增了快照里没有的章节（按节路径会把它们留下）。
+            attributable_to_sections = (
+                not _introduces_degeneration(current, candidate)
+                and _blocker_instances(candidate) <= before
+                and set(after_anchors) <= set(snapshot)
+            )
+            if attributable_to_sections:
+                rolled_back = await _roll_back_worsened_sections(
+                    context,
+                    snapshot=snapshot,
+                    before=before_anchors,
+                    after=after_anchors,
+                )
+            if not attributable_to_sections or not rolled_back:
+                # 归因不到，或归因到了却一节都没退：都说明这次退步不是按节能表达的。
+                await restore_document_sections(context, snapshot)
+                rolled_back = sorted(snapshot)
             # 回滚之后库里 live 的还是被拒候选的报告，必须让它重新对上正文。
             # 正文是逐字复原的，所以先试着把 current 这份结论重新落库（无 LLM 调用）；
             # 快照哈希对不上才说明复原不完整，那时才真的重新评估一次。
             candidate = await _republish_after_rollback(
                 context,
                 current,
-                quality_profile="scholarly",
+                quality_profile=quality_profile,
                 review_style=review_style,
             )
             if candidate is None:
                 candidate = await _quality(
                     context,
-                    quality_profile="scholarly",
+                    quality_profile=quality_profile,
                     review_style=review_style,
                 )
             after = _blocker_instances(candidate)
@@ -2676,6 +3926,16 @@ async def _converge_scholarly_quality(
             "before": before,
             "after": after,
             "accepted": accepted,
+            "rolled_back": rolled_back,
+            # 变差、但仍然活在库里的章节。两层排除缺一不可：已回滚的不算；
+            # 被拒时**快照里没有**的那些是重写新增的，整轮回滚会把它们删掉
+            # （restore_document_sections 会删掉快照外的章节），它们同样不算「保留」。
+            # 少这一层就会在台账里显示一个其实已经不存在的「更差的章节」。
+            "regressed_kept": [
+                key
+                for key in regressed_kept
+                if key not in set(rolled_back) and (accepted or key in snapshot)
+            ],
             "sections": sorted(section_keys),
             "report_id": candidate.report_id,
             "readiness_status": candidate.readiness_status,
@@ -2693,6 +3953,117 @@ async def _converge_scholarly_quality(
     return current, history
 
 
+async def _publish_fast_draft_preview(context: JobContext) -> None:
+    """Expose the written manuscript while the authoritative quality pass runs."""
+    from db import (
+        document_snapshot_hash,
+        evidence_payload,
+        latest_document,
+        list_citation_usage,
+        list_entries,
+        list_evidence_measurements,
+        list_evidence_units,
+        list_sections,
+    )
+
+    from paperforge_worker.pipelines.citation_decisions import semantic_sources
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        if document is None:
+            return
+        rows = await list_sections(session, document.id)
+        if not rows:
+            return
+        snapshot = document_snapshot_hash(rows)
+        previous = context.checkpoint.get("fast_draft_preview")
+        if isinstance(previous, dict) and previous.get("paper_snapshot_hash") == snapshot:
+            return
+        section_ids = {row.id for row in rows}
+        usages = [
+            {
+                "cite_key": row.cite_key,
+                "section_key": "",
+                "context_snippet": row.context_snippet,
+            }
+            for row in await list_citation_usage(session, context.project_id)
+            if row.section_id in section_ids
+        ]
+        entries = await list_entries(session, context.project_id, status="selected")
+        evidence_rows = await list_evidence_units(session, context.project_id)
+        measurements = await list_evidence_measurements(session, [row.id for row in evidence_rows])
+        sources = semantic_sources(
+            entries,
+            [evidence_payload(row, measurements.get(row.id)) for row in evidence_rows],
+        )
+        document_version = document.version
+    try:
+        preview = await preview_citations(
+            usages=usages,
+            sources=sources,
+            decision_runner=context.decision_runner(),
+        )
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - the manuscript is still readable
+        logger.warning("fast draft preview failed", exc_info=True)
+        preview = {
+            "version": "jev-soft-check-v2",
+            "status": "unavailable",
+            "items": [],
+            "error": type(error).__name__,
+        }
+    preview.update(
+        {
+            "paper_snapshot_hash": snapshot,
+            "document_version": document_version,
+            "ready_at": datetime.now(UTC).isoformat(),
+            "verification_status": "pending",
+        }
+    )
+    await context.emit(
+        "fast_draft.ready",
+        preview,
+        stage="quality",
+        checkpoint={"fast_draft_preview": preview},
+    )
+
+
+async def _try_publish_fast_draft_preview(context: JobContext) -> None:
+    try:
+        await _publish_fast_draft_preview(context)
+    except JobStopped:
+        raise
+    except Exception:  # noqa: BLE001 - the manuscript remains available
+        logger.warning("could not publish fast draft preview", exc_info=True)
+
+
+async def _publish_fast_draft_verification(context: JobContext, report: Any) -> None:
+    preview = context.checkpoint.get("fast_draft_preview")
+    if not isinstance(preview, dict):
+        return
+    observed = context.checkpoint.get("fast_draft_verifier")
+    same_snapshot = preview.get("paper_snapshot_hash") == report.paper_snapshot_hash
+    final = {
+        "status": "complete" if same_snapshot else "superseded",
+        "paper_snapshot_hash": report.paper_snapshot_hash,
+        "report_id": report.report_id,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "items": observed.get("items", [])
+        if same_snapshot
+        and isinstance(observed, dict)
+        and observed.get("paper_snapshot_hash") == report.paper_snapshot_hash
+        else [],
+    }
+    preview = {**preview, "verification_status": final["status"]}
+    await context.emit(
+        "fast_draft.verification_complete",
+        final,
+        stage="quality",
+        checkpoint={"fast_draft_preview": preview, "fast_draft_verification": final},
+    )
+
+
 async def run_full_pipeline(
     ctx: dict,
     project_id: str,
@@ -2700,6 +4071,8 @@ async def run_full_pipeline(
     *,
     quality_profile: str = "scholarly",
     review_style: str = "narrative",
+    delivery_mode: str = "standard",
+    regenerate_scope: bool = True,
 ) -> dict:
     """kind=full 一键生成入口。
 
@@ -2714,6 +4087,7 @@ async def run_full_pipeline(
         project_id,
         job_id,
         acquire_fulltext=True,
+        regenerate_scope=regenerate_scope,
         finalize=False,
     )
     if library is None:
@@ -2728,7 +4102,9 @@ async def run_full_pipeline(
         settings=settings,
         session_factory=ctx.get("session_factory"),
         scholar_cache=ctx.get("scholar_cache"),
+        event_publisher=ctx.get("redis"),
     ) as context:
+        delivery_mode = _effective_delivery_mode(context.checkpoint, quality_profile, delivery_mode)
         async with context.session() as session:
             project = await get_project(session, project_uuid)
             language = project.language if project else "en"
@@ -2791,6 +4167,8 @@ async def run_full_pipeline(
         # 续跑时 write 可能被跳过（上一轮已写完），outcome 为 None 但正文确实在库里，
         # 标量因此一律走 _stage_scalar：本轮跑过取内存对象，跳过了取 checkpoint。
         if _stage_scalar(context, "write", "section_count", write_outcome):
+            if delivery_mode == "fast_draft" and quality_profile == "draft":
+                await _try_publish_fast_draft_preview(context)
             quality_outcome = await _run_stage(
                 context,
                 "quality",
@@ -2801,10 +4179,18 @@ async def run_full_pipeline(
                 ),
                 kind="write",
             )
+            # 可恢复的缺陷（整节没写出来、整段照抄证据、语种不一致）在**任何档位**
+            # 都先自动修一轮：只报不修等于把一份自己知道有洞的稿子交出去。
             if (
-                quality_profile != "draft"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status != "preflight_ready"
+                quality_outcome is not None
+                and delivery_mode != "fast_draft"
+                and (
+                    (
+                        quality_profile != "draft"
+                        and quality_outcome.readiness_status != "preflight_ready"
+                    )
+                    or recoverable_findings(quality_outcome)
+                )
             ):
                 quality_outcome, repair_history = await _converge_scholarly_quality(
                     context,
@@ -2812,18 +4198,28 @@ async def run_full_pipeline(
                     language=language,
                     paper_type=paper_type,
                     review_style=review_style,
+                    quality_profile=("draft" if quality_profile == "draft" else "scholarly"),
                 )
-            if (
-                quality_profile == "submission"
-                and quality_outcome is not None
-                and quality_outcome.readiness_status == "preflight_ready"
-            ):
-                quality_outcome = await _quality(
+            # 语义评审放在确定性质量门之后：先修可判定的红线，再问「答没答上」。
+            # 反过来会让评审对着一份还带着引用/数字问题的稿子做判断。
+            semantic_review = (
+                await _review_fast_draft_sections(context, language=language)
+                if delivery_mode == "fast_draft"
+                else await _converge_section_semantics(
                     context,
-                    quality_profile="submission",
-                    review_style=review_style,
+                    language=language,
+                    paper_type=paper_type,
                 )
+            )
+            quality_outcome = await _quality_after_semantics(
+                context,
+                quality_outcome,
+                quality_profile=quality_profile,
+                review_style=review_style,
+            )
             if quality_outcome is not None:
+                if delivery_mode == "fast_draft":
+                    await _publish_fast_draft_verification(context, quality_outcome)
                 await context.emit(
                     "quality.final",
                     quality_outcome.to_payload(),
@@ -2831,13 +4227,26 @@ async def run_full_pipeline(
                     checkpoint={
                         "quality": quality_outcome.to_payload(),
                         "quality_repair_history": repair_history,
+                        "section_review": semantic_review,
                     },
                 )
             readiness = (
                 _stage_scalar(context, "quality", "readiness_status", quality_outcome)
                 or "unassessed"
             )
-            if can_render_after_quality(quality_profile, readiness):
+            if delivery_mode == "fast_draft" and quality_outcome is not None:
+                _, current_hash = await _current_document_snapshot(context)
+                if current_hash != quality_outcome.paper_snapshot_hash:
+                    await context.emit(
+                        "fast_draft.superseded",
+                        {"reason": "document_changed_before_export"},
+                        stage="quality",
+                        checkpoint={"fast_draft_export_status": "superseded"},
+                    )
+                    readiness = "unassessed"
+            if not (
+                delivery_mode == "fast_draft" and readiness == "unassessed"
+            ) and can_render_after_quality(quality_profile, readiness):
                 await _run_stage(
                     context,
                     "visual_plan",
@@ -2874,6 +4283,13 @@ async def run_full_pipeline(
                         "blockers": quality_outcome.blockers,
                     },
                     stage="quality",
+                )
+            if delivery_mode == "fast_draft" and quality_outcome is None:
+                await context.emit(
+                    "fast_draft.verification_unavailable",
+                    {"status": "unavailable", "reason": "quality_stage_failed"},
+                    stage="quality",
+                    checkpoint={"fast_draft_verification": {"status": "unavailable", "items": []}},
                 )
         document_id = _stage_scalar(context, "write", "document_id", write_outcome)
         if (
@@ -2931,8 +4347,20 @@ async def run_full_pipeline(
             and quality_outcome.readiness_status not in RENDERABLE_READINESS
         ):
             await _finish_needs_input(context, quality_outcome)
+        elif _stage_scalar(context, "write", "complete", write_outcome) is False:
+            # 修复轮跑完仍然有章节没有正文。产物保留可查，但这不是一篇交付稿。
+            # 只认显式的 False：``None`` 是「这条 checkpoint 早于完整性判据」，
+            # 不是「不完整」。
+            await _finish_incomplete(context, write_outcome, quality_outcome)
         else:
-            delivered = export_outcome is not None or bool(context.stage_payload("render"))
+            delivered = (
+                export_outcome is not None
+                or bool(context.stage_payload("render"))
+                or (
+                    delivery_mode == "fast_draft"
+                    and isinstance(context.checkpoint.get("fast_draft_preview"), dict)
+                )
+            )
             await _finish(context, delivered=delivered)
         return {
             **library,
@@ -3037,6 +4465,10 @@ async def _outline(context: JobContext, *, review_style: str = "narrative"):
         search_method=search_method,
         sub_question_bundles=synthesis_bundles,
     )
+    from paperforge_worker.orchestration.dependency_contract import apply_proposals
+
+    outcome.tree = apply_proposals(outcome.tree, [])
+    outcome.tree["dependency_contract"]["requires_confirmation"] = False
     async with context.session() as session:
         outline = await create_outline(
             session,
@@ -3078,6 +4510,22 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
         return
     from db.models.paper import GenerationJob
 
+    # A failed job must explain itself on its own row.  ``update_job`` skips a ``None`` error, so
+    # passing warnings-or-nothing left 20 of 23 production failures with an empty ``error_json``
+    # while the actual cause (e.g. ``error_code: "network_timeout"``) sat in the event stream --
+    # visible only to someone who already knew to go looking for it.
+    error_payload: dict[str, Any] | None
+    if delivered:
+        error_payload = {"warnings": context.warnings} if context.warnings else None
+    else:
+        error_payload = {"reason": "not_delivered", "warnings": context.warnings}
+        if context.last_failure:
+            error_payload["failure"] = context.last_failure
+        quota = context.provider_quota_failure()
+        if quota is not None:
+            # 交付不出来而账户没钱时，行上必须写着「没钱」，不能只留一个 not_delivered。
+            error_payload["reason"] = QUOTA_EXHAUSTED
+            error_payload["failure"] = {"error_code": QUOTA_EXHAUSTED, **quota}
     async with context.session() as session:
         job = await session.get(GenerationJob, context.job_id)
         if job is not None:
@@ -3085,11 +4533,136 @@ async def _finish(context: JobContext, *, delivered: bool) -> None:
                 session,
                 job,
                 status=status,
-                error={"warnings": context.warnings} if context.warnings else None,
+                error=error_payload,
             )
+    # ``job.finished`` is committed before this status transition. Wake subscribers again so they
+    # observe the terminal row and close immediately instead of waiting for the safety heartbeat.
+    await context.notify_event()
+
+
+async def _finish_write_outcome(context: JobContext, outcome: Any) -> None:
+    """写作类任务的收尾：完整才算交付，不完整报 needs_input 而不是 succeeded。
+
+    ``section_count`` 曾经是唯一判据，于是「11 节里 5 节只有一句占位」也记成成功。
+    产物照旧留在库里可看可改，但任务状态不再声称这是一篇写完的稿子。
+    """
+    # 续跑时 write 阶段会被跳过，outcome 为 None 而正文确实在库里——此时判据只能
+    # 从 checkpoint 取，否则一次「继续」会把一篇写好的稿子标成失败。
+    section_count = _stage_scalar(context, "write", "section_count", outcome)
+    if not section_count:
+        await _finish(context, delivered=False)
+        return
+    complete = _stage_scalar(context, "write", "complete", outcome)
+    if complete is False:
+        await _finish_incomplete(context, outcome, None)
+        return
+    # ``None`` 表示这条 checkpoint 早于完整性判据存在（旧任务续跑），无从判断，
+    # 不能凭空指控它不完整。
+    await _finish(context, delivered=True)
+
+
+async def _finish_provider_quota_exhausted(
+    context: JobContext, quota: dict[str, Any], *, quality_report: Any = None
+) -> None:
+    """账户余额/配额耗尽：说清楚是没钱了，而不是「章节写不出来」。
+
+    这不是内容问题，也不是用户能靠「再修一轮」解决的问题——重试在有人充值之前
+    只会得到同一个回答。所以状态用 ``failed`` 而不是 ``needs_input``：后者会给出
+    修复/润色入口，而那两个动作此刻必然立刻再失败一次。
+    """
+    calls = int(quota.get("affected_calls") or 0)
+    payload = {
+        "status": "failed",
+        "readiness_status": "provider_quota_exhausted",
+        "blockers": [
+            {
+                "code": "provider_quota_exhausted",
+                "message": (
+                    f"模型服务商账户余额或配额已耗尽（{quota.get('provider') or '未知服务商'}），"
+                    f"本次运行有 {calls} 次调用因此失败。充值或提升配额后重新运行即可，"
+                    "重试在此之前不会有不同结果。"
+                ),
+                "provider": quota.get("provider"),
+                "model": quota.get("model"),
+                "failed_calls": calls,
+            }
+        ],
+        "failure": {"error_code": QUOTA_EXHAUSTED, **quota},
+        "quality_report_id": getattr(quality_report, "report_id", None),
+    }
+    await context.emit(
+        "job.failed",
+        payload,
+        stage="done",
+        checkpoint={"provider_quota_exhausted": payload},
+    )
+    if context.job_id is None:
+        return
+    from db.models.paper import GenerationJob
+
+    async with context.session() as session:
+        job = await session.get(GenerationJob, context.job_id)
+        if job is not None:
+            await update_job(session, job, status="failed", error=payload)
+    await context.notify_event()
+
+
+async def _finish_incomplete(context: JobContext, write_outcome: Any, quality_report: Any) -> None:
+    """稿子不完整：保留产物，但明说缺哪几节、缺什么。"""
+    # 「一节都没写出来」最常见的外部成因是账户没钱。先把这件事认出来，否则报出去的
+    # 是「重试与自动修复之后仍然没有正文」，而它一个字都没提该去充值。
+    quota = context.provider_quota_failure()
+    if quota is not None:
+        await _finish_provider_quota_exhausted(context, quota, quality_report=quality_report)
+        return
+    incomplete = (
+        list(getattr(write_outcome, "incomplete_sections", None) or [])
+        if write_outcome is not None
+        else list(context.stage_payload("write").get("incomplete_sections") or [])
+    )
+    payload = {
+        "status": "needs_input",
+        "readiness_status": "incomplete_manuscript",
+        "blockers": [
+            {
+                "code": "section_not_generated",
+                "message": f"{len(incomplete)} 个章节在重试与自动修复之后仍然没有正文",
+                "count": len(incomplete),
+                "section_keys": [str(item.get("section")) for item in incomplete],
+                "defects": sorted(
+                    {code for item in incomplete for code in item.get("defects") or []}
+                ),
+            }
+        ],
+        "quality_report_id": getattr(quality_report, "report_id", None),
+    }
+    await context.emit(
+        "job.needs_input",
+        payload,
+        stage="done",
+        progress=1.0,
+        checkpoint={"quality_blocked": payload},
+    )
+    if context.job_id is None:
+        return
+    from db.models.paper import GenerationJob
+
+    async with context.session() as session:
+        job = await session.get(GenerationJob, context.job_id)
+        if job is not None:
+            await update_job(session, job, status="needs_input", error=payload)
+    await context.notify_event()
 
 
 async def _finish_needs_input(context: JobContext, report: Any) -> None:
+    # 余额耗尽会让每个 LLM 阶段静默降级，最先垮掉的是 SCOPE：拿不到英文检索词，
+    # 就用中文原句去检索，arXiv 直接拒收 CJK，最后报出来的是「可回答问题的全文
+    # 证据不足两个独立文献来源」。那是降级的**后果**，不是原因——生产实测
+    # （job 44641362，2026-08-26）就是这样把一次欠费说成了检索质量问题。
+    quota = context.provider_quota_failure()
+    if quota is not None:
+        await _finish_provider_quota_exhausted(context, quota, quality_report=report)
+        return
     payload = {
         "status": "needs_input",
         "readiness_status": report.readiness_status,
@@ -3111,57 +4684,107 @@ async def _finish_needs_input(context: JobContext, report: Any) -> None:
         job = await session.get(GenerationJob, context.job_id)
         if job is not None:
             await update_job(session, job, status="needs_input", error=payload)
+    await context.notify_event()
 
 
 async def startup(ctx: dict) -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
+    from observability.tracing import configure_tracing
+
+    configure_tracing("paperforge-worker")
     engine = make_engine(settings.database_url, application_name="paperforge-worker")
+    from paperforge_worker.orchestration.semantic_graph import setup_graph_store
+
+    await setup_graph_store(settings.database_url)
     ctx["settings"] = settings
     ctx["engine"] = engine
     ctx["session_factory"] = make_session_factory(engine)
     ctx["scholar_cache"] = build_scholar_cache(settings)
+    import os
+
+    if os.environ.get("WORKER_METRICS_PORT"):
+        from prometheus_client import start_http_server
+
+        ctx["metrics_server"] = start_http_server(int(os.environ["WORKER_METRICS_PORT"]))
     logger.info("worker started")
 
 
 async def shutdown(ctx: dict) -> None:
+    import asyncio
+
+    from observability.tracing import shutdown_tracing
+
+    await asyncio.to_thread(shutdown_tracing)
     engine = ctx.get("engine")
     if engine is not None:
         await engine.dispose()
 
 
+from paperforge_worker.citation_shadow import citation_shadow_tick  # noqa: E402
+from paperforge_worker.evaluator_shadow import after_job_end, shadow_tick  # noqa: E402
+
+
 class WorkerSettings:
+    after_job_end = after_job_end
+    cron_jobs = (
+        []
+        if get_settings().worker_queue_name == "arq:short"
+        else [
+            cron(shadow_tick, minute=set(range(60)), second=35, timeout=1800, max_tries=1),
+            cron(citation_shadow_tick, minute=set(range(60)), second=10, timeout=120, max_tries=1),
+        ]
+    )
     functions = [
+        func(run_intake_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
+        run_research_pipeline,
+        run_web_research_pipeline,
         run_library_pipeline,
         run_import_pipeline,
         run_cards_pipeline,
         run_qdecomp_pipeline,
         run_evidence_pipeline,
+        run_evidence_index_pipeline,
         run_qmatrix_pipeline,
         run_alignment_pipeline,
         run_synthesis_pipeline,
         run_outline_pipeline,
-        run_write_pipeline,
-        func(run_draft_rebuild_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
-        run_polish_pipeline,
+        run_dependency_rebuild_pipeline,
+        func(run_write_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
+        func(run_draft_rebuild_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
+        func(run_polish_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_export_pipeline,
         run_ingest_pipeline,
         run_pdf_match_pipeline,
         run_uploaded_pdf_pipeline,
         run_snowball_pipeline,
         run_quality_pipeline,
-        func(run_quality_repair_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
+        func(run_quality_repair_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_visual_suggest_pipeline,
         run_visual_generate_pipeline,
-        # 一键生成串起 scope→…→render 十个阶段，是唯一会跑到小时级的任务：
-        # 实测 7 节 / 46 篇约 22 分钟，章节与文献翻倍就顶到默认超时上。
+        # 一键生成串起 scope→…→render 十个阶段；独立写作和润色虽然阶段更少，
+        # 也同样按章节串行调用模型。实测 7 节 / 46 篇约 22 分钟，章节、修复轮次与
+        # 文献规模叠加后会顶到默认超时。
         # 超时不是重试而是直接判失败（arq 用 asyncio.wait_for，抛的是 TimeoutError），
         # 所以宁可给宽，真挂住了还有 LLM 侧的单请求超时兜底。
-        func(run_full_pipeline, timeout=FULL_PIPELINE_TIMEOUT_SECONDS),
+        func(run_full_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
     ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     # 论文生成是分钟级任务：给足超时，并限制并发以尊重 provider 配额。
     job_timeout = 3600
-    max_jobs = 4
+    queue_name = get_settings().worker_queue_name
+    max_jobs = get_settings().worker_max_jobs
+    job_completion_wait = 30
+    max_tries = 3
+
+
+# Keep wire names stable while enforcing one fenced executor per durable intent.
+from paperforge_worker.execution import guarded  # noqa: E402
+
+for _function in WorkerSettings.functions:
+    if hasattr(_function, "coroutine"):
+        _function.coroutine = guarded(_function.coroutine)
+    else:
+        WorkerSettings.functions[WorkerSettings.functions.index(_function)] = guarded(_function)

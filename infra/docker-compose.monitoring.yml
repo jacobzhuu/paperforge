@@ -1,0 +1,20 @@
+services:
+  prometheus:
+    image: ${PAPERFORGE_DEPLOY_MONITORING_IMAGE:-paperforge-monitoring:local}
+    volumes:
+      - capacity-metrics:/prometheus
+    networks:
+      - runtime
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --storage.tsdb.retention.size=1GB
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+volumes:
+  capacity-metrics:

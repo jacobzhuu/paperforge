@@ -50,7 +50,7 @@ class XRefRun(BaseModel):
 
     t: Literal["xref"] = "xref"
     target: str
-    kind: Literal["figure"] = "figure"
+    kind: Literal["figure", "equation"] = "figure"
 
 
 Run = TextRun | CiteRun | GroundingRun | MathInlineRun | XRefRun
@@ -77,6 +77,10 @@ class EquationBlock(BaseModel):
     type: Literal["equation"] = "equation"
     latex: str
     label: str | None = None
+    source_ids: list[str] = Field(default_factory=list)
+    source_latex: str | None = None
+    source_context: str | None = None
+    explanation: str | None = None
 
 
 class FigureBlock(BaseModel):

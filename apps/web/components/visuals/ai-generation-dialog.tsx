@@ -107,7 +107,7 @@ export function AIGenerationDialog({
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>AI 生成可能消耗可用额度。</span>
           </li>
-          <li>· 上述提示词已由 DeepSeek 读取当前论文全文并结合本次意图生成。</li>
+          <li>· 上述提示词已由模型读取当前论文全文并结合本次意图生成。</li>
           <li>· Yunwu 只接收上面这段最终提示词，<b>不会</b>附带论文原文、数据表或上传文件。</li>
           <li>· 图中文字可能出错，生成后请核对；承载数据的图请改用图表或示意图。</li>
         </ul>

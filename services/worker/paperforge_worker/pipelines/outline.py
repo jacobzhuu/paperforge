@@ -18,9 +18,13 @@ from typing import Any
 
 from llm_runtime import LLMRunner
 
+from paperforge_worker.locators import locator_display
+
 MAX_SECTIONS = 8
 MIN_SECTIONS = 3
-MAX_POINTS_PER_SECTION = 6
+# 8 条要点对齐 `MAX_PARAGRAPHS_PER_SECTION`（writing.py，现为 8）：一条要点写成
+# 一个段落，议程的长度就直接决定了章节的厚度。
+MAX_POINTS_PER_SECTION = 8
 
 _SYSTEM_PROMPT_ZH = """你是综述论文的大纲规划助手。根据研究问题与文献卡片列表，输出章节树。
 只输出 JSON：
@@ -63,6 +67,63 @@ Rules:
 # 固定框架章节：由系统在正文写完后生成（设计 §4.4.1 「摘要/引言/结论后写」）。
 FRONT_SECTION_KEYS = ("abstract", "introduction")
 BACK_SECTION_KEYS = ("conclusion",)
+
+# 框架章节此前的 summary 是空字符串，于是写作提示词里那一行就是「Section goal:」后面
+# 什么都没有，argument_points 也是空的。模型没有任何交代，写出来的引言只有 200 字左右；
+# 更糟的是质量修复每一轮都会重写这三节，而修复指令是纯减法（「删掉没有证据支撑的论断」），
+# 于是每修一轮就短一截——实测（项目 ff6b9983 第 2 版）结论 351 → 136 → 137 字，
+# 引言 274 → 179 → 171 字。给它们一份正经的写作交代和各自的篇幅目标，这两件事一起解决。
+FRAME_SECTION_BRIEFS: dict[str, dict[str, Any]] = {
+    "abstract": {
+        "zh": (
+            "写这篇综述的摘要：一句话交代研究背景与为什么现在值得综述；"
+            "说明综述覆盖的范围与取证方式；概括正文各节得出的主要结论（要具体到机制、"
+            "对象或结果，不要只说「进行了讨论」）；点出证据仍然不足之处；最后给出展望。"
+            "不分段，不使用引用标记。"
+        ),
+        "en": (
+            "Write the abstract of this review: one sentence of background and why the topic "
+            "warrants a review now; the scope covered and how evidence was gathered; the "
+            "substantive conclusions of the body sections (name mechanisms, organisms or "
+            "results — never just 'is discussed'); where evidence remains insufficient; and a "
+            "closing outlook. One paragraph, no citation markers."
+        ),
+        "target_zh": 350,
+        "target_en": 220,
+    },
+    "introduction": {
+        "zh": (
+            "写这篇综述的引言，至少三段：第一段交代研究领域的背景与重要性；"
+            "第二段说明目前的研究现状与尚未解决的问题——这里要引用正文用到的文献；"
+            "第三段说明本综述要回答哪些子问题、如何组织各节。"
+            "不要罗列各节标题，要写成连贯的论证。"
+        ),
+        "en": (
+            "Write the introduction of this review in at least three paragraphs: the field and "
+            "why it matters; the current state of the art and what remains unresolved, citing "
+            "the works used in the body; and the sub-questions this review answers together "
+            "with how the sections are organised. Argue in prose; do not list section titles."
+        ),
+        "target_zh": 1000,
+        "target_en": 620,
+    },
+    "conclusion": {
+        "zh": (
+            "写这篇综述的结论，至少两段：第一段综合正文各节的发现，给出跨节的判断"
+            "（哪些结论证据充分、哪些仍是初步的、不同研究之间在哪里不一致）；"
+            "第二段说明本领域下一步最需要什么样的证据或方法。"
+            "不要逐节复述，要给出综合判断。"
+        ),
+        "en": (
+            "Write the conclusion of this review in at least two paragraphs: a cross-section "
+            "judgement (which conclusions are well supported, which remain preliminary, where "
+            "studies disagree), then what evidence or methods the field most needs next. "
+            "Synthesise; do not restate the sections one by one."
+        ),
+        "target_zh": 800,
+        "target_en": 500,
+    },
+}
 
 
 @dataclass
@@ -126,6 +187,10 @@ async def generate_outline(
             language=language,
             allowed=allowed,
         )
+        body = await _headline_sections(
+            body, topic=topic, language=language, runner=runner
+        )
+        body = await _headline_subsections(body, language=language, runner=runner)
         generator = "question_evidence_matrix"
     else:
         body, generator = await _body_sections(
@@ -142,24 +207,37 @@ async def generate_outline(
     if not sub_question_bundles:
         body = _reclaim_orphans(body, allowed)
     if paper_type == "review" and len(allowed_cards) >= 2:
-        body.append(
-            review_synthesis_section(
-                allowed_cards,
-                language=language,
-                sub_question_bundles=sub_question_bundles or [],
-            )
-        )
+        synthesis_section = review_synthesis_section(
+            allowed_cards, language=language, sub_question_bundles=sub_question_bundles or [])
+        matrix_tables = synthesis_section.pop('inline_tables', [])
+        synthesis_section['inline_tables'] = []
+        body.append(synthesis_section)
         ledger = evidence_ledger_section(
             allowed_cards,
             language=language,
             sub_question_bundles=sub_question_bundles or [],
         )
+        if ledger is None and matrix_tables:
+            ledger = {'key': 'evidence_ledger',
+                      'title': '文献与证据附件' if language == 'zh' else 'Literature and evidence',
+                      'appendix': True, 'kind': 'appendix', 'synthesis_kind': 'evidence_ledger',
+                      'cite_keys': synthesis_section['cite_keys'], 'inline_tables': []}
         if ledger is not None:
+            ledger['inline_tables'] = matrix_tables + ledger['inline_tables']
             body.append(ledger)
     if paper_type == "review" and review_style == "systematic" and search_method:
         body.insert(0, systematic_method_section(search_method, language=language))
     sections = _with_frame_sections(body, language=language, paper_type=paper_type)
-    assigned = {key for section in sections for key in section.get("cite_keys", [])}
+    # The ledger inherits every key in the project, so counting it here made
+    # `orphan_key_count` read 0 no matter how many works the body actually
+    # ignored.  Frames only ever mirror body keys, so excluding appendices is
+    # enough to make the count mean what it says.
+    assigned = {
+        key
+        for section in sections
+        if not (section.get("appendix") or section.get("kind") == "appendix")
+        for key in section.get("cite_keys", [])
+    }
     outcome = OutlineOutcome(
         tree={
             "topic": topic,
@@ -339,6 +417,7 @@ def question_driven_sections(
     zh = language == "zh"
     sections: list[dict[str, Any]] = []
     for index, bundle in enumerate(bundles[:MAX_SECTIONS]):
+        question_text = str(bundle.get("question") or ("子问题" if zh else "Sub-question"))
         evidence = bundle.get("evidence") or []
         cite_keys = list(
             dict.fromkeys(
@@ -351,18 +430,22 @@ def question_driven_sections(
         # 来源，所以这种小节必须显式受限地写：说明证据基础有多窄，不得推广。
         source_count = len({str(item.get("work_id")) for item in evidence if item.get("work_id")})
         evidence_limited = source_count < 2
-        sections.append(
-            {
-                "key": f"q{index + 1}",
+        section_key = f"q{index + 1}"
+        section = {
+                "key": section_key,
+                "independent": True,
                 "level": 1,
-                "title": str(bundle.get("question") or ("子问题" if zh else "Sub-question")),
-                "summary": (
-                    f"回答该子问题；当前证据状态：{_stance_label(stance, language)}。"
-                    if zh
-                    else (
-                        "Answer this sub-question; current evidence status: "
-                        f"{_stance_label(stance, language)}."
-                    )
+                # 小标题不是子问题原文。子问题是**给写作器和评审器的输入**，写成标题
+                # 就成了「CRISPR-Cas 在作物抗病性改良中面临哪些技术挑战（如脱靶效应、
+                # 递送方法、多基因编辑）？」这样一行——带问号、带举例括号，导出的 PDF
+                # 一眼看去不像论文。问题原文移进 summary，写作器照样知道要答什么。
+                "title": _section_heading(question_text, language=language),
+                "question": question_text,
+                "summary": _section_goal(
+                    question_text,
+                    stance=stance,
+                    synthesis=bundle.get("synthesis"),
+                    language=language,
                 ),
                 "evidence_limited": evidence_limited,
                 "distinct_source_count": source_count,
@@ -381,14 +464,249 @@ def question_driven_sections(
                 # argument_points 的确定性构造，关闭时为 None。
                 "synthesis": bundle.get("synthesis"),
                 "kind": "body",
+        }
+        # 有足够的论证要点才拆二级标题；不够就保持扁平，为一两条要点造一个孤立小节
+        # 读起来比不拆更糟。母节此时只写引入段，篇幅目标随之下调。
+        subsections = _subsections_for(
+            _synthesis_content_items(bundle.get("synthesis"), language=language),
+            parent_key=section_key,
+            parent=section,
+            language=language,
+        )
+        if subsections:
+            section["has_children"] = True
+            section["target_words"] = (
+                PARENT_TARGET_WORDS_ZH if zh else PARENT_TARGET_WORDS_EN
+            )
+        from paperforge_worker.pipelines.scholarly_content import thematic_tables
+
+        section['inline_tables'] = thematic_tables(section, evidence, language=language)
+        section['content_policy'] = 'scholarly-content-v1'
+        sections.append(section)
+        sections.extend(subsections)
+    return sections
+
+
+#: 少于这个数就不拆小节：为一两条要点造一个孤立的二级标题，读起来比不拆更糟。
+MIN_ITEMS_FOR_SUBSECTIONS = 4
+#: 每个小节承载 2-3 条要点，最多 4 个小节——再多标题就碎了。
+MAX_SUBSECTIONS = 4
+ITEMS_PER_SUBSECTION = 2
+#: 有小节的母节只写引入段；小节各自成篇。
+PARENT_TARGET_WORDS_ZH = 250
+PARENT_TARGET_WORDS_EN = 160
+SUBSECTION_TARGET_WORDS_ZH = 450
+SUBSECTION_TARGET_WORDS_EN = 280
+
+
+def _subsections_for(
+    items: list[dict[str, Any]],
+    *,
+    parent_key: str,
+    parent: dict[str, Any],
+    language: str,
+) -> list[dict[str, Any]]:
+    """Split a section's agenda into level-2 units, or return [] to stay flat."""
+    if len(items) < MIN_ITEMS_FOR_SUBSECTIONS:
+        return []
+    groups: list[list[dict[str, Any]]] = []
+    for start in range(0, len(items), ITEMS_PER_SUBSECTION):
+        groups.append(items[start : start + ITEMS_PER_SUBSECTION])
+    if len(groups) > MAX_SUBSECTIONS:
+        # Fold the overflow into the last subsection rather than dropping it.
+        head, tail = groups[: MAX_SUBSECTIONS - 1], groups[MAX_SUBSECTIONS - 1 :]
+        groups = [*head, [item for group in tail for item in group]]
+    zh = language == "zh"
+    subsections: list[dict[str, Any]] = []
+    for ordinal, group in enumerate(groups, start=1):
+        points = [str(item["text"]) for item in group]
+        evidence_ids = list(
+            dict.fromkeys(value for item in group for value in item["evidence_ids"])
+        )
+        subsections.append(
+            {
+                **{
+                    key: parent[key]
+                    for key in (
+                        "question_id",
+                        "answer_status",
+                        "stance_summary",
+                        "evidence_limited",
+                        "distinct_source_count",
+                        "cite_keys",
+                    )
+                    if key in parent
+                },
+                "key": f"{parent_key}s{ordinal}",
+                "depends_on": [parent_key],
+                "level": 2,
+                "parent_key": parent_key,
+                # 占位：`_headline_subsections` 要么给它一个真标题，要么把整个
+                # 小节撤掉。从要点原句截断出来的标题试过，全是半截短语。
+                "title": "",
+                "summary": (
+                    "在本小节里把下列要点展开成连贯论证，不要重复上级小节已经说过的话。"
+                    if zh
+                    else "Develop the points below into a connected argument; do not repeat "
+                    "what the parent section already said."
+                ),
+                "argument_points": points,
+                # Fall back to the parent's pool when SYNTH gave an entry no ids,
+                # so the writer is never handed an empty evidence ledger.
+                "evidence_ids": evidence_ids or list(parent.get("evidence_ids") or []),
+                "target_words": SUBSECTION_TARGET_WORDS_ZH if zh else SUBSECTION_TARGET_WORDS_EN,
+                "kind": "body",
             }
         )
-    return sections
+    return subsections
+
+
+def _section_goal(
+    question_text: str,
+    *,
+    stance: str,
+    synthesis: Any,
+    language: str,
+) -> str:
+    """What this section must establish, not merely which question it answers.
+
+    SYNTH's `claim` is the cross-study conclusion for this sub-question — the
+    section's thesis. Leaving it out of `Section goal:` meant the writer was
+    told only "answer this question" and had to rediscover the point.
+    """
+    zh = language == "zh"
+    claim = " ".join(str((synthesis or {}).get("claim") or "").split()) if synthesis else ""
+    lines = (
+        [
+            f"回答这个子问题：{question_text}",
+            f"当前证据状态：{_stance_label(stance, language)}。",
+        ]
+        if zh
+        else [
+            f"Answer this sub-question: {question_text}",
+            f"Current evidence status: {_stance_label(stance, language)}.",
+        ]
+    )
+    if claim:
+        lines.append(
+            f"本节要确立的论点：{claim}" if zh else f"The claim this section establishes: {claim}"
+        )
+    return "\n".join(lines)
+
+
+def _synthesis_statement(entry: Any) -> str:
+    """The prose statement carried by one synthesis entry."""
+    if not isinstance(entry, dict):
+        return ""
+    return " ".join(str(entry.get("statement") or "").split())
+
+
+def _synthesis_entry_ids(entry: Any) -> list[str]:
+    if not isinstance(entry, dict):
+        return []
+    return [str(value) for value in entry.get("evidence_ids") or [] if value]
+
+
+def _synthesis_content_items(synthesis: Any, *, language: str) -> list[dict[str, Any]]:
+    """Content points paired with the evidence each one rests on.
+
+    Subsections need the pairing: a subsection that carries three findings must
+    also carry those findings' evidence, or `section_evidence_for` hands the
+    writer an empty ledger and the sentence rules blank the whole thing.
+    """
+    items: list[dict[str, Any]] = []
+    texts = _synthesis_content_points(synthesis, language=language)
+    if not isinstance(synthesis, dict):
+        return items
+    entries = [
+        *(synthesis.get("agreement") or []),
+        *(synthesis.get("conditional") or []),
+        *(synthesis.get("conflict") or []),
+    ]
+    # `_synthesis_content_points` walks the same three lists in the same order
+    # and skips entries with no statement, so pairing by position is exact.
+    kept = [entry for entry in entries if _synthesis_statement(entry)]
+    for text, entry in zip(texts, kept, strict=False):
+        items.append({"text": text, "evidence_ids": _synthesis_entry_ids(entry)})
+    return items
+
+
+def _synthesis_content_points(synthesis: Any, *, language: str) -> list[str]:
+    """Turn SYNTH's findings into the section's actual agenda.
+
+    Each agreement/conditional/conflict is a *finding* — something the section
+    has to argue — as opposed to the methodological instructions below, which
+    only say how to argue. Measured on a real run: every body section received
+    exactly one point, the generic fallback, because `comparison_clusters` was
+    empty; the section then came back at 500-700 characters and three retries
+    could not fix it, while 8-13 concrete findings sat unused in
+    `question_synthesis`.
+    """
+    if not isinstance(synthesis, dict):
+        return []
+    zh = language == "zh"
+    points: list[str] = []
+    for entry in synthesis.get("agreement") or []:
+        if statement := _synthesis_statement(entry):
+            points.append(statement)
+    for entry in synthesis.get("conditional") or []:
+        statement = _synthesis_statement(entry)
+        if not statement:
+            continue
+        dimension = " ".join(str((entry or {}).get("dimension") or "").split())
+        if dimension:
+            points.append(
+                f"说明随「{dimension}」变化的条件差异：{statement}"
+                if zh
+                else f"Explain how this varies with {dimension}: {statement}"
+            )
+        else:
+            points.append(statement)
+    for entry in synthesis.get("conflict") or []:
+        if statement := _synthesis_statement(entry):
+            points.append(
+                f"显式呈现这一冲突而不要调和：{statement}"
+                if zh
+                else f"State this conflict explicitly rather than reconciling it: {statement}"
+            )
+    return points
+
+
+def _synthesis_gap_point(synthesis: Any, *, language: str) -> str:
+    """At most one gap, in the author's voice.
+
+    SYNTH routinely returns 1-4 gaps per question. Letting all of them become
+    agenda items is how a review turns into a report on its own evidence.
+    """
+    if not isinstance(synthesis, dict):
+        return ""
+    for entry in synthesis.get("gap") or []:
+        if statement := _synthesis_statement(entry):
+            # SYNTH 用的是**本文证据**的口吻（"现有证据未提供…"）。原样送进议程就是
+            # 把上一轮刚清掉的审计腔重新发给模型。这里不改写它的文字——试过按前缀
+            # 剥离，剥出来的是「报告攻击前后 HR 的具体数值变化，无法量化…」这种断句
+            # ——而是把改写要求写进指令，让模型把它转成领域现状。
+            return (
+                f"用一句话交代该问题在文献中尚未解决。"
+                f"把下面这条改写成对领域现状的判断，不要出现「证据」「本文」「现有研究未提供」"
+                f"这类说法：{statement}"
+                if language == "zh"
+                else (
+                    "Note in one sentence that the literature has not settled this. Recast the "
+                    "following as a statement about the field, never about this review's own "
+                    f"evidence: {statement}"
+                )
+            )
+    return ""
 
 
 def _synthesis_argument_points(bundle: dict[str, Any], *, language: str) -> list[str]:
     zh = language == "zh"
-    points: list[str] = []
+    # Content first: these are what give the section something to say.  The
+    # methodological points below are modifiers on top of them.
+    synthesis = bundle.get("synthesis")
+    points: list[str] = _synthesis_content_points(synthesis, language=language)
+    gap_point = _synthesis_gap_point(synthesis, language=language)
     for cluster in bundle.get("comparison_clusters") or []:
         classification = str(cluster.get("classification") or "mixed")
         if zh:
@@ -410,16 +728,260 @@ def _synthesis_argument_points(bundle: dict[str, Any], *, language: str) -> list
             if zh
             else "Report evidence with different datasets, tasks, or metrics separately"
         )
-    if bundle.get("evidence_gap"):
+    # 用作者口吻交代领域的空白，而不是复述本系统的检索结果。前者是综述该有的
+    # 判断，后者读起来像审计记录——实测 s4/s5 整节都是后者。缺口全节只留一条：
+    # SYNTH 每个问题能给出 1-4 条，全放进议程等于把综述写成检索报告。
+    if gap_point:
+        points.append(gap_point)
+    elif bundle.get("evidence_gap"):
         points.append(
-            "明确说明现有全文证据不足以回答该子问题"
+            "用一句话指出该问题在文献中尚未被系统研究，不要描述本文的检索或证据评级过程"
             if zh
-            else "State explicitly that current full-text evidence is insufficient"
+            else "Note in one sentence that the literature has not yet settled this question; "
+            "do not describe this review's own retrieval or evidence grading"
         )
     return points or (
         ["按证据等级陈述现有发现与适用边界"]
         if zh
         else ["State current findings and boundaries according to evidence grade"]
+    )
+
+
+#: 中文疑问式小标题里，把句子拉成问题的那些词。去掉它们剩下的就是主题短语。
+_ZH_INTERROGATIVES = (
+    "有哪些",
+    "哪些",
+    "如何",
+    "怎样",
+    "是什么",
+    "为什么",
+    "能否",
+    "是否",
+    "多大程度上",
+)
+_EN_INTERROGATIVES = (
+    "what are the",
+    "what is the",
+    "what are",
+    "what is",
+    "how do",
+    "how does",
+    "how has",
+    "how can",
+    "which",
+    "why do",
+    "why does",
+    "to what extent",
+)
+
+
+_HEADING_SYSTEM_ZH = """你在给一篇综述论文拟正文小标题。
+输入是若干研究子问题，按顺序给每个子问题拟一个小标题。
+只输出 JSON：{"headings": ["小标题1", "小标题2", ...]}
+要求：
+- 数量与顺序必须与输入的子问题一一对应；
+- 每条是**名词性短语**，不是问句：不带问号、不带「哪些/如何/是否」这类疑问词；
+- 不超过 18 个汉字，不加编号、不加括号举例；
+- 各条之间风格一致、彼此可区分，读起来像一篇论文的目录。"""
+
+_HEADING_SYSTEM_EN = """You are naming the body sections of a review paper.
+Given a list of research sub-questions, produce one heading per sub-question, in order.
+Output JSON only: {"headings": ["heading 1", "heading 2", ...]}
+Rules:
+- exactly one heading per input question, same order;
+- each heading is a NOUN PHRASE, never a question: no question mark, no "what/how/which";
+- at most 8 words, no numbering, no parenthetical examples;
+- headings must be parallel in style and mutually distinguishable."""
+
+
+async def _headline_sections(
+    sections: list[dict[str, Any]],
+    *,
+    topic: str,
+    language: str,
+    runner: LLMRunner | None,
+) -> list[dict[str, Any]]:
+    """把问题驱动小节的标题换成像论文目录的短语。
+
+    ``_section_heading`` 的确定性结果准确但读着仍像半截句子（「CRISPR-Cas 编辑作物在
+    抗病性改良方面取得了具体成果」）。这里花一次 planner 调用把整组标题一起拟出来，
+    整组一起拟才能保证风格一致、彼此可区分。模型不可用或返回不合规就沿用确定性结果——
+    标题拟不好是遗憾，拟错或者数量对不上是事故。
+    """
+    targets = [item for item in sections if item.get("question")]
+    if not targets or runner is None:
+        return sections
+    questions = [str(item.get("question") or "") for item in targets]
+    result = await runner.agenerate_json(
+        "planner",
+        system_prompt=(_HEADING_SYSTEM_ZH if language == "zh" else _HEADING_SYSTEM_EN),
+        user_prompt="\n".join(
+            [f"论文主题：{topic}" if language == "zh" else f"Paper topic: {topic}", "", *(
+                f"{index + 1}. {text}" for index, text in enumerate(questions)
+            )]
+        ),
+        max_output_tokens=1200,
+        temperature=0.2,
+        metadata={"stage": "outline_headings"},
+    )
+    headings = (result.value or {}).get("headings") if result.ok else None
+    if not isinstance(headings, list) or len(headings) != len(targets):
+        return sections
+    cleaned = [" ".join(str(item).split()).strip("：: ") for item in headings]
+    if any(not item or "？" in item or "?" in item for item in cleaned):
+        return sections
+    if len({item for item in cleaned}) != len(cleaned):
+        return sections
+    for section, heading in zip(targets, cleaned, strict=True):
+        section["title"] = heading
+    return sections
+
+
+_SUBHEADING_SYSTEM_ZH = """你在给一篇综述论文的某一节拟二级小标题。
+输入是这一节的标题，以及若干组论证要点（每组对应一个二级小节）。
+只输出 JSON：{"headings": ["小标题1", "小标题2", ...]}
+要求：
+- 数量与顺序必须与输入的要点组一一对应；
+- 每条是**名词性短语**，概括该组要点讲的是什么，不是把要点原句截断；
+- 不超过 14 个汉字，不带问号、不加编号；
+- 同一节内各条彼此可区分，且都比上级标题更具体。"""
+
+_SUBHEADING_SYSTEM_EN = """You are naming the subsections of one section of a review paper.
+You get the section title and several groups of argument points, one group per subsection.
+Output JSON only: {"headings": ["heading 1", "heading 2", ...]}
+Rules:
+- exactly one heading per group, same order;
+- each is a NOUN PHRASE summarising what that group argues, never a truncated sentence;
+- at most 6 words, no question mark, no numbering;
+- headings within a section must be mutually distinguishable and more specific than the parent."""
+
+
+async def _headline_subsections(
+    sections: list[dict[str, Any]],
+    *,
+    language: str,
+    runner: LLMRunner | None,
+) -> list[dict[str, Any]]:
+    """给二级小节拟标题；拟不出来就**把小节撤掉**，退回扁平结构。
+
+    确定性标题在这里行不通——从要点原句截断出来的是「在联邦学习领域」「说明随
+    「threat_model」变」这种半截短语，而二级标题是 PDF 里最显眼的东西之一，
+    宁可没有也不能是这样。撤掉小节不损失任何内容：母节的 ``argument_points``
+    本来就是全部要点的超集，扁平结构照样比改造前厚得多。
+    """
+    parents = [item for item in sections if item.get("has_children")]
+    if not parents:
+        return sections
+    named: set[str] = set()
+    for parent in parents:
+        children = [
+            item
+            for item in sections
+            if item.get("parent_key") == parent.get("key") and item.get("level") == 2
+        ]
+        headings = await _subsection_headings(
+            parent, children, language=language, runner=runner
+        )
+        if headings is None or any(heading in named for heading in headings):
+            _drop_children(parent, children)
+            continue
+        named.update(headings)
+        for child, heading in zip(children, headings, strict=True):
+            child["title"] = heading
+    return [item for item in sections if not item.get("_dropped")]
+
+
+async def _subsection_headings(
+    parent: dict[str, Any],
+    children: list[dict[str, Any]],
+    *,
+    language: str,
+    runner: LLMRunner | None,
+) -> list[str] | None:
+    if not children or runner is None:
+        return None
+    zh = language == "zh"
+    groups = [
+        "\n".join(
+            [
+                f"第 {index + 1} 组：" if zh else f"Group {index + 1}:",
+                *(f"  - {point}" for point in child.get("argument_points") or []),
+            ]
+        )
+        for index, child in enumerate(children)
+    ]
+    result = await runner.agenerate_json(
+        "planner",
+        system_prompt=(_SUBHEADING_SYSTEM_ZH if zh else _SUBHEADING_SYSTEM_EN),
+        user_prompt="\n\n".join(
+            [
+                (f"本节标题：{parent.get('title')}" if zh else f"Section: {parent.get('title')}"),
+                *groups,
+            ]
+        ),
+        max_output_tokens=800,
+        temperature=0.2,
+        metadata={"stage": "outline_subheadings"},
+    )
+    headings = (result.value or {}).get("headings") if result.ok else None
+    if not isinstance(headings, list) or len(headings) != len(children):
+        return None
+    cleaned = [" ".join(str(item).split()).strip("：: ") for item in headings]
+    limit = 14 if zh else 60
+    if any(not item or "？" in item or "?" in item or len(item) > limit for item in cleaned):
+        return None
+    if len(set(cleaned)) != len(cleaned):
+        return None
+    return cleaned
+
+
+def _drop_children(parent: dict[str, Any], children: list[dict[str, Any]]) -> None:
+    """Fold subsections back into their parent, restoring the flat contract."""
+    for child in children:
+        child["_dropped"] = True
+    parent.pop("has_children", None)
+    # 去掉母节的引入段目标，写作器就回到它自己的正文小节默认篇幅。
+    parent.pop("target_words", None)
+
+
+def _section_heading(question: str, *, language: str) -> str:
+    """把一句子问题改写成能印在论文上的小标题。
+
+    确定性做法，不额外调模型：删掉举例括号（「（如脱靶效应、递送方法）」这种在标题里
+    只会把一行撑到三十多字）、删掉问号、删掉疑问词。剩下的是主题短语。
+
+    实测（项目 ff6b9983 第 2 版）导出的 PDF 里，五个正文小标题全是子问题原文，最长的
+    一条 44 个字并且带着括号和问号。这个函数把它变成「CRISPR-Cas 在作物抗病性改良中
+    面临的技术挑战」。删不动时**保留原文**——一个啰嗦但准确的标题，好过一个被截断到
+    看不懂的标题。
+    """
+    text = " ".join(str(question or "").split())
+    if not text:
+        return "子问题" if language == "zh" else "Sub-question"
+    # 举例括号（中英文两种）只在标题里碍事，问题原文仍完整留在 summary 里。
+    text = re.sub(r"[（(](?:如|e\.g\.|例如|包括)[^）)]*[）)]", "", text)
+    text = text.strip().rstrip("?？.。").strip()
+    if language == "zh":
+        for word in _ZH_INTERROGATIVES:
+            text = text.replace(word, "")
+        text = text.replace("  ", " ").strip("，,、 ")
+    else:
+        lowered = text.lower()
+        for word in _EN_INTERROGATIVES:
+            if lowered.startswith(word):
+                text = text[len(word) :].strip()
+                break
+    text = " ".join(text.split())
+    if not text:
+        return " ".join(str(question).split()).rstrip("?？")
+    return text
+
+
+def _cross_study_gap_note(language: str) -> str:
+    return (
+        "没有可用于跨研究比较的结构化证据。"
+        if language == "zh"
+        else "No structured evidence is available for cross-study comparison."
     )
 
 
@@ -482,21 +1044,13 @@ def review_synthesis_section(
             if measurement
             else ("未结构化" if zh else "Not structured")
         )
-        locator = ", ".join(
-            value
-            for value in (
-                f"p.{evidence.get('page')}" if evidence.get("page") else "",
-                str(evidence.get("section_path") or ""),
-                str(evidence.get("object_ref") or ""),
-            )
-            if value
-        ) or ("未定位" if zh else "Unlocated")
+        locator = locator_display(evidence) or ("未定位" if zh else "Unlocated")
         rows.append(
             [
                 _short_study_label(str(evidence.get("title") or ""), evidence.get("year")),
                 task_dataset,
                 (
-                    _clean(card.methods[0])
+                    _clip(card.methods[0], 90)
                     if card and card.methods
                     else ("未报告" if zh else "Not reported")
                 ),
@@ -505,8 +1059,10 @@ def review_synthesis_section(
                 locator,
             ]
         )
-        if len(rows) >= 40:
-            break
+
+    headers, rows, omission_note = _drop_empty_matrix_columns(
+        headers, rows, language=language
+    )
     cite_keys = list(by_cite)
     evidence_ids = list(
         dict.fromkeys(
@@ -515,6 +1071,7 @@ def review_synthesis_section(
     )
     return {
         "key": "review_synthesis",
+        "requires_all_body": True,
         "level": 1,
         "title": "跨研究比较、局限与证据冲突"
         if zh
@@ -542,15 +1099,20 @@ def review_synthesis_section(
         ),
         "cite_keys": cite_keys,
         "evidence_ids": evidence_ids,
-        "evidence_gap": not bool(rows),
+        # A bool here reached the writer prompt as the literal line
+        # "[EVIDENCE GAP] True".  This field is prose or nothing.
+        "evidence_gap": None if rows else _cross_study_gap_note(language),
         "kind": "body",
         "synthesis_kind": "comparison_limitations_conflicts",
         "inline_tables": (
             [
                 {
-                    "caption": "纳入研究的方法与证据基础比较"
-                    if zh
-                    else "Methods and evidence basis of included studies",
+                    "caption": (
+                        "纳入研究的方法与证据基础比较"
+                        if zh
+                        else "Methods and evidence basis of included studies"
+                    )
+                    + omission_note,
                     "label": "tab:literature-matrix",
                     "headers": headers,
                     "rows": rows,
@@ -589,15 +1151,7 @@ def evidence_ledger_section(
             seen.add(evidence_id)
             evidence_ids.append(evidence_id)
             cite_keys.append(cite_key)
-            locator = ", ".join(
-                value
-                for value in (
-                    str(evidence.get("locator_display") or ""),
-                    f"p.{evidence.get('page')}" if evidence.get("page") else "",
-                    str(evidence.get("object_ref") or ""),
-                )
-                if value
-            ) or ("未定位" if zh else "Unlocated")
+            locator = locator_display(evidence) or ("未定位" if zh else "Unlocated")
             rows.append(
                 [
                     _short_study_label(
@@ -668,8 +1222,82 @@ def _task_label(task_id: str, *, language: str) -> str:
 
 def _short_study_label(title: str, year: Any) -> str:
     cleaned = _clean(title)
-    first = re.split(r"[:.。]", cleaned, maxsplit=1)[0][:56]
+    first = _clip(re.split(r"[:.。]", cleaned, maxsplit=1)[0], 40)
     return f"{first} ({year})" if year else first
+
+
+def _clip(text: str, limit: int) -> str:
+    """在词边界截断，超出时补省略号。
+
+    比较矩阵的每一列都是窄 ``p{}`` 列，一段 200 字的方法描述会把整行撑成十几行
+    高——16 行的表因此排到 5 页。硬切会留下 ``unseen ta`` 这种半个单词，
+    所以优先退到最后一个空格/标点。
+
+    先过 :func:`_clean`：来源字段可能带 ``<i>`` 一类轻量标记，截断长度必须按
+    去标记后的可见文本算，否则一个 ``<sub>`` 就吃掉五个字的配额。
+    """
+    cleaned = _clean(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    head = cleaned[:limit]
+    cut = max(head.rfind(" "), head.rfind("，"), head.rfind("、"), head.rfind(","))
+    if cut > limit * 0.6:
+        head = head[:cut]
+    return head.rstrip(" ,，、;；") + "…"
+
+
+# 「本列没有任何一行报告了内容」的判据。
+#
+# 这些占位串由 `review_synthesis_section` 自己写入：真实数据里
+# 「任务/数据集」与「关键指标与数值」经常整列都是它们（结构化抽取没命中），
+# 于是一整列只贡献了 16 个「未报告」，却和有内容的列平分了版面宽度。
+_MATRIX_PLACEHOLDERS = frozenset(
+    {
+        "未报告",
+        "Not reported",
+        "未结构化",
+        "Not structured",
+        "未定位",
+        "Unlocated",
+        "未评定",
+        "Unassessed",
+    }
+)
+
+
+def _drop_empty_matrix_columns(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    language: str,
+) -> tuple[list[str], list[list[str]], str]:
+    """删掉整列都是占位符的列，并返回一句如实说明。
+
+    静默删列会让读者以为这些维度从未被考察过，所以省略的事实写进 caption——
+    「降级可以，装作没降级不行」。第一列（研究）永远保留。
+    """
+    keep = [
+        index
+        for index in range(len(headers))
+        if index == 0
+        or any(str(row[index]).strip() not in _MATRIX_PLACEHOLDERS for row in rows)
+    ]
+    if len(keep) == len(headers) or len(keep) < 2:
+        return headers, rows, ""
+    dropped = [headers[index] for index in range(len(headers)) if index not in keep]
+    note = (
+        f"（纳入研究均未报告以下维度，已略去相应列：{'、'.join(dropped)}）"
+        if language == "zh"
+        else (
+            "(Columns omitted because no included study reported them: "
+            f"{', '.join(dropped)}.)"
+        )
+    )
+    return (
+        [headers[index] for index in keep],
+        [[row[index] for index in keep] for row in rows],
+        note,
+    )
 
 
 def imrad_body_sections(cite_keys: list[str], *, language: str = "en") -> list[dict[str, Any]]:
@@ -730,41 +1358,104 @@ def _with_frame_sections(
         "introduction": "引言" if zh else "Introduction",
         "conclusion": "结论" if zh else "Conclusion",
     }
+    # An introduction and a conclusion that cite nothing are a desk reject, and
+    # `FRAME_SECTION_BRIEFS["introduction"]` already tells the model to cite the
+    # body's works — it was just handed an empty whitelist, so the prompt read
+    # "Available cite keys: (none)".  Hand over what the body actually used.
+    # The evidence ids come too: without them every non-background sentence the
+    # model writes is blanked by the R4/R6 rules.
+    frame_cite_keys, frame_evidence_ids = _body_citation_pool(body)
     sections: list[dict[str, Any]] = []
     for key in FRONT_SECTION_KEYS:
+        # Abstracts do not carry citations in any venue we target.
+        citable = key != "abstract"
         sections.append(
             {
                 "key": key,
                 "level": 1,
                 "title": frame_titles[key],
-                "summary": "",
+                "summary": FRAME_SECTION_BRIEFS[key]["zh" if zh else "en"],
+                "target_words": FRAME_SECTION_BRIEFS[key]["target_zh" if zh else "target_en"],
                 "argument_points": [],
-                "cite_keys": [],
+                "cite_keys": frame_cite_keys if citable else [],
+                "evidence_ids": frame_evidence_ids if citable else [],
                 "kind": "frame",
             }
         )
+    # 母节 s1、s2…，子节 s2-1、s2-2…。此前是无条件 `s{index+1}`，二级标题一进来
+    # 就会被编成同级的 s{n}，父子关系当场丢掉。
+    key_map: dict[str, str] = {}
+    parent_ordinal = 0
+    child_ordinal = 0
     for index, section in enumerate(body):
+        old_key = str(section.get("key") or "")
+        parent_old = str(section.get("parent_key") or "")
         # Preserve stable keys for appendix / ledger sections so downstream
         # writers and templates can address them (N6).
         if section.get("appendix") or section.get("kind") == "appendix":
             key = str(section.get("key") or f"appendix{index + 1}")
+        elif parent_old and parent_old in key_map:
+            child_ordinal += 1
+            key = f"{key_map[parent_old]}-{child_ordinal}"
         else:
-            key = f"s{index + 1}"
-        sections.append({**section, "key": key, "order": index})
+            parent_ordinal += 1
+            child_ordinal = 0
+            key = f"s{parent_ordinal}"
+        key_map[old_key] = key
+        entry = {**section, "key": key, "order": index}
+        if parent_old:
+            # 孤儿子节（父节没进大纲）降回一级，而不是留一个指向不存在的 parent_key。
+            resolved = key_map.get(parent_old)
+            if resolved and resolved != key:
+                entry["parent_key"] = resolved
+            else:
+                entry.pop("parent_key", None)
+                entry["level"] = 1
+        sections.append(entry)
+    for entry in sections:
+        if entry.get("requires_all_body"):
+            entry["depends_on"] = [
+                s["key"] for s in sections if s.get("kind") != "frame"
+                and s["key"] != entry["key"] and not s.get("appendix")
+            ]
+        elif "depends_on" in entry:
+            entry["depends_on"] = [key_map.get(k, k) for k in entry["depends_on"]]
     for key in BACK_SECTION_KEYS:
         sections.append(
             {
                 "key": key,
                 "level": 1,
                 "title": frame_titles[key],
-                "summary": "",
+                "summary": FRAME_SECTION_BRIEFS[key]["zh" if zh else "en"],
+                "target_words": FRAME_SECTION_BRIEFS[key]["target_zh" if zh else "target_en"],
                 "argument_points": [],
-                "cite_keys": [],
+                "cite_keys": frame_cite_keys,
+                "evidence_ids": frame_evidence_ids,
                 "kind": "frame",
             }
         )
     del paper_type  # 目前两种论文类型共用同一框架章节集合
     return sections
+
+
+def _body_citation_pool(body: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Every cite key and evidence id the body sections were given.
+
+    The appendix is skipped: the ledger inherits every key in the project, and
+    an introduction should be framed by what the paper argues, not by the audit
+    record.  The evidence block applies its own character budget downstream, so
+    handing over the full union here does not blow up the prompt.
+    """
+    keys: dict[str, None] = {}
+    ids: dict[str, None] = {}
+    for section in body:
+        if section.get("appendix") or section.get("kind") == "appendix":
+            continue
+        for key in section.get("cite_keys") or []:
+            keys.setdefault(str(key))
+        for evidence_id in section.get("evidence_ids") or []:
+            ids.setdefault(str(evidence_id))
+    return list(keys), list(ids)
 
 
 def _as_list(value: Any) -> list[Any]:

@@ -36,6 +36,13 @@ jobs:
           python-version: "3.12"
       - name: Sync workspace
         run: uv sync --all-packages --frozen
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/pi/package-lock.json
+      - name: Install Pi runtime for backend tests
+        run: npm ci --omit=dev --ignore-scripts --prefix services/pi
       - name: Ruff
         run: uv run ruff check .
       # R16：领域词表必须住在 task_definition 行里。这条 lint 写好很久却从未被调用，
@@ -72,6 +79,10 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm build
+      - name: Browser contracts (controlled API, no paid calls)
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          pnpm test:e2e
 
   macos-host:
     runs-on: macos-15

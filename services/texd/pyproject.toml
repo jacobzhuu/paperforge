@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "PaperForge Tectonic 编译沙箱微服务"
 requires-python = ">=3.12"
 dependencies = [
+    "paperforge-observability",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
 ]

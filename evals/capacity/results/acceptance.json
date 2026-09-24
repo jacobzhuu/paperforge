@@ -1,0 +1,46 @@
+{
+  "at": "2026-09-16",
+  "deployment": "paperforge-deploy-20260916-202356",
+  "public_url": "https://paperforge-linux.tail53ab99.ts.net",
+  "funnel_target": "127.0.0.1:3014",
+  "public_login_byte_comparison": true,
+  "public_login_sha256": "87d3807db5a889d0cfe4385f3f216e7ae01ef7ede327c338cd2ec1fe03e57839",
+  "public_unauthenticated_projects_status": 401,
+  "public_dispatch_header": "durable-v1",
+  "migration": "0030_job_dispatch",
+  "replicas": {
+    "api": 2,
+    "long_worker": 2,
+    "auxiliary_worker": 1
+  },
+  "prometheus_targets_up": 5,
+  "postgres_connections_post_deploy_snapshot": 44,
+  "old_deployment_retained": true,
+  "checks": {
+    "api_full_latest": "186 passed, 1 warning in 243.50s (0:04:03)",
+    "worker_recovery_pool_latest": "28 passed in 31.71s",
+    "shared_limits_observability_latest": "5 passed in 2.24s",
+    "ops_latest": "25 passed, 8 skipped in 1.82s",
+    "worker_db_storage_earlier": "755 passed, 2 skipped in 167.34s (0:02:47)",
+    "renderer_clients": "132 passed, 3 skipped in 1.29s",
+    "dispatch_recovery": "8 passed in 12.38s"
+  },
+  "static_checks": {
+    "ruff": "passed",
+    "bash_syntax": "passed",
+    "git_diff_check": "passed",
+    "prometheus_rules": 4
+  },
+  "limitations": [
+    "No paid real LLM jobs",
+    "No 8-hour soak",
+    "No production RTO/RPO claim",
+    "No 100-user production capacity certification",
+    "Fixture load ran against isolated capped containers, not the public deployment"
+  ],
+  "final_image_capacity_runs": [
+    "final-30.json",
+    "final-100-sse.json"
+  ],
+  "final_image_capacity_all_assertions_passed": true
+}

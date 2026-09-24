@@ -25,7 +25,7 @@ import { WorkbenchHeader } from '@/components/project/workbench-header';
 import { WorkbenchFooterNav } from '@/components/project/workbench-footer-nav';
 import { useJobFinished, useProject } from '@/components/project/project-context';
 import { CiteKeyPicker } from '@/components/writing/cite-key-picker';
-import { generateOutline, generateSections, getOutline, updateOutline } from '@/lib/api';
+import { rebuildDependencies, generateOutline, generateSections, getOutline, updateOutline } from '@/lib/api';
 import type { Job, OutlineSection, OutlineTree } from '@/lib/types';
 import { describeError } from '@/lib/errors';
 import { projectHref } from '@/lib/pipeline';
@@ -64,6 +64,10 @@ export function OutlineEditor() {
 
   const [tree, setTree] = React.useState<OutlineTree>({ sections: [] });
   const [version, setVersion] = React.useState(0);
+  const [outlineId, setOutlineId] = React.useState<string | null>(null);
+  const [contentHash, setContentHash] = React.useState<string | null>(null);
+  const [confirmed, setConfirmed] = React.useState(false);
+  const [polishPolicy, setPolishPolicy] = React.useState<import('@/lib/types').PolishPolicy>('legacy');
   const [activeIndex, setActiveIndex] = React.useState(0);
   const [loading, setLoading] = React.useState(true);
   const [loadError, setLoadError] = React.useState<string | null>(null);
@@ -79,6 +83,9 @@ export function OutlineEditor() {
     if (outline.data) {
       setTree(normalizeTree(outline.data.tree));
       setVersion(outline.data.version);
+      setOutlineId(outline.data.outline_id || null);
+      setContentHash(outline.data.content_hash || null);
+      setConfirmed(outline.data.status === 'confirmed');
     }
     setLoadError(null);
     setLoading(false);
@@ -115,6 +122,9 @@ export function OutlineEditor() {
       if (result.data && seq === seqRef.current && !pendingRef.current) {
         setTree(normalizeTree(result.data.tree));
         setVersion(result.data.version);
+        setOutlineId(result.data.outline_id || null);
+        setContentHash(result.data.content_hash || null);
+        setConfirmed(result.data.status === 'confirmed');
       }
     } catch (err) {
       toast({ title: '大纲未能保存', description: describeError(err), variant: 'error' });
@@ -127,6 +137,8 @@ export function OutlineEditor() {
   const save = React.useCallback(
     (next: OutlineTree, status: 'draft' | 'confirmed' = 'draft', immediate = false) => {
       setTree(next);
+      setContentHash(null);
+      setConfirmed(false);
       if (!projectId) return;
       pendingRef.current = { tree: next, status };
       if (timerRef.current) clearTimeout(timerRef.current);
@@ -242,15 +254,27 @@ export function OutlineEditor() {
             >
               <Wand2 className="h-4 w-4" /> 生成大纲
             </Button>
+            <Button variant="outline" disabled={busy || saving || !outlineId || !contentHash}
+              onClick={() => runAction(() => rebuildDependencies(projectId, outlineId!, contentHash!),
+                '暂时无法优化章节关系', '章节关系优化未能启动')}>优化章节依赖</Button>
+            {tree.dependency_contract?.requires_confirmation !== false && !!tree.dependency_contract && !confirmed && <Button variant="outline"
+              disabled={busy || saving || !contentHash} onClick={() => save(tree, 'confirmed', true)}>
+              确认章节关系</Button>}
+            <select aria-label="润色策略" className="max-w-full rounded border bg-background p-2 text-sm"
+              value={polishPolicy} onChange={event => setPolishPolicy(event.target.value as typeof polishPolicy)}>
+              <option value="legacy">逐节全部润色</option>
+              <option value="full_parallel">并行全部润色（实验）</option>
+              <option value="selective_parallel">按需并行润色（实验）</option>
+            </select>
             <Button
               onClick={() =>
                 runAction(
-                  () => generateSections(projectId, true),
+                  () => generateSections(projectId, true, polishPolicy),
                   '后端不可用：无法开始写作',
                   '写作未能启动',
                 )
               }
-              disabled={!projectId || busy || tree.sections.length === 0}
+              disabled={!projectId || busy || saving || !contentHash || tree.sections.length === 0 || (tree.dependency_contract?.requires_confirmation !== false && !!tree.dependency_contract && !confirmed)}
             >
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PenLine className="h-4 w-4" />}
               开始写作
@@ -259,6 +283,12 @@ export function OutlineEditor() {
         }
       />
 
+      {tree.dependency_contract && <section className="rounded border p-3 text-sm" aria-label="章节执行关系">
+        <p>以下关系用于新写作任务，已有稿件保留。内容修改后会重新检查依赖。</p>
+        <ul className="mt-2 space-y-1">{tree.sections.filter(s => s.kind !== 'frame').map(s =>
+          <li key={s.key}><strong>{s.title}</strong>：{s.depends_on?.length ? `等待 ${s.depends_on.join('、')}` : '可独立执行'}
+            {s.dependency_reason && <span className="ml-2 text-muted-foreground">{s.dependency_reason}</span>}</li>)}</ul>
+      </section>}
       <LoadState loading={loading} error={loadError} onRetry={runReload} skeletonClassName="h-80">
         {tree.sections.length === 0 ? (
           <div className="rounded-lg border border-dashed py-16 text-center text-body text-muted-foreground">

@@ -87,14 +87,29 @@ class _FakeQueue:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple, dict]] = []
+        #: arq 任务 id 与管线参数分开记：断言关心的是「这条管线带了什么参数」，
+        #: 而 ``_job_id`` 是派发管道自己的东西。
+        self.job_ids: list[str | None] = []
 
-    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> None:
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> Any:
+        arq_job_id = kwargs.pop("_job_id", None)
         self.calls.append((function, args, kwargs))
+        self.job_ids.append(arq_job_id)
+        # 真实的 arq 返回 Job；返回 None 表示「这个 id 已经在队列里，没有入队」，
+        # 而 start_job 现在把那当成派发失败。替身必须照实区分这两件事。
+        return SimpleNamespace(job_id=arq_job_id)
 
 
 class _FailingQueue:
     async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> None:
         raise ConnectionError("queue unavailable during dispatch")
+
+
+class _DedupedQueue:
+    """arq 在任务 id 撞车时返回 ``None``——那表示**没有**入队。"""
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 def _install_deepseek_image_stub(monkeypatch, *, captured: list[dict[str, Any]] | None = None):
@@ -473,10 +488,23 @@ def test_full_generation_defaults_to_delivering_a_draft(client: TestClient) -> N
     于是「跑通全流程」默认可能不产出任何稿件。
     """
     project = _create_project(client)
-    assert client.post(f"/api/v1/projects/{project['id']}/generate").status_code == 202
+    started = client.post(f"/api/v1/projects/{project['id']}/generate")
+    assert started.status_code == 202
     function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
     assert function == "run_full_pipeline"
     assert kwargs == {"quality_profile": "draft", "review_style": "narrative"}
+    # 队列里的任务 id 就是 generation_job 的 id。没有这条对应关系，就没法回答
+    # 「这条 queued 的行还在队列里吗」——而那正是分辨「排队中」和「已经没人在跑」
+    # 的唯一可信信号。
+    assert client.queue.job_ids[-1] == started.json()["id"]  # type: ignore[attr-defined]
+
+
+def test_deduplicated_dispatch_is_accepted_as_already_published(client: TestClient) -> None:
+    project = _create_project(client)
+    client.app.dependency_overrides[get_queue] = lambda: _DedupedQueue()
+    response = client.post(f"/api/v1/projects/{project['id']}/generate")
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
 
 
 def test_delivered_full_job_can_start_or_skip_quality_repair(
@@ -501,9 +529,7 @@ def test_delivered_full_job_can_start_or_skip_quality_repair(
         )
 
     seed(clean_pg_database_url, _deliver_with_findings)
-    response = client.post(
-        f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair"
-    )
+    response = client.post(f"/api/v1/projects/{project['id']}/jobs/{started['id']}/quality-repair")
     assert response.status_code == 202, response.text
     repair = response.json()
     assert repair["kind"] == "write"
@@ -994,7 +1020,7 @@ def test_pdf_upload_is_private_and_enqueues_matching(
     function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
     assert function == "run_pdf_match_pipeline"
     assert kwargs["upload_id"] == body["upload"]["id"]
-    assert kwargs["_job_id"] == body["job"]["id"]
+    assert client.queue.job_ids[-1] == body["job"]["id"]  # type: ignore[attr-defined]
 
     async def _load(session):
         row = await session.get(LiteraturePdfUpload, uuid.UUID(body["upload"]["id"]))
@@ -1032,7 +1058,7 @@ def test_pdf_upload_is_private_and_enqueues_matching(
     function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
     assert function == "run_pdf_match_pipeline"
     assert kwargs["upload_id"] == body["upload"]["id"]
-    assert kwargs["_job_id"] == retried_body["job"]["id"]
+    assert client.queue.job_ids[-1] == retried_body["job"]["id"]  # type: ignore[attr-defined]
 
 
 def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
@@ -1046,12 +1072,12 @@ def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
         f"/api/v1/projects/{project['id']}/library/pdf-uploads",
         files={"file": ("paper.pdf", _pdf_bytes(), "application/pdf")},
     )
-    assert response.status_code == 503, response.text
+    assert response.status_code == 202, response.text
 
     uploads = client.get(f"/api/v1/projects/{project['id']}/library/pdf-uploads").json()
     assert len(uploads) == 1
-    assert uploads[0]["status"] == "match_failed"
-    assert uploads[0]["error"]["reason"] == "task_enqueue_failed"
+    assert uploads[0]["status"] == "matching"
+    assert not uploads[0]["error"]
     downloaded = client.get(
         f"/api/v1/projects/{project['id']}/library/pdf-uploads/{uploads[0]['id']}/download"
     )
@@ -1064,8 +1090,8 @@ def test_pdf_upload_enqueue_failure_is_committed_as_retryable(
         return row.status, row.error_json
 
     job_status, error = seed(clean_pg_database_url, _job_state)
-    assert job_status == "failed"
-    assert error["reason"] == "task_enqueue_failed"
+    assert job_status == "queued"
+    assert not error
 
 
 def test_cancelling_queued_pdf_job_makes_upload_retryable(client: TestClient) -> None:
@@ -1175,7 +1201,7 @@ def test_confirmed_pdf_binds_private_document_and_enters_library(
     function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
     assert function == "run_uploaded_pdf_pipeline"
     assert kwargs["upload_id"] == uploaded["id"]
-    assert kwargs["_job_id"] == confirmed_body["job"]["id"]
+    assert client.queue.job_ids[-1] == confirmed_body["job"]["id"]  # type: ignore[attr-defined]
 
     library = client.get(f"/api/v1/projects/{project['id']}/library").json()
     assert len(library) == 1
@@ -1235,7 +1261,7 @@ def test_confirmed_pdf_binds_private_document_and_enters_library(
     function, _args, kwargs = client.queue.calls[-1]  # type: ignore[attr-defined]
     assert function == "run_uploaded_pdf_pipeline"
     assert kwargs["upload_id"] == uploaded["id"]
-    assert kwargs["_job_id"] == retried_body["job"]["id"]
+    assert client.queue.job_ids[-1] == retried_body["job"]["id"]  # type: ignore[attr-defined]
 
 
 def test_private_pdf_utilization_does_not_leak_to_another_project(
@@ -1579,6 +1605,9 @@ def test_cost_endpoint_starts_at_zero(client: TestClient) -> None:
         # 一次调用都没有时金额是完整的 0；有未定价调用才降级成下界（P1-4）。
         "unpriced_call_count": 0,
         "cost_complete": True,
+        # 金额的货币代码（部署的 LLM_PRICE_CURRENCY）。默认 USD——界面据此选符号，
+        # 不做任何换算。
+        "currency": "USD",
     }
 
 
@@ -2170,7 +2199,7 @@ def test_ai_image_draft_fails_closed_when_deepseek_is_unavailable(client: TestCl
         json={"kind": "ai_image", "intent": "生成全文综述图"},
     )
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "deepseek_image_prompt_failed"
+    assert response.json()["detail"]["code"] == "image_prompt_analysis_failed"
 
 
 def test_yunwu_ai_draft_requires_deepseek_full_paper_analysis(
@@ -2199,7 +2228,7 @@ def test_yunwu_ai_draft_requires_deepseek_full_paper_analysis(
         assert body["spec"]["refined_prompt"]
         assert body["spec"]["semantics"]["aspect_ratio"] == "3:2"
         assert calls[0]["role"] == "polisher"
-        assert "COMPLETE PAPER" in calls[0]["user_prompt"]
+        assert "SECTION-BALANCED PAPER CONTEXT" in calls[0]["user_prompt"]
         assert "循证研究自动化" in calls[0]["user_prompt"]
     finally:
         api_config._settings = None
@@ -2262,7 +2291,7 @@ def test_old_ai_draft_is_analyzed_against_full_paper_before_generation(
             f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/generate"
         )
         assert blocked.status_code == 409
-        assert blocked.json()["detail"]["code"] == "ai_prompt_requires_deepseek"
+        assert blocked.json()["detail"]["code"] == "ai_prompt_requires_analysis"
 
         prepared = client.post(
             f"/api/v1/projects/{project['id']}/visuals/{old.json()['id']}/prepare-generation"

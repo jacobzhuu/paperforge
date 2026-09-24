@@ -39,6 +39,7 @@ from db import (
     upsert_question_evidence_link,
     upsert_section,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.paper import (
     ClaimEvidenceAnchor,
     ExportArtifact,
@@ -51,6 +52,7 @@ from db.repositories.exports import list_export_artifacts
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from paper_ir import Bibliography, PaperIR, PaperMeta, ReferenceMetadata, render_markdown
 from paper_ir.schema import Section as IRSection
+from paperforge_worker.orchestration.writing_graph import fingerprint
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from storage import make_object_store
@@ -63,7 +65,8 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.jobs import start_job
+from paperforge_api.jobs import retry_profile_checkpoint, start_job
+from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
     AcceptSectionRewriteRequest,
@@ -85,6 +88,7 @@ from paperforge_api.schemas import (
     OutlineResponse,
     QualityResponse,
     QuestionEvidenceLinkResponse,
+    RebuildDependenciesRequest,
     RefineRequest,
     RefineResponse,
     ResearchQuestionResponse,
@@ -105,7 +109,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["writing"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 QueueDep = Annotated[ArqRedis | None, Depends(get_queue)]
 
 
@@ -121,6 +125,7 @@ async def generate_outline_endpoint(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -129,6 +134,35 @@ async def generate_outline_endpoint(
         project_id=project.id,
         kind="outline",
         function="run_outline_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
+    )
+    return _job_response(job)
+
+
+@router.post(
+    "/projects/{project_id}/outline/dependencies/rebuild",
+    response_model=JobResponse,
+    status_code=202,
+)
+async def rebuild_dependencies(
+    project_id: str, request: RebuildDependenciesRequest, session: SessionDep, queue: QueueDep
+):
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+
+    project = await _require_project(session, project_id)
+    source = await latest_outline(session, project.id)
+    if source is None or source.id != request.outline_id:
+        raise HTTPException(409, "outline version changed")
+    if fingerprint(source.tree_json) != request.content_hash:
+        raise HTTPException(409, "outline content changed")
+    job = await start_job(
+        session,
+        queue,
+        project_id=project.id,
+        kind="outline",
+        function="run_dependency_rebuild_pipeline",
+        outline_id=str(source.id),
+        source_hash=request.content_hash,
     )
     return _job_response(job)
 
@@ -151,6 +185,7 @@ async def get_outline_endpoint(project_id: str, session: SessionDep) -> OutlineR
     return OutlineResponse(
         project_id=str(project.id),
         outline_id=str(outline.id),
+        content_hash=fingerprint(outline.tree_json),
         version=outline.version,
         status=outline.status,
         tree=outline.tree_json or {},
@@ -175,11 +210,24 @@ async def put_outline(
     if outline is None:
         raise HTTPException(status_code=404, detail="outline not generated yet")
     whitelist = set(await get_writing_whitelist(session, project.id))
+    from db import create_outline
+    from paperforge_worker.orchestration.dependency_contract import content_hash, validate_edit
+
     tree = _sanitize_outline_tree(request.tree, whitelist)
-    await update_outline_tree(session, outline, tree, status=request.status)
+    try:
+        tree = validate_edit(tree, outline.tree_json or {})
+    except (ValueError, TypeError) as error:
+        raise HTTPException(422, str(error)) from error
+    if (outline.tree_json or {}).get("dependency_contract") and content_hash(tree) != content_hash(
+        outline.tree_json
+    ):
+        outline = await create_outline(session, project_id=project.id, tree=tree, status="draft")
+    else:
+        await update_outline_tree(session, outline, tree, status=request.status)
     return OutlineResponse(
         project_id=str(project.id),
         outline_id=str(outline.id),
+        content_hash=fingerprint(outline.tree_json),
         version=outline.version,
         status=outline.status,
         tree=outline.tree_json or {},
@@ -444,7 +492,9 @@ async def rebuild_draft_from_latest_evidence(
     request: GenerationOptionsRequest | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
-    options = request or GenerationOptionsRequest()
+    options = request or GenerationOptionsRequest(
+        quality_profile="draft" if project.execution_profile == "fast_draft" else "scholarly"
+    )
     job = await start_job(
         session,
         queue,
@@ -576,36 +626,9 @@ async def generate_full(
 
 
 def _original_generation_prerequisites(assets: list[Any]) -> list[dict[str, str]]:
-    """Return actionable, deterministic blockers before an expensive original-paper run."""
-    has_results = False
-    has_method = False
-    for asset in assets:
-        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
-        if asset.kind in {"dataset", "result_table"}:
-            has_results = (
-                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
-                or has_results
-            )
-        if asset.kind in {"method_note", "code"}:
-            has_method = (
-                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
-            )
-    issues: list[dict[str, str]] = []
-    if not has_results:
-        issues.append(
-            {
-                "code": "result_material_missing",
-                "message": "请上传包含数据行和可解析数值的结果表或数据集",
-            }
-        )
-    if not has_method:
-        issues.append(
-            {
-                "code": "method_material_missing",
-                "message": "请上传可解析的方法笔记或代码",
-            }
-        )
-    return issues
+    from db.intake import material_issues
+
+    return material_issues(assets)
 
 
 @router.post(
@@ -618,17 +641,38 @@ async def generate_sections(
     request: WriteRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     outline = await latest_outline(session, project.id)
     if outline is None:
         raise HTTPException(status_code=409, detail="generate an outline first")
+    contract = (outline.tree_json or {}).get("dependency_contract")
+    if contract and contract.get("requires_confirmation", True) and outline.status != "confirmed":
+        raise HTTPException(409, "confirm rebuilt outline before writing")
+    from paperforge_api.config import get_settings
+
+    settings = get_settings()
+    checkpoint = {
+        "writer_outline_id": str(outline.id),
+        "writer_outline_hash": fingerprint(outline.tree_json),
+        "semantic_repair_engine": settings.semantic_repair_engine,
+        "evidence_retrieval_mode": settings.evidence_retrieval_mode,
+        "writer_polish_policy": settings.writer_polish_policy,
+        "writer_polish_concurrency": settings.writer_polish_concurrency,
+    }
+    if request.polish_policy is not None:
+        checkpoint["writer_polish_policy"] = request.polish_policy
+    if contract and contract.get("requires_confirmation", True):
+        checkpoint["writer_execution_mode"] = "dag_parallel"
+    checkpoint.update(await retry_profile_checkpoint(session, project.id, retry_of) or {})
     job = await start_job(
         session,
         queue,
         project_id=project.id,
         kind="write",
         function="run_write_pipeline",
+        checkpoint=checkpoint or None,
         coherence=request.coherence,
     )
     return _job_response(job)
@@ -873,6 +917,14 @@ def _claim_evidence_response(row: ClaimEvidenceAnchor) -> ClaimEvidenceResponse:
         support_status=row.support_status,
         support_score=row.support_score,
         manual_status=row.manual_status,
+        entailment_verdict=row.entailment_verdict,
+        entailment_confidence=row.entailment_confidence,
+        entailment_reason=row.entailment_reason,
+        entailment_model=row.entailment_model,
+        entailment_verifier_version=row.entailment_verifier_version,
+        entailment_cached=row.entailment_cached,
+        entailment_review=row.entailment_review_json,
+        entailment_checked_at=row.entailment_checked_at,
     )
 
 
@@ -907,6 +959,7 @@ async def start_export(
     request: ExportRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     document = await latest_document(session, project.id)
@@ -952,6 +1005,7 @@ async def start_export(
         project_id=project.id,
         kind="compile",
         function="run_export_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         formats=request.formats,
         quality_profile=request.quality_profile,
         quality_report_id=str(quality_report.id) if quality_report else None,
@@ -1079,7 +1133,10 @@ async def retry_export_run(
         project_id=project.id,
         kind="compile",
         function=spec["function"],
-        checkpoint={"retried_from": str(source.id)},
+        checkpoint={
+            "retried_from": str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
+        },
         **spec["kwargs"],
     )
     return _job_response(retried)
@@ -1229,6 +1286,7 @@ async def start_snowball(
     request: SnowballRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     """引文雪球扩展：邻居入库为 candidate，需用户圈选后才进写作白名单。"""
     project = await _require_project(session, project_id)
@@ -1238,6 +1296,7 @@ async def start_snowball(
         project_id=project.id,
         kind="search",
         function="run_snowball_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         direction=request.direction,
         max_seeds=request.max_seeds,
     )
@@ -1254,6 +1313,7 @@ async def start_ingest(
     request: IngestRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     """OA 全文获取 → 解析 → 全文级卡片。只走 OA/官方渠道，不绕 paywall。"""
     project = await _require_project(session, project_id)
@@ -1263,6 +1323,7 @@ async def start_ingest(
         project_id=project.id,
         kind="ingest",
         function="run_ingest_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         max_works=request.max_works,
     )
     return _job_response(job)
@@ -1278,6 +1339,7 @@ async def start_quality(
     session: SessionDep,
     queue: QueueDep,
     request: GenerationOptionsRequest | None = None,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     options = request or GenerationOptionsRequest()
@@ -1287,6 +1349,7 @@ async def start_quality(
         project_id=project.id,
         kind="write",
         function="run_quality_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         quality_profile=options.quality_profile,
         review_style=options.review_style,
     )
@@ -1461,7 +1524,6 @@ async def refine_text(
     红线：润色**不得**新增引用键、不得改动任何数字——改动后一旦发现数字变化，
     直接放弃改写并原样返回（宁可不润色，也不让数字漂移）。
     """
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.writing import extract_numbers
 
     from paperforge_api.config import get_settings as api_settings
@@ -1472,61 +1534,63 @@ async def refine_text(
     if not original:
         raise HTTPException(status_code=422, detail="text must not be empty")
 
-    runner = LLMRunner(api_settings().llm_config())
-    if not runner.enabled:
-        return RefineResponse(
-            action=request.action,
-            original=original,
-            refined=original,
-            changed=False,
-            note="未配置 LLM provider：润色不可用，已原样返回",
-        )
+    async with accounted_runner(
+        session, api_settings().llm_config(), project_id=project_id
+    ) as runner:
+        if not runner.enabled:
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="未配置 LLM provider：润色不可用，已原样返回",
+            )
 
-    goals = {
-        "polish": "润色文字，使表达更准确流畅",
-        "expand": "在不引入新事实的前提下展开论述",
-        "shorten": "精简表达，保留全部论点",
-        "academic_tone": "调整为学术书面语气",
-    }
-    response = await runner.agenerate(
-        "polisher",
-        system_prompt=(
-            "你是学术论文润色助手。只输出改写后的正文纯文本，不要解释。"
-            "绝对禁止：新增或修改任何数字、新增引用标记、引入原文没有的事实。"
-        ),
-        user_prompt=(
-            f"目标：{goals.get(request.action, '润色')}\n"
-            f"额外要求：{request.instruction or '无'}\n\n原文：\n{original}"
-        ),
-        max_output_tokens=2000,
-        temperature=0.3,
-        metadata={"stage": "refine", "action": request.action},
-    )
-    if response is None or not response.text.strip():
-        return RefineResponse(
-            action=request.action,
-            original=original,
-            refined=original,
-            changed=False,
-            note="润色调用失败，已原样返回",
+        goals = {
+            "polish": "润色文字，使表达更准确流畅",
+            "expand": "在不引入新事实的前提下展开论述",
+            "shorten": "精简表达，保留全部论点",
+            "academic_tone": "调整为学术书面语气",
+        }
+        response = await runner.agenerate(
+            "polisher",
+            system_prompt=(
+                "你是学术论文润色助手。只输出改写后的正文纯文本，不要解释。"
+                "绝对禁止：新增或修改任何数字、新增引用标记、引入原文没有的事实。"
+            ),
+            user_prompt=(
+                f"目标：{goals.get(request.action, '润色')}\n"
+                f"额外要求：{request.instruction or '无'}\n\n原文：\n{original}"
+            ),
+            max_output_tokens=2000,
+            temperature=0.3,
+            metadata={"stage": "refine", "action": request.action},
         )
+        if response is None or not response.text.strip():
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="润色调用失败，已原样返回",
+            )
 
-    refined = response.text.strip()
-    if extract_numbers(refined) != extract_numbers(original):
-        # 数字红线优先于文采。
+        refined = response.text.strip()
+        if extract_numbers(refined) != extract_numbers(original):
+            # 数字红线优先于文采。
+            return RefineResponse(
+                action=request.action,
+                original=original,
+                refined=original,
+                changed=False,
+                note="改写改动了正文数字，已放弃本次润色",
+            )
         return RefineResponse(
             action=request.action,
             original=original,
-            refined=original,
-            changed=False,
-            note="改写改动了正文数字，已放弃本次润色",
+            refined=refined,
+            changed=refined != original,
         )
-    return RefineResponse(
-        action=request.action,
-        original=original,
-        refined=refined,
-        changed=refined != original,
-    )
 
 
 @router.post(
@@ -1540,7 +1604,6 @@ async def rewrite_section_candidate(
     session: SessionDep,
 ) -> RewriteSectionCandidateResponse:
     """只生成候选，不写数据库；引用、数字与素材引用必须原样守恒。"""
-    from llm_runtime import LLMRunner
     from paperforge_worker.pipelines.writing import extract_numbers
 
     from paperforge_api.config import get_settings as api_settings
@@ -1556,58 +1619,61 @@ async def rewrite_section_candidate(
         raise HTTPException(status_code=404, detail="section not found")
     require_section_unchanged(row, request.expected_updated_at)
     original = IRSection(**(row.body_ir_json or {}))
-    runner = LLMRunner(api_settings().llm_config())
-    if not runner.enabled:
+    async with accounted_runner(
+        session, api_settings().llm_config(), project_id=project.id
+    ) as runner:
+        if not runner.enabled:
+            return RewriteSectionCandidateResponse(
+                section_key=section_key,
+                original_body_ir=original.model_dump(mode="json"),
+                candidate_body_ir=original.model_dump(mode="json"),
+                changed=False,
+                checks={"citations": "pass", "numbers": "pass", "assets": "pass"},
+                note="未配置 LLM provider，未生成候选",
+            )
+        response = await runner.agenerate_json(
+            "writer",
+            system_prompt=(
+                "你是学术论文单章重写助手。返回完整 Section JSON。只能修改 text run 的 v 字段；"
+                "所有 cite/grounding/xref/math_inline run、非文字 block、key、title "
+                "和结构必须保留。"
+                "禁止新增、删除或修改任何数字、引用键、证据 id、素材引用与图表。"
+            ),
+            user_prompt=(
+                f"用户要求：{request.instruction}\n"
+                f"允许的证据引用（仅作范围说明，不得新增）：{request.allowed_evidence_refs}\n"
+                f"原章节 JSON：{original.model_dump_json()}"
+            ),
+            max_output_tokens=8000,
+            temperature=0.2,
+            metadata={"stage": "rewrite_section", "section_key": section_key},
+        )
+        if not response.ok or not isinstance(response.value, dict):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "rewrite_generation_failed",
+                    "message": response.error or "模型未返回有效候选",
+                },
+            )
+        try:
+            candidate = IRSection(**response.value)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(
+                status_code=422, detail={"code": "rewrite_invalid_ir", "message": str(error)}
+            ) from error
+        checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
+        if any(value != "pass" for value in checks.values()):
+            raise HTTPException(
+                status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
+            )
         return RewriteSectionCandidateResponse(
             section_key=section_key,
             original_body_ir=original.model_dump(mode="json"),
-            candidate_body_ir=original.model_dump(mode="json"),
-            changed=False,
-            checks={"citations": "pass", "numbers": "pass", "assets": "pass"},
-            note="未配置 LLM provider，未生成候选",
+            candidate_body_ir=candidate.model_dump(mode="json"),
+            changed=candidate != original,
+            checks=checks,
         )
-    response = await runner.agenerate_json(
-        "writer",
-        system_prompt=(
-            "你是学术论文单章重写助手。返回完整 Section JSON。只能修改 text run 的 v 字段；"
-            "所有 cite/grounding/xref/math_inline run、非文字 block、key、title 和结构必须保留。"
-            "禁止新增、删除或修改任何数字、引用键、证据 id、素材引用与图表。"
-        ),
-        user_prompt=(
-            f"用户要求：{request.instruction}\n"
-            f"允许的证据引用（仅作范围说明，不得新增）：{request.allowed_evidence_refs}\n"
-            f"原章节 JSON：{original.model_dump_json()}"
-        ),
-        max_output_tokens=8000,
-        temperature=0.2,
-        metadata={"stage": "rewrite_section", "section_key": section_key},
-    )
-    if not response.ok or not isinstance(response.value, dict):
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "rewrite_generation_failed",
-                "message": response.error or "模型未返回有效候选",
-            },
-        )
-    try:
-        candidate = IRSection(**response.value)
-    except Exception as error:  # noqa: BLE001
-        raise HTTPException(
-            status_code=422, detail={"code": "rewrite_invalid_ir", "message": str(error)}
-        ) from error
-    checks = _rewrite_invariant_checks(original, candidate, extract_numbers=extract_numbers)
-    if any(value != "pass" for value in checks.values()):
-        raise HTTPException(
-            status_code=422, detail={"code": "rewrite_quality_failed", "checks": checks}
-        )
-    return RewriteSectionCandidateResponse(
-        section_key=section_key,
-        original_body_ir=original.model_dump(mode="json"),
-        candidate_body_ir=candidate.model_dump(mode="json"),
-        changed=candidate != original,
-        checks=checks,
-    )
 
 
 @router.post(

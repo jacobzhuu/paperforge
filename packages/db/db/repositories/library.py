@@ -31,6 +31,7 @@ ADDED_VIA = frozenset(
         "bibtex_import",
         "pdf_upload",
         "llm_suggested_verified",
+        "mcp_web_verified",
     }
 )
 
@@ -120,7 +121,7 @@ async def upsert_entry(
         )
         session.add(entry)
         created = True
-    else:
+    elif added_via != "mcp_web_verified":
         if relevance_score is not None:
             entry.relevance_score = relevance_score
         if rank_reason is not None:

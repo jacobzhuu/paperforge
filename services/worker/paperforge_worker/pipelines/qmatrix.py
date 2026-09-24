@@ -6,7 +6,6 @@ search_query / term_aliases 做桥接；零候选时降级放行，绝不静默�
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -21,9 +20,16 @@ from db import (
     upsert_question_evidence_link,
 )
 
+from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.context import JobContext
+from paperforge_worker.locators import locator_display
 
-MAX_CANDIDATES_PER_QUESTION = 24
+# 从 24 提到 48。本文件的 docstring 记着：一次真实运行抽出 848 条证据单元，每个
+# 问题只看前 24 条，**97% 从没被任何问题看过**。文献库扩到 38 篇之后证据总量还会
+# 再涨，24 只会更紧；而可用证据不足 `MIN_ELIGIBLE_UNITS` 的子问题连 synthesis 都
+# 不会生成（实测子问题「防御策略」就是这么丢的），没有 synthesis 就没有论证要点，
+# 章节也就写不厚。代价是 evidence_classifier 调用量约翻倍。
+MAX_CANDIDATES_PER_QUESTION = 48
 MAX_CANDIDATES_PER_WORK = 4
 MIN_LEXICAL_SCORE = 0.02
 # 可比性桥接的上限：桥进来的是"同一比较的另一条臂"，不是新的检索面。
@@ -119,7 +125,19 @@ async def build_question_evidence_matrix(
     context: JobContext,
     *,
     language: str,
+    deepen_question_ids: set[Any] | None = None,
 ) -> QuestionMatrixOutcome:
+    """把证据挂到子问题上。
+
+    ``deepen_question_ids`` 打开**加挂**模式：只处理这些问题，候选池排除已经挂上的
+    证据单元，分类结果与现有链接合并而不是替换。
+
+    这条路存在的原因来自实测：一次真实全流程抽出 848 条证据单元，而每个问题只看
+    排名前 24 条（``MAX_CANDIDATES_PER_QUESTION``），5 个问题合计 120 条进了分类器、
+    最终挂上 26 条。也就是说 97% 的证据从没被任何问题看过一眼。语义评审判「证据薄」
+    的那些章节，缺的不是检索——库里躺着的东西它们根本没机会看到。补检索买回来的
+    新文献只会让 848 变成更大的数，仍然挤不进那 24 个位置。
+    """
     outcome = QuestionMatrixOutcome()
     async with context.session() as session:
         questions = await list_research_questions(session, context.project_id, kind="sub")
@@ -145,22 +163,68 @@ async def build_question_evidence_matrix(
             previous_automatic.setdefault(existing_link.research_question_id, []).append(
                 existing_link
             )
-    concurrency = max(1, min(int(context.settings.qmatrix_concurrency), 8))
-    for batch_start in range(0, len(questions), concurrency):
-        batch = questions[batch_start : batch_start + concurrency]
-        results = await asyncio.gather(
-            *(
-                _classify_question(
-                    question,
-                    evidence=evidence,
-                    measurements=measurements,
-                    work_context=work_context,
-                    runner=runner,
-                    language=language,
-                )
-                for question in batch
-            )
+    already_linked: dict[Any, set[Any]] = {}
+    for existing_link in existing_links:
+        already_linked.setdefault(existing_link.research_question_id, set()).add(
+            existing_link.evidence_unit_id
         )
+    if deepen_question_ids is not None:
+        questions = [question for question in questions if question.id in deepen_question_ids]
+    concurrency = max(1, min(int(context.settings.qmatrix_concurrency), 8))
+
+    retrieval_mode = context.checkpoint.get("evidence_retrieval_mode")
+    if retrieval_mode is None:
+        retrieval_mode = "legacy"
+        await context.emit("retrieval.configured", {"mode": retrieval_mode},
+                           checkpoint={"evidence_retrieval_mode": retrieval_mode})
+
+    async def _classify_one(question: Any) -> Any:
+        retrieval_ids = None
+        if retrieval_mode != "legacy":
+            from retrieval.search import search
+
+            async with context.session() as session:
+                found = await search(session, context.project_id, question.text,
+                                     limit=40, mode=retrieval_mode)
+            retrieval_ids = [item["evidence_id"] for item in found["results"]]
+            await context.emit("retrieval.completed", {
+                "question_id": str(question.id), "version": found["version"],
+                "mode": found["mode"], "elapsed_ms": found["elapsed_ms"],
+                "indexed_count": found["indexed_count"], "warnings": found["warnings"],
+            })
+        return await _classify_question(
+            question,
+            retrieval_ids=retrieval_ids,
+            evidence=evidence,
+            measurements=measurements,
+            work_context=work_context,
+            runner=runner,
+            language=language,
+            exclude_unit_ids=(
+                already_linked.get(question.id, set())
+                if deepen_question_ids is not None
+                else None
+            ),
+        )
+
+    async def _process_batch(batch: list[Any], results: list[Any]) -> None:
+        failed = [
+            (question, result)
+            for question, result in zip(batch, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        for question, error in failed:
+            warning = {
+                "stage": "qmatrix",
+                "reason": type(error).__name__,
+                "question_id": str(question.id),
+                "message": str(error)[:300],
+            }
+            outcome.warnings.append(warning)
+            context.warn("qmatrix.classification", type(error).__name__, warning)
+            await context.emit("qmatrix.warning", warning, stage="qmatrix")
+        # 后面两趟都只看成功的那些；顺序仍是输入序，诊断与链接决策因此不变。
+        results = [result for result in results if not isinstance(result, BaseException)]
         # LLM classification is concurrent; events and writes stay ordered so
         # SSE/checkpoint semantics and deterministic diagnostics do not change.
         for result in results:
@@ -203,6 +267,12 @@ async def build_question_evidence_matrix(
         # empty stochastic rerun must never erase a previously useful matrix.
         accepted: list[_QuestionClassification] = []
         for result in results:
+            if deepen_question_ids is not None:
+                # 加挂模式没有「上一轮的同一批」可比：候选池本来就排除了已挂的单元，
+                # 拿它和现有链接比强弱，等于用新增的几条去否决全部旧链接。
+                result.diagnostic["update_decision"] = "deepened"
+                accepted.append(result)
+                continue
             previous = previous_automatic.get(result.question.id, [])
             previous_ids = [link.evidence_unit_id for link in previous]
             new_ids = [link["evidence_id"] for link in result.classified]
@@ -220,12 +290,14 @@ async def build_question_evidence_matrix(
 
         if accepted:
             async with context.session() as session:
-                await clear_automatic_question_evidence_links(
-                    session,
-                    [result.question.id for result in accepted],
-                )
+                if deepen_question_ids is None:
+                    await clear_automatic_question_evidence_links(
+                        session,
+                        [result.question.id for result in accepted],
+                    )
                 for result in accepted:
-                    previous_automatic[result.question.id] = []
+                    if deepen_question_ids is None:
+                        previous_automatic[result.question.id] = []
                     for link_payload in result.classified:
                         stored = await upsert_question_evidence_link(
                             session,
@@ -238,7 +310,31 @@ async def build_question_evidence_matrix(
                             bridge_source=result.bridge_source,
                         )
                         previous_automatic[result.question.id].append(stored)
-        await context.raise_if_stopped()
+
+    # 滑动窗口取代批次栅栏：原来一批 4 个问题要等最慢的那个跑完才开下一批。
+    # 但**落库仍按原来的批粒度**——`on_ready` 按前缀序调用，所以缓冲区攒满
+    # concurrency 个就是原来的那一批，链接更新的事务边界与停止语义都不变。
+    pending_batch: list[Any] = []
+    pending_results: list[Any] = []
+
+    async def _collect(index: int, question: Any, result: Any) -> None:
+        pending_batch.append(question)
+        pending_results.append(result)
+        if len(pending_batch) < concurrency and index != len(questions) - 1:
+            return
+        batch, results = list(pending_batch), list(pending_results)
+        pending_batch.clear()
+        pending_results.clear()
+        await _process_batch(batch, results)
+
+    await bounded_map(
+        questions,
+        _classify_one,
+        limit=concurrency,
+        on_ready=_collect,
+        stop_check=context.raise_if_stopped,
+    )
+
     async with context.session() as session:
         outcome.links = len(await list_question_evidence_links(session, context.project_id))
     return outcome
@@ -252,7 +348,12 @@ async def _classify_question(
     work_context: dict[Any, dict[str, Any]],
     runner: Any,
     language: str,
+    exclude_unit_ids: set[Any] | None = None,
+    retrieval_ids: list[str] | None = None,
 ) -> _QuestionClassification:
+    if exclude_unit_ids:
+        # 加挂时把已经挂上的单元从池子里拿掉，前 24 名于是让给了从没被看过的那一批。
+        evidence = [unit for unit in evidence if unit.id not in exclude_unit_ids]
     ranked, rejected_by_task, rejected_by_lexical, bridge_source = cast(
         tuple[list[tuple[Any, float]], int, int, str | None],
         _rank_candidates(
@@ -265,6 +366,18 @@ async def _classify_question(
             return_diagnostics=True,
         ),
     )
+    if retrieval_ids:
+        from retrieval.ranking import rrf
+
+        # Only replace candidate ranking. Task compatibility, per-work diversity,
+        # comparability bridging and the existing classifier remain authoritative.
+        eligible = {str(unit.id): unit for unit in evidence
+                    if not question.task_id or getattr(unit, "task_id", None) in
+                    {None, question.task_id}}
+        merged = rrf([(str(unit.id), score) for unit, score in ranked],
+                     [(key, 1.0) for key in retrieval_ids if key in eligible],
+                     limit=MAX_CANDIDATES_PER_QUESTION * 2)
+        ranked = [(eligible[key], score) for key, score in merged if key in eligible]
     routing_mode = "lexical"
     bridge_source_count = None
     if bridge_source and bridge_source != "text":
@@ -320,6 +433,7 @@ async def _classify_question(
 
     classified: list[dict[str, Any]] = []
     classifier_returned_valid_payload = False
+    fallback_returned_valid_payload = False
     if runner.enabled:
         llm_result = await runner.agenerate_json(
             "evidence_classifier",
@@ -343,11 +457,27 @@ async def _classify_question(
                 llm_result.value.get("links"),
                 allowed_ids={str(unit.id) for unit, _score in candidates},
             )
-        # A syntactically valid empty array is not trustworthy when lexical
-        # retrieval found a strong eligible pool.  Retry only this anomaly on
-        # the quality tier with a smaller prompt; legitimate non-matches remain
-        # empty if the second independent judgement agrees.
-        if classifier_returned_valid_payload and not classified and candidates:
+        # Retry on the quality tier with a smaller prompt whenever the first pass yielded no
+        # usable links.  Two distinct causes, both answered by the same smaller ask:
+        #
+        # 1. A syntactically valid empty array is not trustworthy when lexical retrieval found a
+        #    strong eligible pool.  Legitimate non-matches stay empty if the second independent
+        #    judgement agrees.
+        # 2. A truncated or malformed response yields no links at all.  This is the *common* case
+        #    -- 31 of 65 production classifier calls truncated -- and it previously skipped the
+        #    retry entirely (the gate required a valid payload), falling straight through to the
+        #    deterministic fallback below.  That fallback can only ever emit stance="supports";
+        #    157 of 367 production links sit at exactly its min(0.85, score) cap, so it is a large
+        #    minority of all linkage.  Since synthesis detects conflict only through stance
+        #    disagreement, every truncated call permanently removed any chance of a dissenting
+        #    stance for that question -- production holds zero `contradicts` links.  Halving the
+        #    candidate count is the targeted fix: the output budget, not the model's judgement,
+        #    was the binding limit.
+        #
+        # If the retry itself returns a valid but empty array, that is an explicit decision by the
+        # quality tier and the deterministic fallback stays off -- the same rule already applied to
+        # the first pass, now applied consistently to whichever pass produced a valid payload.
+        if not classified and candidates:
             focused = candidates[:12]
             retry = await runner.agenerate_json(
                 "evidence_classifier_fallback",
@@ -369,17 +499,22 @@ async def _classify_question(
                 and isinstance(retry.value, dict)
                 and isinstance(retry.value.get("links"), list)
             ):
+                fallback_returned_valid_payload = True
                 classified = _normalize_links(
                     retry.value.get("links"),
                     allowed_ids={str(unit.id) for unit, _score in focused},
                 )
                 diagnostic["fallback_classifier_used"] = True
-    llm_classified = len(classified) if classifier_returned_valid_payload else 0
+    # Either pass returning a valid payload means a model judged these candidates.  The retry now
+    # also runs after a truncated first pass, so this must not stay keyed on the first pass alone:
+    # that would let the deterministic fallback below overwrite links the retry just recovered.
+    semantic_payload = classifier_returned_valid_payload or fallback_returned_valid_payload
+    llm_classified = len(classified) if semantic_payload else 0
     fallback_classified = 0
     # A valid empty list is an explicit decision.  Deterministic fallback is
     # only for an unavailable/invalid classifier and never promotes a
     # topic-blind degraded pool.
-    if not classifier_returned_valid_payload and routing_mode != "degraded_lexical_bypass":
+    if not semantic_payload and routing_mode != "degraded_lexical_bypass":
         classified = _deterministic_links(candidates, measurements=measurements)
         fallback_classified = len(classified)
     diagnostic["classified_count"] = len(classified)
@@ -394,7 +529,7 @@ async def _classify_question(
     if not classified:
         diagnostic["no_link_reason"] = (
             "classifier_rejected_all"
-            if classifier_returned_valid_payload
+            if semantic_payload
             else (
                 "degraded_classifier_unavailable"
                 if routing_mode == "degraded_lexical_bypass"
@@ -789,15 +924,7 @@ def _matrix_prompt(
 ) -> str:
     lines = [f"Sub-question: {question}", "Candidate evidence:"]
     for unit, score in candidates:
-        locator = ", ".join(
-            value
-            for value in (
-                f"p.{unit.page}" if unit.page else "",
-                unit.section_path or "",
-                unit.object_ref or "",
-            )
-            if value
-        )
+        locator = locator_display(unit) or ""
         measure_text = "; ".join(
             f"{item.metric_name}={item.value}{item.unit or ''}"
             f" dataset={item.dataset or 'unknown'} key={item.comparability_key}"

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "PaperForge 无外网确定性图表与示意图渲染沙箱"
 requires-python = ">=3.12"
 dependencies = [
+    "paperforge-observability",
     "fastapi==0.139.2",
     "uvicorn[standard]==0.51.0",
     "pydantic==2.13.4",

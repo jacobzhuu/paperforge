@@ -42,12 +42,19 @@ async def dispose_engine() -> None:
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
-    """请求级会话：正常返回时提交，异常回滚。"""
+    """Commit before sending HTTP headers (all users declare function scope).
+
+    A 202 is a durable acknowledgement: another API replica must immediately
+    see the job, including an SSE subscription started as soon as fetch returns.
+    """
     factory = get_session_factory()
     async with factory() as session:
         try:
             yield session
             await session.commit()
+            from paperforge_api.dispatch import dispatch_after_commit
+
+            await dispatch_after_commit(session)
         except Exception:
             await session.rollback()
             raise
@@ -74,10 +81,25 @@ def _session_hash(token: str) -> str:
 
 
 async def get_current_auth(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     settings: Annotated[Settings, Depends(get_settings)],
     session_token: Annotated[str | None, Cookie(alias="paperforge_session")] = None,
     secure_session_token: Annotated[str | None, Cookie(alias="__Host-paperforge_session")] = None,
+) -> AuthContext:
+    return await _authenticate_session(
+        session,
+        settings,
+        session_token=session_token,
+        secure_session_token=secure_session_token,
+    )
+
+
+async def _authenticate_session(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    session_token: str | None,
+    secure_session_token: str | None,
 ) -> AuthContext:
     token = secure_session_token if settings.auth_cookie_secure else session_token
     if not token:
@@ -104,7 +126,7 @@ async def get_current_user(
 
 async def require_owned_project(
     project_id: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     auth: Annotated[AuthContext, Depends(get_current_auth)],
 ) -> PaperProject:
     try:
@@ -119,13 +141,23 @@ async def require_owned_project(
 
 async def authorize_project_request(
     request: Request,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session, scope="function")],
     auth: Annotated[AuthContext, Depends(get_current_auth)],
 ) -> AuthContext:
     """Authenticate a router and enforce ownership whenever its route has project_id."""
+    await _authorize_request_project(request, session, auth)
+    return auth
+
+
+async def _authorize_request_project(
+    request: Request,
+    session: AsyncSession,
+    auth: AuthContext,
+) -> None:
+    """Bind the authorized project to request/session state for downstream route helpers."""
     project_id = request.path_params.get("project_id")
     if project_id is None:
-        return auth
+        return
     try:
         project_uuid = uuid.UUID(project_id)
     except ValueError as error:
@@ -138,7 +170,36 @@ async def authorize_project_request(
         raise HTTPException(status_code=404, detail="project not found")
     request.state.owned_project = project
     session.info["paperforge_owned_project"] = project
-    return auth
+
+
+async def authorize_stream_project_request(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    session_token: Annotated[str | None, Cookie(alias="paperforge_session")] = None,
+    secure_session_token: Annotated[str | None, Cookie(alias="__Host-paperforge_session")] = None,
+) -> AuthContext:
+    """Authorize an SSE request without retaining a DB session for the stream lifetime.
+
+    Yield-based FastAPI dependencies are finalized only after a streaming response closes. Using
+    ``get_session`` here would therefore hold an open transaction and potentially a pool checkout
+    for a multi-hour generation job. This dependency owns and closes its short session before the
+    endpoint constructs the ``StreamingResponse``.
+    """
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            auth = await _authenticate_session(
+                session,
+                settings,
+                session_token=session_token,
+                secure_session_token=secure_session_token,
+            )
+            await _authorize_request_project(request, session, auth)
+            await session.commit()
+            return auth
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def get_authorized_project(

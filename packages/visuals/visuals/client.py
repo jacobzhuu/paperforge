@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from observability.http import post_when_available
 
 MAX_RENDITION_BYTES = 16 * 1024 * 1024
 
@@ -83,8 +84,8 @@ class VisualdClient:
 
     def _request(self, path: str, payload: dict[str, Any]) -> RenderResult:
         try:
-            response = self.client.post(
-                f"{self.base_url}{path}", json=payload, timeout=self.timeout_seconds
+            response = post_when_available(
+                self.client, f"{self.base_url}{path}", json=payload, timeout=self.timeout_seconds
             )
         except httpx.HTTPError as error:
             raise VisualdError(f"visuald unavailable: {type(error).__name__}") from error

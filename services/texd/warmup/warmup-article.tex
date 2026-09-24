@@ -7,6 +7,10 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{longtable}
+%% natbib：article 模板用它把 plainnat 的作者-年份标签排成 (Wang et al., 2023)。
+%% 宏包按文件缓存，选项不影响缓存；这里与模板逐条对齐是
+%% test_warmup_covers_templates 的判据。
+\usepackage[round,authoryear]{natbib}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage[margin=2.5cm]{geometry}
@@ -16,7 +20,7 @@
 \maketitle
 \begin{abstract}warmup\end{abstract}
 \section{Warmup}\label{sec:warmup}
-Text with a citation~\cite{warmup2020sample} and \todo{placeholder}.
+Text with a citation~\citep{warmup2020sample} and \citet{warmup2020sample} and \todo{placeholder}.
 \begin{equation}E = mc^2\end{equation}
 \begin{table}[t]\centering\begin{tabular}{ll}\toprule a & b \\ \midrule 1 & 2 \\ \bottomrule\end{tabular}\caption{t}\end{table}
 

@@ -1,0 +1,643 @@
+[
+  {
+    "id": "teacher_student",
+    "expected": "reject",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:4:0:4",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "9e7dd237-649b-4d71-89f4-b8c5171fd784"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "9e7dd237-649b-4d71-89f4-b8c5171fd784"
+      ],
+      "source_refs": [],
+      "text": "同一工作的知识蒸馏实验面向不同任务：在 CIFAR-100 验证集上，以 WRN-40-2 为教师蒸馏 ResNet32x4 学生等配对中，CFD-CLIP 相对多种蒸馏基线具有竞争力，作者还报告其在 CIFAR-100 与 ImageNet 上可将 MobileNet 准确率提升 4.83%；这些属于紧凑模型部署场景，与上述少样本分类结果不可直接比较。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "694ceb23825726bb37a89a63a87aea4266c77984d2329e354151d0402dc31cb7",
+        "evidence_id": "9e7dd237-649b-4d71-89f4-b8c5171fd784",
+        "grade": "B_located_prose",
+        "id": "9e7dd237-649b-4d71-89f4-b8c5171fd784",
+        "kind": "experimental_fact",
+        "locator_display": "p.2, §Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": 2,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Experiments on CIFAR-100 and ImageNet show that our approach improves MobileNet accuracy by 4.83% and outperforms existing distillation baselines, providing a compact yet semantically aligned model for efficient deployment.",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "8eba593f",
+      "section": "s5",
+      "claim_id": "s5:4:0:4"
+    }
+  },
+  {
+    "id": "missing_table_cell",
+    "expected": "reject",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:2:0:3",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "source_refs": [],
+      "text": "值得注意的是，同一表中零样本 CLIP 在 Tiny ImageNet 上仅 14.4 的精度远低于 CFD-CLIP，说明当类别语义偏离预训练分布时，跨模态零样本推理需要额外的适配或蒸馏才能保持竞争力。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "ab2c9071",
+      "section": "s5",
+      "claim_id": "s5:2:0:3"
+    }
+  },
+  {
+    "id": "reversed_comparison",
+    "expected": "reject",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:3:0:1",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "source_refs": [],
+      "text": "在其报告的5-shot下游评测中，CFD-CLIP在STL10、CIFAR100、CINIC10与CIFAR10等数据集上的Top-1准确率全面高于零样本CLIP、线性探测、微调、原型网络（Prototypical Network）、SVM与KNN等对比基线，具体数值见其表2。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "342d61f5",
+      "section": "s5",
+      "claim_id": "s5:3:0:1"
+    }
+  },
+  {
+    "id": "rank_and_network",
+    "expected": "reject",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s2:3:0:2",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "source_refs": [],
+      "text": "值得注意的是，CFD-CLIP 同时也是知识蒸馏对比实验中的最优方法之一，例如在 ResNet32x4 学生网络上达到 76.85%，仅次于 ReviewKD 的 76.11% 之后位列前列，说明对比式蒸馏信号在监督学习与少样本迁移两种设置下均有效。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "a00a5e81",
+      "section": "s2",
+      "claim_id": "s2:3:0:2"
+    }
+  },
+  {
+    "id": "shot_mapping",
+    "expected": "reject",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "shen2024adaptive"
+      ],
+      "claim_id": "s2:0:0:1",
+      "evidence_ids": [
+        "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "fd6c02e6-1db9-42b5-aeca-c441cd9df82a"
+      ],
+      "resolved_evidence_ids": [
+        "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "fd6c02e6-1db9-42b5-aeca-c441cd9df82a"
+      ],
+      "source_refs": [],
+      "text": "例如 APFP 方法在 miniImageNet 的 5-way 1-shot 与 5-way 5-shot 设置下分别报告了 67.98% 与 85.32% 的准确率，在细粒度数据集 CUB 的 5-shot 场景下报告了 84.02% 与 94.44% 的结果，说明度量学习框架在这些基准上已经能够取得相当高的水平。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "d9dd837a53e5aaaebd153f2444d8c4c8985e56a5b296c9e2afc97e33ea06ffb6",
+        "evidence_id": "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "grade": "B_located_prose",
+        "id": "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "kind": "experimental_fact",
+        "locator_display": "§Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Few-shot learning aims to enable machines to recognize unseen novel classes using limited samples akin to human capabilities. Metric learning is a crucial approach to addressing this challenge, with its performance primarily dependent on the effectiveness of feature extraction and prototype computation. This article introduces an Adaptive Prototype few-shot image classification method based on Feature Pyramid (APFP). APFP employs a novel feature extraction method called FResNet, which builds upon the ResNet architecture and leverages a feature pyramid structure to retain finer details. In the 5-shot scenario, traditional methods for computing average prototypes exhibit limitations due to the typically diverse and uneven distribution of samples, where simple means may inadequately reflect such diversity. To address this issue, APFP proposes an Adaptive Prototype method (AP) that dynamically computes class prototypes of the support set based on the similarity between support set samples and query samples. Experimental results demonstrate that APFP achieves 67.98% and 85.32% accuracy in the 5-way 1-shot and 5-way 5-shot scenarios on the MiniImageNet dataset, respectively, and 84.02%",
+        "topical_status": "uncertain",
+        "work_id": "d962b870-47d6-45d4-b24b-384fcd4f81c0"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "abc18886b4176c836adba2a058763a2b9d75b0c93881259a984dbf50e5320ca2",
+        "evidence_id": "fd6c02e6-1db9-42b5-aeca-c441cd9df82a",
+        "grade": "B_located_prose",
+        "id": "fd6c02e6-1db9-42b5-aeca-c441cd9df82a",
+        "kind": "experimental_fact",
+        "locator_display": "§Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "and 94.44% accuracy on the CUB dataset. These results indicate that the proposed APFP method addresses the few-shot learning problem.",
+        "topical_status": "uncertain",
+        "work_id": "d962b870-47d6-45d4-b24b-384fcd4f81c0"
+      }
+    ],
+    "source": {
+      "prefix": "1ddf7856",
+      "section": "s2",
+      "claim_id": "s2:0:0:1"
+    }
+  },
+  {
+    "id": "author_report",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "fuller2025efficient"
+      ],
+      "claim_id": "s5:3:0:3",
+      "evidence_ids": [
+        "60ae68ef-db75-4e46-96ca-359cadf37b6a",
+        "52450736-8a32-4259-bd20-82a6d74b1b4e"
+      ],
+      "resolved_evidence_ids": [
+        "60ae68ef-db75-4e46-96ca-359cadf37b6a",
+        "52450736-8a32-4259-bd20-82a6d74b1b4e"
+      ],
+      "source_refs": [],
+      "text": "医学影像领域的情况与上一节提到的层级对比适配相呼应：前述 HiCA 框架的两阶段微调策略（领域内预训练结合层次化对比对齐）在 Chest X-ray 与 Breast Ultrasound 两个基准的少样本（1-shot 至 20-shot）与零样本设置中均取得优于 CLIP 零样本、全监督 CNN 与 ResNet 迁移学习基线的最先进表现，并以准确率与 AUC 为指标验证了显著性，进一步说明专业领域需要超越直接零样本迁移的适配手段。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "39a8c9e380a4601a21c61166b5e8fbed2ae4dff9624cbeb9c4b39d20a613d3b2",
+        "evidence_id": "52450736-8a32-4259-bd20-82a6d74b1b4e",
+        "grade": "B_located_prose",
+        "id": "52450736-8a32-4259-bd20-82a6d74b1b4e",
+        "kind": "experimental_fact",
+        "locator_display": "§Experiments / Experimental Setup ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Experiments / Experimental Setup",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "We conduct experiments using the following competing methods: itemize CLIP (Zero-shot): A baseline vision-language model without any task-specific fine-tuning. Supervised CNN: A convolutional neural network trained in a fully supervised manner using the available labeled data. Transfer Learning (ResNet): A ResNet model pre-trained on ImageNet and fine-tuned on the medical datasets. Ours (HiCA): Our proposed hierarchical contrastive learning method applied to LVLMs. itemize We evaluate the methods using accuracy and the area under the ROC curve (AUC). For all experiments, we use few-shot settings with labeled data ranging from 1-shot to 20-shot per class. Statistical significance testing is conducted to verify the observed improvements.",
+        "topical_status": "uncertain",
+        "work_id": "c1849abb-4f77-4238-9120-341443e53176"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "5b9a4ea64dca30820e66cba8fe3161e359876e3fbaa491548a7241be34ca897b",
+        "evidence_id": "60ae68ef-db75-4e46-96ca-359cadf37b6a",
+        "grade": "B_located_prose",
+        "id": "60ae68ef-db75-4e46-96ca-359cadf37b6a",
+        "kind": "experimental_fact",
+        "locator_display": "§Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Few-shot learning in medical image classification presents a significant challenge due to the limited availability of annotated data and the complex nature of medical imagery. In this work, we propose Adaptive Vision-Language Fine-tuning with Hierarchical Contrastive Alignment (HiCA), a novel framework that leverages the capabilities of Large Vision-Language Models (LVLMs) for medical image analysis. HiCA introduces a two-stage fine-tuning strategy, combining domain-specific pretraining and hierarchical contrastive learning to align visual and textual representations at multiple levels. We evaluate our approach on two benchmark datasets, Chest X-ray and Breast Ultrasound, achieving state-of-the-art performance in both few-shot and zero-shot settings. Further analyses demonstrate the robustness, generalizability, and interpretability of our method, with substantial improvements in performance compared to existing baselines. Our work highlights the potential of hierarchical contrastive strategies in adapting LVLMs to the unique challenges of medical imaging tasks.",
+        "topical_status": "uncertain",
+        "work_id": "c1849abb-4f77-4238-9120-341443e53176"
+      }
+    ],
+    "source": {
+      "prefix": "ffaf5045",
+      "section": "s5",
+      "claim_id": "s5:3:0:3"
+    }
+  },
+  {
+    "id": "table_inference",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "gu2025multi",
+        "chen2021self"
+      ],
+      "claim_id": "s6:4:0:2",
+      "evidence_ids": [
+        "c6acf0ab-1758-4da3-b1aa-79fbbc7e7eb6",
+        "b9f14d1a-7809-4c92-aec8-cdec160ec163"
+      ],
+      "resolved_evidence_ids": [
+        "c6acf0ab-1758-4da3-b1aa-79fbbc7e7eb6",
+        "b9f14d1a-7809-4c92-aec8-cdec160ec163"
+      ],
+      "source_refs": [],
+      "text": "第三个开放问题是域偏移下的评测覆盖：迁移学习路线中的增强策略与交替训练可用于克服域差异，但跨域设置下的方法排序仍随数据集明显波动，缺乏统一结论。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "b861b0dcc32b5fb684ee91470d22a830d97618e007f593268ddb858d8c0da309",
+        "evidence_id": "b9f14d1a-7809-4c92-aec8-cdec160ec163",
+        "grade": "A_located_structured",
+        "id": "b9f14d1a-7809-4c92-aec8-cdec160ec163",
+        "kind": "experimental_fact",
+        "locator_display": "table:tab:result_tab, §Experimental Results / Evaluation results / Cross-domain few-shot Learning ¶1",
+        "measurements": [],
+        "object_ref": "table:tab:result_tab",
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Experimental Results / Evaluation results / Cross-domain few-shot Learning",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": "medical_imaging.evaluation",
+        "text": "Cross-domain few-shot learning tests on four datasets [] 0.5 tabular@ccccccc@ Methods & 3cChestX & 3cISIC \\\\ & 5-way 5-shot & 5-way 20-shot & 5-way 50-shot & 5-way 5-shot & 5-way 20-shot & 5-way 50-shot \\\\ (l)2-7 Ours\\_trans & 28.50 $ $ 0.40\\% & 33.79 $ $ 0.48\\% & 38.78 $ $ 0.64\\% & 44.15 $ $ 0.52\\% & 55.63 $ $ 0.49\\% & 62.76 $ $ 0.50\\% \\\\ Cross & 26.09 $ $ 0.96\\% & 31.01 $ $ 0.59\\% & 36.79 $ $ 0.53\\% & 49.68 $ $ 0.36\\% & 61.09 $ $ 0.44\\% & 67.20 $ $ 59\\% \\\\ & 3cEuroSAT & 3cCropDiseases \\\\ & 5-way 5-shot & 5-way 20-shot & 5-way 50-shot & 5-way 5-shot & 5-way 20-shot & 5-way 50-shot \\\\ (l)2-7 Ours\\_trans & 83.44 $ $ 0.61\\% & 90.43 $ $ 0.52\\% & 94.71 $ $ 0.47\\% & 91.79 $ $ 0.48\\% & 97.38 $ $ 0.65\\% & 99.50 $ $ 0.63\\% \\\\ Cross & 81.76 $ $ 0.48\\% & 87.97 $ $ 0.42\\% & 92.00 $ $ 0.56\\% & 90.64 $ $ 0.54\\% & 95.91 $ $ 0.72\\% & 97.48 $ $ 0.56\\% \\\\ tabular Cross-domain few-shot learning tests on four datasets -4mm",
+        "topical_status": "uncertain",
+        "work_id": "862bed50-e99f-4152-90a4-849651eadd50"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "cbe4ea3a9bb89c242bbafa7d8a66b994bc3add58381a9e348b82b91af90adcc5",
+        "evidence_id": "c6acf0ab-1758-4da3-b1aa-79fbbc7e7eb6",
+        "grade": "B_located_prose",
+        "id": "c6acf0ab-1758-4da3-b1aa-79fbbc7e7eb6",
+        "kind": "experimental_fact",
+        "locator_display": "§Related work / Transfer learning based methods ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Related work / Transfer learning based methods",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": "medical_imaging.generative",
+        "text": "contrastive learning to improve the generalization ability. Zheng et al. 39 proposed a data augmentation strategy and an alternating training manner to overcome domain discrepancies",
+        "topical_status": "on_topic",
+        "work_id": "6cd10b53-bb27-42a6-9236-ef2997641ed7"
+      }
+    ],
+    "source": {
+      "prefix": "ea66e564",
+      "section": "s6",
+      "claim_id": "s6:4:0:2"
+    }
+  },
+  {
+    "id": "explicit_gap",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [],
+      "claim_id": "s1:5:0:1",
+      "evidence_ids": [],
+      "resolved_evidence_ids": [],
+      "source_refs": [],
+      "text": "此外，CrossTransformer、InfoPRO 等方法的实证表现与上述路线的优劣排序，在当前可用证据中缺乏可直接比较的定量结果，相关数值待补充。"
+    },
+    "evidence": [],
+    "source": {
+      "prefix": "ffaf5045",
+      "section": "s1",
+      "claim_id": "s1:5:0:1"
+    }
+  },
+  {
+    "id": "bounded_result",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:2:0:4",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "source_refs": [],
+      "text": "同一表中 CFD-CLIP 在 STL10 上为 90.64%、CIFAR100 上为 43.8%，显著高于同设置的 5-shot 线性探测（16.7%）、微调（14.7%）与原型网络（14.2%）等基线，但低于零样本 CLIP 在 STL10 上的结果。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "8280fc21",
+      "section": "s5",
+      "claim_id": "s5:2:0:4"
+    }
+  },
+  {
+    "id": "teacher_student_corrected",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:4:0:4",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "9e7dd237-649b-4d71-89f4-b8c5171fd784"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "9e7dd237-649b-4d71-89f4-b8c5171fd784"
+      ],
+      "source_refs": [],
+      "text": "Table 1 中 WRN-40-2 为教师，MN-V3 为学生；ResNet32x4 为教师，WRN-16-2 为学生。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "694ceb23825726bb37a89a63a87aea4266c77984d2329e354151d0402dc31cb7",
+        "evidence_id": "9e7dd237-649b-4d71-89f4-b8c5171fd784",
+        "grade": "B_located_prose",
+        "id": "9e7dd237-649b-4d71-89f4-b8c5171fd784",
+        "kind": "experimental_fact",
+        "locator_display": "p.2, §Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": 2,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Experiments on CIFAR-100 and ImageNet show that our approach improves MobileNet accuracy by 4.83% and outperforms existing distillation baselines, providing a compact yet semantically aligned model for efficient deployment.",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "8eba593f",
+      "section": "s5",
+      "claim_id": "s5:4:0:4"
+    }
+  },
+  {
+    "id": "missing_table_cell_corrected",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "pang2025cfd"
+      ],
+      "claim_id": "s5:2:0:3",
+      "evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "resolved_evidence_ids": [
+        "42810af8-f431-418d-8b05-ad12167bdfd6"
+      ],
+      "source_refs": [],
+      "text": "现有表格摘录未包含 CFD-CLIP 在 Tiny ImageNet 上的结果，因此无法比较其与零样本 CLIP 14.4 的大小。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "structured_cell",
+        "content_hash": "e0e159d6399d6b2996e092637348390dc6ee69f0a7a2dbd453a54e85f1881eec",
+        "evidence_id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "grade": "A_located_structured",
+        "id": "42810af8-f431-418d-8b05-ad12167bdfd6",
+        "kind": "experimental_fact",
+        "locator_display": "p.8, table:1",
+        "measurements": [],
+        "object_ref": "table:1",
+        "page": 8,
+        "paragraph_index": 1,
+        "section_path": null,
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Table 1 TheTop-1Accuracy(%)ofdifferentknowledgedistillationmethodsonthevalidationsetofCIFAR-100.The\nbestandsecondbestresultsareemphasizedinboldandunderlinedcases.\nteacher ResNet56 ResNet110 WRN-40-2 ResNet32x4\n72.34 74.31 75.61 79.42\nDistillation manner\nstudent ResNet20 ResNet32 MN-V3 WRN-16-2\n69.06 71.14 64.60 73.26\nFitNet 69.21 71.06 68.64 74.70\nAT 70.55 72.31 60.78 73.91\nRKD 69.61 71.82 69.27 74.86\nCRD 71.16 73.48 70.28 75.65\nFeature\nOFD 70.98 73.23 69.92 76.17\nReviewKD 71.89 73.89 71.28 76.11\nSimKD 71.05 73.92 70.10 77.17\nCAT-KD 71.62 73.62 70.24 76.97\nKD 70.66 73.08 68.36 74.90\nLogit DKD 71.97 73.52 68.34 75.70\nMLKD 72.19 74.11 70.78 76.52\nCFD-CLIP(Ours) 72.33 74.89 71.75 76.85\nTable 2 Few-shotperformancecomparisonondownstreamdatasets(Top-1accuracy,%).\nSetting Method STL10 CIFAR100 CINIC10 CIFAR10 Tiny ImageNet\nZero-shot CLIP (ViT-B/32) 97.24 61.3 79.25 88.76 14.4\n5-shot Linear Probing 54.0 16.7 22.67 32.67 11.27\n5-shot Fine-tuning 48.67 14.7 16.00 24.0 9.27\n5-shot Prototypical 56.67 14.2 18.0 33.3 7.23\n5-shot Relation Network 10.0 10.2 10.0 10.0 5.7\n5-shot SVM 54.67 12.9 20.67 38.0 7.37\n5-shot KNN 48.0 9.0 14.67 24.0 3.7\n5-shot CFD-CLIP (Ours) 90.64 43.8 47.93 66.23",
+        "topical_status": "uncertain",
+        "work_id": "0a012c4a-0cb9-4081-8467-9ff6708b3513"
+      }
+    ],
+    "source": {
+      "prefix": "ab2c9071",
+      "section": "s5",
+      "claim_id": "s5:2:0:3"
+    }
+  },
+  {
+    "id": "shot_mapping_corrected",
+    "expected": "accept",
+    "question": "这一论断的事实、实验条件及比较方向是否与绑定证据相称？允许明确限定的作者自报、表内推理及证据缺口声明。",
+    "claim": {
+      "cite_keys": [
+        "shen2024adaptive"
+      ],
+      "claim_id": "s2:0:0:1",
+      "evidence_ids": [
+        "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "fd6c02e6-1db9-42b5-aeca-c441cd9df82a"
+      ],
+      "resolved_evidence_ids": [
+        "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "fd6c02e6-1db9-42b5-aeca-c441cd9df82a"
+      ],
+      "source_refs": [],
+      "text": "APFP 在 miniImageNet 上 5-way 1-shot 为67.98%、5-shot为85.32%；在CUB上1-shot为84.02%、5-shot为94.44%。"
+    },
+    "evidence": [
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "d9dd837a53e5aaaebd153f2444d8c4c8985e56a5b296c9e2afc97e33ea06ffb6",
+        "evidence_id": "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "grade": "B_located_prose",
+        "id": "6ebb1be0-f0a0-40f6-a2e9-dc847946f5fe",
+        "kind": "experimental_fact",
+        "locator_display": "§Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "Few-shot learning aims to enable machines to recognize unseen novel classes using limited samples akin to human capabilities. Metric learning is a crucial approach to addressing this challenge, with its performance primarily dependent on the effectiveness of feature extraction and prototype computation. This article introduces an Adaptive Prototype few-shot image classification method based on Feature Pyramid (APFP). APFP employs a novel feature extraction method called FResNet, which builds upon the ResNet architecture and leverages a feature pyramid structure to retain finer details. In the 5-shot scenario, traditional methods for computing average prototypes exhibit limitations due to the typically diverse and uneven distribution of samples, where simple means may inadequately reflect such diversity. To address this issue, APFP proposes an Adaptive Prototype method (AP) that dynamically computes class prototypes of the support set based on the similarity between support set samples and query samples. Experimental results demonstrate that APFP achieves 67.98% and 85.32% accuracy in the 5-way 1-shot and 5-way 5-shot scenarios on the MiniImageNet dataset, respectively, and 84.02%",
+        "topical_status": "uncertain",
+        "work_id": "d962b870-47d6-45d4-b24b-384fcd4f81c0"
+      },
+      {
+        "anchor_strength": "prose_only",
+        "content_hash": "abc18886b4176c836adba2a058763a2b9d75b0c93881259a984dbf50e5320ca2",
+        "evidence_id": "fd6c02e6-1db9-42b5-aeca-c441cd9df82a",
+        "grade": "B_located_prose",
+        "id": "fd6c02e6-1db9-42b5-aeca-c441cd9df82a",
+        "kind": "experimental_fact",
+        "locator_display": "§Abstract ¶1",
+        "measurements": [],
+        "object_ref": null,
+        "page": null,
+        "paragraph_index": 1,
+        "section_path": "Abstract",
+        "selection_reason": "explicit_claim_binding",
+        "task_id": null,
+        "text": "and 94.44% accuracy on the CUB dataset. These results indicate that the proposed APFP method addresses the few-shot learning problem.",
+        "topical_status": "uncertain",
+        "work_id": "d962b870-47d6-45d4-b24b-384fcd4f81c0"
+      }
+    ],
+    "source": {
+      "prefix": "1ddf7856",
+      "section": "s2",
+      "claim_id": "s2:0:0:1"
+    }
+  }
+]

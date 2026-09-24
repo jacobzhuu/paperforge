@@ -1,13 +1,15 @@
 # PaperForge
 
-> AI 科研论文生成系统 —— **成稿优先(draft-first)、引用真实(citation-authentic)、流程宽松(gate-free)**
+PaperForge 采用证据驱动的科研 Agent 工作流：固定主链路结合模型评审与规则约束的自适应修复，支持持久化修复决策、动作边界恢复及正文快照绑定的质量检查。实际能力、架构边界与验证方式见 [Agent 平台升级](docs/agent-platform-upgrade.md)。
 
-PaperForge 从 DeepSearch 的文献综述子系统分离重建而来。设计哲学相对旧系统完全反转：
-旧系统「溯源优先、拒绝产出不合格报告」，PaperForge「成稿优先、引用真实、流程宽松」——
-任何阶段失败都**降级而不阻断**，永远能拿到当前最好的稿子。
+当前升级能力与边界见 [Agent 平台升级](docs/agent-platform-upgrade.md)：局部 LangGraph 修复、项目内混合证据检索、任务详情和 OpenTelemetry/Langfuse 观测；工程上线与人工质量验收分别记录，详见 [本次验收](docs/acceptance/agent-platform-20260918.md)。
 
-产出物：可直接投稿级排版的 **LaTeX + PDF** 论文初稿，支持可溯数据图表、学术示意图与
-用户确认后的 AI 概念插图，全部参考文献真实可溯。
+> 科研写作 Agent —— **证据驱动、引用可溯、可恢复执行**
+
+PaperForge 从 DeepSearch 的文献综述子系统分离重建而来。系统保留已生成的稿件和执行记录；证据不足或修复预算耗尽时暂停并请求补充材料，未完成的评估不会被标记为质量验收通过。
+
+产出物：按目标模板排版的 **LaTeX + PDF** 论文初稿，支持可溯数据图表、学术示意图与
+用户确认后的 AI 概念插图，保留参考文献与证据来源。
 
 设计方案全文见 `docs/design.md`（源自 DeepSearch/plans/standalone-paper-generation-system-design-2026-07-24.md）；
 前端设计原则与改造计划见 `docs/ui-design.md`。
@@ -74,6 +76,7 @@ Tectonic、visuald、API、worker 和 Web。成功后会自动打开并打印：
 ./scripts/dev status
 ./scripts/dev logs
 ./scripts/dev restart   # 改完代码用这个
+./scripts/dev reap      # 只读检查已排空的旧蓝绿部署；确认后加 --apply 清理
 ./scripts/dev down
 ```
 

@@ -6,11 +6,17 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.library import LibraryEntry
-from db.models.paper import PaperDocument, PaperProject, PaperSection
+from db.models.paper import (
+    ClaimEntailmentCache,
+    ClaimEvidenceAnchor,
+    PaperDocument,
+    PaperProject,
+    PaperSection,
+)
 
 PAPER_TYPES = frozenset({"review", "original"})
 WRITING_MODES = frozenset({"auto", "assisted"})
@@ -35,6 +41,7 @@ async def create_project(
     title: str,
     paper_type: str,
     writing_mode: str = "auto",
+    execution_profile: str = "standard",
     language: str = "en",
     topic: str | None = None,
     venue_template: str | None = None,
@@ -51,6 +58,10 @@ async def create_project(
         raise ValueError(f"unsupported paper_type: {paper_type}")
     if writing_mode not in WRITING_MODES:
         raise ValueError(f"unsupported writing_mode: {writing_mode}")
+    from db.execution_profile import EXECUTION_PROFILES
+
+    if execution_profile not in EXECUTION_PROFILES:
+        raise ValueError(f"unsupported execution_profile: {execution_profile}")
     if language not in LANGUAGES:
         raise ValueError(f"unsupported language: {language}")
     if citation_style not in CITATION_STYLES:
@@ -68,6 +79,7 @@ async def create_project(
         title=title.strip(),
         paper_type=paper_type,
         writing_mode=writing_mode,
+        execution_profile=execution_profile,
         language=language,
         venue_template=venue_template,
         citation_style=citation_style,
@@ -221,9 +233,54 @@ async def purge_project(session: AsyncSession, project: PaperProject) -> None:
 
     对象存储不在事务里，调用方必须**先**删对象再调它——反过来的话一旦删行成功、
     删对象失败，object_key 就再也查不出来了，存储里留下永远没人认领的垃圾。
+
+    ``claim_entailment_cache`` 是唯一的例外：它故意不带 project_id（一条判定要能服务所有
+    项目），因此 CASCADE 够不到它，而它的 ``reason`` 是模型写的、会复述稿件论断的散文。
+    删项目前先清掉只属于该项目的缓存行。
     """
+    await _purge_orphaned_claim_entailment_cache(session, project.id)
     await session.delete(project)
     await session.flush()
+
+
+async def _purge_orphaned_claim_entailment_cache(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Delete cached verdicts that no surviving project's claims would reach.
+
+    Scoped by ``(claim_hash, evidence_hash)`` rather than by project, because that is the only
+    linkage the cache has.  A pair still anchored by another project is kept: the cache is shared
+    by design, and the identical claim/excerpt text is already present in that other project.
+    """
+    owned = select(ClaimEvidenceAnchor.claim_hash, ClaimEvidenceAnchor.evidence_hash).where(
+        ClaimEvidenceAnchor.project_id == project_id,
+        # Cache rows always carry both hashes; an anchor without one can never match a cache row,
+        # and letting a NULL into the tuple subquery would only muddy the comparison.
+        ClaimEvidenceAnchor.evidence_hash.is_not(None),
+    )
+    # NOT EXISTS, not NOT IN: ``evidence_hash`` is nullable.  Postgres row-constructor comparison
+    # short-circuits to FALSE when any element differs, so a NULL poisons the predicate only when
+    # the other element matches -- i.e. when a surviving project holds an anchor for the *same*
+    # claim whose excerpt was never located.  That is reachable, and under ``NOT IN`` it makes the
+    # predicate UNKNOWN for every row, silently deleting nothing.  Guarded by
+    # test_a_null_evidence_hash_elsewhere_cannot_block_the_purge.
+    still_anchored = (
+        select(1)
+        .where(
+            ClaimEvidenceAnchor.project_id != project_id,
+            ClaimEvidenceAnchor.claim_hash == ClaimEntailmentCache.claim_hash,
+            ClaimEvidenceAnchor.evidence_hash == ClaimEntailmentCache.evidence_hash,
+        )
+        .exists()
+    )
+    result = await session.execute(
+        delete(ClaimEntailmentCache).where(
+            tuple_(ClaimEntailmentCache.claim_hash, ClaimEntailmentCache.evidence_hash).in_(owned),
+            ~still_anchored,
+        )
+    )
+    return int(result.rowcount or 0)
 
 
 #: `update_project` 里「不传就是不改」的哨兵。
@@ -241,12 +298,14 @@ async def update_project(
     language: str | None = _UNSET,
     citation_style: str | None = _UNSET,
     writing_mode: str | None = _UNSET,
+    execution_profile: str | None = _UNSET,
     contribution_points: list[str] | None = _UNSET,
     publication_title: str | None = _UNSET,
     authors: list[str] | None = _UNSET,
     author_details: list[dict[str, Any]] | None = _UNSET,
     keywords: list[str] | None = _UNSET,
     metadata_confirmed: bool | None = _UNSET,
+    web_research_enabled: bool = _UNSET,
 ) -> PaperProject:
     """
     局部更新项目元数据。枚举值非法时抛 ValueError（API 转 422）。
@@ -260,8 +319,17 @@ async def update_project(
     保持一致；这里做的是**合并**而非整体替换，避免把 SCOPE 生成出来的关键词矩阵
     连带清空（那是 `update_project_scope` 的职责）。
     """
+    if (project.scope_json or {}).get("intake") and language is not _UNSET and language:
+        intake = project.scope_json["intake"]
+        project.scope_json = {**project.scope_json, "intake": {
+            **intake, "overrides": {**intake.get("overrides", {}), "language": language},
+        }}
     # title 与 topic 不同：topic=None 是「清空主题」，title=None 是非法的——
     # 论文永远得有个题目。两者都会走到这里，所以必须分别判。
+    if web_research_enabled is not _UNSET:
+        if not isinstance(web_research_enabled, bool):
+            raise ValueError("web_research_enabled must be a boolean")
+        project.web_research_enabled = web_research_enabled
     if title is not _UNSET:
         if title is None or not title.strip():
             raise ValueError("project title must not be empty")
@@ -278,6 +346,12 @@ async def update_project(
         if writing_mode not in WRITING_MODES:
             raise ValueError(f"unsupported writing_mode: {writing_mode}")
         project.writing_mode = writing_mode
+    if execution_profile is not _UNSET:
+        from db.execution_profile import EXECUTION_PROFILES
+
+        if execution_profile not in EXECUTION_PROFILES:
+            raise ValueError(f"unsupported execution_profile: {execution_profile}")
+        project.execution_profile = execution_profile
     if venue_template is not _UNSET:
         project.venue_template = venue_template
     publication_metadata_changed = any(

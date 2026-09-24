@@ -46,11 +46,17 @@ class PaperProject(Base, TimestampMixin):
     metadata_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paper_type: Mapped[str] = mapped_column(String(16), nullable=False)  # review|original
     writing_mode: Mapped[str] = mapped_column(String(16), nullable=False)  # auto|assisted
+    execution_profile: Mapped[str] = mapped_column(
+        String(16), default="standard", server_default="standard", nullable=False
+    )
     language: Mapped[str] = mapped_column(String(8), default="en", nullable=False)  # zh|en
     venue_template: Mapped[str | None] = mapped_column(String(64))
     citation_style: Mapped[str] = mapped_column(String(32), default="author_year", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     scope_json: Mapped[dict | None] = mapped_column(JSONB)
+    web_research_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     # 软删除：删掉的项目动辄是几小时 LLM 花费的产物，误删不可逆太贵。
     # 置位后所有 project 作用域路由一律 404（收口在 get_owned_project），
     # 真正的行删除与对象回收由保留期后的 `paperforge-admin purge-projects` 执行。
@@ -218,6 +224,10 @@ class QuestionSynthesis(Base):
 
 class GenerationJob(Base):
     __tablename__ = "generation_job"
+    # 0027 用 SQL 建了这个索引却没有在模型上声明它，于是 `alembic check` 从那次
+    # 提交起一直把它报成「该被删掉的索引」——一条阻断性 CI 步骤自此常红，
+    # 下一个真正的 schema 漂移就没人看得见了。
+    __table_args__ = (Index("ix_generation_job_status_heartbeat", "status", "heartbeat_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     project_id: Mapped[uuid.UUID] = mapped_column(
@@ -235,6 +245,34 @@ class GenerationJob(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 跑这条任务的进程还活着的最后证明。worker 领走任务后按 JOB_HEARTBEAT_INTERVAL_SECONDS
+    #: 定期回写；被硬杀掉（容器被换掉、OOM、SIGKILL）时没有任何收尾代码会运行，
+    #: 这个时间戳是唯一还能分辨「跑得慢」和「已经没人在跑」的信号。
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class JobDispatch(Base):
+    """Transactional dispatch intent; queue identity contains no credentials."""
+    __tablename__ = "job_dispatch"
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="CASCADE"), index=True
+    )
+    queue_identity: Mapped[str] = mapped_column(String(64), index=True)
+    function: Mapped[str] = mapped_column(String(120))
+    kwargs_json: Mapped[dict] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(String(120))
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    executions: Mapped[int] = mapped_column(Integer, server_default="0")
 
 
 class JobEvent(Base):
@@ -390,6 +428,7 @@ class PaperDocument(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     outline_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("outline.id"))
     status: Mapped[str] = mapped_column(String(24), default="draft", nullable=False)
+    writing_state_json: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class PaperSection(Base):
@@ -408,6 +447,7 @@ class PaperSection(Base):
     asset_refs_json: Mapped[list | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(16), default="generated", nullable=False)
     model: Mapped[str | None] = mapped_column(String(128))
+    generation_json: Mapped[dict | None] = mapped_column(JSONB)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -519,6 +559,58 @@ class ClaimEvidenceAnchor(Base):
     support_status: Mapped[str] = mapped_column(String(48), nullable=False)
     support_score: Mapped[float | None] = mapped_column(Float)
     manual_status: Mapped[str] = mapped_column(String(24), default="unreviewed", nullable=False)
+    # Shadow verdicts are durable review evidence even when they do not change support_status.
+    # Keeping them on the snapshot-bound anchor makes the UI and later audits independent of the
+    # transient job event stream.
+    entailment_verdict: Mapped[str | None] = mapped_column(String(16))
+    entailment_confidence: Mapped[float | None] = mapped_column(Float)
+    entailment_reason: Mapped[str | None] = mapped_column(Text)
+    entailment_model: Mapped[str | None] = mapped_column(String(128))
+    entailment_verifier_version: Mapped[str | None] = mapped_column(String(32))
+    entailment_cached: Mapped[bool | None] = mapped_column(Boolean)
+    entailment_review_json: Mapped[dict | None] = mapped_column(JSONB)
+    entailment_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ClaimEntailmentCache(Base):
+    """Content-addressed semantic verdict cache shared by quality jobs.
+
+    ``cache_key`` hashes verifier version, configured model, claim kind, claim text and exact
+    excerpt, so a model change cannot silently reuse an incompatible verdict.  Bumping
+    ``CLAIM_VERIFIER_VERSION`` is the only invalidation mechanism: rows are immutable
+    (``on_conflict_do_nothing``) and have no TTL.
+
+    Two retention facts this table's shape does not make obvious:
+
+    * ``reason`` is model-authored prose that routinely paraphrases both the claim and the cited
+      excerpt, so this table **does** hold derived manuscript text — the claim/evidence columns are
+      hashes, but the reason is not.
+    * New rows carry project_id and cascade on project deletion. NULL rows belong to the
+      legacy global namespace, retained for draining old workers. New workers neither read
+      nor copy that namespace; its historic derived text needs a separate retention decision.
+    """
+
+    __tablename__ = "claim_entailment_cache"
+    __table_args__ = (
+        Index("ix_claim_entailment_cache_claim_evidence", "claim_hash", "evidence_hash"),
+    )
+
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # NULL belongs to the legacy global namespace; new workers never read it.
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), index=True
+    )
+    claim_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    verifier_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -572,6 +664,62 @@ class ExportArtifact(Base):
     )
 
 
+class SentenceDowngrade(Base):
+    """写作阶段规则从正文里拿掉（或改写）的一句，及其判定依据。
+
+    句级证据规则会删 prose。此前 ``enforce_sentence_evidence_rules`` 把弃用句收进
+    ``paragraph["downgraded_sentences"]``，但 ``to_ir_section()`` 只读
+    ``paragraph["sentences"]``——线索死在 Draft→IR 那一步，434 个已交付章节里
+    没有一个留下过删除记录。资产接地规则更彻底：直接 ``continue``，连收都没收。
+
+    一句一行，与所属章节同一事务写入；该节被重写时整节替换，生命周期与
+    ``citation_usage`` 一致。
+    """
+
+    __tablename__ = "sentence_downgrade"
+    __table_args__ = (
+        Index("ix_sentence_downgrade_section", "section_id"),
+        Index("ix_sentence_downgrade_document_rule", "document_id", "rule"),
+        Index("ix_sentence_downgrade_project", "project_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), nullable=False
+    )
+    #: 哪一次运行删的。测试与影子评估里写作阶段没有 job，所以可空。
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="SET NULL")
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_document.id", ondelete="CASCADE"), nullable=False
+    )
+    section_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_section.id", ondelete="CASCADE"), nullable=False
+    )
+    section_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    paragraph_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    sentence_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: 触发的规则代号：R4_grade_missing / R5_not_comparable / R6_locator_missing /
+    #: numlint_unsourced_number / asset_* 等。
+    rule: Mapped[str] = mapped_column(String(48), nullable=False)
+    #: ``removed``（整句从正文拿掉）或 ``rewritten``（改写后仍在正文里，如 R4 归因）。
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False, server_default="removed")
+    #: 模型原本写出来的那一句，在规则清空它之前取。
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    cite_keys_json: Mapped[list | None] = mapped_column(JSONB)
+    evidence_ids_json: Mapped[list | None] = mapped_column(JSONB)
+    #: ``located`` / ``unlocated`` / ``no_evidence``——删除当时这句绑的证据能不能被查证。
+    locator_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, server_default="unknown"
+    )
+    #: 每条绑定证据的定位快照：evidence_id、grade、located、人可读 display。
+    locators_json: Mapped[list | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class LlmCallLog(Base):
     """LLM 成本记账（简化自旧 token_ledger 设计）。"""
 
@@ -595,6 +743,16 @@ class LlmCallLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     # 失败调用也要留痕：否则成本面板里「失败」与「零 token 成功」无法区分。
     error_code: Mapped[str | None] = mapped_column(String(64))
+    # 请求侧的形状。没有这几列，台账只能回答「花了多少」，回答不了「当时问的是
+    # 什么」——一次截断到底还有没有预算余量、一节写薄了是不是因为议程只有一行，
+    # 都得靠翻管线源码去猜。全部可空：蓝绿部署下正在排空的旧 worker 会省略它们。
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer)
+    finish_reason: Mapped[str | None] = mapped_column(String(32))
+    # 只存摘要不存原文：64 字节、零内容、零隐私风险，却足以回答「这次和上次是不是
+    # 同一个 prompt」——那正是区分「提示词回归」与「模型回归」的那个问题。
+    prompt_sha256: Mapped[str | None] = mapped_column(String(64))
+    prompt_chars: Mapped[int | None] = mapped_column(Integer)
+    output_chars: Mapped[int | None] = mapped_column(Integer)
     metadata_json: Mapped[dict | None] = mapped_column(JSONB)
     # Keep a server default for blue/green compatibility: an older worker may
     # finish an in-flight job after this column exists and omit it on INSERT.
@@ -604,3 +762,25 @@ class LlmCallLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class EvaluatorShadowRun(Base):
+    """Isolated evaluation outbox; never a delivery/quality authority."""
+    __tablename__ = "evaluator_shadow_run"
+    __table_args__ = (UniqueConstraint("source_job_id", "version", name="uq_shadow_job_version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    source_job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("generation_job.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("paper_project.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    input_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    results_json: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    artifact_prefix: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

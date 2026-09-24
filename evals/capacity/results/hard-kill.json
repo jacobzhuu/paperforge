@@ -1,0 +1,35 @@
+{
+  "kind": "fixture_hard_kill_explicit_resume",
+  "trials": [
+    {
+      "trial": 1,
+      "configured_original_job_seconds": 1800,
+      "seconds_running_before_kill": 5,
+      "kill_to_paused_seconds": 115.99229466496035,
+      "resume_to_success_seconds": 12.145590280881152,
+      "checkpoint_preserved": true,
+      "original_job": "b52b6c88-46da-4eec-aaf9-5bf9f6936dd4",
+      "resumed_job": "d5f369f4-b1c1-4c26-9e31-59a18067de39"
+    },
+    {
+      "trial": 2,
+      "configured_original_job_seconds": 1800,
+      "seconds_running_before_kill": 5,
+      "kill_to_paused_seconds": 115.02623981703073,
+      "resume_to_success_seconds": 12.66312083415687,
+      "checkpoint_preserved": true,
+      "original_job": "8cecf944-1a3a-4761-9e09-9aa0c0324897",
+      "resumed_job": "5ad1114a-95bd-468a-ab3a-87889b77535c"
+    },
+    {
+      "trial": 3,
+      "configured_original_job_seconds": 1800,
+      "seconds_running_before_kill": 5,
+      "kill_to_paused_seconds": 115.54416241194122,
+      "resume_to_success_seconds": 13.164854231989011,
+      "checkpoint_preserved": true,
+      "original_job": "262bfd1a-9cca-4214-9a0a-cdf626cd385f",
+      "resumed_job": "eb52fa37-6676-4c17-8cce-cfe20130a7e4"
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Annotated, Any
 
@@ -39,7 +40,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["assets"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 PREFERRED_ASSET_EXTENSIONS = [
@@ -84,32 +85,9 @@ async def material_preflight(project_id: str, session: SessionDep) -> MaterialPr
 
 
 def _original_material_issues(assets: list[Any]) -> list[dict[str, str]]:
-    has_results = False
-    has_method = False
-    for asset in assets:
-        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
-        if asset.kind in {"dataset", "result_table"}:
-            has_results = (
-                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
-                or has_results
-            )
-        if asset.kind in {"method_note", "code"}:
-            has_method = (
-                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
-            )
-    issues: list[dict[str, str]] = []
-    if not has_results:
-        issues.append(
-            {
-                "code": "result_material_missing",
-                "message": "请上传包含数据行和可解析数值的结果表或数据集",
-            }
-        )
-    if not has_method:
-        issues.append(
-            {"code": "method_material_missing", "message": "请上传可解析的方法笔记或代码"}
-        )
-    return issues
+    from db.intake import material_issues
+
+    return material_issues(assets)
 
 
 @router.post(
@@ -125,26 +103,27 @@ async def upload_asset(
     description: Annotated[str | None, Form()] = None,
 ) -> AssetResponse:
     project = await _require_project(session, project_id)
-    content = await file.read()
+    content = await file.read(MAX_ASSET_BYTES + 1)
     if not content:
         raise HTTPException(status_code=422, detail="uploaded file is empty")
     if len(content) > MAX_ASSET_BYTES:
         raise HTTPException(status_code=413, detail="asset exceeds 32 MiB limit")
 
     filename = file.filename or "asset"
-    parsed = parse_asset(
+    parsed = await asyncio.to_thread(
+        parse_asset,
         content=content,
         filename=filename,
         mime_type=file.content_type or "application/octet-stream",
         kind=kind,
     )
 
-    store = make_object_store(get_settings())
+    store = await asyncio.to_thread(make_object_store, get_settings())
     object_key = (
         f"users/{project.owner_id}/projects/{project.id}/assets/"
         f"{uuid.uuid4()}-{_safe_name(filename)}"
     )
-    store.put(object_key, content)
+    await asyncio.to_thread(store.put, object_key, content)
 
     payload = dict(parsed.parsed)
     if parsed.kind == "figure":
@@ -215,7 +194,7 @@ async def download_asset(project_id: str, asset_id: str, session: SessionDep) ->
     asset = await get_asset(session, asset_uuid)
     if asset is None or asset.project_id != project.id or not asset.object_key:
         raise HTTPException(status_code=404, detail="asset not found")
-    store = make_object_store(get_settings())
+    store = await asyncio.to_thread(make_object_store, get_settings())
     try:
         data = store.get(asset.object_key)
     except (FileNotFoundError, ValueError) as error:

@@ -1,0 +1,65 @@
+{
+  "kind": "infrastructure_fixture_not_real_agent_or_llm",
+  "resource_profile": "container-limited",
+  "streams_per_job": 5,
+  "works_per_project": 40,
+  "submit_interval_seconds": 0,
+  "read_mix": [
+    "project",
+    "library",
+    "jobs"
+  ],
+  "at": "2026-09-16T12:18:18.680160+00:00",
+  "seconds": 121.01263878401369,
+  "accounts": 100,
+  "active_users": 30,
+  "job_fixture_seconds": "10",
+  "request_count": 2912,
+  "request_per_second": 24.06360219280408,
+  "http_statuses": {
+    "200": 2892,
+    "202": 20
+  },
+  "latency_seconds": {
+    "p50": 0.23016721988096833,
+    "p95": 0.5947991299908608,
+    "p99": 0.8287732440512627
+  },
+  "sampled_running_peak": 8,
+  "sampled_queued_peak": 16,
+  "job_failure_ratio": 0.0,
+  "accepted_jobs": 20,
+  "completed_jobs": 20,
+  "job_states": {
+    "b4b42c38-d8a0-4a7e-b15b-e68ba600cc1f": "succeeded",
+    "23db09ac-d302-4083-8602-3f203fedbedf": "succeeded",
+    "e2bbca56-98c3-40fb-8c81-1f855ccf90b9": "succeeded",
+    "e13ead37-bd0b-42f1-a43a-3fff4fcd4dcf": "succeeded",
+    "1a3afe9a-0f0a-462a-973c-dc66a09360e3": "succeeded",
+    "1d1ba906-a997-412c-ab1f-ce40b12d4d69": "succeeded",
+    "33ec3031-6580-477a-8c07-e5be55755deb": "succeeded",
+    "ca30dd82-af67-4b73-a772-3ccc92173a23": "succeeded",
+    "4f94dc04-ee42-4814-ae6a-dfd4efe74a4b": "succeeded",
+    "0a19f494-49d8-4193-b991-407e125f84e0": "succeeded",
+    "06804ead-0be8-47b7-96fc-85b262579776": "succeeded",
+    "4d4016f6-f9d7-456b-a796-2938dfe798e5": "succeeded",
+    "2ea72203-4560-4ffe-8977-be8f1348910d": "succeeded",
+    "0cca88e0-53bd-4d40-9c00-024851444118": "succeeded",
+    "fb664112-9d11-45c1-93d2-1eafcaf379af": "succeeded",
+    "04794464-5d17-4282-9e51-974022ccde1d": "succeeded",
+    "9abdd353-339a-4b62-9c11-b2e8afaba402": "succeeded",
+    "fb5ca889-d009-40a6-9bb0-63f803ba63ba": "succeeded",
+    "e7207394-fd86-475b-8f20-b908cf897d7c": "succeeded",
+    "0ad32851-5788-45cb-bf92-229cc2a32d00": "succeeded"
+  },
+  "observed_completions_per_hour": 594.9791750968042,
+  "queue_wait_seconds": {
+    "p50": 11.587844,
+    "p95": 25.066883,
+    "max": 25.114847
+  },
+  "sse_peak": 100,
+  "sse_unique_events_received": 600,
+  "sse_errors": [],
+  "failure_ratio": 0.0
+}

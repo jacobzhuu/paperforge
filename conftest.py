@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import uuid
 from collections.abc import AsyncIterator
 
@@ -27,6 +28,7 @@ DEFAULT_TEST_DATABASE_URL = (
 # provider 凭据则让 *_configured 断言翻车。CI 没有 .env，所以这类问题在 CI 上
 # 永远不会暴露，只砸本地。需要验证生产配置的用例自己 monkeypatch 覆盖即可。
 _DEPLOYMENT_ENV_DEFAULTS = {
+    "JOB_DISPATCH_ENABLED": "false",
     "AUTH_COOKIE_SECURE": "false",
     "AUTH_DEV_LOGIN_ENABLED": "true",
     "AUTH_EMAIL_MODE": "file",
@@ -60,6 +62,14 @@ def isolate_deployment_env(
     for name, value in _DEPLOYMENT_ENV_DEFAULTS.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("STORAGE_FS_ROOT", str(tmp_path / "objects"))
+    # API tests inject their queue dependency; lifespan must not contact a real
+    # deployment Redis or sleep through ARQ's connection retries.
+    async def no_live_queue(_settings):
+        return None
+
+    api_main = sys.modules.get("paperforge_api.main")
+    if api_main is not None:
+        monkeypatch.setattr(api_main, "create_arq_pool", no_live_queue)
     # 开发机可能通过 SOCKS 代理联网，而最小测试依赖没有安装 httpx[socks]。
     # 单元/集成测试使用本地替身，不应继承宿主代理；否则连一个请求都没发就初始化失败。
     for name in _PROXY_ENV_NAMES:

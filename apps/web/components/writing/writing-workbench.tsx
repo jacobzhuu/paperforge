@@ -127,6 +127,9 @@ const SECTION_STATUS: Record<PaperSection['status'], { label: string; variant: '
   generated: { label: '已生成', variant: 'muted' },
   edited: { label: '已编辑', variant: 'secondary' },
   approved: { label: '已定稿', variant: 'success' },
+  // 写作降级留下的缺口：这一节没有正文，只有一句说明。必须和「已生成」看得出区别，
+  // 否则用户要读完整节才发现它是空的。
+  needs_rewrite: { label: '待重写', variant: 'secondary' },
 };
 
 /** 本地草稿键：崩溃或误关标签页后能恢复。 */
@@ -752,6 +755,10 @@ export function WritingWorkbench() {
         }
       />
 
+      {writing && sections.length > 0 && (
+        <p role="status" className="text-sm text-muted-foreground">已生成 {sections.length} 节，后续章节会自动出现。正在编辑的内容会保留，请使用「保存本节」保存修改。</p>
+      )}
+
       {outlineModule.data?.stale && (
         <Callout variant="warning" className="flex flex-wrap items-center justify-between gap-3">
           <span>证据矩阵与综合判定已更新，当前正文仍基于旧大纲。</span>
@@ -764,30 +771,6 @@ export function WritingWorkbench() {
             按最新证据重建草稿
           </Button>
         </Callout>
-      )}
-
-      {/* 视觉列表失败不能让正文编辑器消失：它只是正文旁边的一条辅助信息。 */}
-      {!focusMode && (
-        <>
-          <ModuleError
-            label="视觉建议"
-            error={visualsModule.error}
-            onRetry={visualsModule.reload}
-          />
-          {!visualsModule.error && (
-            <VisualSuggestionsPanel
-              projectId={projectId}
-              controller={visualsModule}
-              sections={sections}
-              activeSectionKey={activeKey}
-              busy={busy}
-              onSuggest={startVisualSuggestions}
-              onApprove={approveVisualIntoPaper}
-              onEdit={setEditingVisual}
-              onRequestGenerate={requestVisualGeneration}
-            />
-          )}
-        </>
       )}
 
       <LoadState
@@ -1065,6 +1048,30 @@ export function WritingWorkbench() {
           />
         )}
       </React.Suspense>
+
+      {/* 视觉列表失败不能让正文编辑器消失：它只是正文旁边的一条辅助信息。 */}
+      {!focusMode && (
+        <>
+          <ModuleError
+            label="视觉建议"
+            error={visualsModule.error}
+            onRetry={visualsModule.reload}
+          />
+          {!visualsModule.error && (
+            <VisualSuggestionsPanel
+              projectId={projectId}
+              controller={visualsModule}
+              sections={sections}
+              activeSectionKey={activeKey}
+              busy={busy}
+              onSuggest={startVisualSuggestions}
+              onApprove={approveVisualIntoPaper}
+              onEdit={setEditingVisual}
+              onRequestGenerate={requestVisualGeneration}
+            />
+          )}
+        </>
+      )}
 
       <WorkbenchFooterNav current="write" />
     </div>

@@ -151,7 +151,7 @@ function normalizeRuns(runs: IRRun[]): IRRun[] {
       continue;
     }
     if (run.t === 'xref' && run.target) {
-      out.push({ t: 'xref', target: run.target, kind: 'figure' });
+      out.push({ t: 'xref', target: run.target, kind: run.kind ?? 'figure' });
     }
   }
   return out;
@@ -323,7 +323,7 @@ function nodeToRun(node: TiptapNode): IRRun | null {
   }
   if (node.type === XREF_NODE) {
     const target = String(node.attrs?.target ?? '');
-    return target ? { t: 'xref', target, kind: 'figure' } : null;
+    return target ? { t: 'xref', target, kind: node.attrs?.kind === 'equation' ? 'equation' : 'figure' } : null;
   }
   return null;
 }

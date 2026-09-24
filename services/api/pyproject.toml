@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "PaperForge FastAPI 服务：REST + SSE"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.121",
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.3",
     "paperforge-observability",

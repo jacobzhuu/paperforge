@@ -140,3 +140,45 @@ async def test_another_project_s_calls_are_not_counted(session):
     await _call(session, other, cost_estimate=99.0)
 
     assert (await project_llm_cost(session, project.id))["call_count"] == 0
+
+
+async def test_the_request_shape_survives_a_round_trip(session):
+    """请求侧的形状要真的落库：诊断靠的是这几列，不是内存里的记录对象。"""
+    project = await _project(session)
+    row = await _call(
+        session,
+        project,
+        max_output_tokens=8000,
+        finish_reason="length",
+        prompt_sha256="a" * 64,
+        prompt_chars=4321,
+        output_chars=0,
+    )
+    await session.flush()
+    session.expunge(row)
+
+    stored = await session.get(type(row), row.id)
+    assert stored.max_output_tokens == 8000
+    assert stored.finish_reason == "length"
+    assert stored.prompt_sha256 == "a" * 64
+    assert stored.prompt_chars == 4321
+    assert stored.output_chars == 0
+
+
+async def test_an_old_worker_can_still_write_without_the_new_columns(session):
+    """蓝绿部署下正在排空的旧 worker 会省略这几列——那必须仍然是一次合法 INSERT。
+
+    0020 之所以存在，就是因为这张表上一次加列时丢掉了 server default，
+    正在排空的旧 worker 当场开始失败。
+    """
+    project = await _project(session)
+    row = await _call(session, project)
+    await session.flush()
+
+    assert row.max_output_tokens is None
+    assert row.finish_reason is None
+    assert row.prompt_sha256 is None
+    assert row.prompt_chars is None
+    assert row.output_chars is None
+    # 记账本身照旧完整。
+    assert row.cost_estimate == 0.25

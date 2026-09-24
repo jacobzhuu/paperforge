@@ -3,13 +3,38 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from paperforge_worker import worker
 
 
+@pytest.fixture(autouse=True)
+def _no_anchor_lookups(monkeypatch):
+    """这一组测试断言的是收敛**控制流**，不是锚点计数。
+
+    真实的 `_unresolved_anchor_counts` 要连库、并把 report_id 当 UUID 解析，而这里的
+    报告是 SimpleNamespace、id 是 "worse-1" 之类的字符串。故意**不**放宽那边的解析：
+    一个解析不了的 report_id 在生产里是真的出问题了，不该被静默吞掉。
+    """
+
+    async def _none(_context, _report):
+        return {}
+
+    monkeypatch.setattr(worker, "_unresolved_anchor_counts", _none)
+
+
 class _Context:
-    def __init__(self) -> None:
+    def __init__(self, *, quality_repair_rounds: int = 2) -> None:
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.warnings: list[tuple[str, str, dict[str, Any]]] = []
+        # 轮数现在来自部署配置（QUALITY_REPAIR_ROUNDS）；默认值就是原先写死的 2，
+        # 所以这些用例断言的行为不变。
+        # writer_repair_concurrency 是修复轮章节重写的波宽。它必须在这里出现：
+        # 缺字段会在 `_converge_scholarly_quality` 的 try 里抛 AttributeError，
+        # 被那层兜底吞成「这一轮修复失败」——测试于是绿着跑，却什么都没测到。
+        self.settings = SimpleNamespace(
+            quality_repair_rounds=quality_repair_rounds,
+            writer_repair_concurrency=1,
+        )
 
     async def emit(self, event: str, payload: dict[str, Any], **_kwargs: Any) -> None:
         self.events.append((event, payload))
@@ -71,6 +96,8 @@ async def test_quality_convergence_stops_as_soon_as_the_gate_passes(monkeypatch)
             "before": 2,
             "after": 0,
             "accepted": True,
+            "rolled_back": [],
+            "regressed_kept": [],
             "sections": ["s4"],
             "report_id": "passed",
             "readiness_status": "preflight_ready",
@@ -218,8 +245,150 @@ def test_repair_candidate_cannot_improve_by_deleting_the_review_core() -> None:
         ],
     )
 
+    # 计数确实变小了——正是这一点让「数目标函数」这条路单独不够用：把综述核心删掉
+    # 也能让计数变小。退化码的判定必须独立于计数，所以它拆成了自己的谓词。
     assert worker._blocker_instances(degenerated) < worker._blocker_instances(previous)
-    assert worker._repair_candidate_improves(previous, degenerated) is False
+    assert worker._introduces_degeneration(previous, degenerated) is True
+
+
+def test_improvement_counts_the_anchors_that_triggered_the_repair() -> None:
+    """修好锚点必须算改善——否则修复轮是在为一个它动不了的计数付钱。
+
+    生产实测（项目 aaa9a5b1，2026-09-06）：可计数的发现项恒为 1，而触发重写的是 56 条
+    未定位锚点。只数发现项时 `1 < 1` 永远为假，两轮 29 次重写全部回滚，37 分钟白跑。
+    """
+    previous = SimpleNamespace(
+        readiness_status="needs_revision",
+        blockers=[{"code": "original_claim_source_missing", "count": 1}],
+    )
+    candidate = SimpleNamespace(
+        readiness_status="needs_revision",
+        blockers=[{"code": "original_claim_source_missing", "count": 1}],
+    )
+
+    # 发现项没变，只数它就看不见任何进展——这正是旧行为。
+    assert worker._repair_candidate_improves(previous, candidate) is False
+    # 锚点从 56 降到 36：这一轮确实修了东西，必须判为改善。
+    assert (
+        worker._repair_candidate_improves(
+            previous, candidate, previous_unresolved=56, candidate_unresolved=36
+        )
+        is True
+    )
+    # 锚点变多则不是改善。
+    assert (
+        worker._repair_candidate_improves(
+            previous, candidate, previous_unresolved=36, candidate_unresolved=56
+        )
+        is False
+    )
+
+
+async def test_only_the_worsened_sections_are_rolled_back(monkeypatch) -> None:
+    """按节结算：改善和持平的留下，只有变差的退回。
+
+    旧行为是全有全无——9 个章节里 8 个改好了、1 个没改好，整轮一起退回。
+    """
+    context = _Context()
+    restored: list[dict[str, Any]] = []
+
+    async def current_state(_context):
+        return {"s1": "rewritten", "s2": "rewritten", "s3": "rewritten"}
+
+    async def restore(_context, value):
+        restored.append(value)
+
+    monkeypatch.setattr(worker, "snapshot_document_sections", current_state)
+    monkeypatch.setattr(worker, "restore_document_sections", restore)
+
+    rolled = await worker._roll_back_worsened_sections(
+        context,
+        snapshot={"s1": "old-1", "s2": "old-2", "s3": "old-3"},
+        before={"s1": 5, "s2": 5, "s3": 5},
+        after={"s1": 2, "s2": 5, "s3": 9},   # 改善 / 持平 / 变差
+    )
+
+    assert rolled == ["s3"]
+    # 传给 restore 的必须是**完整**快照：restore_document_sections 会删掉快照里没有的
+    # 章节，过滤过的快照会把要保留的 s1/s2 一起删掉。
+    assert restored == [{"s1": "rewritten", "s2": "rewritten", "s3": "old-3"}]
+
+
+async def test_a_section_lost_by_the_rewrite_is_restored_not_dropped(monkeypatch) -> None:
+    """重写把某一节整个弄丢时，它不在「现状」里，也就不会被判为变差——必须补回来。"""
+    context = _Context()
+    restored: list[dict[str, Any]] = []
+
+    async def current_state(_context):
+        return {"s1": "rewritten"}   # s2 没了
+
+    async def restore(_context, value):
+        restored.append(value)
+
+    monkeypatch.setattr(worker, "snapshot_document_sections", current_state)
+    monkeypatch.setattr(worker, "restore_document_sections", restore)
+
+    await worker._roll_back_worsened_sections(
+        context,
+        snapshot={"s1": "old-1", "s2": "old-2"},
+        before={"s1": 5},
+        after={"s1": 9},
+    )
+
+    assert restored == [{"s1": "old-1", "s2": "old-2"}]
+
+
+async def test_a_rejected_candidate_is_never_left_live_when_no_section_regressed(
+    monkeypatch,
+) -> None:
+    """按节回滚是优化，不是新的安全边界。
+
+    退步来自**报告级**阻断项时，没有任何单一章节的锚点数会变差，于是按节路径算出
+    「一节都不用退」。若就此收手，一份已经判定为更差的稿子会留在库里——这正是引入
+    按节回滚时差点放进去的回归。不变量是：accepted=False 就绝不能留在库里。
+    """
+    context = _Context(quality_repair_rounds=1)   # 只测一轮的结算，不测收敛
+    restores: list[dict[str, Any]] = []
+
+    async def failing_sections(_context, _report):
+        return {"s1"}
+
+    async def snapshot(_context):
+        return {"s1": "old-1"}
+
+    async def repair(_context, **_kwargs):
+        return None
+
+    async def restore(_context, value):
+        restores.append(value)
+
+    # 候选的阻断项**变多**（1 → 3），而锚点计数两边都空：归因不到任何章节。
+    quality_results = iter([_report(3, report_id="worse")])
+
+    async def quality(_context, **_kwargs):
+        return next(quality_results)
+
+    async def republish(_context, report, **_kwargs):
+        return report
+
+    monkeypatch.setattr(worker, "_quality_failing_sections", failing_sections)
+    monkeypatch.setattr(worker, "snapshot_document_sections", snapshot)
+    monkeypatch.setattr(worker, "repair_document_sections", repair)
+    monkeypatch.setattr(worker, "restore_document_sections", restore)
+    monkeypatch.setattr(worker, "_quality", quality)
+    monkeypatch.setattr(worker, "_republish_after_rollback", republish)
+
+    _final, history = await worker._converge_scholarly_quality(
+        context,
+        initial_report=_report(1, report_id="initial"),
+        language="en",
+        paper_type="original",
+        review_style="narrative",
+    )
+
+    assert history[0]["accepted"] is False
+    assert restores, "被拒的候选必须回滚，哪怕没有一个章节的锚点计数变差"
+    assert history[0]["rolled_back"] == ["s1"]
 
 
 def test_manual_confirmation_only_skips_repair_when_the_source_is_located() -> None:
@@ -351,3 +520,24 @@ async def test_republish_after_rollback_refuses_when_the_body_does_not_match(mon
     assert result is None
     assert published == []
     assert report.report_id == "best-so-far"
+
+
+async def test_user_pause_is_not_swallowed_by_quality_repair(monkeypatch):
+    from paperforge_worker.context import JobStopped
+
+    async def failing(*args):
+        return {"s1"}
+
+    async def snapshot(*args):
+        return {"s1": "original"}
+
+    async def stopped(*args, **kwargs):
+        raise JobStopped("pause")
+
+    monkeypatch.setattr(worker, "_quality_failing_sections", failing)
+    monkeypatch.setattr(worker, "snapshot_document_sections", snapshot)
+    monkeypatch.setattr(worker, "repair_document_sections", stopped)
+    with pytest.raises(JobStopped):
+        await worker._converge_scholarly_quality(
+            _Context(), initial_report=_report(1), language="en",
+            paper_type="review", review_style="narrative")

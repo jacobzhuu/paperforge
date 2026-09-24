@@ -1,3 +1,5 @@
+import re
+
 from latex_render import latex_escape, render_body
 from paper_ir.schema import (
     CiteRun,
@@ -417,8 +419,130 @@ def test_inline_literature_matrix_renders_without_external_asset():
     assert "Evidence matrix" in latex
     assert "Located full text" in latex
     assert "\\todo{" not in latex
-    assert "p{0.277\\linewidth}" in latex
     assert "\\begin{longtable}" in latex
+    # 内容驱动的列宽：``Evidence`` 那一列的文字长得多，就该分到更多版面。
+    study, evidence = _column_fractions_in(latex)
+    assert evidence > study
+    # 两列表曾各自顶到 0.34 的固定上限，白白空掉三分之一的版心。
+    assert study + evidence > 0.9
+
+
+def _column_fractions_in(latex: str) -> list[float]:
+    return [float(value) for value in re.findall(r"p\{([0-9.]+)\\linewidth\}", latex)]
+
+
+def test_column_widths_follow_content_and_fit_the_line():
+    """六列文献矩阵曾把 0.117\\linewidth 平均分给「未报告」和 60 字的标题列。
+
+    结果是每行被撑成七八行高、16 行的表排了 5 页。列宽必须按内容需求分配，
+    且连同列间距一起不超过一个 \\linewidth。
+    """
+    from paper_ir.schema import TableBlock, TableSource
+
+    headers = ["Study", "Task", "Method", "Metric", "Grade", "Locator"]
+    rows = [
+        [
+            "Self-Supervised Learning for Few-shot Image Classification",
+            "Not reported",
+            "Contrastive pre-training with a frozen encoder and linear probe",
+            "Not structured",
+            "Located prose",
+            "§Method p2",
+        ]
+    ] * 16
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="synthesis",
+                title="Synthesis",
+                blocks=[
+                    TableBlock(
+                        caption="Matrix",
+                        source=TableSource(
+                            kind="inline", data={"headers": headers, "rows": rows}
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    latex = render_body(ir, {})
+    fractions = _column_fractions_in(latex)
+    assert len(fractions) == 6
+    study, task, method, metric, _grade, _locator = fractions
+    assert study > task and method > metric
+    # 6pt 的列间距共占 5 × 0.0132 ≈ 0.066，正文列必须给它留出余量。
+    assert 0.85 < sum(fractions) < 0.94
+    assert min(fractions) >= 0.07
+    assert "\\setlength{\\tabcolsep}{3pt}" in latex
+    # 列多的表降一档字号，进一步缓解宽度压力。
+    assert "\\footnotesize" in latex
+
+
+def test_wide_tables_never_use_a_package_no_template_loads():
+    """渲染器一度对 5 列以上的双栏表格发 ``tabularx``——没有任何模板加载它。
+
+    运行时无外网，缺了宏包就是 ``Environment tabularx undefined``，
+    IEEE 模板下带宽表的论文因此 100%% 编译失败。
+    """
+    from paper_ir.schema import TableBlock, TableSource
+
+    rows = [[f"r{index}"] * 6 for index in range(3)]
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="s",
+                title="S",
+                blocks=[
+                    TableBlock(
+                        caption="Wide",
+                        source=TableSource(
+                            kind="inline", data={"headers": list("ABCDEF"), "rows": rows}
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    for twocolumn in (False, True):
+        latex = render_body(ir, {}, twocolumn=twocolumn)
+        assert "tabularx" not in latex
+    # IEEE 正文栏只有 ~8.8cm，六列摊下来每列不到 1.5cm——实测每页几十个
+    # Overfull hbox。放不下的表必须跨栏；`\linewidth` 在 `table*` 里等于
+    # `\textwidth`，按 `\linewidth` 算的列宽照常成立。
+    wide = render_body(ir, {}, twocolumn=True)
+    assert "\\begin{table*}" in wide and "\\end{table*}" in wide
+    # 单栏文档没有跨栏这回事，绝不能借这条路把表推去页顶/浮动页。
+    assert "table*" not in render_body(ir, {}, twocolumn=False)
+
+
+def test_narrow_two_column_tables_stay_inside_their_column():
+    """跨栏是给放不下的表的出口，不是所有表的默认——带星浮动体只能上页顶。"""
+    from paper_ir.schema import TableBlock, TableSource
+
+    ir = PaperIR(
+        meta=PaperMeta(title="T"),
+        sections=[
+            Section(
+                key="s",
+                title="S",
+                blocks=[
+                    TableBlock(
+                        caption="Narrow",
+                        source=TableSource(
+                            kind="inline",
+                            data={"headers": ["A", "B"], "rows": [["1", "2"]]},
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+    latex = render_body(ir, {}, twocolumn=True)
+    assert "\\begin{table}" in latex
+    assert "table*" not in latex
 
 
 def test_six_column_longtable_reserves_intercolumn_spacing_and_keeps_all_rows():
@@ -443,7 +567,9 @@ def test_six_column_longtable_reserves_intercolumn_spacing_and_keeps_all_rows():
         ],
     )
     latex = render_body(ir, {})
-    assert "p{0.200\\linewidth}" in latex
+    fractions = _column_fractions_in(latex)
+    assert len(fractions) == 6
+    assert sum(fractions) < 1.0
     assert "Study 44" in latex
 
 

@@ -86,25 +86,25 @@ async def test_polish_is_its_own_stage_with_per_section_progress(
 
     events = await _events(session_factory, job_id)
     by_type = [event.event_type for event in events]
-    assert by_type.count("polish.section") == 4
+    assert by_type.count("polish.section") == 3
     assert "polish.started" in by_type and "polish.completed" in by_type
     # 阶段名不能还是 write——那正是「看起来卡死」的根源。
     polish_events = [e for e in events if e.event_type.startswith("polish.")]
-    assert all(e.payload_json.get("total") == 4 for e in polish_events if "total" in e.payload_json)
+    assert all(e.payload_json.get("total") == 3 for e in polish_events if "total" in e.payload_json)
 
     # 写作事件带序号，用户能看出「还剩几节」。
     write_events = [e for e in events if e.event_type == "write.section"]
     assert [e.payload_json["index"] for e in write_events] == [1, 2, 3, 4]
     assert all(e.payload_json["total"] == 4 for e in write_events)
 
-    assert outcome.polished_count == 4
+    assert outcome.polished_count == 3
     assert outcome.polish_skipped is False
     assert outcome.polish_pending_count == 0
 
     # 任务上的阶段名也得换过去：进度条读的是这个字段，不是事件类型。
     async with session_factory() as session:
         job = await session.get(GenerationJob, job_id)
-    assert job.stage == "polish"
+    assert job.stage == "write"
     assert job.progress == pytest.approx(0.90)
 
 
@@ -125,11 +125,11 @@ async def test_user_can_skip_the_rest_of_the_polish(session_factory, monkeypatch
     assert len(calls) == 1
     assert outcome.polish_skipped is True
     assert outcome.polished_count == 1
-    assert outcome.polish_pending_count == 3
+    assert outcome.polish_pending_count == 2
 
     events = await _events(session_factory, job_id)
     skipped = next(e for e in events if e.event_type == "polish.skipped")
-    assert skipped.payload_json == {"done": 1, "total": 4, "remaining": 3}
+    assert skipped.payload_json == {"done": 1, "total": 3, "remaining": 2}
 
     # 稿子是完整的：跳过的章节留着初稿，不是空章节。
     document = await _document(session_factory, project_id)

@@ -751,7 +751,7 @@ function QualityTab({
       {report.soft_check.length > 0 && (
         <section>
           <header className="pb-2">
-            <h3 className="text-body">语义引用软校验（弱相关）</h3>
+            <h3 className="text-body">语义引用软校验（弱相关 / 未核验）</h3>
           </header>
           <div className="space-y-1.5 text-meta">
             {report.soft_check.map((finding, index) => (
@@ -1115,6 +1115,37 @@ function EvidenceReviewList({
                   <blockquote className="line-clamp-4 rounded-md bg-muted/50 p-3 leading-relaxed text-muted-foreground">
                     {anchor.evidence_excerpt}
                   </blockquote>
+                )}
+
+                {anchor.entailment_verdict && (
+                  <div className="space-y-1.5 rounded-md border bg-muted/20 p-3">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Badge
+                        variant={
+                          anchor.entailment_verdict === 'supported'
+                            ? 'success'
+                            : anchor.entailment_verdict === 'partial' ||
+                                anchor.entailment_verdict === 'uncertain'
+                              ? 'warning'
+                              : 'destructive'
+                        }
+                      >
+                        语义核验：{anchor.entailment_verdict}
+                      </Badge>
+                      {anchor.entailment_confidence !== null &&
+                        anchor.entailment_confidence !== undefined && (
+                          <span className="text-muted-foreground">
+                            置信度 {(anchor.entailment_confidence * 100).toFixed(0)}%
+                          </span>
+                        )}
+                      {anchor.entailment_cached && <Badge variant="muted">缓存复用</Badge>}
+                    </div>
+                    {anchor.entailment_reason && (
+                      <p className="leading-relaxed text-muted-foreground">
+                        {anchor.entailment_reason}
+                      </p>
+                    )}
+                  </div>
                 )}
 
                 {errors[anchor.id] && (

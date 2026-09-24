@@ -30,6 +30,7 @@ from db.models.library import (
 )
 from db.models.paper import (
     CitationUsage,
+    ClaimEntailmentCache,
     ClaimEvidenceAnchor,
     ExportArtifact,
     GenerationJob,
@@ -52,14 +53,25 @@ from db.models.paper import (
     VisualGenerationAttempt,
     VisualSourceAsset,
 )
+from db.models.web_research import (
+    McpDailyBudget,
+    McpToolInvocation,
+    WebResearchRun,
+    WebResearchSource,
+)
 
 __all__ = [
+    "McpDailyBudget",
+    "McpToolInvocation",
+    "WebResearchRun",
+    "WebResearchSource",
     "DOCUMENT_ACCESS_SCOPES",
     "LITERATURE_ROLES",
     "PDF_UPLOAD_STATUSES",
     "AppUser",
     "AuthActionToken",
     "CitationUsage",
+    "ClaimEntailmentCache",
     "ClaimEvidenceAnchor",
     "DocumentChunk",
     "DocumentFile",
@@ -101,3 +113,6 @@ __all__ = [
     "WorkUrl",
     "WorkVersionRelation",
 ]
+
+from db.models.research import CitationShadow, ResearchAnalysis  # noqa: F401
+from db.models.retrieval import EvidenceEmbedding  # noqa: F401

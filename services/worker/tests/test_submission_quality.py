@@ -493,6 +493,49 @@ def test_explicit_evidence_unit_drives_r4_grade_check() -> None:
     assert anchors[0]["support_status"] == "grade_not_permitted"
 
 
+def test_claim_anchor_keeps_located_alternatives_for_safe_negative_review() -> None:
+    selected_id, alternative_id = str(uuid.uuid4()), str(uuid.uuid4())
+    work_id = uuid.uuid4()
+    row = _row("The treatment significantly improved recovery.")
+    row.body_ir_json["blocks"][0]["runs"][1]["evidence_ids"] = [selected_id]
+
+    anchors = build_claim_evidence(
+        rows=[row],
+        evidence_sources={
+            "smith2020": {
+                "work_id": work_id,
+                "fulltext_used": True,
+                "quotable_points": [],
+            }
+        },
+        evidence_units={
+            selected_id: {
+                "id": selected_id,
+                "work_id": str(work_id),
+                "grade": "A_located_structured",
+                "text": "Figure 1. Overview of the treatment and recovery study.",
+                "object_ref": "fig:F1",
+                "measurements": [],
+            },
+            alternative_id: {
+                "id": alternative_id,
+                "work_id": str(work_id),
+                "grade": "B_located_prose",
+                "text": "The treatment significantly improved recovery in the study cohort.",
+                "section_path": "Results",
+                "paragraph_index": 4,
+                "measurements": [],
+            },
+        },
+    )
+
+    assert anchors[0]["evidence_unit_id"] == selected_id
+    alternatives = anchors[0]["_verification_alternatives"]
+    assert len(alternatives) == 1
+    assert alternatives[0]["evidence_unit_id"] == alternative_id
+    assert alternatives[0]["source_section"] == "Results"
+
+
 def test_r6_numeric_claim_requires_page_or_structured_object() -> None:
     evidence_id = str(uuid.uuid4())
     work_id = uuid.uuid4()
@@ -728,3 +771,93 @@ def test_original_asset_audit_rejects_a_value_attached_to_the_wrong_metric() -> 
         },
     )
     assert anchors[0]["support_status"] == "asset_numeric_context_mismatch"
+
+
+def _reference(key: str, title: str) -> tuple[SimpleNamespace, SimpleNamespace]:
+    return (
+        SimpleNamespace(bibtex_key=key),
+        SimpleNamespace(canonical_title=title, publication_year=2024),
+    )
+
+
+def test_a_bibtex_key_collision_is_reported_as_a_suspected_duplicate() -> None:
+    """`make_bibtex_key`'s `a` suffix means author, year and keyword all matched.
+
+    That signal used to be spent silently, so one manuscript shipped the LoRec
+    paper twice as `zhang2024lorec` and `zhang2024loreca`.
+    """
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference("zhang2024lorec", "LoRec: Combating Poisons with Large Language Model"),
+            _reference("zhang2024loreca", "LoRec: Large Language Model for Robust Recommendation"),
+        ],
+    )
+    duplicates = [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+    assert len(duplicates) == 1
+    assert set(duplicates[0]["keys"]) == {"zhang2024lorec", "zhang2024loreca"}
+
+
+def test_near_identical_titles_are_reported_even_without_a_key_collision() -> None:
+    """DARTS and DV-FSR have different keys and different years, so dedupe keeps
+    both — but the manuscript then compared the framework with itself."""
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference(
+                "qin2025darts",
+                "DARTS: A Dual-View Attack Framework for Targeted Manipulation "
+                "in Federated Sequential Recommendation",
+            ),
+            _reference(
+                "qin2024fsr",
+                "DV-FSR: A Dual-View Target Attack Framework for Federated "
+                "Sequential Recommendation",
+            ),
+        ],
+    )
+    duplicates = [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+    assert len(duplicates) == 1
+    assert duplicates[0]["basis"] == "title_similarity"
+
+
+def test_distinct_references_raise_no_duplicate_warning() -> None:
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=_project(),
+        whitelist={"smith2020"},
+        search_runs=[],
+        references=[
+            _reference("zhang2020practical", "Practical Data Poisoning Attack against Next-Item"),
+            _reference("zhao2025diversity", "Diversity-aware Dual-promotion Poisoning Attack"),
+        ],
+    )
+    assert not [w for w in report.warnings if w["code"] == "duplicate_reference_suspected"]
+
+
+def test_a_review_with_too_few_references_is_flagged() -> None:
+    row = _row("A background sentence.")
+    report = _report(row, [])
+    apply_readiness_gate(
+        report,
+        rows=[row],
+        project=SimpleNamespace(**{**vars(_project()), "paper_type": "review"}),
+        whitelist={"smith2020"},
+        search_runs=[],
+    )
+    assert any(item["code"] == "library_undersized" for item in report.warnings)

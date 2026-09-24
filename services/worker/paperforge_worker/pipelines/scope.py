@@ -57,7 +57,10 @@ _SYSTEM_PROMPT_ZH = """你是科研文献调研的规划助手。根据论文主
 
 **keywords 必须全部是英文检索词**（name 与其余叙述字段用中文）。
 eligibility_criteria 至少给出“研究领域”和“核心主题”两组英文锚点；组内任一词命中即可，
-但两组都必须命中才可自动纳入。exclusion_domains 只列明确离题领域。
+但两组都必须命中才可自动纳入。锚点必须有区分度：用 poisoning attack、sequential
+recommendation 这样的专指短语，不要用 robustness、defense、performance、model 这类
+几乎每篇论文摘要都有的通用词——一个通用词会让整组形同虚设。
+exclusion_domains 只列明确离题领域。
 检索面向的是 OpenAlex / arXiv / Crossref / Europe PMC，
 它们只索引英文题录：中文检索词几乎必然零召回，或召回完全无关的中文期刊文献。
 请把主题翻译成该领域论文实际使用的英文术语，例如
@@ -101,7 +104,10 @@ cross-language evidence routing; put English dataset/metric names in comparison_
 
 **Every keyword must be English**, even when the topic is written in another language.
 Provide at least two eligibility anchor groups (domain and topic). A work must match at
-least one English term in every group to be auto-included.
+least one English term in every group to be auto-included. Anchor terms must discriminate:
+use specific phrases such as "poisoning attack" or "sequential recommendation", never
+generic words such as "robustness", "defense", "performance" or "model" that appear in
+almost every abstract — one of those makes its whole group a no-op.
 The providers behind this plan (OpenAlex / arXiv / Crossref / Europe PMC) index
 English metadata only, so non-English keywords either return
 nothing or return unrelated foreign-language articles. Translate the topic into the
@@ -167,7 +173,7 @@ async def generate_scope(
         "planner",
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        # 推理型 planner 模型（deepseek-v4-pro 等）把思维链算进 max_tokens，
+        # 推理型 planner 模型把思维链算进 max_tokens（GLM-5.3 系还关不掉思考），
         # 1500 只够想不够写：JSON 会在中途断掉，整个 SCOPE 静默退回确定性回退。
         max_output_tokens=3000,
         temperature=0.2,
@@ -298,6 +304,46 @@ def deterministic_scope(
     }
 
 
+#: Single words that appear in most machine-learning abstracts regardless of
+#: subject.  As an anchor term one of these silently turns its whole group into
+#: a pass: a review of *attacks* on sequential recommendation admitted a paper on
+#: multimodal LLM recommendation because "robustness" occurred in its abstract.
+#: Anchors have to discriminate; these do not.
+_GENERIC_ANCHOR_TERMS = frozenset(
+    {
+        "accuracy",
+        "algorithm",
+        "analysis",
+        "application",
+        "architecture",
+        "baseline",
+        "benchmark",
+        "dataset",
+        "deep learning",
+        "defense",
+        "efficiency",
+        "evaluation",
+        "experiment",
+        "framework",
+        "machine learning",
+        "method",
+        "model",
+        "network",
+        "neural network",
+        "optimization",
+        "performance",
+        "robustness",
+        "security",
+        "system",
+        "training",
+    }
+)
+
+
+def _is_generic_anchor(term: str) -> bool:
+    return term.casefold().strip() in _GENERIC_ANCHOR_TERMS
+
+
 def _normalize_eligibility_criteria(
     value: Any,
     *,
@@ -313,7 +359,9 @@ def _normalize_eligibility_criteria(
         terms = [
             term
             for raw in _as_list(item.get("terms"))[:12]
-            if (term := _clean_text(raw)) and _is_english_query(term)
+            if (term := _clean_text(raw))
+            and _is_english_query(term)
+            and not _is_generic_anchor(term)
         ]
         if name and terms:
             groups.append({"name": name, "terms": list(dict.fromkeys(terms))})

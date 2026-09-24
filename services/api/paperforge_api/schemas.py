@@ -123,15 +123,31 @@ class AcademicProfileResponse(BaseModel):
 
 PaperType = Literal["review", "original"]
 WritingMode = Literal["auto", "assisted"]
+ExecutionProfile = Literal["standard", "fast_draft"]
 Language = Literal["zh", "en"]
 CitationStyle = Literal["author_year", "gbt7714", "ieee", "apa"]
 EntryStatus = Literal["candidate", "selected", "excluded"]
 
 
+class IntakeOverrides(BaseModel):
+    paper_type: PaperType | None = None
+    language: Language | None = None
+    submission_target: str | None = Field(default=None, max_length=500)
+
+
+class IntakeRequest(BaseModel):
+    version: int = Field(ge=0)
+    topic: str | None = Field(default=None, max_length=20000)
+    answer: str | None = Field(default=None, max_length=10000)
+    overrides: IntakeOverrides = Field(default_factory=IntakeOverrides)
+
+
 class CreateProjectRequest(BaseModel):
+    intake: IntakeOverrides | None = None
     title: str
     paper_type: PaperType
     writing_mode: WritingMode = "auto"
+    execution_profile: ExecutionProfile = "standard"
     language: Language = "en"
     topic: str | None = None
     venue_template: str | None = None
@@ -158,12 +174,14 @@ class UpdateProjectRequest(BaseModel):
     language: Language | None = None
     citation_style: CitationStyle | None = None
     writing_mode: WritingMode | None = None
+    execution_profile: ExecutionProfile | None = None
     contribution_points: list[str] | None = None
     publication_title: str | None = None
     authors: list[str] | None = None
     author_details: list[AuthorDetail] | None = None
     keywords: list[str] | None = None
     metadata_confirmed: bool | None = None
+    web_research_enabled: bool | None = None
 
 
 class ProjectAttentionSummary(BaseModel):
@@ -190,10 +208,12 @@ class SubmissionReadinessResponse(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    intake: dict[str, Any] | None = None
     id: str
     title: str
     paper_type: str
     writing_mode: str
+    execution_profile: ExecutionProfile = "standard"
     language: str
     status: str
     venue_template: str | None = None
@@ -205,6 +225,7 @@ class ProjectResponse(BaseModel):
     author_details: list[AuthorDetail] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     metadata_confirmed: bool = False
+    web_research_enabled: bool = False
     library_count: int = 0
     section_count: int = 0
     created_at: datetime | None = None
@@ -453,12 +474,21 @@ class CostResponse(BaseModel):
     unpriced_call_count: int = 0
     # 为假时 cost_estimate 只是**下界**；界面必须照实说，不能显示成确定值。
     cost_complete: bool = True
+    # cost_estimate 的货币代码（来自部署的 LLM_PRICE_CURRENCY）。金额本身不换算，
+    # 界面据此选符号——把人民币印成 `$` 是这个字段唯一要防的事。
+    currency: str = "USD"
 
 
 # ---- M2：大纲 / 章节 / 引用审计 / 预览 ----
 
 
+class RebuildDependenciesRequest(BaseModel):
+    outline_id: uuid.UUID
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class OutlineResponse(BaseModel):
+    content_hash: str | None = None
     project_id: str
     outline_id: str | None = None
     version: int = 0
@@ -475,6 +505,7 @@ class UpdateOutlineRequest(BaseModel):
 
 class WriteRequest(BaseModel):
     coherence: bool = True
+    polish_policy: Literal["legacy", "full_parallel", "selective_parallel"] | None = None
 
 
 class SectionResponse(BaseModel):
@@ -948,6 +979,14 @@ class ClaimEvidenceResponse(BaseModel):
     support_status: str
     support_score: float | None = None
     manual_status: str = "unreviewed"
+    entailment_verdict: str | None = None
+    entailment_confidence: float | None = None
+    entailment_reason: str | None = None
+    entailment_model: str | None = None
+    entailment_verifier_version: str | None = None
+    entailment_cached: bool | None = None
+    entailment_review: dict[str, Any] | None = None
+    entailment_checked_at: datetime | None = None
 
 
 class ReviewClaimEvidenceRequest(BaseModel):
@@ -1060,6 +1099,7 @@ class DocumentVersionResponse(BaseModel):
     status: str
     section_count: int | None = None
     is_current: bool = False
+    paper_snapshot_hash: str | None = None
     created_at: datetime | None = None
 
 

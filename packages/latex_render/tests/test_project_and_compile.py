@@ -224,6 +224,95 @@ def test_long_single_column_table_compiles_across_pages_in_real_texd() -> None:
     assert "LASTROW" in text
 
 
+def test_article_loads_natbib_matched_to_its_bibliography_style() -> None:
+    """``plainnat`` 的 ``\\bibitem`` 带作者-年份标签，只有 natbib 读得懂。
+
+    少了 natbib，LaTeX 会把整个标签当引用打印出来：正文里出现
+    ``[Wang et al.(2023)Wang, Li, Zhang, and Chen]``，实测 124pt 的
+    Overfull hbox，直接溢出版心。数字风格则必须走 ``numbers``——
+    ``IEEEtran``/``unsrt`` 写的是无标签 ``\\bibitem``，在 authoryear 模式下
+    natbib 会报 "Bibliography not compatible with author-year citations"。
+    """
+    for style, bibstyle, expected in (
+        ("author_year", "plainnat", "authoryear"),
+        ("apa", "plainnat", "authoryear"),
+        ("ieee", "IEEEtran", "numbers"),
+        ("gbt7714", "unsrt", "numbers"),
+    ):
+        main = build_latex_project(
+            _ir(), references=[_ref()], template="article", citation_style=style
+        ).files["main.tex"]
+        assert f"\\bibliographystyle{{{bibstyle}}}" in main
+        assert "{natbib}" in main
+        assert expected in main.split("{natbib}")[0].rsplit("\\usepackage[", 1)[1]
+
+
+def test_article_cite_is_parenthetical_not_textual() -> None:
+    """渲染器只发 ``\\cite``，而 natbib 在 authoryear 下把它当 ``\\citet``。
+
+    PaperForge 的引用一律挂在句末，需要的是 ``(Wang et al., 2023)``，
+    不是 ``Wang et al. (2023)``。
+    """
+    main = build_latex_project(_ir(), references=[_ref()], template="article").files["main.tex"]
+    assert "\\AtBeginDocument{\\let\\cite\\citep}" in main
+
+
+def test_apa_uses_a_bibliography_style_that_is_actually_in_the_cache() -> None:
+    """``apalike`` 从没被任何预热文档拉过；texd 无外网，取不到就退回内联书目。"""
+    for name in TEMPLATES:
+        main = build_latex_project(
+            _ir(), references=[_ref()], template=name, citation_style="apa"
+        ).files["main.tex"]
+        assert "apalike" not in main
+
+
+def test_author_year_citations_stay_inside_the_page_in_real_texd() -> None:
+    texd_url = os.getenv("PAPERFORGE_TEST_TEXD_URL")
+    if not texd_url:
+        pytest.skip("set PAPERFORGE_TEST_TEXD_URL to run the real texd regression")
+
+    reference = _ref(
+        bibtex_key="wang2023survey",
+        title="A Survey of Contrastive Learning",
+        publication_year=2023,
+        citation_metadata={
+            "authors": [
+                {"author_name": name, "author_order": index}
+                for index, name in enumerate(
+                    ["Xiaoming Wang", "Hua Li", "Wei Zhang", "Jing Chen"], start=1
+                )
+            ]
+        },
+    )
+    ir = _ir()
+    ir.sections[0].blocks = [
+        ParagraphBlock(
+            runs=[TextRun(v="Contrastive learning works. "), CiteRun(keys=["wang2023survey"])]
+        )
+    ]
+    project = build_latex_project(
+        ir, references=[reference], template="article", citation_style="author_year"
+    )
+    client = TexdClient(texd_url)
+    try:
+        outcome = client.compile(project.files, entrypoint=project.entrypoint)
+    finally:
+        client.close()
+    assert outcome.ok, outcome.log
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(outcome.pdf or b""))
+    text = " ".join(" ".join((page.extract_text() or "").split()) for page in reader.pages)
+    # `\citep` 把作者-年份包进 hyperref 链接，pypdf 会在链接边界插空格
+    # （实测抽出来是 ``( Wang et al. , 2023)``），所以比对时把空白抹平。
+    squeezed = "".join(text.split())
+    assert "(Wangetal.,2023)" in squeezed
+    # 回归钉子：没有 natbib 时正文里会出现整条作者列表。
+    assert "Wangetal.(2023)Wang" not in squeezed
+    assert "Overfull" not in outcome.log
+
+
 def test_ieee_structured_authors_use_ieee_blocks() -> None:
     ir = _ir()
     ir.meta.author_details = [

@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 from db import (
     create_document,
+    document_snapshot_hash,
     get_writing_whitelist,
     invalidate_quality_reports_for_project,
     latest_document,
@@ -42,7 +43,7 @@ router = APIRouter(
     prefix="/api/v1", tags=["settings"], dependencies=[Depends(authorize_project_request)]
 )
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 ROLES = (
     "planner",
@@ -53,6 +54,7 @@ ROLES = (
     "writer",
     "polisher",
     "verifier",
+    "section_reviewer",
 )
 ROLE_DESCRIPTION = {
     "planner": "SCOPE / 大纲 / 主题聚类（中档，严格 JSON 校验 + 确定性回退）",
@@ -63,6 +65,7 @@ ROLE_DESCRIPTION = {
     "writer": "章节写作与连贯性 pass（最强档，结构化输出）",
     "polisher": "编辑器内润色 / 改写 / 学术语气（强档）",
     "verifier": "引用语义软校验、数字 lint 辅助（便宜，仅出提示）",
+    "section_reviewer": "语义评审：章节答没答上子问题、证据之间是什么关系（强档，关思考）",
 }
 
 
@@ -141,6 +144,9 @@ async def version_history(project_id: str, session: SessionDep) -> VersionHistor
         ).all()
     )
     current = await latest_document(session, project.id)
+    current_hash = (
+        document_snapshot_hash(await list_sections(session, current.id)) if current else None
+    )
     section_counts = {
         document_id: int(count)
         for document_id, count in (
@@ -172,6 +178,9 @@ async def version_history(project_id: str, session: SessionDep) -> VersionHistor
                 status=row.status,
                 section_count=section_counts.get(row.id),
                 is_current=current is not None and row.id == current.id,
+                paper_snapshot_hash=(
+                    current_hash if current is not None and row.id == current.id else None
+                ),
                 created_at=row.created_at,
             )
             for row in documents
@@ -313,7 +322,8 @@ async def cost_detail(project_id: str, session: SessionDep) -> dict[str, Any]:
     ).all()
     return {
         "project_id": str(project.id),
-        "totals": totals,
+        # 金额不换算，只带上它的货币代码——界面据此选符号，而不是假定美元。
+        "totals": {**totals, "currency": get_settings().llm_price_currency},
         "by_role": [
             {
                 "role": row[0],

@@ -13,6 +13,7 @@ import { PasswordField } from '@/components/auth/password-field';
 export default function RegisterPage() {
   const [form, setForm] = React.useState({ displayName: '', email: '', password: '', confirm: '' });
   const [error, setError] = React.useState('');
+  const [directLogin, setDirectLogin] = React.useState(false);
   const [sent, setSent] = React.useState(false);
   const [submitting, setSubmitting] = React.useState(false);
 
@@ -25,14 +26,15 @@ export default function RegisterPage() {
     setSubmitting(true);
     setError('');
     try {
-      await registerAccount({
+      const message = await registerAccount({
         email: form.email,
         password: form.password,
         display_name: form.displayName || undefined,
       });
+      setDirectLogin(message === "Registration complete. You can sign in.");
       setSent(true);
     } catch (cause) {
-      setError(cause instanceof ApiError && cause.code === 'weak_password' ? '密码至少需要 15 个字符，且不能使用常见弱密码。' : '暂时无法注册，请稍后重试。');
+      setError(cause instanceof ApiError && cause.code === 'weak_password' ? '密码至少需要 15 个字符，且不能使用常见弱密码。' : cause instanceof ApiError && cause.code === 'registration_not_allowed' ? '该邮箱暂未获准注册，请联系管理员。' : '暂时无法注册，请稍后重试。');
     } finally {
       setSubmitting(false);
     }
@@ -42,14 +44,14 @@ export default function RegisterPage() {
     <AuthPageShell>
       <Card className="auth-card">
         <CardHeader>
-          <CardTitle className="font-serif text-2xl leading-tight">{sent ? '检查邮箱' : '创建账户'}</CardTitle>
-          <CardDescription>{sent ? '验证后即可进入独立工作空间' : '每个账户的项目与文件相互隔离'}</CardDescription>
+          <CardTitle className="font-serif text-2xl leading-tight">{sent ? directLogin ? '注册完成' : '检查邮箱' : '创建账户'}</CardTitle>
+          <CardDescription>{sent ? directLogin ? '使用邮箱和密码即可登录' : '验证后即可进入独立工作空间' : '每个账户的项目与文件相互隔离'}</CardDescription>
         </CardHeader>
         <CardContent>
           {sent ? (
             <div className="space-y-4 text-sm text-muted-foreground">
-              <p>如果 <strong className="text-foreground">{form.email}</strong> 可以注册，我们已经发送了验证链接。链接将在 24 小时后失效。</p>
-              {process.env.NODE_ENV === 'development' && (
+              {directLogin ? <p>请使用 <strong className="text-foreground">{form.email}</strong> 和你设置的密码登录，无需邮件验证。若该邮箱已有账户，请使用原密码。</p> : <p>如果 <strong className="text-foreground">{form.email}</strong> 可以注册，我们已经发送了验证链接。链接将在 24 小时后失效。</p>}
+              {!directLogin && process.env.NODE_ENV === 'development' && (
                 <p className="rounded-md bg-muted px-3 py-2 text-xs leading-relaxed">
                   本地开发不会发送真实邮件；请打开项目 data/auth-outbox 目录中的最新验证文件。
                 </p>
