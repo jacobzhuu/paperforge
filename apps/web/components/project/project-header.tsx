@@ -1,12 +1,17 @@
 'use client';
 
+import * as React from 'react';
 import Link from 'next/link';
-import { BookOpen, ChevronLeft, FlaskConical } from 'lucide-react';
+import { BookOpen, ChevronLeft, FlaskConical, SlidersHorizontal } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { Dialog } from '@/components/ui/dialog';
+import { FastDraftToggle } from '@/components/ui/fast-draft-toggle';
 import { Skeleton } from '@/components/ui/skeleton';
-import { getSubmissionReadiness } from '@/lib/api';
+import { useToast } from '@/components/ui/toast';
+import { getSubmissionReadiness, updateProject } from '@/lib/api';
+import { describeError } from '@/lib/errors';
 import { CITATION_STYLE_LABEL, LANGUAGE_LABEL, PAPER_TYPE_LABEL, VENUE_TEMPLATES, WRITING_MODE_LABEL } from '@/lib/labels';
-import type { Project, SubmissionReadiness } from '@/lib/types';
+import type { Job, Project, SubmissionReadiness } from '@/lib/types';
 import { useAsyncModule } from '@/lib/useAsyncModule';
 import { ProjectTitle } from './project-title';
 
@@ -20,10 +25,17 @@ import { ProjectTitle } from './project-title';
 export function ProjectHeader({
   project,
   onRenamed,
+  onProfileChanged,
+  activeJob,
 }: {
   project: Project | undefined;
+  activeJob?: Job;
   onRenamed?: (title: string) => void;
+  onProfileChanged?: () => void;
 }) {
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [savingProfile, setSavingProfile] = React.useState(false);
+  const { toast } = useToast();
   const projectId = String(project?.id ?? '');
   const readinessModule = useAsyncModule<SubmissionReadiness | undefined>(
     (signal) =>
@@ -71,31 +83,54 @@ export function ProjectHeader({
       >
         <ChevronLeft className="h-3.5 w-3.5" /> 全部项目
       </Link>
-      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
-        {/* 论文题目是产品的中心对象（ui-design.md 原则 01）：serif，且可就地改名。 */}
-        <ProjectTitle
-          projectId={String(project.id)}
-          title={project.title}
-          onRenamed={(title) => onRenamed?.(title)}
-        />
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Badge variant="secondary" className="gap-1">
-            <Icon className="h-3 w-3" />
-            {PAPER_TYPE_LABEL[project.paper_type]}
-          </Badge>
-          <Badge variant="outline">{LANGUAGE_LABEL[project.language]}</Badge>
-          {project.citation_style && (
-            <Badge variant="outline">{CITATION_STYLE_LABEL[project.citation_style]}</Badge>
-          )}
-          {template && <Badge variant="outline">{template.label}</Badge>}
-          <Badge variant="muted">{WRITING_MODE_LABEL[project.writing_mode]}</Badge>
-          {readiness && readinessLabel && (
-            <Link href={readiness.href} className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              <Badge variant={readinessVariant}>{readinessLabel}</Badge>
-            </Link>
+      <ProjectTitle
+        projectId={String(project.id)}
+        title={project.title}
+        onRenamed={(title) => onRenamed?.(title)}
+      />
+      <div aria-label="论文属性" className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-2 text-xs text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5"><Icon className="h-3.5 w-3.5" />{project.intake && project.intake.status !== 'ready' ? '论文类型待判断' : PAPER_TYPE_LABEL[project.paper_type]}</span>
+        <span>{LANGUAGE_LABEL[project.language]}</span>
+        {project.citation_style && <span>{CITATION_STYLE_LABEL[project.citation_style]}</span>}
+        {template && <span>{template.label}</span>}
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 border-t border-border/60 pt-2 text-xs">
+        <div aria-label="执行设置与状态" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+          <span>{WRITING_MODE_LABEL[project.writing_mode]} · {project.execution_profile === 'fast_draft' ? '快速草稿' : '标准生成'}</span>
+          <button type="button" onClick={() => setSettingsOpen(true)} className="inline-flex min-h-9 items-center gap-1 rounded px-1 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <SlidersHorizontal className="h-3.5 w-3.5" />执行设置
+          </button>
+          {activeJob && ['queued', 'running', 'paused'].includes(activeJob.status) && (
+            <span className="text-foreground">{activeJob.status === 'queued' ? '排队中' : activeJob.status === 'paused' ? '已暂停' : '执行中'} · {activeJob.checkpoint?.execution_profile === 'fast_draft' ? '快速草稿' : activeJob.checkpoint?.execution_profile === 'standard' ? '标准生成' : '按任务配置'}</span>
           )}
         </div>
+        {readiness && readinessLabel && (
+          <Link href={readiness.href} aria-label={`投稿状态：${readinessLabel}`} className="inline-flex min-h-9 items-center rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <Badge variant={readinessVariant}>{readinessLabel}</Badge>
+          </Link>
+        )}
       </div>
+      <Dialog open={settingsOpen} onClose={() => setSettingsOpen(false)} title="执行设置" description="修改生成策略用于后续新任务，已启动任务保留原有执行配置。">
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">当前协作方式：{WRITING_MODE_LABEL[project.writing_mode]}</p>
+          <FastDraftToggle
+            value={project.execution_profile ?? 'standard'}
+            disabled={savingProfile}
+            onChange={async (execution_profile) => {
+              setSavingProfile(true);
+              try {
+                await updateProject(projectId, { execution_profile });
+                onProfileChanged?.();
+              } catch (error) {
+                toast({ title: '快速草稿设置未保存', description: describeError(error), variant: 'error' });
+              } finally {
+                setSavingProfile(false);
+              }
+            }}
+          />
+          <p className="text-xs text-muted-foreground">更快生成初稿，引用仍需完整核验。</p>
+        </div>
+      </Dialog>
     </div>
   );
 }

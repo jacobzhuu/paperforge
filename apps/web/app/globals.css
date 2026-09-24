@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+@keyframes fast-draft-activate {
+  0% { opacity: 0.65; transform: translateY(2px) scale(0.94); }
+  55% { opacity: 1; transform: translateY(-2px) scale(1.08); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.fast-draft-activating .fast-draft-icon {
+  animation: fast-draft-activate 400ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fast-draft-activating .fast-draft-icon { animation: none; }
+}
+
 @layer base {
   /*
    * 暖色学术调（docs/ui-design.md §3.4）。
@@ -403,5 +417,15 @@
   .auth-citation,
   .auth-stage {
     animation: none !important;
+  }
+}
+
+@layer base {
+  h1, h2, h3 { overflow-wrap: anywhere; }
+  summary { border-radius: var(--radius); }
+  summary:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 4px; }
+  ::selection { background: hsl(var(--accent)); color: hsl(var(--accent-foreground)); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
   }
 }

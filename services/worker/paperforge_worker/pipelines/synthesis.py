@@ -381,6 +381,9 @@ def _synthesize_bundle(
             "confidence": link.confidence,
             "measurements": measurement_rows,
         }
+        from paperforge_worker.pipelines.scholarly_content import enrich_evidence
+
+        row = enrich_evidence(row)
         evidence_rows.append(row)
         eligible_count += int(unit.grade in FULLTEXT_GRADES)
         if unit.grade in FULLTEXT_GRADES:

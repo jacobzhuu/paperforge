@@ -23,6 +23,7 @@ from paperforge_worker.pipelines.quality import (
     claim_verification_cache_key,
     count_words,
     coverage_hints,
+    preview_citations,
     soft_check_citations,
     verify_claim_evidence,
     verify_cross_language_claim_evidence,
@@ -984,15 +985,27 @@ def test_count_words_matches_writing_pipeline() -> None:
 
 async def test_soft_check_retries_only_missing_and_rejects_duplicate_indexes():
     calls = []
-    runner = _sequence_runner([
-        {"judgements": [{"index": 0, "score": 0.9}, {"index": 1, "score": 0.1},
-                         {"index": 1, "score": 0.9}]},
-        {"judgements": [{"index": 0, "score": 0.2}]},
-    ], calls=calls)
+    runner = _sequence_runner(
+        [
+            {
+                "judgements": [
+                    {"index": 0, "score": 0.9},
+                    {"index": 1, "score": 0.1},
+                    {"index": 1, "score": 0.9},
+                ]
+            },
+            {"judgements": [{"index": 0, "score": 0.2}]},
+        ],
+        calls=calls,
+    )
     findings = await soft_check_citations(
-        usages=[{"cite_key": "a", "context_snippet": "first"},
-                {"cite_key": "b", "context_snippet": "second"}],
-        abstracts={"a": "alpha", "b": "beta"}, runner=runner)
+        usages=[
+            {"cite_key": "a", "context_snippet": "first"},
+            {"cite_key": "b", "context_snippet": "second"},
+        ],
+        abstracts={"a": "alpha", "b": "beta"},
+        runner=runner,
+    )
     assert len(calls) == 2
     assert "first" not in calls[1].user_prompt
     assert [f.score for f in findings] == [0.9, 0.2]
@@ -1001,21 +1014,75 @@ async def test_soft_check_retries_only_missing_and_rejects_duplicate_indexes():
 
 async def test_production_shadow_does_not_call_jev_inline(monkeypatch):
     from paperforge_worker import citation_shadow
+
     queued = []
+
     async def enqueue(context, pairs, observation):
         queued.append((pairs, observation))
+
     monkeypatch.setattr(citation_shadow, "enqueue", enqueue)
+
     class Trace:
         session_factory = True
+
         async def emit(self, *args, **kwargs):
             pass
+
     class Never:
         enabled = True
+
         async def decide(self, **kwargs):
             raise AssertionError("foreground must not call Jev")
+
     findings = await soft_check_citations(
-        usages=[{"cite_key": "a", "context_snippet": "first"}], abstracts={"a": "alpha"},
+        usages=[{"cite_key": "a", "context_snippet": "first"}],
+        abstracts={"a": "alpha"},
         runner=_runner({"judgements": [{"index": 0, "score": 0.9}]}),
-        decision_runner=Never(), decision_mode="shadow", trace_context=Trace())
+        decision_runner=Never(),
+        decision_mode="shadow",
+        trace_context=Trace(),
+    )
     assert findings[0].score == 0.9
     assert len(queued) == 1
+
+
+async def test_fast_draft_preview_keeps_low_confidence_as_preliminary():
+    class Jev:
+        enabled = True
+
+        async def decide(self, **kwargs):
+            assert "pairs[0].context" in kwargs["questions"]["item_0"]["instructions"]
+            return SimpleNamespace(
+                ok=True,
+                answers={"item_0": {"score": 1, "confidence": 0.02}},
+                model="jev-test",
+                latency_ms=1300,
+            )
+
+    result = await preview_citations(
+        usages=[{"cite_key": "a", "context_snippet": "claim"}],
+        sources={"a": "excerpt"},
+        decision_runner=Jev(),
+    )
+    assert result["status"] == "complete"
+    assert result["items"][0]["status"] == "preliminary"
+    assert result["items"][0]["weak"] is True
+    assert result["items"][0]["confidence"] == 0.02
+
+
+async def test_fast_draft_preview_failure_never_marks_a_citation_verified():
+    class Jev:
+        enabled = True
+
+        async def decide(self, **_kwargs):
+            return SimpleNamespace(
+                ok=False, answers=None, model="jev-test", latency_ms=2000, error="timeout"
+            )
+
+    result = await preview_citations(
+        usages=[{"cite_key": "a", "context_snippet": "claim"}],
+        sources={"a": "excerpt"},
+        decision_runner=Jev(),
+    )
+    assert result["status"] == "unavailable"
+    assert result["items"][0]["status"] == "unverified"

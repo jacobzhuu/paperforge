@@ -39,6 +39,7 @@ from db import (
     upsert_question_evidence_link,
     upsert_section,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.paper import (
     ClaimEvidenceAnchor,
     ExportArtifact,
@@ -64,7 +65,7 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.jobs import start_job
+from paperforge_api.jobs import retry_profile_checkpoint, start_job
 from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.routers.projects import _job_response
 from paperforge_api.schemas import (
@@ -124,6 +125,7 @@ async def generate_outline_endpoint(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -132,6 +134,7 @@ async def generate_outline_endpoint(
         project_id=project.id,
         kind="outline",
         function="run_outline_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
     )
     return _job_response(job)
 
@@ -489,7 +492,9 @@ async def rebuild_draft_from_latest_evidence(
     request: GenerationOptionsRequest | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
-    options = request or GenerationOptionsRequest()
+    options = request or GenerationOptionsRequest(
+        quality_profile="draft" if project.execution_profile == "fast_draft" else "scholarly"
+    )
     job = await start_job(
         session,
         queue,
@@ -621,36 +626,9 @@ async def generate_full(
 
 
 def _original_generation_prerequisites(assets: list[Any]) -> list[dict[str, str]]:
-    """Return actionable, deterministic blockers before an expensive original-paper run."""
-    has_results = False
-    has_method = False
-    for asset in assets:
-        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
-        if asset.kind in {"dataset", "result_table"}:
-            has_results = (
-                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
-                or has_results
-            )
-        if asset.kind in {"method_note", "code"}:
-            has_method = (
-                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
-            )
-    issues: list[dict[str, str]] = []
-    if not has_results:
-        issues.append(
-            {
-                "code": "result_material_missing",
-                "message": "请上传包含数据行和可解析数值的结果表或数据集",
-            }
-        )
-    if not has_method:
-        issues.append(
-            {
-                "code": "method_material_missing",
-                "message": "请上传可解析的方法笔记或代码",
-            }
-        )
-    return issues
+    from db.intake import material_issues
+
+    return material_issues(assets)
 
 
 @router.post(
@@ -663,6 +641,7 @@ async def generate_sections(
     request: WriteRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     outline = await latest_outline(session, project.id)
@@ -686,6 +665,7 @@ async def generate_sections(
         checkpoint["writer_polish_policy"] = request.polish_policy
     if contract and contract.get("requires_confirmation", True):
         checkpoint["writer_execution_mode"] = "dag_parallel"
+    checkpoint.update(await retry_profile_checkpoint(session, project.id, retry_of) or {})
     job = await start_job(
         session,
         queue,
@@ -979,6 +959,7 @@ async def start_export(
     request: ExportRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     document = await latest_document(session, project.id)
@@ -1024,6 +1005,7 @@ async def start_export(
         project_id=project.id,
         kind="compile",
         function="run_export_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         formats=request.formats,
         quality_profile=request.quality_profile,
         quality_report_id=str(quality_report.id) if quality_report else None,
@@ -1151,7 +1133,10 @@ async def retry_export_run(
         project_id=project.id,
         kind="compile",
         function=spec["function"],
-        checkpoint={"retried_from": str(source.id)},
+        checkpoint={
+            "retried_from": str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
+        },
         **spec["kwargs"],
     )
     return _job_response(retried)
@@ -1301,6 +1286,7 @@ async def start_snowball(
     request: SnowballRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     """引文雪球扩展：邻居入库为 candidate，需用户圈选后才进写作白名单。"""
     project = await _require_project(session, project_id)
@@ -1310,6 +1296,7 @@ async def start_snowball(
         project_id=project.id,
         kind="search",
         function="run_snowball_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         direction=request.direction,
         max_seeds=request.max_seeds,
     )
@@ -1326,6 +1313,7 @@ async def start_ingest(
     request: IngestRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     """OA 全文获取 → 解析 → 全文级卡片。只走 OA/官方渠道，不绕 paywall。"""
     project = await _require_project(session, project_id)
@@ -1335,6 +1323,7 @@ async def start_ingest(
         project_id=project.id,
         kind="ingest",
         function="run_ingest_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         max_works=request.max_works,
     )
     return _job_response(job)
@@ -1350,6 +1339,7 @@ async def start_quality(
     session: SessionDep,
     queue: QueueDep,
     request: GenerationOptionsRequest | None = None,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     options = request or GenerationOptionsRequest()
@@ -1359,6 +1349,7 @@ async def start_quality(
         project_id=project.id,
         kind="write",
         function="run_quality_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         quality_profile=options.quality_profile,
         review_style=options.review_style,
     )

@@ -15,6 +15,7 @@ from arq.connections import ArqRedis
 from arq.jobs import Job as ArqJob
 from arq.jobs import JobStatus
 from db import JOB_RESUME_KEY, abandon_job, create_job, job_is_abandoned
+from db.execution_profile import EXECUTION_PROFILE_KEY, EXECUTION_PROFILES, source_execution_profile
 from db.models.paper import GenerationJob, JobDispatch, PaperProject
 from fastapi import HTTPException
 from observability import get_logger
@@ -54,6 +55,15 @@ async def start_job(
     )
     ready = await require_queue(queue)
     await ensure_project_job_slot(session, project_id, ready)
+    project = await session.get(PaperProject, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    intake = (getattr(project, "scope_json", None) or {}).get("intake")
+    if intake and intake.get("status") != "ready" and function != "run_intake_pipeline":
+        raise HTTPException(409, "请先完成研究方向理解或澄清")
+    execution_profile = (checkpoint or {}).get(EXECUTION_PROFILE_KEY, project.execution_profile)
+    if execution_profile not in EXECUTION_PROFILES:
+        raise ValueError(f"unsupported execution_profile: {execution_profile}")
     job = await create_job(
         session,
         project_id=project_id,
@@ -75,6 +85,7 @@ async def start_job(
                 if checkpoint
                 else get_settings().evidence_retrieval_mode
             ),
+            EXECUTION_PROFILE_KEY: execution_profile,
             **(checkpoint or {}),
             JOB_RESUME_KEY: {"function": function, "kwargs": kwargs},
         },
@@ -83,6 +94,22 @@ async def start_job(
 
     await record_dispatch(session, job, function, kwargs, ready)
     return job
+
+
+async def retry_profile_checkpoint(
+    session: AsyncSession, project_id: uuid.UUID, retry_of: str | None
+) -> dict[str, str] | None:
+    """Pin a stage rerun to its source job, even if the project default changed."""
+    if retry_of is None:
+        return None
+    try:
+        source_id = uuid.UUID(retry_of)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="source job not found") from error
+    source = await session.get(GenerationJob, source_id)
+    if source is None or source.project_id != project_id:
+        raise HTTPException(status_code=404, detail="source job not found")
+    return {EXECUTION_PROFILE_KEY: source_execution_profile(source)}
 
 
 async def queue_knows_job(queue: ArqRedis | None, job_id: uuid.UUID) -> bool | None:
@@ -139,7 +166,8 @@ async def ensure_project_job_slot(
     # requests can both observe "no active job" and then concurrently clear
     # the evidence matrix or write competing latest documents.
     await session.scalar(
-        select(PaperProject.id).where(PaperProject.id == project_id).with_for_update()
+        select(PaperProject).where(PaperProject.id == project_id).with_for_update()
+        .execution_options(populate_existing=True)
     )
     open_jobs = list(
         (

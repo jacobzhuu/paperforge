@@ -51,6 +51,7 @@ from paperforge_worker.pipelines.experiment_extraction import (
     reconcile,
 )
 from paperforge_worker.pipelines.fulltext import load_persisted_fulltext_sources
+from paperforge_worker.pipelines.scholarly_content import balanced_evidence, enrich_evidence
 
 MAX_EVIDENCE_UNITS_PER_WORK = 32
 MAX_EVIDENCE_TEXT_CHARS = 1_600
@@ -60,8 +61,9 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
 _RESULT_CUES = re.compile(
     r"\b(?:result|experiment|evaluat|outperform|improv|decreas|increas|"
     r"conclu|find|observ|demonstrat|significant|accuracy|precision|recall|"
-    r"f1|ndcg|auc|dataset|sample|theorem|proof|derive|limitation)\w*\b|"
-    r"(?:结果|实验|评估|优于|提升|下降|增加|结论|发现|观察|证明|数据集|样本|定理|局限)",
+    r"f1|ndcg|auc|dataset|sample|theorem|proof|derive|limitation|method|mechanism|"
+    r"algorithm|assum|constraint|defin|denot|baseline|ablation|where)\w*\b|"
+    r"(?:结果|实验|评估|优于|提升|下降|增加|结论|发现|观察|证明|数据集|样本|定理|局限|方法|机制|算法|假设|约束|定义|变量|其中|消融|基线)",
     re.IGNORECASE,
 )
 # 无本体时的兜底：只用真正跨领域的指标核心。领域指标（NDCG@K、ASR、Tanimoto…）
@@ -313,7 +315,8 @@ async def _extract_work_evidence(
         return outcome
     outcome.works = 1
     source_hash = hashlib.sha256(
-        "\u241f".join((work.canonical_title or "", work.abstract or "", fulltext or "")).encode(
+        "\u241f".join(("scholarly-content-v1", work.canonical_title or "",
+                        work.abstract or "", fulltext or "")).encode(
             "utf-8"
         )
     ).hexdigest()[:40]
@@ -795,6 +798,12 @@ async def _persist_structured_experiment_data(
             tasks=tasks,
             dataset_pattern=dataset_pattern,
         )
+        payload['scholarly_content_version'] = 'scholarly-content-v1'
+        payload['method_evidence'] = [enrich_evidence({
+            'text': candidate.text, 'evidence_id': str(evidence_unit_ids.get(candidate.text) or ''),
+            'grade': candidate.grade, 'page': candidate.page,
+            'section_path': candidate.section_path, 'object_ref': candidate.object_ref,
+        }) for candidate in candidates]
         extraction.status = "parsed"
         extraction.payload_json = payload
         extraction.source_hash = source_hash
@@ -1250,7 +1259,11 @@ def _evidence_candidates(
                     grade="D_abstract_only",
                 )
             )
-    return _deduplicate(candidates)
+    unique = _deduplicate(candidates)
+    by_text = {c.text: c for c in unique}
+    ordered = balanced_evidence([{'text': c.text, 'object_ref': c.object_ref,
+                                'grade': c.grade} for c in unique])
+    return [by_text[row['text']] for row in ordered]
 
 
 def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
@@ -1261,16 +1274,21 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
         locator = _parse_locator(match.group("locator"))
         raw_block = fulltext[match.end() : end]
         block = raw_block.strip()
-        if not block or not classify_content_role(block).claim_eligible:
+        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        if not block or (not is_formula and not classify_content_role(block).claim_eligible):
             continue
         # `[[...]]\s*` 已经被 `_MARKER_RE` 吃掉，所以 raw_block 从 chunk.text 的第一个
         # 字符开始；再减去 strip 掉的前导空白，就得到 block 在 chunk.text 里的偏移。
         block_offset = len(raw_block) - len(raw_block.lstrip())
-        passages = _split_passages(block)
+        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        passages = [(0, block)] if is_formula else _split_passages(block)
         for paragraph_index, (passage_offset, passage) in enumerate(passages, start=1):
-            if not _RESULT_CUES.search(passage) and not re.search(r"\d", passage):
+            if (not is_formula and not _RESULT_CUES.search(passage)
+                    and not re.search(r"\d", passage)):
                 continue
-            text = passage[:MAX_EVIDENCE_TEXT_CHARS]
+            if is_formula and len(passage) > 12000:
+                continue  # Never silently truncate a mathematical expression.
+            text = passage if is_formula else passage[:MAX_EVIDENCE_TEXT_CHARS]
             char_start, char_end = _passage_span(
                 locator, block_offset + passage_offset, len(text)
             )

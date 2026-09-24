@@ -85,32 +85,9 @@ async def material_preflight(project_id: str, session: SessionDep) -> MaterialPr
 
 
 def _original_material_issues(assets: list[Any]) -> list[dict[str, str]]:
-    has_results = False
-    has_method = False
-    for asset in assets:
-        parsed = asset.parsed_json if isinstance(asset.parsed_json, dict) else {}
-        if asset.kind in {"dataset", "result_table"}:
-            has_results = (
-                bool(parsed.get("rows") and (parsed.get("numeric_cells") or parsed.get("numbers")))
-                or has_results
-            )
-        if asset.kind in {"method_note", "code"}:
-            has_method = (
-                bool(str(parsed.get("text") or asset.description or "").strip()) or has_method
-            )
-    issues: list[dict[str, str]] = []
-    if not has_results:
-        issues.append(
-            {
-                "code": "result_material_missing",
-                "message": "请上传包含数据行和可解析数值的结果表或数据集",
-            }
-        )
-    if not has_method:
-        issues.append(
-            {"code": "method_material_missing", "message": "请上传可解析的方法笔记或代码"}
-        )
-    return issues
+    from db.intake import material_issues
+
+    return material_issues(assets)
 
 
 @router.post(

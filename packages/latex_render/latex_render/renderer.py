@@ -4,6 +4,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from paper_ir.mathematics import valid_math
 from paper_ir.schema import (
     AlgorithmBlock,
     CiteRun,
@@ -81,9 +82,7 @@ def _column_fractions(headers: list[str], rows: list[Any]) -> list[float]:
     demands: list[float] = []
     for index, header in enumerate(headers):
         widths = sorted(_display_width(str(row[index])) for row in rows if index < len(row))
-        cell_demand = (
-            widths[min(len(widths) - 1, int(len(widths) * 0.85))] if widths else 0.0
-        )
+        cell_demand = widths[min(len(widths) - 1, int(len(widths) * 0.85))] if widths else 0.0
         demands.append(min(_TABLE_DEMAND_CAP, max(_display_width(header), cell_demand)))
 
     total = sum(demands) or float(count)
@@ -93,9 +92,7 @@ def _column_fractions(headers: list[str], rows: list[Any]) -> list[float]:
     # 归一化会把刚夹上的列又推回界外。
     for _ in range(count):
         free = [
-            index
-            for index, value in enumerate(fractions)
-            if _MIN_COLUMN_FRACTION < value < ceiling
+            index for index, value in enumerate(fractions) if _MIN_COLUMN_FRACTION < value < ceiling
         ]
         fractions = [min(ceiling, max(_MIN_COLUMN_FRACTION, value)) for value in fractions]
         drift = available - sum(fractions)
@@ -137,9 +134,13 @@ def _render_run(run: TextRun | CiteRun | GroundingRun | MathInlineRun | XRefRun)
     if isinstance(run, GroundingRun):
         return ""
     if isinstance(run, MathInlineRun):
+        if not valid_math(run.v):
+            raise ValueError("Invalid or unsafe inline mathematical expression")
         return f"${run.v}$"
     if isinstance(run, XRefRun):
-        return f"\\ref{{{latex_identifier(run.target, prefix='fig')}}}"
+        prefix = "eq" if run.kind == "equation" else "fig"
+        command = "eqref" if run.kind == "equation" else "ref"
+        return f"\\{command}{{{latex_identifier(run.target, prefix=prefix)}}}"
     return ""
 
 
@@ -151,6 +152,8 @@ def _render_block(
     if isinstance(block, ParagraphBlock):
         return "".join(_render_run(r) for r in block.runs)
     if isinstance(block, EquationBlock):
+        if not valid_math(block.latex):
+            raise ValueError("Invalid or unsafe mathematical expression")
         label = f"\n\\label{{{latex_identifier(block.label, prefix='eq')}}}" if block.label else ""
         return f"\\begin{{equation}}{label}\n{block.latex}\n\\end{{equation}}"
     if isinstance(block, FigureBlock):
@@ -278,9 +281,7 @@ def _render_table(
         )
 
     fractions = _column_fractions(headers, rows)
-    column_spec = (
-        "@{}" + "".join(f"p{{{value:.3f}\\linewidth}}" for value in fractions) + "@{}"
-    )
+    column_spec = "@{}" + "".join(f"p{{{value:.3f}\\linewidth}}" for value in fractions) + "@{}"
     body_size = "\\footnotesize" if len(headers) >= _WIDE_TABLE_COLUMNS else "\\small"
     header_row = (
         "    "

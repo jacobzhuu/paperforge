@@ -159,8 +159,9 @@ def _walk_jats(
         return
     if tag in {"disp-formula", "inline-formula"}:
         object_ref = _object_ref(node, prefix="eq")
+        tex = _node_text(_first_descendant(node, "tex-math"))
         builder.append(
-            _node_text(node),
+            f"$$\n{tex}\n$$" if tex else _node_text(node),
             section_path=" / ".join(section_path) or None,
             object_ref=object_ref,
             object_kind="equation",
@@ -237,7 +238,16 @@ def _local_name(tag: str) -> str:
 
 
 def _node_text(node: ET.Element | None) -> str:
-    return _clean_text(" ".join(node.itertext())) if node is not None else ""
+    if node is None:
+        return ""
+    if _local_name(node.tag) in {"inline-formula", "disp-formula"}:
+        tex = _first_descendant(node, "tex-math")
+        if tex is not None:
+            return "$" + _clean_text(" ".join(tex.itertext())) + "$"
+    parts = [node.text or ""]
+    for child in node:
+        parts.extend((_node_text(child), child.tail or ""))
+    return _clean_text(" ".join(parts))
 
 
 def _clean_text(value: str) -> str:

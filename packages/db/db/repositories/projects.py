@@ -41,6 +41,7 @@ async def create_project(
     title: str,
     paper_type: str,
     writing_mode: str = "auto",
+    execution_profile: str = "standard",
     language: str = "en",
     topic: str | None = None,
     venue_template: str | None = None,
@@ -57,6 +58,10 @@ async def create_project(
         raise ValueError(f"unsupported paper_type: {paper_type}")
     if writing_mode not in WRITING_MODES:
         raise ValueError(f"unsupported writing_mode: {writing_mode}")
+    from db.execution_profile import EXECUTION_PROFILES
+
+    if execution_profile not in EXECUTION_PROFILES:
+        raise ValueError(f"unsupported execution_profile: {execution_profile}")
     if language not in LANGUAGES:
         raise ValueError(f"unsupported language: {language}")
     if citation_style not in CITATION_STYLES:
@@ -74,6 +79,7 @@ async def create_project(
         title=title.strip(),
         paper_type=paper_type,
         writing_mode=writing_mode,
+        execution_profile=execution_profile,
         language=language,
         venue_template=venue_template,
         citation_style=citation_style,
@@ -292,6 +298,7 @@ async def update_project(
     language: str | None = _UNSET,
     citation_style: str | None = _UNSET,
     writing_mode: str | None = _UNSET,
+    execution_profile: str | None = _UNSET,
     contribution_points: list[str] | None = _UNSET,
     publication_title: str | None = _UNSET,
     authors: list[str] | None = _UNSET,
@@ -312,6 +319,11 @@ async def update_project(
     保持一致；这里做的是**合并**而非整体替换，避免把 SCOPE 生成出来的关键词矩阵
     连带清空（那是 `update_project_scope` 的职责）。
     """
+    if (project.scope_json or {}).get("intake") and language is not _UNSET and language:
+        intake = project.scope_json["intake"]
+        project.scope_json = {**project.scope_json, "intake": {
+            **intake, "overrides": {**intake.get("overrides", {}), "language": language},
+        }}
     # title 与 topic 不同：topic=None 是「清空主题」，title=None 是非法的——
     # 论文永远得有个题目。两者都会走到这里，所以必须分别判。
     if web_research_enabled is not _UNSET:
@@ -334,6 +346,12 @@ async def update_project(
         if writing_mode not in WRITING_MODES:
             raise ValueError(f"unsupported writing_mode: {writing_mode}")
         project.writing_mode = writing_mode
+    if execution_profile is not _UNSET:
+        from db.execution_profile import EXECUTION_PROFILES
+
+        if execution_profile not in EXECUTION_PROFILES:
+            raise ValueError(f"unsupported execution_profile: {execution_profile}")
+        project.execution_profile = execution_profile
     if venue_template is not _UNSET:
         project.venue_template = venue_template
     publication_metadata_changed = any(

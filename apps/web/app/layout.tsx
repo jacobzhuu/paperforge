@@ -2,7 +2,8 @@ import type { ReactNode } from 'react';
 import './globals.css';
 import { AppShell } from '@/components/auth/app-shell';
 import { AuthProvider } from '@/components/auth/auth-provider';
-import { ThemeProvider, THEME_INIT_SCRIPT } from '@/components/theme-provider';
+import { ThemeProvider } from '@/components/theme-provider';
+import { THEME_INIT_SCRIPT } from '@/lib/theme';
 import { ToastProvider } from '@/components/ui/toast';
 import { WebVitalsReporter } from '@/components/performance/web-vitals';
 

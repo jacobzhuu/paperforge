@@ -24,13 +24,13 @@ export function WorkbenchHeader({
   className?: string;
 }) {
   return (
-    <div className={cn('flex flex-wrap items-start justify-between gap-3', className)}>
+    <div className={cn('flex flex-wrap items-start justify-between gap-4 border-b pb-4', className)}>
       <div className="min-w-0 space-y-0.5">
         <h2 className="font-serif text-lg font-semibold tracking-tight">{title}</h2>
         {description && <p className="text-sm text-muted-foreground">{description}</p>}
       </div>
       {(actions || overflowActions?.length) && (
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex max-w-full flex-wrap items-center gap-2">
           {actions}
           {overflowActions && overflowActions.length > 0 && (
             <>

@@ -141,6 +141,12 @@ async def export_document(
             outcome.warnings.append({"stage": "export", "reason": "no_document"})
             return outcome
         all_rows = await list_sections(session, document.id)
+        if paper_snapshot_hash is not None:
+            from db import document_snapshot_hash
+
+            if document_snapshot_hash(all_rows) != paper_snapshot_hash:
+                outcome.warnings.append({"stage": "export", "reason": "quality_snapshot_mismatch"})
+                return outcome
         # The evidence ledger is an audit record, not a chapter.  On one real
         # review it ran to 68 rows of verbatim 500-character source excerpts —
         # longer than the entire manuscript, and enough to turn a 5,250-word
@@ -298,9 +304,7 @@ async def export_document(
                 quality=quality,
             )
         except Exception as error:  # noqa: BLE001 - an audit extra cannot fail the export
-            outcome.warnings.append(
-                {"stage": "evidence_ledger", "reason": str(error)[:200]}
-            )
+            outcome.warnings.append({"stage": "evidence_ledger", "reason": str(error)[:200]})
     if "latex_zip" in wanted:
         outcome.formats["latex_zip"] = await _store(
             context,

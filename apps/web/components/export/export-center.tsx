@@ -118,6 +118,8 @@ export function ExportCenter() {
   const [result, setResult] = React.useState<Record<string, unknown> | null>(null);
   const [formats, setFormats] = React.useState<RequestableExportFormat[]>(ALL_EXPORT_FORMATS);
   const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('scholarly');
+  const [starting, setStarting] = React.useState(false);
+  const startingRef = React.useRef(false);
   const [gateBlockers, setGateBlockers] = React.useState<QualityIssue[]>([]);
   const artifactsModule = useAsyncModule<ExportArtifact[]>(
     (signal) => listExports(projectId, signal).then((response) => response.data), [], [projectId],
@@ -152,17 +154,20 @@ export function ExportCenter() {
   });
 
   const run = async () => {
+    if (startingRef.current || busy) return;
     setResult(null);
     setGateBlockers([]);
     if (formats.length === 0) {
       toast({ title: '请至少选择一种格式', variant: 'error' });
       return;
     }
+    startingRef.current = true;
+    setStarting(true);
     try {
       const started = await startExport(projectId, formats, qualityProfile);
       startJob(started.data, '后端不可用：无法触发导出');
       toast({
-        title: '已开始生成导出产物',
+        title: '已开始生成投稿文件',
         description: `${formats.length} 种格式正在编译，完成后会自动出现在本页。`,
       });
     } catch (err) {
@@ -174,6 +179,9 @@ export function ExportCenter() {
         setGateBlockers(detail?.blockers ?? []);
       }
       toast({ title: '导出未能启动', description: describeError(err), variant: 'error' });
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
     }
   };
 
@@ -186,14 +194,37 @@ export function ExportCenter() {
   const compileOk = result?.compile_ok as boolean | undefined;
 
   const retryRun = React.useCallback(async (runId: string) => {
+    if (startingRef.current || busy) return;
+    startingRef.current = true;
+    setStarting(true);
     try {
       const started = await retryExportRun(projectId, runId);
       startJob(started, '后端不可用：无法重试导出');
       toast({ title: '已重新开始这批导出' });
     } catch (error) {
       toast({ title: '批次重试失败', description: describeError(error), variant: 'error' });
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
     }
-  }, [projectId, startJob, toast]);
+  }, [projectId, startJob, toast, busy]);
+
+  const exportSettings = (
+    <details className="rounded-lg border bg-card p-4" open={runs.length === 0 ? true : undefined}>
+      <summary className="cursor-pointer text-sm font-medium">文件格式与投稿设置 · {formats.length} 种格式</summary>
+      <div className="mt-4 space-y-4">
+        {project && (
+          <PublicationMetadata
+            project={project}
+            onSaved={reloadProject}
+            collapsedByDefault
+          />
+        )}
+
+        <FormatSelector formats={formats} onChange={setFormats} />
+      </div>
+    </details>
+  );
 
   return (
     <div className="space-y-4">
@@ -201,22 +232,14 @@ export function ExportCenter() {
         title="导出中心"
         description={formats.length > 0 ? `将生成：${formats.map((format) => FORMAT_LABEL[format]).join(' / ')}` : '请选择至少一种投稿文件格式'}
         actions={
-          <Button onClick={run} disabled={!projectId || busy}>
+          <Button onClick={run} disabled={!projectId || busy || formats.length === 0 || progress.sectionCount === 0} loading={starting} loadingLabel="正在启动导出…">
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
             生成投稿文件
           </Button>
         }
       />
 
-      {project && (
-        <PublicationMetadata
-          project={project}
-          onSaved={reloadProject}
-          collapsedByDefault
-        />
-      )}
-
-      <FormatSelector formats={formats} onChange={setFormats} />
+      {busy && <p role="status" className="text-sm text-muted-foreground">任务正在进行，完成后会自动更新文件列表。已有文件仍可下载。</p>}
 
       <SubmissionExportMode
         profile={qualityProfile}
@@ -226,7 +249,6 @@ export function ExportCenter() {
       />
       <ModuleError label="质量报告" error={qualityModule.error} onRetry={qualityModule.reload} />
       <ModuleError label="编译诊断" error={jobsModule.error} onRetry={jobsModule.reload} />
-      <DepthMetricsPanel quality={quality} />
 
       <VisualExportSummary
         projectId={projectId}
@@ -234,14 +256,6 @@ export function ExportCenter() {
         latestRunAt={runs[0]?.at}
       />
 
-      {result && (
-        <CompileDiagnostics
-          result={result}
-          ok={compileOk}
-          projectId={projectId}
-          log={latest?.artifacts.find((a) => a.format === 'compile_log')}
-        />
-      )}
 
       <LoadState
         loading={artifactsModule.loading && !artifactsModule.ready}
@@ -258,10 +272,10 @@ export function ExportCenter() {
                 <Link href={projectHref(projectId, 'write')} className="mx-1 underline">
                   写作工作台
                 </Link>
-                生成正文，再点「生成导出产物」。
+                生成正文，再点「生成投稿文件」。
               </>
             ) : (
-              <>已有正文，还没有导出过。点右上角「生成导出产物」编译成 PDF。</>
+              <>已有正文，还没有导出过。点右上角「生成投稿文件」生成所选格式的文件。</>
             )}
           />
         ) : (
@@ -273,8 +287,8 @@ export function ExportCenter() {
                   <PdfPreviewPane projectId={projectId} artifact={latestPdf} />
                 ) : (
                   <EmptyState
-                    title="最近一次运行没有产出 PDF"
-                    description="LaTeX 工程与其余格式仍可在右侧下载，也可以查看编译日志后重新导出。"
+                    title={latest?.artifacts.length ? '最近一次运行没有产出 PDF' : '本批次尚无可下载文件'}
+                    description={latest?.artifacts.length ? '已生成的其他格式可在文件列表下载，也可以查看编译诊断后重新导出。' : '任务进行中会自动更新；若任务已失败，可查看诊断或重试本批。'}
                     className="py-12"
                   />
                 )}
@@ -282,7 +296,7 @@ export function ExportCenter() {
 
               <aside className="space-y-2 lg:sticky lg:top-4 lg:self-start">
                 <h3 className="text-sm font-medium">
-                  最近一次运行 · {formatDate(latest?.artifacts[0]?.created_at ?? new Date(latest?.at ?? 0).toISOString())}
+                  {latest?.id === 'historical-unknown' ? '历史产物（批次未知）' : '最近一次运行'} · {formatDate(latest?.artifacts[0]?.created_at ?? new Date(latest?.at ?? 0).toISOString())}
                 </h3>
                 {latest && latest.id !== 'historical-unknown' && latest.artifacts.length > 0 && (
                   <a
@@ -294,7 +308,7 @@ export function ExportCenter() {
                   </a>
                 )}
                 {latest?.status === 'failed' && (
-                  <Button variant="outline" size="sm" onClick={() => retryRun(latest.id)}>
+                  <Button variant="outline" size="sm" disabled={busy || starting} onClick={() => retryRun(latest.id)}>
                     重试本批
                   </Button>
                 )}
@@ -305,20 +319,38 @@ export function ExportCenter() {
                 </div>
                 {!latest?.artifacts.some((a) => a.format === 'compile_log') && (
                   <p className="text-xs text-muted-foreground">
-                    这次运行早于「编译日志登记为产物」的改动，因此没有日志条目；
-                    重新导出一次即可拿到。
+                    本批次暂无编译日志。
                   </p>
                 )}
               </aside>
             </div>
 
             {runs.length > 1 && (
-              <HistoryRuns projectId={projectId} runs={runs.slice(1)} onRetry={retryRun} />
+              <details className="border-t pt-4">
+                <summary className="cursor-pointer text-sm font-medium">查看历史导出（{runs.length - 1} 批）</summary>
+                <div className="mt-4"><HistoryRuns projectId={projectId} runs={runs.slice(1)} onRetry={retryRun} /></div>
+              </details>
             )}
           </div>
         )}
       </LoadState>
 
+      {exportSettings}
+      <details className="border-t pt-4" open={compileOk === false ? true : undefined}>
+        <summary className="cursor-pointer text-sm font-medium">质量指标与编译诊断{compileOk === false ? ' · 编译未成功' : ''}</summary>
+        <div className="mt-4 space-y-4">
+          <DepthMetricsPanel quality={quality} />
+      {result && (
+        <CompileDiagnostics
+          result={result}
+          ok={compileOk}
+          projectId={projectId}
+          log={latest?.artifacts.find((a) => a.format === 'compile_log')}
+        />
+      )}
+          {!result && <p className="text-sm text-muted-foreground">暂无编译诊断。生成投稿文件后会在这里显示。</p>}
+        </div>
+      </details>
       <WorkbenchFooterNav current="export" />
     </div>
   );
@@ -473,12 +505,12 @@ function SubmissionExportMode({
                 ? '最终 PDF 已通过'
                 : ready === 'preflight_ready'
                   ? '内容预检已通过'
-                  : '尚未通过投稿质量门'}
+                  : !quality ? '质量状态待确认' : '尚未通过投稿质量门'}
             </Badge>
             {quality?.stale && <Badge variant="warning">质量报告已过期</Badge>}
             <span className="text-muted-foreground">
               核心论断全文覆盖{' '}
-              {Math.round((quality?.core_claim_fulltext_coverage ?? 0) * 100)}%
+              {quality?.core_claim_fulltext_coverage == null ? '待确认' : `${Math.round(quality.core_claim_fulltext_coverage * 100)}%`}
             </span>
           </div>
         )}

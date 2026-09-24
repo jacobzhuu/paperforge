@@ -945,6 +945,9 @@ def _draft_from_section(section: PaperSection) -> SectionDraft:
         level=int((section.body_ir_json or {}).get("level") or 1),
         parent_key=section.parent_key,
         inline_tables=list((section.generation_json or {}).get("inline_tables") or []),
+        preserved_blocks=deepcopy((section.body_ir_json or {}).get('blocks') or []),
+        citation_warnings=deepcopy((section.body_ir_json or {}).get('citation_warnings') or []),
+        appendix=bool((section.body_ir_json or {}).get('appendix')),
     )
 
 
@@ -1072,10 +1075,13 @@ async def _upsert_draft(
     job_id: uuid.UUID | None = None,
 ) -> None:
     """章节 + 引用使用记录的落库动作，中途存与收尾存共用同一份实现。"""
-    cite_keys = sorted({key for p in draft.paragraphs for key in p.get("cite_keys", [])})
+    cite_keys: list[str] = []
     asset_refs: list[str] = []
     if body_ir:
         section_ir = IRSection(**body_ir)
+        cite_keys = sorted(
+            PaperIR(meta=PaperMeta(title=""), sections=[section_ir]).collect_cite_keys()
+        )
         asset_refs = sorted(
             PaperIR(meta=PaperMeta(title=""), sections=[section_ir]).collect_asset_refs()
         )

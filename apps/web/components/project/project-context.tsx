@@ -18,7 +18,7 @@ import {
 import { describeError } from '@/lib/errors';
 import { useJobTracker, type TrackedJob } from '@/lib/useJobTracker';
 import { useProjectProgress, type ProjectProgress } from '@/lib/useProjectProgress';
-import type { DataSource, Job, JobEvent, PaperType, Project } from '@/lib/types';
+import type { DataSource, Job, JobEvent, PaperType, Project, QualityProfile } from '@/lib/types';
 import type { RetryableStage } from '@/lib/pipeline';
 
 interface ProjectContextValue {
@@ -48,7 +48,7 @@ interface ProjectContextValue {
   /** 返回 job id（后端不可用时为 null），供卡片级 `visual_id → job_id` 映射使用。 */
   startJob: (started: Job | undefined, fallbackMessage: string) => string | null;
   /** 单独重跑有独立端点的管线阶段；运行中与终态任务共用这一入口。 */
-  retryStage: (stage: RetryableStage) => Promise<void>;
+  retryStage: (stage: RetryableStage, sourceJob?: Job) => Promise<void>;
   /** 跳过剩余的连贯性润色：已润色的保留，剩下的直接交付初稿。 */
   skipPolish: (jobId: string) => Promise<void>;
   /** 取消任务：当前这一步跑完即停，已产出内容保留。 */
@@ -230,16 +230,25 @@ export function ProjectProvider({
   );
 
   const retryStage = React.useCallback(
-    async (stage: RetryableStage) => {
+    async (stage: RetryableStage, sourceJob?: Job) => {
+      const sourceJobId = sourceJob?.id;
+      const resume = sourceJob?.checkpoint?.resume;
+      const sourceOptions = resume && typeof resume === 'object' && 'kwargs' in resume
+        ? resume.kwargs : undefined;
+      const requestedQuality = sourceOptions && typeof sourceOptions === 'object' &&
+        'quality_profile' in sourceOptions ? sourceOptions.quality_profile : undefined;
+      const qualityProfile: QualityProfile = requestedQuality === 'draft' ||
+        requestedQuality === 'scholarly' || requestedQuality === 'submission'
+        ? requestedQuality : 'scholarly';
       const starters: Record<RetryableStage, () => Promise<{ data: Job | undefined }>> = {
-        search: () => startSearch(projectId, {}),
-        ingest: () => startIngest(projectId),
-        snowball: () => startSnowball(projectId, 'both'),
-        cards: () => generateCards(projectId),
-        quality: () => generateQuality(projectId),
-        outline: () => generateOutline(projectId),
-        write: () => generateSections(projectId, true),
-        render: () => startExport(projectId),
+        search: () => startSearch(projectId, {}, sourceJobId),
+        ingest: () => startIngest(projectId, sourceJobId),
+        snowball: () => startSnowball(projectId, 'both', sourceJobId),
+        cards: () => generateCards(projectId, sourceJobId),
+        quality: () => generateQuality(projectId, { quality_profile: qualityProfile }, sourceJobId),
+        outline: () => generateOutline(projectId, sourceJobId),
+        write: () => generateSections(projectId, true, undefined, sourceJobId),
+        render: () => startExport(projectId, undefined, qualityProfile, sourceJobId),
       };
       const started = await starters[stage]();
       start(started.data, '后端不可用：无法重跑该阶段');

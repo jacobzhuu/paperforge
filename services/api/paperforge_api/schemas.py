@@ -123,15 +123,31 @@ class AcademicProfileResponse(BaseModel):
 
 PaperType = Literal["review", "original"]
 WritingMode = Literal["auto", "assisted"]
+ExecutionProfile = Literal["standard", "fast_draft"]
 Language = Literal["zh", "en"]
 CitationStyle = Literal["author_year", "gbt7714", "ieee", "apa"]
 EntryStatus = Literal["candidate", "selected", "excluded"]
 
 
+class IntakeOverrides(BaseModel):
+    paper_type: PaperType | None = None
+    language: Language | None = None
+    submission_target: str | None = Field(default=None, max_length=500)
+
+
+class IntakeRequest(BaseModel):
+    version: int = Field(ge=0)
+    topic: str | None = Field(default=None, max_length=20000)
+    answer: str | None = Field(default=None, max_length=10000)
+    overrides: IntakeOverrides = Field(default_factory=IntakeOverrides)
+
+
 class CreateProjectRequest(BaseModel):
+    intake: IntakeOverrides | None = None
     title: str
     paper_type: PaperType
     writing_mode: WritingMode = "auto"
+    execution_profile: ExecutionProfile = "standard"
     language: Language = "en"
     topic: str | None = None
     venue_template: str | None = None
@@ -158,6 +174,7 @@ class UpdateProjectRequest(BaseModel):
     language: Language | None = None
     citation_style: CitationStyle | None = None
     writing_mode: WritingMode | None = None
+    execution_profile: ExecutionProfile | None = None
     contribution_points: list[str] | None = None
     publication_title: str | None = None
     authors: list[str] | None = None
@@ -191,10 +208,12 @@ class SubmissionReadinessResponse(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    intake: dict[str, Any] | None = None
     id: str
     title: str
     paper_type: str
     writing_mode: str
+    execution_profile: ExecutionProfile = "standard"
     language: str
     status: str
     venue_template: str | None = None
@@ -1080,6 +1099,7 @@ class DocumentVersionResponse(BaseModel):
     status: str
     section_count: int | None = None
     is_current: bool = False
+    paper_snapshot_hash: str | None = None
     created_at: datetime | None = None
 
 

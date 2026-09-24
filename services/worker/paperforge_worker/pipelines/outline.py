@@ -207,19 +207,23 @@ async def generate_outline(
     if not sub_question_bundles:
         body = _reclaim_orphans(body, allowed)
     if paper_type == "review" and len(allowed_cards) >= 2:
-        body.append(
-            review_synthesis_section(
-                allowed_cards,
-                language=language,
-                sub_question_bundles=sub_question_bundles or [],
-            )
-        )
+        synthesis_section = review_synthesis_section(
+            allowed_cards, language=language, sub_question_bundles=sub_question_bundles or [])
+        matrix_tables = synthesis_section.pop('inline_tables', [])
+        synthesis_section['inline_tables'] = []
+        body.append(synthesis_section)
         ledger = evidence_ledger_section(
             allowed_cards,
             language=language,
             sub_question_bundles=sub_question_bundles or [],
         )
+        if ledger is None and matrix_tables:
+            ledger = {'key': 'evidence_ledger',
+                      'title': '文献与证据附件' if language == 'zh' else 'Literature and evidence',
+                      'appendix': True, 'kind': 'appendix', 'synthesis_kind': 'evidence_ledger',
+                      'cite_keys': synthesis_section['cite_keys'], 'inline_tables': []}
         if ledger is not None:
+            ledger['inline_tables'] = matrix_tables + ledger['inline_tables']
             body.append(ledger)
     if paper_type == "review" and review_style == "systematic" and search_method:
         body.insert(0, systematic_method_section(search_method, language=language))
@@ -474,6 +478,10 @@ def question_driven_sections(
             section["target_words"] = (
                 PARENT_TARGET_WORDS_ZH if zh else PARENT_TARGET_WORDS_EN
             )
+        from paperforge_worker.pipelines.scholarly_content import thematic_tables
+
+        section['inline_tables'] = thematic_tables(section, evidence, language=language)
+        section['content_policy'] = 'scholarly-content-v1'
         sections.append(section)
         sections.extend(subsections)
     return sections
@@ -1051,8 +1059,7 @@ def review_synthesis_section(
                 locator,
             ]
         )
-        if len(rows) >= 40:
-            break
+
     headers, rows, omission_note = _drop_empty_matrix_columns(
         headers, rows, language=language
     )

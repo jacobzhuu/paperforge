@@ -56,6 +56,15 @@ def render_markdown(
         if block.label
     }
 
+    figure_numbering.update(
+        {
+            block.label: index
+            for index, block in enumerate(
+                (b for s in ir.sections for b in s.blocks if isinstance(b, EquationBlock)), start=1
+            )
+            if block.label
+        }
+    )
     parts: list[str] = [f"# {ir.meta.title}".rstrip()]
     if ir.meta.authors:
         parts.append("*" + ", ".join(ir.meta.authors) + "*")
@@ -150,7 +159,9 @@ def _render_block(
             for run in block.runs
         ).strip()
     if isinstance(block, EquationBlock):
-        return f"$$\n{block.latex}\n$$"
+        number = figure_numbering.get(block.label or "")
+        suffix = f"\n\n({'式' if language == 'zh' else 'Equation'} {number})" if number else ""
+        return f"$$\n{block.latex}\n$$" + suffix
     if isinstance(block, FigureBlock):
         caption = block.caption or ""
         alt = block.alt_text or caption
@@ -232,6 +243,8 @@ def _render_run(
         return f"${run.v}$"
     if isinstance(run, XRefRun):
         index = figure_numbering.get(run.target)
+        if run.kind == "equation":
+            return f"式（{index or '?'}）" if language == "zh" else f"Equation ({index or '?'})"
         if index is None:
             return "图 ?" if language == "zh" else "Figure ?"
         return f"图 {index}" if language == "zh" else f"Figure {index}"

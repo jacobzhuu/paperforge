@@ -31,6 +31,7 @@ import { deleteProject, listDeletedProjects, listProjects, restoreProject } from
 import { describeError } from '@/lib/errors';
 import type { DataSource, PaperType, Project } from '@/lib/types';
 import { LANGUAGE_LABEL, PAPER_TYPE_LABEL, WRITING_MODE_LABEL } from '@/lib/labels';
+import { projectActivity } from '@/lib/project-activity';
 import { cn, formatDate } from '@/lib/utils';
 
 type TypeFilter = 'all' | PaperType;
@@ -176,7 +177,7 @@ export default function ProjectsPage() {
           }}
         >
           {loading ? (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
               {[0, 1, 2].map((i) => (
                 <div key={i} className="space-y-4 rounded-lg border p-5" aria-hidden="true">
                   <div className="flex justify-between">
@@ -258,7 +259,7 @@ export default function ProjectsPage() {
                   }
                 />
               ) : (
-                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
                   {visible.map((p) => (
                     <ProjectCard key={p.id} project={p} onDelete={() => setPendingDelete(p)} />
                   ))}
@@ -324,7 +325,7 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
               type="button"
               onClick={onDelete}
               aria-label={`删除项目：${project.title}`}
-              className="relative z-10 flex h-11 w-11 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-destructive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100"
+              className="relative z-10 flex h-11 w-11 items-center justify-center rounded text-muted-foreground opacity-100 transition-opacity md:opacity-0 hover:bg-accent hover:text-destructive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
@@ -347,13 +348,10 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
             <FileText className="h-3.5 w-3.5" /> {project.section_count ?? 0} 章节
           </span>
         </div>
+        {!summary && <p className="text-sm font-medium">{projectActivity(project)}</p>}
         {summary && (
           <div className="rounded-md bg-muted/50 px-3 py-2 text-xs">
-            {summary.active_job ? (
-              <p className="font-medium text-primary">正在运行：{summary.active_job.stage}</p>
-            ) : (
-              <p className="font-medium">下一步：{summary.readiness.nextAction}</p>
-            )}
+            <p className="font-medium">{projectActivity(project)}</p>
             <p className="mt-1 text-muted-foreground">
               {summary.manuscript.wordCount != null ? `${summary.manuscript.wordCount.toLocaleString()} 字正文` : '尚无正文'}
               {summary.readiness.attentionCount != null && summary.readiness.attentionCount > 0
@@ -367,7 +365,7 @@ function ProjectCard({ project, onDelete }: { project: Project; onDelete: () => 
           <span>
             {LANGUAGE_LABEL[project.language]} · {WRITING_MODE_LABEL[project.writing_mode]}
           </span>
-          <span>{formatDate(project.updated_at)}</span>
+          <span>{formatDate(project.updated_at)} · 继续研究 →</span>
         </div>
       </CardContent>
     </Card>

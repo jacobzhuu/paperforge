@@ -76,3 +76,19 @@ describe('PaperIR 证据绑定往返', () => {
     }
   });
 });
+
+it('公式、来源与公式引用在编辑保存后完整保留', () => {
+  const section: SectionIR = {
+    key: 'methods', title: 'Methods', level: 1, citation_warnings: [],
+    blocks: [
+      { type: 'paragraph', runs: [
+        { t: 'text', v: 'The loss is ' }, { t: 'math_inline', v: 'L=x^2' },
+        { t: 'xref', kind: 'equation', target: 'eq:loss' },
+        { t: 'cite', keys: ['a'], evidence_ids: ['e1'] },
+      ] },
+      { type: 'equation', latex: 'L=x^2', label: 'eq:loss', source_ids: ['e1'],
+        source_latex: 'L=x^2', source_context: 'x is residual.', explanation: 'x is residual.' },
+    ],
+  };
+  expect(tiptapToIR(irToTiptap(section), section)).toEqual(normalizeSectionIR(section));
+});

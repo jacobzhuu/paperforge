@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
@@ -28,6 +29,7 @@ from db import (
     update_job,
     update_project_scope,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY
 from db.session import make_engine, make_session_factory
 from llm_runtime import QUOTA_EXHAUSTED
 from observability import configure_logging, get_logger, record_job_stage
@@ -36,6 +38,7 @@ from paperforge_worker.concurrency import bounded_map
 from paperforge_worker.config import WorkerSettings as Settings
 from paperforge_worker.config import get_settings
 from paperforge_worker.context import JobContext, JobStopped, build_scholar_cache, job_context
+from paperforge_worker.intake_job import run_intake_pipeline
 from paperforge_worker.orchestration.semantic_repair import (
     CHECKPOINT_KEY as SEMANTIC_REPAIR_KEY,
 )
@@ -78,6 +81,7 @@ from paperforge_worker.pipelines.quality import (
     build_original_claim_grounding,
     build_quality_report,
     claim_verification_cache_keys,
+    preview_citations,
     recoverable_findings,
     repairable_finding_count,
     soft_check_citations,
@@ -264,6 +268,20 @@ def can_render_after_quality(quality_profile: str, readiness_status: str) -> boo
     匹配字符串，一次等价重构就让它失效了，行为却没变。
     """
     return quality_profile == "draft" or readiness_status in RENDERABLE_READINESS
+
+
+def _prewrite_quality_profile(context: JobContext) -> str:
+    """Use the job's pinned strategy for assisted prewrite readiness."""
+    return "draft" if context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft" else "scholarly"
+
+
+def _effective_delivery_mode(
+    checkpoint: dict[str, Any], quality_profile: str, legacy_delivery_mode: str
+) -> str:
+    """A fast project never weakens an explicitly requested formal quality run."""
+    pinned = checkpoint.get(EXECUTION_PROFILE_KEY)
+    fast = pinned == "fast_draft" or (pinned is None and legacy_delivery_mode == "fast_draft")
+    return "fast_draft" if quality_profile == "draft" and fast else "standard"
 
 
 async def run_library_pipeline(
@@ -768,7 +786,7 @@ async def run_alignment_pipeline(
         )
         readiness = await _evaluate_prewrite_evidence(
             context,
-            quality_profile="scholarly",
+            quality_profile=_prewrite_quality_profile(context),
             review_style="narrative",
             matrix_payload=matrix.to_payload() if matrix else None,
         )
@@ -809,7 +827,7 @@ async def run_synthesis_pipeline(
         )
         readiness = await _evaluate_prewrite_evidence(
             context,
-            quality_profile="scholarly",
+            quality_profile=_prewrite_quality_profile(context),
             review_style="narrative",
         )
         if readiness.ready:
@@ -918,7 +936,7 @@ async def run_outline_pipeline(
         if project is not None and project.paper_type == "review":
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
-                quality_profile="scholarly",
+                quality_profile=_prewrite_quality_profile(context),
                 review_style="narrative",
                 language=project.language,
             )
@@ -966,7 +984,7 @@ async def run_write_pipeline(
         if paper_type == "review":
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
-                quality_profile="scholarly",
+                quality_profile=_prewrite_quality_profile(context),
                 review_style="narrative",
                 language=language,
             )
@@ -989,9 +1007,14 @@ async def run_write_pipeline(
             ),
             critical=True,
         )
+        fast_draft = context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
+        if fast_draft and _stage_scalar(context, "write", "section_count", outcome):
+            await _try_publish_fast_draft_preview(context)
         # 完整性是交付的前提：``section_count`` 只说明有章节行，不说明每一节都有正文。
         # 补写扫描已经尽过力，到这里还缺的章节必须体现在任务状态上。
-        if context.checkpoint.get("writer_execution_mode") in {"dag_serial", "dag_parallel"}:
+        if not fast_draft and context.checkpoint.get("writer_execution_mode") in {
+            "dag_serial", "dag_parallel"
+        }:
             # Standalone WRITE has no downstream full-pipeline evaluator. Record
             # final-snapshot evidence checks here, preserving its draft delivery policy.
             await _run_stage(
@@ -1069,16 +1092,22 @@ async def run_draft_rebuild_pipeline(
         )
         quality = None
         if write and write.section_count:
-            quality = await _run_stage(
-                context,
-                "quality",
-                lambda: _quality(
+            if (
+                context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
+                and quality_profile == "draft"
+            ):
+                await _try_publish_fast_draft_preview(context)
+            else:
+                quality = await _run_stage(
                     context,
-                    quality_profile=quality_profile,
-                    review_style=review_style,
-                ),
-                kind="write",
-            )
+                    "quality",
+                    lambda: _quality(
+                        context,
+                        quality_profile=quality_profile,
+                        review_style=review_style,
+                    ),
+                    kind="write",
+                )
         if (
             quality_profile != "draft"
             and quality is not None
@@ -1900,21 +1929,52 @@ async def _quality(
         }
         for item in usage_rows
     ]
+    fast_preview = context.checkpoint.get("fast_draft_preview")
+    preview_matches_snapshot = (
+        isinstance(fast_preview, dict)
+        and document is not None
+        and fast_preview.get("paper_snapshot_hash") == document_snapshot_hash(rows)
+    )
+    soft_decision_mode = (
+        "off"
+        if preview_matches_snapshot
+        else getattr(context.settings, "typesafe_soft_check_mode", "off")
+    )
     findings = await soft_check_citations(
         usages=usages,
         abstracts=semantic_sources,
         runner=context.llm_runner(),
-        decision_runner=(
-            context.decision_runner()
-            if getattr(context.settings, "typesafe_soft_check_mode", "off") != "off"
-            else None
-        ),
-        decision_mode=getattr(context.settings, "typesafe_soft_check_mode", "off"),
+        decision_runner=(context.decision_runner() if soft_decision_mode != "off" else None),
+        decision_mode=soft_decision_mode,
         decision_confidence_threshold=getattr(
             context.settings, "typesafe_confidence_threshold", 0.90
         ),
         trace_context=context,
     )
+    if isinstance(context.checkpoint.get("fast_draft_preview"), dict):
+        from paperforge_worker.pipelines.citation_decisions import citation_pairs
+
+        pairs = citation_pairs(usages, semantic_sources)
+        observed = {
+            "paper_snapshot_hash": document_snapshot_hash(rows) if document else None,
+            "items": [
+                {
+                    "index": index,
+                    "pair_hash": pair["pair_hash"],
+                    "cite_key": finding.cite_key,
+                    "status": finding.status,
+                    "weak": finding.weak,
+                    "score": round(finding.score, 3) if finding.status == "completed" else None,
+                }
+                for index, (pair, finding) in enumerate(zip(pairs, findings, strict=False))
+            ],
+        }
+        await context.emit(
+            "fast_draft.verifier_observed",
+            observed,
+            stage="quality",
+            checkpoint={"fast_draft_verifier": observed},
+        )
     report = build_quality_report(
         sections=sections,
         whitelist_size=len(whitelist),
@@ -3083,6 +3143,50 @@ async def _converge_section_semantics(
     return payload
 
 
+async def _review_fast_draft_sections(context: JobContext, *, language: str) -> dict[str, Any]:
+    """Review the delivered snapshot once, without rewriting a user's editable draft."""
+    inputs = await _section_review_inputs(context)
+    outcome = ReviewOutcome()
+    unassessed: list[str] = []
+    runner = context.llm_runner()
+
+    async def review_one(item: dict[str, Any]) -> Any:
+        return await review_section(
+            section_key=item["section_key"],
+            question=item["question"],
+            prose=item["prose"],
+            evidence=item["evidence"],
+            review_input=item.get("review_input"),
+            trace_context=context,
+            runner=runner,
+            language=language,
+        )
+
+    async def collect(_index: int, item: dict[str, Any], verdict: Any) -> None:
+        outcome.calls += 1
+        if isinstance(verdict, BaseException) or verdict is None:
+            outcome.failed_calls += 1
+            unassessed.append(item["section_key"])
+        else:
+            outcome.verdicts.append(verdict)
+
+    await bounded_map(
+        inputs,
+        review_one,
+        limit=context.settings.section_review_concurrency,
+        on_ready=collect,
+        stop_check=context.raise_if_stopped,
+    )
+    result = {
+        **outcome.to_payload(),
+        "status": "reviewed" if not unassessed else "partial",
+        "unassessed": unassessed,
+        "repair_deferred": True,
+    }
+    await context.emit("section_review.completed", result, stage="quality")
+    return result
+
+
 async def _rebuild_question_matrix(context: JobContext, *, language: str) -> None:
     """补检索之后重建问题—证据矩阵，否则新文献永远进不了任何一节。"""
     try:
@@ -3849,6 +3953,117 @@ async def _converge_scholarly_quality(
     return current, history
 
 
+async def _publish_fast_draft_preview(context: JobContext) -> None:
+    """Expose the written manuscript while the authoritative quality pass runs."""
+    from db import (
+        document_snapshot_hash,
+        evidence_payload,
+        latest_document,
+        list_citation_usage,
+        list_entries,
+        list_evidence_measurements,
+        list_evidence_units,
+        list_sections,
+    )
+
+    from paperforge_worker.pipelines.citation_decisions import semantic_sources
+
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        if document is None:
+            return
+        rows = await list_sections(session, document.id)
+        if not rows:
+            return
+        snapshot = document_snapshot_hash(rows)
+        previous = context.checkpoint.get("fast_draft_preview")
+        if isinstance(previous, dict) and previous.get("paper_snapshot_hash") == snapshot:
+            return
+        section_ids = {row.id for row in rows}
+        usages = [
+            {
+                "cite_key": row.cite_key,
+                "section_key": "",
+                "context_snippet": row.context_snippet,
+            }
+            for row in await list_citation_usage(session, context.project_id)
+            if row.section_id in section_ids
+        ]
+        entries = await list_entries(session, context.project_id, status="selected")
+        evidence_rows = await list_evidence_units(session, context.project_id)
+        measurements = await list_evidence_measurements(session, [row.id for row in evidence_rows])
+        sources = semantic_sources(
+            entries,
+            [evidence_payload(row, measurements.get(row.id)) for row in evidence_rows],
+        )
+        document_version = document.version
+    try:
+        preview = await preview_citations(
+            usages=usages,
+            sources=sources,
+            decision_runner=context.decision_runner(),
+        )
+    except JobStopped:
+        raise
+    except Exception as error:  # noqa: BLE001 - the manuscript is still readable
+        logger.warning("fast draft preview failed", exc_info=True)
+        preview = {
+            "version": "jev-soft-check-v2",
+            "status": "unavailable",
+            "items": [],
+            "error": type(error).__name__,
+        }
+    preview.update(
+        {
+            "paper_snapshot_hash": snapshot,
+            "document_version": document_version,
+            "ready_at": datetime.now(UTC).isoformat(),
+            "verification_status": "pending",
+        }
+    )
+    await context.emit(
+        "fast_draft.ready",
+        preview,
+        stage="quality",
+        checkpoint={"fast_draft_preview": preview},
+    )
+
+
+async def _try_publish_fast_draft_preview(context: JobContext) -> None:
+    try:
+        await _publish_fast_draft_preview(context)
+    except JobStopped:
+        raise
+    except Exception:  # noqa: BLE001 - the manuscript remains available
+        logger.warning("could not publish fast draft preview", exc_info=True)
+
+
+async def _publish_fast_draft_verification(context: JobContext, report: Any) -> None:
+    preview = context.checkpoint.get("fast_draft_preview")
+    if not isinstance(preview, dict):
+        return
+    observed = context.checkpoint.get("fast_draft_verifier")
+    same_snapshot = preview.get("paper_snapshot_hash") == report.paper_snapshot_hash
+    final = {
+        "status": "complete" if same_snapshot else "superseded",
+        "paper_snapshot_hash": report.paper_snapshot_hash,
+        "report_id": report.report_id,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "items": observed.get("items", [])
+        if same_snapshot
+        and isinstance(observed, dict)
+        and observed.get("paper_snapshot_hash") == report.paper_snapshot_hash
+        else [],
+    }
+    preview = {**preview, "verification_status": final["status"]}
+    await context.emit(
+        "fast_draft.verification_complete",
+        final,
+        stage="quality",
+        checkpoint={"fast_draft_preview": preview, "fast_draft_verification": final},
+    )
+
+
 async def run_full_pipeline(
     ctx: dict,
     project_id: str,
@@ -3856,6 +4071,8 @@ async def run_full_pipeline(
     *,
     quality_profile: str = "scholarly",
     review_style: str = "narrative",
+    delivery_mode: str = "standard",
+    regenerate_scope: bool = True,
 ) -> dict:
     """kind=full 一键生成入口。
 
@@ -3870,6 +4087,7 @@ async def run_full_pipeline(
         project_id,
         job_id,
         acquire_fulltext=True,
+        regenerate_scope=regenerate_scope,
         finalize=False,
     )
     if library is None:
@@ -3886,6 +4104,7 @@ async def run_full_pipeline(
         scholar_cache=ctx.get("scholar_cache"),
         event_publisher=ctx.get("redis"),
     ) as context:
+        delivery_mode = _effective_delivery_mode(context.checkpoint, quality_profile, delivery_mode)
         async with context.session() as session:
             project = await get_project(session, project_uuid)
             language = project.language if project else "en"
@@ -3948,6 +4167,8 @@ async def run_full_pipeline(
         # 续跑时 write 可能被跳过（上一轮已写完），outcome 为 None 但正文确实在库里，
         # 标量因此一律走 _stage_scalar：本轮跑过取内存对象，跳过了取 checkpoint。
         if _stage_scalar(context, "write", "section_count", write_outcome):
+            if delivery_mode == "fast_draft" and quality_profile == "draft":
+                await _try_publish_fast_draft_preview(context)
             quality_outcome = await _run_stage(
                 context,
                 "quality",
@@ -3960,12 +4181,16 @@ async def run_full_pipeline(
             )
             # 可恢复的缺陷（整节没写出来、整段照抄证据、语种不一致）在**任何档位**
             # 都先自动修一轮：只报不修等于把一份自己知道有洞的稿子交出去。
-            if quality_outcome is not None and (
-                (
-                    quality_profile != "draft"
-                    and quality_outcome.readiness_status != "preflight_ready"
+            if (
+                quality_outcome is not None
+                and delivery_mode != "fast_draft"
+                and (
+                    (
+                        quality_profile != "draft"
+                        and quality_outcome.readiness_status != "preflight_ready"
+                    )
+                    or recoverable_findings(quality_outcome)
                 )
-                or recoverable_findings(quality_outcome)
             ):
                 quality_outcome, repair_history = await _converge_scholarly_quality(
                     context,
@@ -3977,10 +4202,14 @@ async def run_full_pipeline(
                 )
             # 语义评审放在确定性质量门之后：先修可判定的红线，再问「答没答上」。
             # 反过来会让评审对着一份还带着引用/数字问题的稿子做判断。
-            semantic_review = await _converge_section_semantics(
-                context,
-                language=language,
-                paper_type=paper_type,
+            semantic_review = (
+                await _review_fast_draft_sections(context, language=language)
+                if delivery_mode == "fast_draft"
+                else await _converge_section_semantics(
+                    context,
+                    language=language,
+                    paper_type=paper_type,
+                )
             )
             quality_outcome = await _quality_after_semantics(
                 context,
@@ -3989,6 +4218,8 @@ async def run_full_pipeline(
                 review_style=review_style,
             )
             if quality_outcome is not None:
+                if delivery_mode == "fast_draft":
+                    await _publish_fast_draft_verification(context, quality_outcome)
                 await context.emit(
                     "quality.final",
                     quality_outcome.to_payload(),
@@ -4003,7 +4234,19 @@ async def run_full_pipeline(
                 _stage_scalar(context, "quality", "readiness_status", quality_outcome)
                 or "unassessed"
             )
-            if can_render_after_quality(quality_profile, readiness):
+            if delivery_mode == "fast_draft" and quality_outcome is not None:
+                _, current_hash = await _current_document_snapshot(context)
+                if current_hash != quality_outcome.paper_snapshot_hash:
+                    await context.emit(
+                        "fast_draft.superseded",
+                        {"reason": "document_changed_before_export"},
+                        stage="quality",
+                        checkpoint={"fast_draft_export_status": "superseded"},
+                    )
+                    readiness = "unassessed"
+            if not (
+                delivery_mode == "fast_draft" and readiness == "unassessed"
+            ) and can_render_after_quality(quality_profile, readiness):
                 await _run_stage(
                     context,
                     "visual_plan",
@@ -4040,6 +4283,13 @@ async def run_full_pipeline(
                         "blockers": quality_outcome.blockers,
                     },
                     stage="quality",
+                )
+            if delivery_mode == "fast_draft" and quality_outcome is None:
+                await context.emit(
+                    "fast_draft.verification_unavailable",
+                    {"status": "unavailable", "reason": "quality_stage_failed"},
+                    stage="quality",
+                    checkpoint={"fast_draft_verification": {"status": "unavailable", "items": []}},
                 )
         document_id = _stage_scalar(context, "write", "document_id", write_outcome)
         if (
@@ -4103,7 +4353,14 @@ async def run_full_pipeline(
             # 不是「不完整」。
             await _finish_incomplete(context, write_outcome, quality_outcome)
         else:
-            delivered = export_outcome is not None or bool(context.stage_payload("render"))
+            delivered = (
+                export_outcome is not None
+                or bool(context.stage_payload("render"))
+                or (
+                    delivery_mode == "fast_draft"
+                    and isinstance(context.checkpoint.get("fast_draft_preview"), dict)
+                )
+            )
             await _finish(context, delivered=delivered)
         return {
             **library,
@@ -4479,6 +4736,7 @@ class WorkerSettings:
         ]
     )
     functions = [
+        func(run_intake_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_research_pipeline,
         run_web_research_pipeline,
         run_library_pipeline,

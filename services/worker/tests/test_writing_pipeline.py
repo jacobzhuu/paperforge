@@ -32,6 +32,7 @@ from paperforge_worker.pipelines.writing import (
     enforce_sentence_evidence_rules,
     enforce_sentence_grounding_rules,
     extract_numbers,
+    inspect_section_draft,
     normalize_paragraphs,
     summarize_paragraphs,
     write_section,
@@ -81,6 +82,78 @@ def _runner(payloads: list[Any]) -> tuple[LLMRunner, _StubProvider]:
             provider=provider,
         ),
         provider,
+    )
+
+
+async def test_review_abstract_preserves_findings_synthesized_from_completed_body() -> None:
+    section = {
+        "key": "abstract",
+        "kind": "frame",
+        "title": "摘要",
+        "summary": "写这篇综述的摘要，概括正文得出的主要结论。",
+        "target_words": 120,
+        "cite_keys": [],
+    }
+    context = WritingContext(
+        outline={
+            "topic": "RAG 评估方法",
+            "research_question": "如何评估检索与生成质量？",
+            "sections": [section, {"key": "s1", "kind": "body", "title": "主要发现"}],
+        },
+        language="zh",
+        paper_type="review",
+        rolling_summaries={
+            "s1": "检索质量主要用 Recall@K 与 MRR 衡量；生成质量按忠实度与答案相关性分别衡量。"
+        },
+    )
+    finding = (
+        "现有研究分别衡量检索与生成质量：检索侧采用 Recall@K 与 MRR，"
+        "生成侧则区分忠实度和答案相关性。"
+    )
+    runner, provider = _runner(
+        [{"paragraphs": [{"sentences": [{"text": finding, "cite_keys": [], "evidence_ids": []}]}]}]
+    )
+
+    draft = await write_section(
+        section=section,
+        cards={},
+        whitelist=set(),
+        context=context,
+        runner=runner,
+    )
+
+    assert draft.paragraphs[0]["text"] == finding
+    assert draft.paragraphs[0]["sentences"][0]["evidence_ids"] == []
+    assert "已完成正文的发现" in provider.requests[0].user_prompt
+    assert "Recall@K" in provider.requests[0].user_prompt
+    assert "摘要是论文内容本身" in provider.requests[0].system_prompt
+
+
+def test_abstract_roadmap_is_rejected_even_when_it_meets_length_target() -> None:
+    draft = SectionDraft(
+        section_key="abstract",
+        title="摘要",
+        paragraphs=[
+            {
+                "text": (
+                    "取证方式遵循统一规则，将文献中的论断与可定位证据逐一登记于证据台账。"
+                    "正文按主题展开检索与生成两侧的指标。摘要之后各节将分别呈现具体发现与证据边界。"
+                    "展望未来，标准化基准建设是推动评估可比较的可行路径。"
+                ),
+                "cite_keys": [],
+            }
+        ],
+        generator="llm:stub",
+    )
+    defects = inspect_section_draft(
+        draft,
+        language="zh",
+        is_frame=True,
+        section={"key": "abstract", "kind": "frame", "target_words": 100},
+    )
+    assert "abstract_roadmap" in {defect.code for defect in defects}
+    assert next(defect for defect in defects if defect.code == "abstract_roadmap").correction(
+        language="zh"
     )
 
 

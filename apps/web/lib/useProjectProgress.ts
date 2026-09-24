@@ -259,8 +259,8 @@ export function nextAction(
   if (progress.exportCount === 0) {
     return {
       step: 'export',
-      label: '生成导出产物',
-      reason: `已有 ${progress.sectionCount} 节共 ${progress.wordCount.toLocaleString()} 字正文，可以编译成 PDF 了。`,
+      label: '生成投稿文件',
+      reason: `已有 ${progress.sectionCount} 节共 ${progress.wordCount.toLocaleString()} 字正文，可以选择格式并生成投稿文件。`,
     };
   }
   return {

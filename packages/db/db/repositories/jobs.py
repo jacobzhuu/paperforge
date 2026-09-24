@@ -17,6 +17,7 @@ from db.models.paper import GenerationJob, JobEvent, LlmCallLog
 
 JOB_KINDS = frozenset(
     {
+        "intake",
         "web_research",
         "research",
         "search",
@@ -305,6 +306,9 @@ def resume_checkpoint(job: GenerationJob) -> dict[str, Any]:
         # 润色跳过也不继承：那是针对上一轮的一次性决定。
         if key not in {JOB_CONTROL_KEY, POLISH_SKIP_KEY}
     }
+    from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
+
+    seeded[EXECUTION_PROFILE_KEY] = source_execution_profile(job)
     seeded[JOB_RESUMED_FROM_KEY] = str(job.id)
     return seeded
 

@@ -609,7 +609,7 @@ async def active_progress(redis, keys):
     active = 0
     for key in keys:
         job_id = key.decode().removeprefix("arq:in-progress:")
-        if job_id.startswith("cron:shadow_tick:"):
+        if job_id.startswith(("cron:shadow_tick:", "cron:citation_shadow_tick:")):
             # ARQ atomically deletes the job and shortens this marker on completion.
             # The remaining marker prevents duplicate cron scheduling; it is not work.
             async with redis.pipeline(transaction=True) as pipe:

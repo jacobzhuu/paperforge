@@ -49,6 +49,7 @@ from db import (
     update_project,
     update_project_scope,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.library import (
     DocumentFile,
     DocumentParse,
@@ -82,7 +83,7 @@ from paperforge_api.deps import (
     get_session,
 )
 from paperforge_api.deps import get_authorized_project as _require_project
-from paperforge_api.jobs import reconcile_abandoned_jobs, start_job
+from paperforge_api.jobs import reconcile_abandoned_jobs, retry_profile_checkpoint, start_job
 from paperforge_api.llm_accounting import accounted_runner
 from paperforge_api.repair_response import RepairResponse, consume_response, validate_response
 from paperforge_api.schemas import (
@@ -359,11 +360,26 @@ async def create_project_endpoint(
             session,
             title=request.title,
             paper_type=request.paper_type,
-            writing_mode=request.writing_mode,
-            language=request.language,
+            writing_mode=(
+                "assisted"
+                if request.intake is not None and "writing_mode" not in request.model_fields_set
+                else request.writing_mode
+            ),
+            execution_profile=request.execution_profile,
+            language=(
+                request.intake.language
+                or (request.language if "language" in request.model_fields_set else "zh")
+            )
+            if request.intake is not None
+            else request.language,
             topic=request.topic,
-            venue_template=request.venue_template,
-            citation_style=request.citation_style,
+            venue_template=request.venue_template
+            or ("article" if request.intake is not None else None),
+            citation_style=(
+                "gbt7714"
+                if request.intake is not None and "citation_style" not in request.model_fields_set
+                else request.citation_style
+            ),
             contribution_points=request.contribution_points,
             publication_title=request.publication_title,
             authors=request.authors,
@@ -377,8 +393,16 @@ async def create_project_endpoint(
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    return _project_response(project, {"library_count": 0, "section_count": 0})
+    if request.intake is not None:
+        from db.intake import initial_intake
 
+        project.scope_json = {
+            **(project.scope_json or {}),
+            "intake": initial_intake(request.intake.model_dump(exclude_none=True)),
+        }
+        await session.flush()
+        await session.refresh(project)
+    return _project_response(project, {"library_count": 0, "section_count": 0})
 
 @router.get("/projects", response_model=list[ProjectResponse])
 async def list_projects_endpoint(
@@ -426,6 +450,7 @@ async def update_project_endpoint(
     前者应当报 422（题目不能为空），后者应当不动。
     """
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
     sent = request.model_fields_set
     if {"authors", "author_details"} <= sent:
         raise HTTPException(status_code=422, detail="send authors or author_details, not both")
@@ -493,9 +518,18 @@ async def put_scope(
 ) -> ScopeResponse:
     """SCOPE 可编辑、可随时重生成（设计 §3.2：去掉协议锁定语义）。"""
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
+    if (project.scope_json or {}).get("intake", {}).get("status", "ready") != "ready":
+        raise HTTPException(409, "请先完成研究方向理解或澄清")
+
     # 打上 generator='user'：SEARCH 会自动重生成确定性回退留下的降级 scope，
     # 手改过的必须豁免，否则用户调好的关键词会被下一次检索悄悄覆盖。
-    await update_project_scope(session, project, {**request.scope, "generator": "user"})
+    scope = {**request.scope, "generator": "user"}
+    # Clients may edit scope, never the protected intake state or pinned preferences.
+    scope.pop("intake", None)
+    if (project.scope_json or {}).get("intake"):
+        scope["intake"] = project.scope_json["intake"]
+    await update_project_scope(session, project, scope)
     return ScopeResponse(project_id=str(project.id), scope=project.scope_json or {})
 
 
@@ -621,6 +655,10 @@ async def generate_scope_endpoint(
     from paperforge_api.config import get_settings
 
     project = await _require_project(session, project_id)
+    await session.refresh(project, with_for_update=True)
+    if (project.scope_json or {}).get("intake", {}).get("status", "ready") != "ready":
+        raise HTTPException(409, "请先完成研究方向理解或澄清")
+
     topic = (request.topic or (project.scope_json or {}).get("topic") or project.title).strip()
     async with accounted_runner(
         session, get_settings().llm_config(), project_id=project.id
@@ -649,6 +687,7 @@ async def start_search(
     request: SearchRequest,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -657,6 +696,7 @@ async def start_search(
         project_id=project.id,
         kind="search",
         function="run_library_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
         providers=request.providers,
         regenerate_scope=request.regenerate_scope,
     )
@@ -706,6 +746,7 @@ async def generate_cards_endpoint(
     project_id: str,
     session: SessionDep,
     queue: QueueDep,
+    retry_of: str | None = None,
 ) -> JobResponse:
     project = await _require_project(session, project_id)
     job = await start_job(
@@ -714,6 +755,7 @@ async def generate_cards_endpoint(
         project_id=project.id,
         kind="cards",
         function="run_cards_pipeline",
+        checkpoint=await retry_profile_checkpoint(session, project.id, retry_of),
     )
     return _job_response(job)
 
@@ -998,6 +1040,7 @@ async def start_polish(
         checkpoint={
             WRITE_DOCUMENT_KEY: str(document.id),
             POLISH_SOURCE_JOB_KEY: str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
         },
         source_job_id=str(source.id),
         quality_profile=str(options.get("quality_profile") or "scholarly"),
@@ -1069,7 +1112,10 @@ async def start_quality_repair_from_job(
         project_id=source.project_id,
         kind="write",
         function="run_quality_repair_pipeline",
-        checkpoint={QUALITY_REPAIR_SOURCE_JOB_KEY: str(source.id)},
+        checkpoint={
+            QUALITY_REPAIR_SOURCE_JOB_KEY: str(source.id),
+            EXECUTION_PROFILE_KEY: source_execution_profile(source),
+        },
         source_job_id=str(source.id),
         quality_profile="scholarly",
         review_style=str(options.get("review_style") or "narrative"),
@@ -1465,9 +1511,13 @@ def _project_response(
     scope = project.scope_json or {}
     return ProjectResponse(
         id=str(project.id),
+        intake={k: v for k, v in scope["intake"].items()
+                if k in {"version", "status", "paper_type", "language", "summary", "next_step"}}
+        if scope.get("intake") else None,
         title=project.title,
         paper_type=project.paper_type,
         writing_mode=project.writing_mode,
+        execution_profile=project.execution_profile,
         language=project.language,
         status=project.status,
         venue_template=project.venue_template,

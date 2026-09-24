@@ -1316,6 +1316,9 @@ def apply_readiness_gate(
                 evidence_score=report.scores["evidence"],
             )
         )
+    from paperforge_worker.pipelines.scholarly_content import math_quality_issues
+
+    warnings.extend(math_quality_issues(rows))
     if report.quality_profile == "submission":
         profile_blockers = blockers
         profile_warnings = warnings
@@ -2515,6 +2518,72 @@ async def soft_check_citations(
         )
 
     return llm_findings
+
+
+async def preview_citations(
+    *,
+    usages: list[dict[str, Any]],
+    sources: dict[str, str],
+    decision_runner: DecisionRunner | None,
+) -> dict[str, Any]:
+    """Fast, explicitly provisional citation hints for a draft snapshot."""
+    pairs = citation_pairs(usages, sources, limit=MAX_SOFT_CHECKS)
+    preview: dict[str, Any] = {
+        "version": TYPESAFE_SOFT_CHECK_VERSION,
+        "status": "no_citations" if not pairs else "pending",
+        "items": [
+            {
+                "index": pair["index"],
+                "pair_hash": pair["pair_hash"],
+                "cite_key": pair["cite_key"],
+                "section_key": pair["section_key"],
+                "status": "unverified",
+            }
+            for pair in pairs
+        ],
+    }
+    if not pairs:
+        return preview
+    if decision_runner is None or not decision_runner.enabled:
+        preview["status"] = "unavailable"
+        return preview
+    state, questions = decision_request(pairs)
+    response = await decision_runner.decide(
+        state=state,
+        questions=questions,
+        metadata={"stage": "fast_draft_preview", "decision_version": TYPESAFE_SOFT_CHECK_VERSION},
+    )
+    preview.update({"model": response.model, "latency_ms": response.latency_ms})
+    if not response.ok or response.answers is None:
+        preview["status"] = "unavailable"
+        preview["error"] = response.error or "invalid_response"
+        return preview
+    for item in preview["items"]:
+        answer = response.answers.get(f"item_{item['index']}")
+        if not isinstance(answer, dict):
+            continue
+        score, confidence = answer.get("score"), answer.get("confidence")
+        if (
+            type(score) not in (int, float)
+            or not 0 <= score <= 4
+            or type(confidence) not in (int, float)
+            or not 0 <= confidence <= 1
+        ):
+            continue
+        item.update(
+            {
+                "status": "preliminary",
+                "score": round(float(score) / 4, 3),
+                "confidence": float(confidence),
+                "weak": score < 2,
+            }
+        )
+    preview["status"] = (
+        "complete"
+        if all(item["status"] == "preliminary" for item in preview["items"])
+        else "partial"
+    )
+    return preview
 
 
 def coverage_hints(

@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 from db import (
     create_document,
+    document_snapshot_hash,
     get_writing_whitelist,
     invalidate_quality_reports_for_project,
     latest_document,
@@ -143,6 +144,9 @@ async def version_history(project_id: str, session: SessionDep) -> VersionHistor
         ).all()
     )
     current = await latest_document(session, project.id)
+    current_hash = (
+        document_snapshot_hash(await list_sections(session, current.id)) if current else None
+    )
     section_counts = {
         document_id: int(count)
         for document_id, count in (
@@ -174,6 +178,9 @@ async def version_history(project_id: str, session: SessionDep) -> VersionHistor
                 status=row.status,
                 section_count=section_counts.get(row.id),
                 is_current=current is not None and row.id == current.id,
+                paper_snapshot_hash=(
+                    current_hash if current is not None and row.id == current.id else None
+                ),
                 created_at=row.created_at,
             )
             for row in documents

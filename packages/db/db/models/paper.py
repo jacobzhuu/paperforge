@@ -46,6 +46,9 @@ class PaperProject(Base, TimestampMixin):
     metadata_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paper_type: Mapped[str] = mapped_column(String(16), nullable=False)  # review|original
     writing_mode: Mapped[str] = mapped_column(String(16), nullable=False)  # auto|assisted
+    execution_profile: Mapped[str] = mapped_column(
+        String(16), default="standard", server_default="standard", nullable=False
+    )
     language: Mapped[str] = mapped_column(String(8), default="en", nullable=False)  # zh|en
     venue_template: Mapped[str | None] = mapped_column(String(64))
     citation_style: Mapped[str] = mapped_column(String(32), default="author_year", nullable=False)

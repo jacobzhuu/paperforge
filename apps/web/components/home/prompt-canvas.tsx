@@ -1,20 +1,24 @@
 'use client';
 
+import { projectActivity } from '@/lib/project-activity';
+
 import * as React from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { AlertCircle, ArrowRight, BookOpen, CheckCircle2, ChevronDown, FileText, FlaskConical, Loader2, Paperclip, RefreshCw, Settings2, X } from 'lucide-react';
+import { ArrowRight, BookOpen, CheckCircle2, FileText, FlaskConical, Loader2, Paperclip, RefreshCw, Settings2, X } from 'lucide-react';
 import { ContributionEditor } from '@/components/projects/contribution-editor';
 import { Button } from '@/components/ui/button';
 import { Callout } from '@/components/ui/callout';
+import { Dialog } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { FastDraftToggle } from '@/components/ui/fast-draft-toggle';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
-import { createProject, generateAll, getAssetCapabilities, getMaterialPreflight, listProjects, uploadAsset } from '@/lib/api';
+import { createProject, submitIntake, getAssetCapabilities, listProjects, uploadAsset } from '@/lib/api';
 import { describeError, networkHelp } from '@/lib/errors';
 import { CITATION_STYLE_LABEL, LANGUAGE_LABEL, VENUE_TEMPLATES } from '@/lib/labels';
-import type { AssetCapabilities, CitationStyle, Language, MaterialPreflight, PaperType, Project, UserAsset, WritingMode } from '@/lib/types';
+import type { AssetCapabilities, CitationStyle, ExecutionProfile, Language, PaperType, Project, UserAsset, WritingMode } from '@/lib/types';
 import { cn, formatDate } from '@/lib/utils';
 
 /** 从一段自由描述里取出一个像样的题目。 */
@@ -56,34 +60,16 @@ function uploadStatusLabel(status: UploadStatus): string {
   }[status];
 }
 
-/**
- * 首页：从研究意图开始，而不是从功能导航开始（docs/ui-design.md 原则 02 / §3.2）。
- *
- * 此前 `app/page.tsx` 直接 redirect 到 `/projects`——一个带搜索框和两个筛选下拉的
- * SaaS 卡片网格。那个页面回答的是「我有哪些项目」，但用户打开 PaperForge 时
- * 想做的第一件事是**开始一篇论文**。
- *
- * 类型选择降级为输入框内的下拉，不再是两张对等的大卡片；模板 / 语言 / 引用样式 /
- * 写作模式收进「更多设置」（原则 06 Progressive disclosure）。
- */
+/** 从研究意图开始；设置按需打开，提交后交给持久化的理解任务。 */
 export function PromptCanvas() {
   const router = useRouter();
 
   const [text, setText] = React.useState('');
-  const [paperType, setPaperType] = React.useState<PaperType>('review');
-  /**
-   * 用户是否手动选过类型——选过之后拖文件不再自动改写它。
-   *
-   * 用 ref 而不是 state：这个值只在事件回调里读，从不参与渲染。用 state 时
-   * `addFiles` 读到的是**本次渲染闭包里的旧值**，「点完类型立刻拖文件」会漏判
-   * （实测：选中综述后马上拖一个 csv，类型仍被改回研究型）。
-   */
-  const typePinned = React.useRef(false);
+  const [paperType, setPaperType] = React.useState<PaperType | 'auto'>('auto');
   const [files, setFiles] = React.useState<File[]>([]);
   const [uploadStates, setUploadStates] = React.useState<Record<string, UploadItemState>>({});
   const [capabilities, setCapabilities] = React.useState<AssetCapabilities | null>(null);
   const [createdProject, setCreatedProject] = React.useState<Project | null>(null);
-  const [materialPreflight, setMaterialPreflight] = React.useState<MaterialPreflight | null>(null);
   const [dragging, setDragging] = React.useState(false);
   const [showSettings, setShowSettings] = React.useState(false);
   const [submitting, setSubmitting] = React.useState(false);
@@ -93,7 +79,10 @@ export function PromptCanvas() {
   const [citationStyle, setCitationStyle] = React.useState<CitationStyle>('gbt7714');
   const [venueTemplate, setVenueTemplate] = React.useState('article');
   const [writingMode, setWritingMode] = React.useState<WritingMode>('assisted');
-  const [customTitle, setCustomTitle] = React.useState('');
+  const [executionProfile, setExecutionProfile] = React.useState<ExecutionProfile>('standard');
+  const [languagePinned, setLanguagePinned] = React.useState(false);
+  const [submissionTarget, setSubmissionTarget] = React.useState('');
+  const submittingRef = React.useRef(false);
   const [contributionPoints, setContributionPoints] = React.useState<string[]>(['']);
 
   const [recent, setRecent] = React.useState<Project[] | null>(null);
@@ -135,14 +124,6 @@ export function PromptCanvas() {
     }
   }, []);
 
-  /**
-   * 带上文件就切到研究型论文。
-   *
-   * ui-design.md §4.2：研究型论文的起点是一批实验数据，不是一句话
-   * （`lib/pipeline.ts` 的 ORIGINAL_FLOW 把 assets 排在第一位）。一个只收文本的
-   * 输入框对这条管线是结构性错配，所以这里让文件本身承担分流。
-   * 用户手动选过类型就不再自动改——显式选择永远压过推断。
-   */
   const addFiles = (incoming: File[]) => {
     if (incoming.length === 0) return;
     const unique = incoming.filter((file) => !files.some((existing) => fileKey(existing) === fileKey(file)));
@@ -159,22 +140,12 @@ export function PromptCanvas() {
       }
       return next;
     });
-    if (!typePinned.current) {
-      setPaperType('original');
-      setCitationStyle('ieee');
-    }
   };
 
-  const pickType = (next: PaperType) => {
-    setPaperType(next);
-    typePinned.current = true;
-    setCitationStyle(next === 'original' ? 'ieee' : 'gbt7714');
-  };
-
+  const pickType = (next: PaperType | 'auto') => setPaperType(next);
   const hasUsableFile = files.some((file) => uploadStates[fileKey(file)]?.status !== 'invalid');
-  const canSubmit = !submitting && (
-    paperType === 'review' ? text.trim().length > 0 : text.trim().length > 0 || hasUsableFile
-  );
+  const canSubmit = !submitting && (text.trim().length > 0 || hasUsableFile)
+    && !files.some((file) => ['invalid', 'uploading'].includes(uploadStates[fileKey(file)]?.status ?? ''));
 
   const uploadOne = async (projectId: string, file: File): Promise<boolean> => {
     const key = fileKey(file);
@@ -198,15 +169,22 @@ export function PromptCanvas() {
   };
 
   const submit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     setError(null);
     const topic = text.trim();
     try {
       const res = createdProject ? { data: createdProject, source: 'live' as const } : await createProject({
-        title: customTitle.trim() || (topic ? deriveTitle(topic) : titleFromFile(files[0])),
-        paper_type: paperType,
+        title: topic ? deriveTitle(topic) : titleFromFile(files[0]),
+        intake: {
+          ...(paperType !== 'auto' ? { paper_type: paperType } : {}),
+          ...(languagePinned ? { language } : {}),
+          ...(submissionTarget.trim() ? { submission_target: submissionTarget.trim() } : {}),
+        },
+        paper_type: paperType === 'auto' ? 'review' : paperType,
         writing_mode: writingMode,
+        execution_profile: executionProfile,
         language,
         topic: topic || undefined,
         venue_template: venueTemplate,
@@ -246,48 +224,23 @@ export function PromptCanvas() {
         setSubmitting(false);
         return;
       }
-      if (paperType === 'original') {
-        const preflight = await getMaterialPreflight(res.data.id);
-        setMaterialPreflight(preflight);
-        if (!preflight.ready) {
-          try {
-            sessionStorage.setItem(`paperforge:material-preflight:${res.data.id}`, JSON.stringify(preflight));
-          } catch { /* 存储不可用不阻断导航，素材页会重新请求 */ }
-          router.push(`${target}/assets?preflight=1`);
-          return;
-        }
-      }
-      if (writingMode === 'auto') {
-        // 「全自动（一次跑到 PDF）」是执行承诺，不只是一个项目标签。必须等素材
-        // 上传完再启动：原创论文的 generate 预检会读取这些素材来确认方法与结果
-        // 可核验。拿到真实 job 后再导航，项目页首次加载即可订阅这条全管线。
-        // 档位固定为 draft：一键全流程的承诺是「一次跑到 PDF」，而 scholarly
-        // 会在写完之后再跑最多两轮「重写失败章节 + 全文重新评估」，并且没过质量门
-        // 就连导出都不做——用户等了更久，最后拿到的是一个 needs_input 而不是稿子。
-        // draft 档同样跑完整评估、warnings 一条不少，只是不把发现项升级成阻断项，
-        // 修复改由用户在概览页显式发起（quality_repair.available）。
-        const started = await generateAll(res.data.id, {
-          quality_profile: 'draft',
-          review_style: 'narrative',
-        });
-        if (!started.data) {
-          throw new Error(started.note ?? '后端未返回全管线任务');
-        }
-      }
-      router.push(!topic && files.length > 0 ? `${target}/assets` : target);
+      await submitIntake(res.data.id, { version: 0 });
+      router.push(target);
     } catch (err) {
       setError(describeError(err));
       setSubmitting(false);
+    } finally {
+      submittingRef.current = false;
     }
   };
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-16 pt-8 md:pt-[12vh]">
+    <div className="mx-auto flex w-full max-w-2xl flex-col px-4 pb-16 pt-8 md:pt-[8vh]">
       <h1 className="text-center font-serif text-display font-semibold tracking-tight">
         {greeting()}
       </h1>
       <p className="mt-2 text-center font-serif text-heading text-muted-foreground">
-        今天想研究什么？
+        说说你的研究问题，或上传已有材料
       </p>
 
       <div
@@ -302,7 +255,7 @@ export function PromptCanvas() {
           addFiles(Array.from(e.dataTransfer.files));
         }}
         className={cn(
-          'mt-8 rounded-lg border bg-card shadow-sm transition-colors',
+          'mt-8 rounded-xl border bg-card shadow-sm transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/15',
           dragging && 'border-primary bg-accent/40',
         )}
       >
@@ -318,9 +271,10 @@ export function PromptCanvas() {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void submit();
           }}
           rows={4}
-          placeholder="描述你的研究主题、问题或论文目标…"
+          disabled={submitting || Boolean(createdProject)}
+          placeholder="描述研究目标、已有材料和希望得到的成果……"
           aria-invalid={Boolean(error)}
-          aria-describedby={error ? 'create-project-error' : undefined}
+          aria-describedby={error ? 'intent-help create-project-error' : 'intent-help'}
           className="w-full resize-none bg-transparent px-4 pt-4 text-body placeholder:text-muted-foreground focus-visible:outline-none"
         />
 
@@ -364,7 +318,7 @@ export function PromptCanvas() {
                       return next;
                     });
                   }}
-                  disabled={uploadStates[fileKey(file)]?.status === 'uploading'}
+                  disabled={submitting || ['uploading', 'received', 'warning'].includes(uploadStates[fileKey(file)]?.status ?? '')}
                   aria-label={`移除 ${file.name}`}
                   className="flex h-11 w-11 items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:h-8 md:w-8"
                 >
@@ -376,7 +330,7 @@ export function PromptCanvas() {
         )}
 
         <div className="flex flex-wrap items-center justify-between gap-2 px-3 pb-3 pt-1">
-          <div className="flex items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
             <input
               ref={fileInputRef}
               type="file"
@@ -387,104 +341,86 @@ export function PromptCanvas() {
                 e.target.value = '';
               }}
             />
-            <Button variant="ghost" size="sm" onClick={() => fileInputRef.current?.click()}>
-              <Paperclip className="h-3.5 w-3.5" /> 材料
+            <Button variant="ghost" size="sm" disabled={submitting || Boolean(createdProject)} onClick={() => fileInputRef.current?.click()}>
+              <Paperclip className="h-3.5 w-3.5" /> 上传材料
             </Button>
-            <PaperTypeSelect value={paperType} onChange={pickType} />
-            <Button variant="ghost" size="sm" onClick={() => setShowSettings((v) => !v)}>
-              <Settings2 className="h-3.5 w-3.5" />
-              更多设置
-              <ChevronDown
-                className={cn('h-3 w-3 transition-transform', showSettings && 'rotate-180')}
-              />
-            </Button>
+            <FastDraftToggle value={executionProfile} onChange={setExecutionProfile} disabled={submitting || Boolean(createdProject)} />
           </div>
           <Button
+            className="w-full sm:w-auto"
             onClick={() => void submit()}
             disabled={!canSubmit}
             loading={submitting}
-            loadingLabel={writingMode === 'auto' ? '正在启动全流程…' : '正在创建…'}
+            loadingLabel="正在保存并启动研究…"
           >
             <ArrowRight className="h-4 w-4" />
-            {createdProject
-              ? '继续处理文件'
-              : writingMode === 'auto'
-                ? '创建并启动全流程'
-                : paperType === 'original' && !text.trim()
-                  ? '从材料创建研究项目'
-                  : '创建项目'}
+            {createdProject ? '继续开始研究' : '开始研究'}
           </Button>
         </div>
 
-        {showSettings && (
-          <div className="grid gap-3 border-t px-4 py-3 sm:grid-cols-2">
-            <Field label="自定义题目（可选）" id="custom-title" className="sm:col-span-2">
-              <Input
-                id="custom-title"
-                value={customTitle}
-                onChange={(event) => setCustomTitle(event.target.value)}
-                placeholder={text.trim() ? deriveTitle(text) : '留空则从研究描述自动生成'}
-              />
-            </Field>
-            <Field label="语言" id="lang">
-              <Select
-                id="lang"
-                value={language}
-                onChange={(e) => setLanguage(e.target.value as Language)}
-              >
-                {(['zh', 'en'] as Language[]).map((l) => (
-                  <option key={l} value={l}>
-                    {LANGUAGE_LABEL[l]}
-                  </option>
-                ))}
-              </Select>
+      </div>
+      <div className="mt-2 flex items-center justify-between text-sm text-muted-foreground">
+        <span>{writingMode === 'auto' ? '全自动' : '协作'} · {LANGUAGE_LABEL[language]}{!languagePinned && '（默认）'}</span>
+        <Button variant="ghost" size="sm" onClick={() => setShowSettings(true)} disabled={submitting || Boolean(createdProject)}>
+          <Settings2 className="h-3.5 w-3.5" /> 调整
+        </Button>
+      </div>
+      <Dialog open={showSettings} onClose={() => setShowSettings(false)} title="调整研究方案"
+        description="这些设置无需提前确定。描述中的明确要求会在提交后识别，手动设置优先。"
+        footer={<Button onClick={() => setShowSettings(false)}>完成</Button>}>
+        <div className="space-y-5">
+          <fieldset className="space-y-2">
+            <legend className="mb-2 text-sm font-medium">合作方式</legend>
+            {([
+              ['assisted', '协作', '先理解目标并提出规划，由你决定何时继续检索与写作。'],
+              ['auto', '全自动', '方向明确、材料齐备后继续生成论文；有歧义时仍会请你澄清。'],
+            ] as const).map(([value, label, hint]) => (
+              <label key={value} className="flex cursor-pointer items-start gap-3 rounded-md border p-3 has-[:checked]:bg-accent">
+                <input className="mt-1 accent-current" type="radio" name="writing-mode" value={value}
+                  checked={writingMode === value} onChange={() => setWritingMode(value)} />
+                <span><span className="block text-sm font-medium">{label}</span><span className="text-xs text-muted-foreground">{hint}</span></span>
+              </label>
+            ))}
+          </fieldset>
+          <Field label="语言" id="lang">
+            <Select id="lang" value={languagePinned ? language : 'auto'} onChange={(e) => {
+              setLanguagePinned(e.target.value !== 'auto');
+              setLanguage(e.target.value === 'auto' ? 'zh' : e.target.value as Language);
+            }}>
+              <option value="auto">按描述判断，默认中文</option>
+              <option value="zh">中文</option><option value="en">English</option>
+            </Select>
+          </Field>
+          <Field label="论文类型" id="paper-type">
+            <Select id="paper-type" value={paperType} onChange={(e) => pickType(e.target.value as PaperType | 'auto')}>
+              <option value="auto">根据研究目标判断</option>
+              <option value="review">综述论文</option><option value="original">研究型论文</option>
+            </Select>
+          </Field>
+          <details className="space-y-3">
+            <summary className="cursor-pointer text-sm font-medium">投稿要求（可稍后修改）</summary>
+            <Field label="目标期刊或会议" id="submission-target">
+              <Input id="submission-target" value={submissionTarget} onChange={(e) => setSubmissionTarget(e.target.value)} placeholder="可选，也可以直接写在研究描述中" />
             </Field>
             <Field label="引用样式" id="cite">
-              <Select
-                id="cite"
-                value={citationStyle}
-                onChange={(e) => setCitationStyle(e.target.value as CitationStyle)}
-              >
-                {(Object.keys(CITATION_STYLE_LABEL) as CitationStyle[]).map((c) => (
-                  <option key={c} value={c}>
-                    {CITATION_STYLE_LABEL[c]}
-                  </option>
-                ))}
+              <Select id="cite" value={citationStyle} onChange={(e) => setCitationStyle(e.target.value as CitationStyle)}>
+                {(Object.keys(CITATION_STYLE_LABEL) as CitationStyle[]).map((c) => <option key={c} value={c}>{CITATION_STYLE_LABEL[c]}</option>)}
               </Select>
             </Field>
             <Field label="投稿模板" id="tpl">
-              <Select
-                id="tpl"
-                value={venueTemplate}
-                onChange={(e) => setVenueTemplate(e.target.value)}
-              >
-                {VENUE_TEMPLATES.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.label}
-                  </option>
-                ))}
+              <Select id="tpl" value={venueTemplate} onChange={(e) => setVenueTemplate(e.target.value)}>
+                {VENUE_TEMPLATES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
               </Select>
             </Field>
-            <Field label="写作模式" id="mode">
-              <Select
-                id="mode"
-                value={writingMode}
-                onChange={(e) => setWritingMode(e.target.value as WritingMode)}
-              >
-                <option value="assisted">协作（逐步确认）</option>
-                <option value="auto">全自动（一次跑到 PDF）</option>
-              </Select>
-            </Field>
-            {paperType === 'original' && (
-              <ContributionEditor points={contributionPoints} onChange={setContributionPoints} />
-            )}
-          </div>
-        )}
-      </div>
+            <p className="text-xs text-muted-foreground">投稿目标用于规划；具体排版可在导出前确认。</p>
+          </details>
+          {paperType === 'original' && <details><summary className="cursor-pointer text-sm">贡献点（可选）</summary><ContributionEditor points={contributionPoints} onChange={setContributionPoints} /></details>}
+        </div>
+      </Dialog>
 
-      {recent?.length === 0 && (
+      {recent?.length === 0 && !createdProject && (
         <div className="mt-3 space-y-2 text-center text-meta text-muted-foreground">
-          <p>描述研究主题，或为研究型论文直接上传材料。</p>
+          <p>描述研究目标，或直接上传已有材料。</p>
           <div className="flex flex-wrap justify-center gap-2" aria-label="研究意图示例">
             {[
               '比较近五年大语言模型事实一致性评估方法',
@@ -494,8 +430,12 @@ export function PromptCanvas() {
               <button
                 key={example}
                 type="button"
-                onClick={() => setText(example)}
-                className="rounded-full border px-3 py-1 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                disabled={submitting}
+                onClick={() => {
+                  setText(current => current.trim() ? `${current}\n${example}` : example);
+                  document.getElementById('intent')?.focus();
+                }}
+                className="min-h-11 rounded-lg border px-3 py-2 text-left leading-relaxed hover:bg-accent disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {example}
               </button>
@@ -504,25 +444,20 @@ export function PromptCanvas() {
         </div>
       )}
 
-      {capabilities && (
-        <p className="mt-2 text-center text-meta text-muted-foreground">
-          单文件上限 {capabilities.max_mib} MiB；推荐 {capabilities.preferred_extensions.join('、')}。
-          其它类型会保留并作为方法备注尝试解析。
-        </p>
-      )}
-
-      {materialPreflight && !materialPreflight.ready && (
-        <Callout variant="warning" className="mt-3">
-          <span className="flex items-center gap-2 font-medium"><AlertCircle className="h-4 w-4" />项目已保存，还需补充材料</span>
-          <ul className="mt-1 list-disc pl-5">
-            {materialPreflight.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}
-          </ul>
-        </Callout>
-      )}
+      <p id="intent-help" className="mt-4 text-center text-sm leading-relaxed text-muted-foreground">
+        开始后会先理解目标并形成研究规划；需要补充的信息会在项目中提示。
+      </p>
+      <div className="mt-2 text-center text-meta text-muted-foreground">
+        <p>支持文献、数据与代码{capabilities ? `，单文件最大 ${capabilities.max_mib} MiB。` : '。'}</p>
+        {capabilities && <details className="mt-1"><summary className="cursor-pointer">查看支持格式</summary>
+          <p className="mt-1">{capabilities.preferred_extensions.join('、')}。其它类型会保留并尝试作为方法备注解析。</p>
+        </details>}
+      </div>
 
       {error && (
         <Callout id="create-project-error" role="alert" variant="error" className="mt-3">
           {error}
+          {createdProject && <Link className="ml-2 underline" href={`/projects/${createdProject.id}`}>进入已保存的项目</Link>}
         </Callout>
       )}
 
@@ -552,31 +487,6 @@ function Field({
   );
 }
 
-/** 类型选择：输入框内的一个轻下拉，而不是首页上两张对等的大卡片。 */
-function PaperTypeSelect({
-  value,
-  onChange,
-}: {
-  value: PaperType;
-  onChange: (next: PaperType) => void;
-}) {
-  return (
-    <>
-      <label className="sr-only" htmlFor="paper-type">论文类型</label>
-      <select
-        id="paper-type"
-        aria-label="论文类型"
-        value={value}
-        onChange={(event) => onChange(event.target.value as PaperType)}
-        className="h-9 rounded-md border-0 bg-transparent px-2 text-sm font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <option value="review">综述论文</option>
-        <option value="original">研究型论文</option>
-      </select>
-    </>
-  );
-}
-
 /** 最近的论文：一列题目 + 时间，不是卡片网格（原则 07）。 */
 function RecentPapers({ projects }: { projects: Project[] | null }) {
   if (projects === null) {
@@ -596,7 +506,7 @@ function RecentPapers({ projects }: { projects: Project[] | null }) {
             从一种工作方式开始
           </h2>
           <p className="mt-1 text-meta text-muted-foreground">
-            两条管线共用同一个入口，类型、素材和贡献点都可以在上方一次说明。
+            说明你的目标，我们会先理解需求，再提出研究方案。
           </p>
         </div>
         <div className="grid gap-6 sm:grid-cols-2">
@@ -637,11 +547,16 @@ function RecentPapers({ projects }: { projects: Project[] | null }) {
           <li key={project.id}>
             <Link
               href={`/projects/${project.id}`}
-              className="flex items-baseline justify-between gap-4 py-2.5 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex flex-col gap-2 rounded-md px-2 py-4 sm:flex-row sm:items-baseline sm:justify-between sm:gap-4 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
-              <span className="min-w-0 flex-1 truncate font-serif text-subheading">{project.title}</span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate font-serif text-subheading">{project.title}</span>
+                <span className="block text-meta text-muted-foreground">{
+                  projectActivity(project)
+                }</span>
+              </span>
               <span className="shrink-0 text-meta text-muted-foreground">
-                {formatDate(project.updated_at)}
+                最近编辑 {formatDate(project.updated_at)} · 继续
               </span>
             </Link>
           </li>

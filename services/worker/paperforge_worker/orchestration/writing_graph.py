@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any
 
-WRITING_VERSION = "writing-v2"
+WRITING_VERSION = "writing-v3-scholarly-content"
 FRAME_KEYS = frozenset({"abstract", "introduction", "conclusion"})
 
 

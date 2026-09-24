@@ -2,146 +2,105 @@ import * as React from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const push = vi.fn();
-const createProject = vi.fn();
-const generateAll = vi.fn();
-const listProjects = vi.fn();
-const uploadAsset = vi.fn();
-const getAssetCapabilities = vi.fn();
-const getMaterialPreflight = vi.fn();
-
-vi.mock('next/navigation', () => ({
-  useRouter: () => ({ push }),
-}));
-
-vi.mock('@/lib/api', () => ({
-  createProject: (...args: unknown[]) => createProject(...args),
-  generateAll: (...args: unknown[]) => generateAll(...args),
-  listProjects: (...args: unknown[]) => listProjects(...args),
-  uploadAsset: (...args: unknown[]) => uploadAsset(...args),
-  getAssetCapabilities: (...args: unknown[]) => getAssetCapabilities(...args),
-  getMaterialPreflight: (...args: unknown[]) => getMaterialPreflight(...args),
-}));
-
+const api = vi.hoisted(() => ({ createProject: vi.fn(), submitIntake: vi.fn(), listProjects: vi.fn(),
+  uploadAsset: vi.fn(), getAssetCapabilities: vi.fn(), push: vi.fn() }));
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push: api.push }) }));
+vi.mock('@/lib/api', () => api);
 import { PromptCanvas } from '@/components/home/prompt-canvas';
 
-const project = {
-  id: 'project-auto',
-  title: '自动论文',
-  paper_type: 'review',
-  writing_mode: 'auto',
-  language: 'zh',
-  status: 'draft',
-  citation_style: 'gbt7714',
-};
-
-function chooseWritingMode(mode: 'auto' | 'assisted') {
-  fireEvent.click(screen.getByRole('button', { name: /更多设置/ }));
-  fireEvent.change(screen.getByLabelText('写作模式'), { target: { value: mode } });
+const project = { id: 'intent-project', title: '研究', paper_type: 'review', writing_mode: 'assisted',
+  language: 'zh', status: 'draft', citation_style: 'gbt7714' };
+function goal() {
+  fireEvent.change(screen.getByLabelText('描述你的研究主题、问题或论文目标'), { target: { value: '根据实验数据写一篇英文研究型论文' } });
 }
-
-function enterTopicAndSubmit() {
-  fireEvent.change(screen.getByLabelText('描述你的研究主题、问题或论文目标'), {
-    target: { value: '大语言模型事实一致性研究' },
-  });
-  fireEvent.click(screen.getByRole('button', { name: /^(创建|从材料)/ }));
+function upload(file = new File(['group,value\nA,0.95'], 'results.csv')) {
+  fireEvent.change(document.querySelector('input[type="file"]')!, { target: { files: [file] } });
 }
+function submit() { fireEvent.click(screen.getByRole('button', { name: /^(开始研究|继续开始研究)$/ })); }
 
-describe('首页创建项目的写作模式', () => {
+describe('研究意图首页', () => {
   beforeEach(() => {
-    push.mockReset();
-    createProject.mockReset();
-    generateAll.mockReset();
-    listProjects.mockReset();
-    uploadAsset.mockReset();
-    getAssetCapabilities.mockReset();
-    getMaterialPreflight.mockReset();
-    listProjects.mockResolvedValue({ data: [], source: 'live' });
-    createProject.mockResolvedValue({ data: project, source: 'live' });
-    getAssetCapabilities.mockResolvedValue({
-      max_bytes: 32 * 1024 * 1024,
-      max_mib: 32,
-      preferred_extensions: ['.csv', '.txt'],
-      accepts_unrecognized_as_method_note: true,
-    });
-    getMaterialPreflight.mockResolvedValue({ ready: true, issues: [] });
-    generateAll.mockResolvedValue({
-      data: { id: 'full-job', project_id: project.id, kind: 'full', status: 'queued' },
-      source: 'live',
-    });
+    vi.clearAllMocks();
+    api.listProjects.mockResolvedValue({ data: [], source: 'live' });
+    api.createProject.mockResolvedValue({ data: project, source: 'live' });
+    api.submitIntake.mockResolvedValue({ id: 'intake-job', status: 'queued' });
+    api.uploadAsset.mockResolvedValue({ data: { id: 'asset-1', warnings: [] }, source: 'live' });
+    api.getAssetCapabilities.mockResolvedValue({ max_bytes: 33554432, max_mib: 32, preferred_extensions: ['.csv', '.txt'] });
   });
-
-  it('全自动模式创建后立即启动全管线，再进入项目页', async () => {
+  it('选择示例保留已有研究目标并返回输入框', async () => {
     render(<PromptCanvas />);
-    chooseWritingMode('auto');
-    enterTopicAndSubmit();
-
-    await waitFor(() => {
-      // draft 而不是 scholarly：一键全流程承诺「一次跑到 PDF」，scholarly 会在
-      // 写完后再跑收敛循环、且未过质量门就不导出——默认走它等于承诺可能落空。
-      expect(generateAll).toHaveBeenCalledWith(project.id, {
-        quality_profile: 'draft',
-        review_style: 'narrative',
-      });
-    });
-    expect(createProject.mock.invocationCallOrder[0]).toBeLessThan(
-      generateAll.mock.invocationCallOrder[0],
-    );
-    expect(push).toHaveBeenCalledWith(`/projects/${project.id}`);
+    const example = await screen.findByRole('button', { name: '比较近五年大语言模型事实一致性评估方法' });
+    goal();
+    fireEvent.click(example);
+    const input = screen.getByLabelText('描述你的研究主题、问题或论文目标');
+    expect(input).toHaveValue('根据实验数据写一篇英文研究型论文\n比较近五年大语言模型事实一致性评估方法');
+    expect(input).toHaveFocus();
   });
-
-  it('协作模式只创建项目，不擅自启动全管线', async () => {
+  it('默认无下拉框，协作与中文默认值可见，文字提交真实启动理解', async () => {
     render(<PromptCanvas />);
-    chooseWritingMode('assisted');
-    enterTopicAndSubmit();
-
-    await waitFor(() => expect(push).toHaveBeenCalledWith(`/projects/${project.id}`));
-    expect(generateAll).not.toHaveBeenCalled();
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+    expect(screen.getByText('协作 · 中文（默认）')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '快速草稿' })).toHaveAttribute('aria-pressed', 'false');
+    goal(); submit();
+    await waitFor(() => expect(api.push).toHaveBeenCalledWith('/projects/intent-project'));
+    expect(api.createProject).toHaveBeenCalledWith(expect.objectContaining({ intake: {}, writing_mode: 'assisted', language: 'zh', execution_profile: 'standard' }));
+    expect(api.submitIntake).toHaveBeenCalledWith(project.id, { version: 0 });
   });
-
-  it('原创论文先上传素材，再启动全管线', async () => {
-    createProject.mockResolvedValue({
-      data: { ...project, paper_type: 'original' },
-      source: 'live',
-    });
-    uploadAsset.mockResolvedValue({ data: { id: 'asset-1' }, source: 'live' });
+  it('调整面板保存手动英文与全自动，快速草稿独立', async () => {
     render(<PromptCanvas />);
-    chooseWritingMode('auto');
-
-    const file = new File(['method,result\nA,0.95'], 'results.csv', { type: 'text/csv' });
-    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
-    fireEvent.change(input, { target: { files: [file] } });
-    enterTopicAndSubmit();
-
-    await waitFor(() => expect(generateAll).toHaveBeenCalledTimes(1));
-    expect(uploadAsset).toHaveBeenCalledWith(project.id, file);
-    expect(uploadAsset.mock.invocationCallOrder[0]).toBeLessThan(
-      generateAll.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('研究型论文可以只凭文件创建，题目来自文件名且不伪造研究问题', async () => {
-    createProject.mockResolvedValue({
-      data: { ...project, title: 'experiment-results', paper_type: 'original' },
-      source: 'live',
-    });
-    uploadAsset.mockResolvedValue({ data: { id: 'asset-file-only' }, source: 'live' });
-    render(<PromptCanvas />);
+    fireEvent.click(screen.getByRole('button', { name: '快速草稿' }));
+    fireEvent.click(screen.getByRole('button', { name: '调整' }));
+    fireEvent.click(screen.getByRole('radio', { name: /全自动/ }));
+    fireEvent.change(screen.getByLabelText('语言'), { target: { value: 'en' } });
     fireEvent.change(screen.getByLabelText('论文类型'), { target: { value: 'original' } });
-    chooseWritingMode('assisted');
-    const file = new File(['group,value\nA,0.95'], 'experiment-results.csv', {
-      type: 'text/csv',
-    });
-    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
-      target: { files: [file] },
-    });
-
-    fireEvent.click(screen.getByRole('button', { name: /^(创建|从材料)/ }));
-    await waitFor(() => expect(push).toHaveBeenCalledWith(`/projects/${project.id}/assets`));
-    expect(createProject).toHaveBeenCalledWith(
-      expect.objectContaining({ title: 'experiment-results', paper_type: 'original' }),
-    );
-    expect(createProject.mock.calls[0][0].topic).toBeUndefined();
-    expect(uploadAsset).toHaveBeenCalledWith(project.id, file);
+    fireEvent.click(screen.getByRole('button', { name: '完成' }));
+    expect(screen.getByText('全自动 · English')).toBeInTheDocument();
+    goal(); submit();
+    await waitFor(() => expect(api.submitIntake).toHaveBeenCalled());
+    expect(api.createProject).toHaveBeenCalledWith(expect.objectContaining({
+      intake: { language: 'en', paper_type: 'original' }, writing_mode: 'auto', execution_profile: 'fast_draft', citation_style: 'gbt7714',
+    }));
+  });
+  it('只上传材料也可启动，上传完成前不调用模型，不按文件类型决定管线', async () => {
+    render(<PromptCanvas />); upload(); submit();
+    await waitFor(() => expect(api.push).toHaveBeenCalled());
+    expect(api.createProject).toHaveBeenCalledWith(expect.objectContaining({ title: 'results', intake: {}, topic: undefined }));
+    expect(api.uploadAsset.mock.invocationCallOrder[0]).toBeLessThan(api.submitIntake.mock.invocationCallOrder[0]);
+  });
+  it('文件失败保留项目，重试不重复创建', async () => {
+    api.uploadAsset.mockRejectedValueOnce(new Error('网络异常'));
+    render(<PromptCanvas />); goal(); upload(); submit();
+    await screen.findByRole('alert');
+    expect(api.submitIntake).not.toHaveBeenCalled();
+    submit();
+    await waitFor(() => expect(api.push).toHaveBeenCalled());
+    expect(api.createProject).toHaveBeenCalledTimes(1);
+    expect(api.uploadAsset).toHaveBeenCalledTimes(2);
+  });
+  it('重复点击不会产生两个项目，创建失败不显示假工作区', async () => {
+    api.createProject.mockResolvedValue({ data: project, source: 'mock', note: 'offline' });
+    render(<PromptCanvas />); goal();
+    const button = screen.getByRole('button', { name: '开始研究' });
+    fireEvent.click(button); fireEvent.click(button);
+    await screen.findByRole('alert');
+    expect(api.createProject).toHaveBeenCalledTimes(1);
+    expect(api.submitIntake).not.toHaveBeenCalled();
+    expect(api.push).not.toHaveBeenCalled();
+  });
+  it('模型任务入队失败时保留已保存项目并可重试', async () => {
+    api.submitIntake.mockRejectedValueOnce(new Error('queue unavailable'));
+    render(<PromptCanvas />); goal(); submit();
+    await screen.findByRole('alert');
+    expect(screen.getByRole('link', { name: '进入已保存的项目' })).toHaveAttribute('href', '/projects/intent-project');
+    submit();
+    await waitFor(() => expect(api.push).toHaveBeenCalled());
+    expect(api.createProject).toHaveBeenCalledTimes(1);
+  });
+  it('无效文件就地提示并阻止开始', async () => {
+    render(<PromptCanvas />);
+    await screen.findByText('支持文献、数据与代码，单文件最大 32 MiB。');
+    upload(new File([], 'empty.csv'));
+    expect(screen.getByText('空文件无法上传')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '开始研究' })).toBeDisabled();
   });
 });

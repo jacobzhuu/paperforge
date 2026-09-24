@@ -2,6 +2,7 @@
 
 export type PaperType = 'review' | 'original';
 export type WritingMode = 'auto' | 'assisted';
+export type ExecutionProfile = 'standard' | 'fast_draft';
 export type Language = 'zh' | 'en';
 export type CitationStyle = 'author_year' | 'gbt7714' | 'ieee' | 'apa';
 export type QualityProfile = 'draft' | 'scholarly' | 'submission';
@@ -35,12 +36,43 @@ export type ProjectStatus =
   | 'review'
   | 'done';
 
+export interface IntakeOverrides {
+  paper_type?: PaperType;
+  language?: Language;
+  submission_target?: string;
+}
+export interface IntakeState {
+  version: number;
+  status: 'pending' | 'running' | 'needs_input' | 'ready' | 'failed';
+  summary?: string;
+  next_step?: string;
+  submission_target?: string;
+  paper_type?: PaperType;
+  language?: Language;
+  sources?: Record<string, string>;
+  overrides?: IntakeOverrides;
+  questions?: { question: string; options: string[] }[];
+  materials?: { id: string; title: string; parsed: boolean; used: boolean; truncated: boolean; warnings?: string[] }[];
+  material_issues?: { code: string; message: string }[];
+  error?: string;
+  job_id?: string;
+  type_locked?: boolean;
+}
+export interface IntakeRequest {
+  version: number;
+  topic?: string;
+  answer?: string;
+  overrides?: IntakeOverrides;
+}
+
 export interface Project {
+  intake?: IntakeState | null;
   web_research_enabled?: boolean;
   id: string;
   title: string;
   paper_type: PaperType;
   writing_mode: WritingMode;
+  execution_profile?: ExecutionProfile;
   language: Language;
   status: ProjectStatus;
   venue_template?: string | null;
@@ -91,9 +123,11 @@ export interface SubmissionReadiness {
 }
 
 export interface CreateProjectRequest {
+  intake?: IntakeOverrides;
   title: string;
   paper_type: PaperType;
   writing_mode: WritingMode;
+  execution_profile?: ExecutionProfile;
   language: Language;
   topic?: string;
   venue_template?: string;
@@ -135,6 +169,7 @@ export interface UpdateProjectRequest {
   language?: Language;
   citation_style?: CitationStyle;
   writing_mode?: WritingMode;
+  execution_profile?: ExecutionProfile;
   contribution_points?: string[];
   publication_title?: string | null;
   authors?: string[];
@@ -330,6 +365,7 @@ export interface ScopePayload {
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
 export type JobKind =
+  | 'intake'
   | 'research'
   | 'web_research'
   | 'search'
@@ -481,7 +517,7 @@ export type IRRun =
   | { t: 'cite'; keys: string[]; evidence_ids?: string[] }
   | { t: 'grounding'; source_refs: string[] }
   | { t: 'math_inline'; v: string }
-  | { t: 'xref'; target: string; kind: 'figure' };
+  | { t: 'xref'; target: string; kind: 'figure' | 'equation' };
 
 export interface IRParagraph {
   type: 'paragraph';
@@ -517,6 +553,10 @@ export interface IRList {
 export interface IREquation {
   type: 'equation';
   latex: string;
+  source_ids?: string[];
+  source_latex?: string | null;
+  source_context?: string | null;
+  explanation?: string | null;
   label?: string | null;
 }
 
@@ -1153,6 +1193,7 @@ export interface DocumentVersion {
   status: string;
   section_count?: number | null;
   is_current: boolean;
+  paper_snapshot_hash?: string | null;
   created_at?: string | null;
 }
 

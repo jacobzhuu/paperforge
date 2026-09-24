@@ -60,6 +60,7 @@ export const STATUS_VARIANT: Record<
  * 阶段集合见 worker.py::_STAGE_PROGRESS。
  */
 export const STAGE_LABEL: Record<string, string> = {
+  intake: '理解研究目标',
   research: '分析实验数据',
   web_research: '补充网页资料',
   scope: '生成研究范围',

@@ -321,7 +321,7 @@ async def _persist_one_document(
         outcome.parsed += 1
 
 
-PARSER_VERSION = "ingest_fulltext_v2"
+PARSER_VERSION = "ingest_fulltext_v3_math"
 
 
 async def parse_document_file(

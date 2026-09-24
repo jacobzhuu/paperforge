@@ -17,6 +17,7 @@ from db import (
     set_entry_status,
     upsert_entry,
 )
+from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 from db.models.library import DocumentFile, LiteraturePdfUpload, ScholarlyWork
 from db.models.paper import GenerationJob
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
@@ -169,6 +170,16 @@ async def confirm_literature_pdf(
     await require_queue(queue)
     await _lock_project_library(session, project.id)
     upload = await _require_upload(session, project.id, upload_id, for_update=True)
+    source_job = await session.scalar(
+        select(GenerationJob)
+        .where(
+            GenerationJob.project_id == project.id,
+            GenerationJob.checkpoint_json["resume"]["kwargs"]["upload_id"].astext
+            == str(upload.id),
+        )
+        .order_by(GenerationJob.created_at.desc())
+        .limit(1)
+    )
     if upload.status != "needs_confirmation" or upload.matched_work_id is None:
         raise HTTPException(status_code=409, detail="PDF upload has no match awaiting confirmation")
     work = await session.get(ScholarlyWork, upload.matched_work_id)
@@ -252,6 +263,9 @@ async def confirm_literature_pdf(
         upload=upload,
         enqueue_failure_status="parse_failed",
         upload_id=str(upload.id),
+        checkpoint=(
+            {EXECUTION_PROFILE_KEY: source_execution_profile(source_job)} if source_job else None
+        ),
     )
     return LiteraturePdfUploadStartedResponse(
         upload=await _upload_response(session, upload),
@@ -300,6 +314,16 @@ async def retry_literature_pdf(
     project = await _require_project(session, project_id)
     await require_queue(queue)
     upload = await _require_upload(session, project.id, upload_id, for_update=True)
+    source_job = await session.scalar(
+        select(GenerationJob)
+        .where(
+            GenerationJob.project_id == project.id,
+            GenerationJob.checkpoint_json["resume"]["kwargs"]["upload_id"].astext
+            == str(upload.id),
+        )
+        .order_by(GenerationJob.created_at.desc())
+        .limit(1)
+    )
     if upload.status == "match_failed":
         upload.status = "matching"
         function = "run_pdf_match_pipeline"
@@ -322,6 +346,9 @@ async def retry_literature_pdf(
             "match_failed" if function == "run_pdf_match_pipeline" else "parse_failed"
         ),
         upload_id=str(upload.id),
+        checkpoint=(
+            {EXECUTION_PROFILE_KEY: source_execution_profile(source_job)} if source_job else None
+        ),
     )
     return LiteraturePdfUploadStartedResponse(
         upload=await _upload_response(session, upload),
@@ -465,6 +492,7 @@ async def _commit_and_enqueue_pdf_job(
     upload: LiteraturePdfUpload,
     enqueue_failure_status: str,
     upload_id: str,
+    checkpoint: dict | None = None,
 ) -> GenerationJob:
     """Commit upload state and its durable dispatch intent together.
 
@@ -481,6 +509,7 @@ async def _commit_and_enqueue_pdf_job(
         project_id=project_id,
         kind="ingest",
         function=function,
+        checkpoint=checkpoint,
         upload_id=upload_id,
     )
     await session.commit()

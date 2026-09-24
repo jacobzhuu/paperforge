@@ -132,6 +132,7 @@ export const FigureXref = Node.create<{ numbering: FigureNumbering }>({
     const numbering = this.options.numbering ?? EMPTY_NUMBERING;
     const number = numbering.byLabel[target];
     const caption = numbering.captions[target];
+    const prefix = node.attrs.kind === 'equation' ? '式' : '图';
     return [
       'span',
       mergeAttributes(HTMLAttributes, {
@@ -140,7 +141,7 @@ export const FigureXref = Node.create<{ numbering: FigureNumbering }>({
         class: 'mx-0.5 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-xs text-primary',
         title: caption ? `${target} — ${caption}` : target,
       }),
-      number ? `图 ${number}` : `图引用 · ${target}`,
+      number ? `${prefix} ${number}` : `${prefix}引用 · ${target}`,
     ];
   },
 });
@@ -235,7 +236,7 @@ export const IrBlock = Node.create({
 /**
  * 行内公式的只读原子节点。
  *
- * 仓库里没有 KaTeX（也不为此新增依赖：写作管线目前不产出 math_inline）。
+ * 使用公式源码展示；保留结构化节点与来源，编辑正文时不重写数学表达式。
  * 这里按源码样式呈现——**能看见、能保存、不丢失**优先于渲染得好看。
  */
 export const MathInline = Node.create({

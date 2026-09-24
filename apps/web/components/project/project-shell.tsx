@@ -12,6 +12,7 @@ import { LoadState } from '@/components/layout/load-state';
 import { ModuleError } from '@/components/layout/module-error';
 import { useToast } from '@/components/ui/toast';
 import { describeError } from '@/lib/errors';
+import { IntakePanel } from './intake-panel';
 import { ProjectHeader } from './project-header';
 import { ProjectPipelineNav } from './project-pipeline-nav';
 import { ProjectProvider, useProject } from './project-context';
@@ -74,9 +75,9 @@ function ShellBody({ children }: { children: React.ReactNode }) {
   const current = stepFromPathname(pathname, projectId);
   const completion = stepCompletion(progress);
 
-  const handleRetryStage = async (stage: Parameters<typeof retryStage>[0]) => {
+  const handleRetryStage = async (stage: Parameters<typeof retryStage>[0], sourceJob: NonNullable<Parameters<typeof retryStage>[1]>) => {
     try {
-      await retryStage(stage);
+      await retryStage(stage, sourceJob);
       toast({ title: '已开始重跑', description: `${stageLabel(stage)}正在重新执行。` });
     } catch (err) {
       toast({ title: '重跑未能启动', description: describeError(err), variant: 'error' });
@@ -121,8 +122,8 @@ function ShellBody({ children }: { children: React.ReactNode }) {
     <div className={wide ? 'mx-auto w-full max-w-[1600px] px-4 sm:px-6 lg:px-8' : 'mx-auto w-full max-w-6xl px-4 sm:px-6 lg:px-8'}>
       <div className="space-y-4 py-6 lg:py-8">
         {/* 改名成功后重拉项目：题目会出现在项目切换器、导出文件名与 LaTeX 标题里。 */}
-        <ProjectHeader project={project} onRenamed={reload} />
-        <ProjectPipelineNav
+        <ProjectHeader activeJob={tracked?.job ?? pausedJob ?? undefined} project={project} onRenamed={reload} onProfileChanged={reload} />
+        {(!project?.intake || project.intake.status === 'ready') && <ProjectPipelineNav
           projectId={projectId}
           paperType={paperType}
           // 项目还没载入时按协作模式渲染：让步骤可见的代价，比让用户短暂
@@ -132,7 +133,7 @@ function ShellBody({ children }: { children: React.ReactNode }) {
           completion={completion}
           running={runningStep}
           badges={badges}
-        />
+        />}
 
         <DataSourceBanner source={source} note={note} />
 
@@ -146,7 +147,7 @@ function ShellBody({ children }: { children: React.ReactNode }) {
         {tracked && (
           <JobProgressCard
             tracked={tracked}
-            onRetryStage={(stage) => void handleRetryStage(stage)}
+            onRetryStage={(stage) => void handleRetryStage(stage, tracked.job)}
             onSkipPolish={() => void skipPolish(tracked.job.id)}
             onPause={() => void pauseJob(tracked.job.id)}
             onCancel={() => void cancelJob(tracked.job.id)}
@@ -178,7 +179,7 @@ function ShellBody({ children }: { children: React.ReactNode }) {
                 size="xs"
                 onClick={discardPaused}
               >
-                放弃
+                隐藏提醒
               </Button>
             </span>
           </Callout>
@@ -194,7 +195,10 @@ function ShellBody({ children }: { children: React.ReactNode }) {
         )}
 
         <LoadState loading={loading && !project} error={error} onRetry={reload} skeletonClassName="h-64">
-          {children}
+          <div className="space-y-6">
+            <IntakePanel />
+            {(!project?.intake || project.intake.status === 'ready') && children}
+          </div>
         </LoadState>
       </div>
     </div>

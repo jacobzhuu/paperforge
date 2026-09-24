@@ -304,6 +304,7 @@ export function createProject(body: CreateProjectRequest): Promise<ApiResult<Pro
     title: body.title,
     paper_type: body.paper_type,
     writing_mode: body.writing_mode,
+    execution_profile: body.execution_profile ?? 'standard',
     language: body.language,
     status: 'draft',
     venue_template: body.venue_template ?? null,
@@ -545,13 +546,16 @@ export function updateScope(
 
 // ---- Jobs（检索 / 导入 / 卡片都是异步任务） ----
 
+const retryQuery = (retryOf?: string) => retryOf ? `?retry_of=${encodeURIComponent(retryOf)}` : '';
+
 export function startSearch(
   projectId: string,
   options: { providers?: string[]; regenerateScope?: boolean } = {},
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/search/runs`, {
+      request<Job>(`/projects/${projectId}/search/runs${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({
           providers: options.providers ?? null,
@@ -576,9 +580,9 @@ export function importReferences(
   );
 }
 
-export function generateCards(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function generateCards(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/cards/generate`, { method: 'POST' }),
+    () => request<Job>(`/projects/${projectId}/cards/generate${retryQuery(retryOf)}`, { method: 'POST' }),
     undefined,
   );
 }
@@ -888,9 +892,9 @@ export function rebuildDependencies(projectId: string, outlineId: string, conten
   }), undefined);
 }
 
-export function generateOutline(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function generateOutline(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
-    () => request<Job>(`/projects/${projectId}/outline/generate`, { method: 'POST' }),
+    () => request<Job>(`/projects/${projectId}/outline/generate${retryQuery(retryOf)}`, { method: 'POST' }),
     undefined,
   );
 }
@@ -923,10 +927,11 @@ export function generateSections(
   projectId: string,
   coherence = true,
   polishPolicy?: import("./types").PolishPolicy,
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/sections/generate`, {
+      request<Job>(`/projects/${projectId}/sections/generate${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({ coherence, polish_policy: polishPolicy }),
       }),
@@ -1021,10 +1026,11 @@ export function startExport(
   projectId: string,
   formats?: RequestableExportFormat[],
   qualityProfile: QualityProfile = 'scholarly',
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/exports`, {
+      request<Job>(`/projects/${projectId}/exports${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({
           formats: formats ?? ALL_EXPORT_FORMATS,
@@ -1336,10 +1342,11 @@ export function getNumLint(projectId: string, signal?: AbortSignal): Promise<Api
 export function startSnowball(
   projectId: string,
   direction: 'both' | 'forward' | 'backward' = 'both',
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/snowball`, {
+      request<Job>(`/projects/${projectId}/snowball${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({ direction, max_seeds: 8 }),
       }),
@@ -1347,10 +1354,10 @@ export function startSnowball(
   );
 }
 
-export function startIngest(projectId: string): Promise<ApiResult<Job | undefined>> {
+export function startIngest(projectId: string, retryOf?: string): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/ingest`, {
+      request<Job>(`/projects/${projectId}/ingest${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify({ max_works: 12 }),
       }),
@@ -1376,10 +1383,11 @@ export function getQuality(
 export function generateQuality(
   projectId: string,
   options: { quality_profile?: QualityProfile; review_style?: ReviewStyle } = {},
+  retryOf?: string,
 ): Promise<ApiResult<Job | undefined>> {
   return withFallback(
     () =>
-      request<Job>(`/projects/${projectId}/quality/generate`, {
+      request<Job>(`/projects/${projectId}/quality/generate${retryQuery(retryOf)}`, {
         method: 'POST',
         body: JSON.stringify(options),
       }),
@@ -1633,4 +1641,12 @@ export function respondToRepair(projectId: string, jobId: string,
   return request<Job>(`/projects/${projectId}/jobs/${jobId}/resume`, {
     method: 'POST', body: JSON.stringify(response),
   });
+}
+
+/** Intent writes must never fall back to optimistic sample data. */
+export function getIntake(projectId: string): Promise<import('./types').IntakeState> {
+  return request(`/projects/${projectId}/intake`);
+}
+export function submitIntake(projectId: string, body: import('./types').IntakeRequest): Promise<Job> {
+  return request(`/projects/${projectId}/intake`, { method: 'POST', body: JSON.stringify(body) });
 }

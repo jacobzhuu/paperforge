@@ -275,3 +275,8 @@ async def test_reaper_keeps_running_jobs_but_ignores_completed_shadow_cron_marke
     assert await active(Redis(0, -1), cron) == 1
     assert await active(Redis(0, 1000), [b"arq:in-progress:user-job"]) == 1
     assert await active(Redis(0, 1000), [b"arq:in-progress:cron:unknown:123"]) == 1
+
+    citation_cron = [b"arq:in-progress:cron:citation_shadow_tick:123"]
+    assert await active(Redis(0, 1000), citation_cron) == 0
+    assert await active(Redis(1, 1000), citation_cron) == 1
+    assert await active(Redis(0, 10_000_000), citation_cron) == 1

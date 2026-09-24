@@ -1,9 +1,61 @@
 import importlib
+from types import SimpleNamespace
 
 import paperforge_worker.config as worker_config
 import paperforge_worker.worker as worker
 import pytest
 from arq.connections import RedisSettings
+
+
+def test_assisted_prewrite_uses_pinned_profile():
+    assert worker._prewrite_quality_profile(
+        SimpleNamespace(checkpoint={"execution_profile": "fast_draft"})
+    ) == "draft"
+    assert worker._prewrite_quality_profile(
+        SimpleNamespace(checkpoint={"execution_profile": "standard"})
+    ) == "scholarly"
+
+
+def test_submission_and_scholarly_runs_ignore_fast_draft_shortcut():
+    pinned = {"execution_profile": "fast_draft"}
+    assert worker._effective_delivery_mode(pinned, "draft", "standard") == "fast_draft"
+    assert worker._effective_delivery_mode(pinned, "scholarly", "standard") == "standard"
+    assert worker._effective_delivery_mode(pinned, "submission", "standard") == "standard"
+    assert worker._effective_delivery_mode(
+        {"execution_profile": "standard"}, "draft", "fast_draft"
+    ) == "standard"
+
+
+async def test_fast_draft_verification_keeps_preliminary_record_and_snapshot_boundary():
+    class Context:
+        def __init__(self):
+            self.checkpoint = {
+                "fast_draft_preview": {
+                    "paper_snapshot_hash": "original",
+                    "items": [{"index": 0, "weak": True}],
+                },
+                "fast_draft_verifier": {
+                    "paper_snapshot_hash": "original",
+                    "items": [{"index": 0, "weak": False}],
+                },
+            }
+
+        async def emit(self, _event, _payload, *, checkpoint, **_kwargs):
+            self.checkpoint.update(checkpoint)
+
+    context = Context()
+    await worker._publish_fast_draft_verification(
+        context, SimpleNamespace(paper_snapshot_hash="original", report_id="report-1")
+    )
+    assert context.checkpoint["fast_draft_preview"]["items"][0]["weak"] is True
+    assert context.checkpoint["fast_draft_verification"]["items"][0]["weak"] is False
+    assert context.checkpoint["fast_draft_verification"]["status"] == "complete"
+
+    await worker._publish_fast_draft_verification(
+        context, SimpleNamespace(paper_snapshot_hash="edited", report_id="report-2")
+    )
+    assert context.checkpoint["fast_draft_verification"]["status"] == "superseded"
+    assert context.checkpoint["fast_draft_verification"]["items"] == []
 
 
 def test_worker_settings_resolve_yunwu_specific_image_credentials():

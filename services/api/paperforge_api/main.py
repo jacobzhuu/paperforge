@@ -121,6 +121,9 @@ def create_app() -> FastAPI:
     app.include_router(agent.router)
     app.include_router(health.router)
     app.include_router(auth.router)
+    from paperforge_api.routers import intake
+
+    app.include_router(intake.router)
     app.include_router(projects.router)
     app.include_router(library_pdf.router)
     app.include_router(writing.router)
