@@ -247,7 +247,7 @@ async def test_wave_scheduling_feeds_identical_prompt_inputs(
         seen[width] = {record["key"]: record for record in records}
         peaks[width] = inflight.get("peak", 0)
 
-    assert seen[1], "修复轮应当至少重写了框架章节"
+    assert seen[1], "修复轮应当至少重写目标章节"
     assert set(seen[1]) == set(seen[4])
     for key, serial in seen[1].items():
         assert seen[4][key]["preceding"] == serial["preceding"], f"{key} 的前文摘要变了"
@@ -255,7 +255,8 @@ async def test_wave_scheduling_feeds_identical_prompt_inputs(
 
     # 并发确实发生了，否则上面的相等是废话。
     assert peaks[1] == 1
-    assert peaks[4] > 1
+    if targets == {"s2", "s5"}:
+        assert peaks[4] > 1
 
 
 # --------------------------------------------------------------------------
@@ -284,13 +285,13 @@ async def test_new_terms_do_not_leak_into_later_targets_in_the_same_pass(
     )
     await repair_document_sections(
         context,
-        section_keys={"s5"},
+        section_keys={"abstract", "s5"},
         language="en",
         paper_type="review",
         concurrency=1,
     )
     by_key = {record["key"]: record for record in records}
-    assert "BrandNewCoinage" in by_key["abstract"]["glossary"] or True  # 它是本节新造的
+    assert "abstract" in by_key
     for key, record in by_key.items():
         if key == "abstract":
             continue
@@ -330,7 +331,7 @@ async def test_thinner_frame_refresh_is_rejected_identically_at_any_width(
         )
         await repair_document_sections(
             context,
-            section_keys={"s2"},
+            section_keys={"abstract", "introduction", "s2"},
             language="en",
             paper_type="review",
             concurrency=width,

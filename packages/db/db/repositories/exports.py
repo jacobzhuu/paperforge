@@ -7,7 +7,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models.paper import ExportArtifact
+from db.models.paper import ExportArtifact, PaperDocument
 
 
 async def list_export_artifacts(
@@ -20,7 +20,16 @@ async def list_export_artifacts(
         (
             await session.scalars(
                 select(ExportArtifact)
-                .where(ExportArtifact.project_id == project_id)
+                .where(
+                    ExportArtifact.project_id == project_id,
+                    ~select(PaperDocument.id)
+                    .where(
+                        PaperDocument.project_id == project_id,
+                        PaperDocument.version == ExportArtifact.document_version,
+                        PaperDocument.status.in_(["revision_candidate", "revision_discarded"]),
+                    )
+                    .exists(),
+                )
                 .order_by(ExportArtifact.created_at.desc())
                 .limit(limit)
             )

@@ -1650,3 +1650,20 @@ export function getIntake(projectId: string): Promise<import('./types').IntakeSt
 export function submitIntake(projectId: string, body: import('./types').IntakeRequest): Promise<Job> {
   return request(`/projects/${projectId}/intake`, { method: 'POST', body: JSON.stringify(body) });
 }
+
+export interface DraftRevision {
+  id: string;
+  status: string;
+  job_id: string;
+  job_status: string;
+  source_document_id: string;
+  candidate_document_id: string;
+  review?: { claim_count?: number; checked_count?: number; uncertain_count?: number; unassessed_count?: number; supported_count?: number; status?: string; sections_reviewed?: number; unassessed?: string[]; sections_failing?: string[]; quality_warnings?: Array<{ code?: string; message?: string }>; layout_checks?: { passed?: boolean } } | null;
+  artifacts: Array<{ id: string; format: string }>;
+}
+export function listDraftRevisions(projectId: string, signal?: AbortSignal) {
+  return request<{ data: DraftRevision[] }>(`/projects/${projectId}/revisions`, { signal });
+}
+export function decideDraftRevision(projectId: string, revisionId: string, action: 'accept' | 'discard') {
+  return request(`/projects/${projectId}/revisions/${revisionId}/${action}`, { method: 'POST' });
+}

@@ -17,6 +17,7 @@ class Question(BaseModel):
 
 class Understanding(BaseModel):
     paper_type: Literal["review", "original"] | None = None
+    review_style: Literal["narrative", "systematic"] = "narrative"
     language: Literal["zh", "en"] = "zh"
     language_explicit: bool = False
     language_inferred: bool = False
@@ -63,7 +64,8 @@ async def understand(runner, *, topic, overrides, answers, assets):
     excerpts, records = material_context(assets)
     instruction = """
 先理解用户的研究意图，再在同一次调用中生成研究范围。输出以下 JSON 对象：
-{ "paper_type": "review|original 或 null", "language": "zh|en",
+{ "review_style": "systematic（用户要求系统综述）或 narrative",
+  "paper_type": "review|original 或 null", "language": "zh|en",
   "language_explicit": false, "language_inferred": false,
   "summary": "简短任务理解（中文）",
   "next_step": "接下来做什么（中文，不声称已执行）", "submission_target": "明确的投稿目标或空串",
@@ -129,6 +131,11 @@ summary 和 next_step 用中文说明能力边界。scope 的叙述语言服从�
         else "default",
     }
     scope = normalize_scope(parsed.scope, topic=topic, language=language)
+    scope["review_style"] = (
+        "systematic"
+        if "系统综述" in topic or "systematic review" in topic.lower()
+        else parsed.review_style
+    )
     scope["generator"] = f"llm:intake:{result.model or 'planner'}"
     payload["scope"] = scope
     return payload

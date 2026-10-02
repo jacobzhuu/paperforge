@@ -255,6 +255,9 @@ class JobContext:
         transport retries. Reserved tokens are a byte-based upper estimate plus output
         allowance, never a claim about actual billing. Ambiguous calls are not refunded.
         """
+        if getattr(self, "shadow_admission", False) and self.checkpoint.get("background_revision"):
+            from paperforge_worker.pipelines.background_revision import yield_to_foreground
+            await yield_to_foreground(self)
         async with self._agent_lock:
             now = datetime.now(UTC)
             state = dict(self.checkpoint.get("agent_budget") or {})

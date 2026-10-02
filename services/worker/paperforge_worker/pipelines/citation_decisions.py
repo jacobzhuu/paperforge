@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
-TYPESAFE_SOFT_CHECK_VERSION = "jev-soft-check-v2"
+TYPESAFE_SOFT_CHECK_VERSION = "jev-soft-check-v3-bound-evidence"
 CRITERIA = [
     "0: no semantic support or unrelated evidence",
     "1: weak topical relation but the cited claim is not supported",
@@ -30,11 +31,67 @@ def semantic_sources(entries: list, evidence_units: list[dict]) -> dict[str, str
         key = keys.get(str(item.get("work_id") or ""))
         if key and item.get("text"):
             excerpts.setdefault(key, []).append(str(item["text"]))
-    sources = {key: "\n".join(texts)[:4000] for key, texts in excerpts.items()}
+    sources = {key: "\n\n".join(texts) for key, texts in excerpts.items()}
     for entry, work in entries:
         if entry.bibtex_key and work.abstract and entry.bibtex_key not in sources:
             sources[entry.bibtex_key] = work.abstract
     return sources
+
+
+def relevant_excerpt(context: str, source: str, *, limit: int = 2400) -> str:
+    """Rank complete passages by claim terms, preserving late methods/results evidence."""
+    terms = set(re.findall(r"[A-Za-z][A-Za-z0-9.-]+|\d+(?:[.,]\d+)*", context.lower()))
+    chunks = [p.strip() for p in re.split(r"\n\s*\n|(?<=[。.!?])\s+", source) if p.strip()]
+    ranked = sorted(
+        enumerate(chunks),
+        key=lambda pair: (-sum(term in pair[1].lower() for term in terms), pair[0]),
+    )
+    selected, used = [], 0
+    for _, chunk in ranked:
+        if used and used + len(chunk) > limit:
+            continue
+        selected.append(chunk[:limit] if not used else chunk)
+        used += len(selected[-1])
+        if used >= limit or len(selected) == 3:
+            break
+    return "\n\n".join(selected)
+
+
+def bound_citation_usages(rows: list, evidence: dict[str, dict], sources: dict) -> list[dict]:
+    """Use each sentence's own binding; never substitute evidence from another work."""
+    usages = []
+    for row in rows:
+        for block in (row.body_ir_json or {}).get("blocks", []):
+            groups = [block] if block.get("type") == "paragraph" else block.get("items", [])
+            for group in groups:
+                text = ""
+                for run in group.get("runs", []):
+                    if run.get("t") == "text":
+                        text += run.get("v", "")
+                    elif run.get("t") == "cite":
+                        for key in run.get("keys", []):
+                            work_id = str((sources.get(key) or {}).get("work_id") or "")
+                            units = [
+                                evidence[eid]
+                                for eid in run.get("evidence_ids", [])
+                                if eid in evidence and str(evidence[eid].get("work_id")) == work_id
+                            ]
+                            if text.strip():
+                                usages.append(
+                                    {
+                                        "cite_key": key,
+                                        "section_key": row.section_key,
+                                        "context_snippet": text.strip(),
+                                        "bound_evidence": "\n\n".join(
+                                            str(u.get("text") or "") for u in units
+                                        ),
+                                        "evidence_ids": [
+                                            str(u.get("id") or u.get("evidence_id")) for u in units
+                                        ],
+                                    }
+                                )
+                        text = ""
+    return usages
 
 
 def citation_pairs(
@@ -44,10 +101,15 @@ def citation_pairs(
     for usage in usages:
         if usage.get("cite_key") not in sources or not usage.get("context_snippet"):
             continue
-        context = str(usage["context_snippet"])[:300]
-        evidence = str(sources[str(usage["cite_key"])] or "")[:400]
+        context = str(usage["context_snippet"])
+        evidence = str(
+            usage.get("bound_evidence")
+            or relevant_excerpt(context, sources[str(usage["cite_key"])])
+        )
         pair_hash = hashlib.sha256(
-            json.dumps([context, evidence], ensure_ascii=False).encode()
+            json.dumps(
+                [TYPESAFE_SOFT_CHECK_VERSION, context, evidence], ensure_ascii=False
+            ).encode()
         ).hexdigest()
         pairs.append(
             {

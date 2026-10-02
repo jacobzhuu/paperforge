@@ -11,8 +11,9 @@ R1：入库候选只来自 provider 真实响应，候选携带 provider_record_
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,6 +21,7 @@ from db import list_research_questions, record_search_run, upsert_entry, upsert_
 from observability import get_logger, record_scholar_provider
 from scholar_gateway import (
     DEFAULT_PROVIDER_ORDER,
+    ScholarlyDiscoveryError,
     ScholarlyDiscoveryQuery,
     ScholarlyDiscoveryResult,
     ScholarlyWorkCandidate,
@@ -94,12 +96,15 @@ async def run_search(
     provider_names = [p for p in (providers or list(DEFAULT_PROVIDER_ORDER)) if p]
     limit = limit_per_provider or settings.search_limit_per_provider
     queries = list(dict.fromkeys(query.strip() for query in (query_texts or []) if query.strip()))
+    task_queries = None
     if query_texts is None:
-        queries = search_queries(
-            scope,
-            sub_question_queries=await _sub_question_queries(context),
-        )
+        task_queries = await _sub_question_queries(context)
+        queries = search_queries(scope, sub_question_queries=task_queries)
     filters = scope_filters(scope)
+    query_filters = None
+    if query_texts is None and scope.get("review_style") == "systematic":
+        from paperforge_worker.pipelines.scope import systematic_query_plan
+        queries, query_filters = systematic_query_plan(scope, queries, task_queries=task_queries)
     outcome = SearchOutcome()
 
     if not queries:
@@ -112,6 +117,7 @@ async def run_search(
         queries=queries,
         filters=filters,
         limit=limit,
+        **({"query_filters": query_filters} if query_filters else {}),
     )
 
     all_candidates: list[ScholarlyWorkCandidate] = []
@@ -128,7 +134,7 @@ async def run_search(
                 project_id=context.project_id,
                 provider=provider_name,
                 query_text=query_text,
-                filters=filters or None,
+                filters=result.query.filters or None,
                 hit_count=result.hit_count,
                 retrieved_count=len(result.candidates),
                 status=run_status,
@@ -143,6 +149,9 @@ async def run_search(
                     "hit_count": result.hit_count,
                     "retrieved_count": len(result.candidates),
                     "error": error_code,
+                    "elapsed_ms": result.metadata.get("elapsed_ms"),
+                    "http_status": result.errors[0].status_code if result.errors else None,
+                    "skipped": bool(result.metadata.get("skipped")),
                 }
             )
             if failed:
@@ -234,6 +243,7 @@ async def _discover_all(
     queries: list[str],
     filters: dict[str, Any],
     limit: int,
+    query_filters: list[dict] | None = None,
 ) -> list[tuple[str, str, ScholarlyDiscoveryResult]]:
     """各 provider 并行、同 provider 内串行（尊重共享配额与单飞语义）。"""
 
@@ -249,14 +259,48 @@ async def _discover_all(
             logger.warning("unknown provider skipped", extra={"provider": provider_name})
             return []
         collected: list[tuple[str, str, ScholarlyDiscoveryResult]] = []
-        for query_text in queries:
+        consecutive_failures = 0
+        for query_index, query_text in enumerate(queries):
             query = ScholarlyDiscoveryQuery(
                 query_text=query_text,
                 limit=limit,
-                filters=filters,
+                filters=query_filters[query_index] if query_filters else filters,
             )
-            # 适配器是同步 httpx 实现：放线程池执行，避免阻塞事件循环。
-            result = await asyncio.to_thread(adapter.discover, query)
+            if provider_name == "arxiv" and consecutive_failures >= 2:
+                result = ScholarlyDiscoveryResult(
+                    provider_name=provider_name,
+                    query=query,
+                    retrieved_at=datetime.now(UTC),
+                    errors=(
+                        ScholarlyDiscoveryError(
+                            provider_name=provider_name,
+                            error_code="provider_run_circuit_open",
+                            message="arXiv failed two consecutive queries in this search run.",
+                        ),
+                    ),
+                    metadata={"skipped": True, "elapsed_ms": 0},
+                )
+            else:
+                # 适配器是同步 httpx 实现：放线程池执行，避免阻塞事件循环。
+                started = time.monotonic()
+                result = await asyncio.to_thread(adapter.discover, query)
+                result = replace(
+                    result,
+                    metadata={
+                        **result.metadata,
+                        "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    },
+                )
+                if provider_name == "arxiv":
+                    # A run-local circuit prevents repeated timeout/retry cycles when
+                    # arXiv is unavailable; successful responses reset the streak.
+                    consecutive_failures = (
+                        consecutive_failures + 1
+                        if result.status == "failed"
+                        and result.errors
+                        and result.errors[0].retryable
+                        else 0
+                    )
             collected.append((provider_name, query_text, result))
         return collected
 
@@ -296,7 +340,17 @@ async def _persist(
     selected = 0
     new_works = 0
     new_entries = 0
-    selected_indices = balanced_selection_indices(ranked, limit=auto_select_top_k)
+    async with context.session() as session:
+        from db import get_project
+        project = await get_project(session, context.project_id)
+        selection_scope = (project.scope_json or {}) if project else {}
+    selected_indices = balanced_selection_indices(
+        ranked,
+        limit=auto_select_top_k,
+        time_range=selection_scope.get("time_range")
+        if selection_scope.get("review_style") == "systematic"
+        else None,
+    )
     async with context.session() as session:
         for index, item in enumerate(ranked):
             work, work_created = await upsert_work(session, item.candidate)

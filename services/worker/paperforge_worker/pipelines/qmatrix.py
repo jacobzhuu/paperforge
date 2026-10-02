@@ -175,8 +175,11 @@ async def build_question_evidence_matrix(
     retrieval_mode = context.checkpoint.get("evidence_retrieval_mode")
     if retrieval_mode is None:
         retrieval_mode = "legacy"
-        await context.emit("retrieval.configured", {"mode": retrieval_mode},
-                           checkpoint={"evidence_retrieval_mode": retrieval_mode})
+        await context.emit(
+            "retrieval.configured",
+            {"mode": retrieval_mode},
+            checkpoint={"evidence_retrieval_mode": retrieval_mode},
+        )
 
     async def _classify_one(question: Any) -> Any:
         retrieval_ids = None
@@ -184,14 +187,21 @@ async def build_question_evidence_matrix(
             from retrieval.search import search
 
             async with context.session() as session:
-                found = await search(session, context.project_id, question.text,
-                                     limit=40, mode=retrieval_mode)
+                found = await search(
+                    session, context.project_id, question.text, limit=40, mode=retrieval_mode
+                )
             retrieval_ids = [item["evidence_id"] for item in found["results"]]
-            await context.emit("retrieval.completed", {
-                "question_id": str(question.id), "version": found["version"],
-                "mode": found["mode"], "elapsed_ms": found["elapsed_ms"],
-                "indexed_count": found["indexed_count"], "warnings": found["warnings"],
-            })
+            await context.emit(
+                "retrieval.completed",
+                {
+                    "question_id": str(question.id),
+                    "version": found["version"],
+                    "mode": found["mode"],
+                    "elapsed_ms": found["elapsed_ms"],
+                    "indexed_count": found["indexed_count"],
+                    "warnings": found["warnings"],
+                },
+            )
         return await _classify_question(
             question,
             retrieval_ids=retrieval_ids,
@@ -201,9 +211,7 @@ async def build_question_evidence_matrix(
             runner=runner,
             language=language,
             exclude_unit_ids=(
-                already_linked.get(question.id, set())
-                if deepen_question_ids is not None
-                else None
+                already_linked.get(question.id, set()) if deepen_question_ids is not None else None
             ),
         )
 
@@ -371,12 +379,16 @@ async def _classify_question(
 
         # Only replace candidate ranking. Task compatibility, per-work diversity,
         # comparability bridging and the existing classifier remain authoritative.
-        eligible = {str(unit.id): unit for unit in evidence
-                    if not question.task_id or getattr(unit, "task_id", None) in
-                    {None, question.task_id}}
-        merged = rrf([(str(unit.id), score) for unit, score in ranked],
-                     [(key, 1.0) for key in retrieval_ids if key in eligible],
-                     limit=MAX_CANDIDATES_PER_QUESTION * 2)
+        eligible = {
+            str(unit.id): unit
+            for unit in evidence
+            if not question.task_id or getattr(unit, "task_id", None) in {None, question.task_id}
+        }
+        merged = rrf(
+            [(str(unit.id), score) for unit, score in ranked],
+            [(key, 1.0) for key in retrieval_ids if key in eligible],
+            limit=MAX_CANDIDATES_PER_QUESTION * 2,
+        )
         ranked = [(eligible[key], score) for key, score in merged if key in eligible]
     routing_mode = "lexical"
     bridge_source_count = None
@@ -712,6 +724,10 @@ def _comparability_bridge(
         if unit.grade not in _COMPARABLE_GRADES:
             continue
         for row in measurements.get(unit.id, []):
+            from paperforge_worker.pipelines.field_provenance import comparison_verified
+
+            if not comparison_verified(getattr(row, "provenance_json", None)):
+                continue
             key = str(getattr(row, "comparability_key", "") or "")
             if not key:
                 continue

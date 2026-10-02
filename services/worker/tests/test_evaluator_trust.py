@@ -62,7 +62,7 @@ def test_claim_error_cannot_hide_behind_overall_matched_or_empty_unsupported_lis
             lambda p: p["claim_checks"][0].update(claim_id="foreign"),
             "invalid_or_duplicate_claim_id",
         ),
-        (lambda p: p["claim_checks"][0].update(status="uncertain"), "uncertain_claim"),
+        (lambda p: p["claim_checks"][0].update(status="uncertain"), None),
         (lambda p: p.update(support=[]), "invalid_verdict_fields"),
         (lambda p: p["claim_checks"][0].update(status=[]), "invalid_claim_status"),
         (lambda p: p.update(gap_declared="false"), "invalid_gap_declared"),

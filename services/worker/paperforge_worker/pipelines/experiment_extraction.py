@@ -64,6 +64,13 @@ Output JSON only:
   }
 }
 
+For each non-null field add field_sources[field] = {"quote": "exact source text",
+"source_marker": "nearest [[...]] marker"}. For pipe tables include the exact header and
+rows, plus zero-based row/column coordinates into that quote (header is row zero).
+A value's column must have its metric header and its row must name the model in column zero.
+For prose use the smallest complete sentence containing the measurement and its metric.
+Do not infer missing dimensions, baseline values, intervals or significance.
+
 Hard rules — a result that breaks any of these is worse than no result:
 
 - `verbatim_span` MUST be copied character-for-character from the supplied text. Do not
@@ -102,6 +109,7 @@ class ExtractedResultCell:
     source_location: str = "fulltext:unlocated"
     locator_verified: bool = False
     verbatim_span: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
     def dedupe_key(self) -> tuple[str, float, str]:
@@ -147,6 +155,7 @@ class LocatorIndex:
     pages: frozenset[int] = frozenset()
     sections: frozenset[str] = frozenset()
     object_refs: frozenset[str] = frozenset()
+    regions: tuple[dict[str, Any], ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -226,6 +235,16 @@ def build_locator_index(
         pages=frozenset(pages),
         sections=frozenset(sections),
         object_refs=frozenset(object_refs),
+        regions=tuple(
+            {
+                "page": getattr(x, "page", None),
+                "section": getattr(x, "section_path", None),
+                "object_ref": getattr(x, "object_ref", None),
+                "paragraph": getattr(x, "paragraph_index", None),
+                "text": getattr(x, "text", ""),
+            }
+            for x in [*(chunks or []), *(anchors or [])]
+        ),
     )
 
 
@@ -290,9 +309,19 @@ def build_extraction(
         if len(cells) >= MAX_RESULT_CELLS:
             rejected.append({"index": index, "reason": "cell_budget_exhausted"})
             continue
+        if isinstance(item, dict):
+            item = {**item, "task": item.get("task") or payload.get("task")}
+            if isinstance(payload.get("field_sources"), dict):
+                item["field_sources"] = {
+                    **payload["field_sources"],
+                    **(
+                        item["field_sources"] if isinstance(item.get("field_sources"), dict) else {}
+                    ),
+                }
         outcome = _accept_cell(
             item,
             haystack=haystack,
+            fulltext=fulltext,
             locators=locators,
             parse_locator=parse_locator,
             normalize_metric=normalize_metric,
@@ -320,6 +349,7 @@ def _accept_cell(
     item: Any,
     *,
     haystack: str,
+    fulltext: str,
     locators: LocatorIndex,
     parse_locator: Any,
     normalize_metric: Any,
@@ -352,7 +382,18 @@ def _accept_cell(
     # 规则 3：定位符必须能落到真实 chunk 上；落不上不拒收，只标记未核验。
     marker = _clean_str(item.get("source_marker"), 200)
     locator = _safe_parse_locator(marker, parse_locator)
-    verified = locators.verifies(locator)
+    from paperforge_worker.pipelines.field_provenance import region_contains, validate_fields
+
+    verified = region_contains(fulltext, marker, span, parse_locator, locators)
+    provenance = validate_fields(
+        item, fulltext=fulltext, locators=locators, parse_locator=parse_locator
+    )
+    # Preserve an unverified candidate for diagnostics; it cannot supply a comparison.
+
+    item = {
+        **item,
+        **{f: None for f, proof in provenance["fields"].items() if proof["status"] != "verified"},
+    }
     source_location = _format_source_location(locator)
 
     return ExtractedResultCell(
@@ -371,6 +412,7 @@ def _accept_cell(
         source_location=source_location,
         locator_verified=verified,
         verbatim_span=span,
+        provenance=provenance,
     )
 
 

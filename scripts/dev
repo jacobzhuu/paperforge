@@ -865,7 +865,8 @@ async def check():
             used = int(await connection.scalar(text("SELECT count(*) FROM pg_stat_activity")))
             active = int(await connection.scalar(text(
                 "SELECT count(*) FROM generation_job WHERE status=:status"), {"status": "running"}))
-        # New stack: 2 API * 6 + 3 worker * 8 = 36. Reserve maintenance
+        # New stack: 2 API * 6 + 2 worker * 8 + short 6 + background 2 = 36.
+        # Reserve maintenance
         # connections and conservative overflow for still-running legacy jobs.
         required = used + 36 + 10 + min(active, 10) * 12
         print(f"PostgreSQL budget: current={used}, new=36, reserve=10, legacy_jobs={active}, max={maximum}")

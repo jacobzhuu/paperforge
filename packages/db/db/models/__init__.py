@@ -53,6 +53,7 @@ from db.models.paper import (
     VisualGenerationAttempt,
     VisualSourceAsset,
 )
+from db.models.revision import DraftRevision
 from db.models.web_research import (
     McpDailyBudget,
     McpToolInvocation,
@@ -61,6 +62,7 @@ from db.models.web_research import (
 )
 
 __all__ = [
+    "DraftRevision",
     "McpDailyBudget",
     "McpToolInvocation",
     "WebResearchRun",

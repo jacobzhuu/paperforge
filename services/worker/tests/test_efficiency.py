@@ -264,8 +264,8 @@ async def test_all_section_review_includes_unlinked_body_and_frames(session_fact
     context = _context(project_id, session_factory)
     try:
         await write_document(context, coherence=False)
-        assert await _section_review_inputs(context) == []
-        all_sections = await _section_review_inputs(context, include_unlinked=True)
+        assert await _section_review_inputs(context, include_unlinked=False) == []
+        all_sections = await _section_review_inputs(context)
         assert len(all_sections) == 9
         assert {"abstract", "introduction", "conclusion"} <= {
             r["section_key"] for r in all_sections

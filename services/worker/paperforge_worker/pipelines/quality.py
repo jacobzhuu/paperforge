@@ -822,6 +822,7 @@ SCHOLARLY_BLOCKER_CODES = frozenset(
         "verbatim_evidence_copy",
         "cross_section_repetition",
         "conclusion_overreach",
+        "manuscript_review_incomplete",
     }
 )
 
@@ -1264,8 +1265,22 @@ def apply_readiness_gate(
                 selected=report.whitelist_size,
             )
         )
-    if report.recent_ratio > 0.85 and report.whitelist_size >= 10:
+    if (report.recent_ratio > 0.85 and report.whitelist_size >= 10
+            and not ((getattr(project, "scope_json", None) or {}).get("time_range"))):
         warnings.append(_issue("year_imbalance", "文献过度集中于近五年，需补充基础研究"))
+    requested_years = (getattr(project, "scope_json", None) or {}).get("time_range") or {}
+    start, end = requested_years.get("start_year"), requested_years.get("end_year")
+    if isinstance(start, int) and isinstance(end, int):
+        covered = {work.publication_year for _, work in (references or [])}
+        missing = [year for year in range(start, end + 1) if year not in covered]
+        if missing:
+            warnings.append(
+                _issue(
+                    "time_range_coverage_gap",
+                    "指定年份尚无入选文献，不代表该时期不存在研究",
+                    years=missing,
+                )
+            )
     if getattr(project, "paper_type", None) == "review":
         section_titles = " ".join(str(getattr(row, "title", "")) for row in rows).lower()
         synthesis_terms = (
@@ -1668,7 +1683,7 @@ def build_depth_metrics(
 
     sub_questions = [question for question in questions if question.kind == "sub"]
     answered = [
-        question for question in sub_questions if question.answer_status != "insufficient_evidence"
+        question for question in sub_questions if question.answer_status == "answered"
     ]
     return {
         "1_fulltext_acquisition_rate": report.fulltext_coverage,
@@ -1697,6 +1712,13 @@ def build_depth_metrics(
             substantive_paragraphs,
         ),
         "11_question_answer_completeness": ratio(len(answered), len(sub_questions)),
+        "question_answer_status": {
+            "answered": len(answered),
+            "partial": sum(q.answer_status == "partial" for q in sub_questions),
+            "unanswered": sum(
+                q.answer_status not in {"answered", "partial"} for q in sub_questions
+            ),
+        },
         "counts": {
             "selected_works": selected_work_count,
             "fulltext_works": len(fulltext_work_ids),
@@ -1929,6 +1951,7 @@ async def verify_claim_evidence(
     cache: dict[str, dict[str, Any]] | None = None,
     mode: ClaimEntailmentMode = "promote_only",
     verifier_concurrency: int = 1,
+    max_checks: int | None = MAX_CLAIM_EVIDENCE_CHECKS,
 ) -> dict[str, Any]:
     """Conservatively verify exact claim/excerpt pairs under an explicit rollout mode.
 
@@ -1952,7 +1975,7 @@ async def verify_claim_evidence(
         _claim_evidence_candidates(anchors),
         key=lambda item: item[1].get("support_status") != "insufficient_support",
     )
-    candidates = all_candidates[:MAX_CLAIM_EVIDENCE_CHECKS]
+    candidates = all_candidates if max_checks is None else all_candidates[:max_checks]
     summary: dict[str, Any] = {
         "mode": resolved_mode,
         "status": (
@@ -2657,7 +2680,11 @@ def coverage_hints(
         # 只对「与主题不同的、实义的」子主题给覆盖建议。
         if len(text) < 4 or text.lower() in topic:
             continue
-        if text.lower() not in section_titles:
+        aliases = [text.lower()]
+        aliases.extend({"BGC": ["生物合成基因簇", "bgc"],
+                        "生物活性": ["生物活性"], "benchmark": ["证据冲突", "证据缺口"]}.get(
+            next((term for term in ("BGC", "生物活性", "benchmark") if term in text), ""), []))
+        if not any(alias in section_titles for alias in aliases):
             hints.append(
                 {
                     "kind": "uncovered_subtopic",

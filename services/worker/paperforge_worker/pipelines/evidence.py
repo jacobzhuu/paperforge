@@ -315,10 +315,14 @@ async def _extract_work_evidence(
         return outcome
     outcome.works = 1
     source_hash = hashlib.sha256(
-        "\u241f".join(("scholarly-content-v1", work.canonical_title or "",
-                        work.abstract or "", fulltext or "")).encode(
-            "utf-8"
-        )
+        "\u241f".join(
+            (
+                "scholarly-content-v1",
+                work.canonical_title or "",
+                work.abstract or "",
+                fulltext or "",
+            )
+        ).encode("utf-8")
     ).hexdigest()[:40]
     document = document if fulltext else None
     private_source = bool(fulltext) and (document is None or document.access_scope == "private")
@@ -532,9 +536,12 @@ async def _apply_llm_measurements(
     written = 0
     async with context.session() as session:
         for cell in extraction.cells:
-            if not cell.locator_verified:
+            if not cell.locator_verified or any(
+                cell.provenance.get("fields", {}).get(f, {}).get("status") != "verified"
+                for f in ("metric_name", "value")
+            ):
                 continue
-            unit_id = by_location.get(cell.source_location) or _unit_for_span(
+            unit_id = _unit_for_span(
                 cell.verbatim_span,
                 candidates=candidates,
                 evidence_unit_ids=evidence_unit_ids,
@@ -548,16 +555,19 @@ async def _apply_llm_measurements(
                 value=cell.value,
                 unit=cell.unit,
                 dataset=cell.dataset,
-                task=task,
+                task=task
+                if cell.provenance.get("fields", {}).get("task", {}).get("status") == "verified"
+                else None,
                 model_family=cell.model_family,
                 sample_size=cell.sample_size,
                 split=cell.split,
                 ci_low=cell.ci_low,
                 ci_high=cell.ci_high,
                 std=cell.std,
-                protocol=extraction.protocol or None,
+                protocol=None,  # Unbound paper-level protocol cannot qualify this result.
                 extraction_source="llm",
                 locator_verified=True,
+                provenance=cell.provenance,
             )
             written += 1
     return written
@@ -798,12 +808,20 @@ async def _persist_structured_experiment_data(
             tasks=tasks,
             dataset_pattern=dataset_pattern,
         )
-        payload['scholarly_content_version'] = 'scholarly-content-v1'
-        payload['method_evidence'] = [enrich_evidence({
-            'text': candidate.text, 'evidence_id': str(evidence_unit_ids.get(candidate.text) or ''),
-            'grade': candidate.grade, 'page': candidate.page,
-            'section_path': candidate.section_path, 'object_ref': candidate.object_ref,
-        }) for candidate in candidates]
+        payload["scholarly_content_version"] = "scholarly-content-v1"
+        payload["method_evidence"] = [
+            enrich_evidence(
+                {
+                    "text": candidate.text,
+                    "evidence_id": str(evidence_unit_ids.get(candidate.text) or ""),
+                    "grade": candidate.grade,
+                    "page": candidate.page,
+                    "section_path": candidate.section_path,
+                    "object_ref": candidate.object_ref,
+                }
+            )
+            for candidate in candidates
+        ]
         extraction.status = "parsed"
         extraction.payload_json = payload
         extraction.source_hash = source_hash
@@ -869,10 +887,12 @@ async def _persist_structured_experiment_data(
         fulltext=fulltext,
         regex_records=records,
         extraction=llm_extraction,
+        candidates=candidates,
+        evidence_unit_ids=evidence_unit_ids,
     )
 
 
-LLM_STRUCTURED_EXTRACTION_SCHEMA = "experiment_v3_llm"
+LLM_STRUCTURED_EXTRACTION_SCHEMA = "experiment_v4_llm"
 
 
 async def _persist_reconciled_experiment_data(
@@ -883,6 +903,8 @@ async def _persist_reconciled_experiment_data(
     fulltext: str,
     regex_records: list[dict[str, Any]],
     extraction: ExperimentExtraction,
+    candidates: list[EvidenceCandidate],
+    evidence_unit_ids: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """写 experiment_v3_llm：正则 × 模型对账后的结果表。"""
     regex_cells = tuple(
@@ -897,9 +919,6 @@ async def _persist_reconciled_experiment_data(
         for record in regex_records
     )
     merged, conflicts = reconcile(llm_cells=extraction.cells, regex_cells=regex_cells)
-    unit_by_location = {
-        str(record["source_location"]): record["evidence_unit_id"] for record in regex_records
-    }
 
     async with context.session() as session:
         row = await session.scalar(
@@ -920,7 +939,7 @@ async def _persist_reconciled_experiment_data(
             await session.flush()
         row.status = "parsed"
         row.source_hash = hashlib.sha256(fulltext.encode("utf-8")).hexdigest()[:40]
-        row.extraction_model = extraction.model or "llm_experiment_v3"
+        row.extraction_model = extraction.model or "llm_experiment_v4"
         row.payload_json = _json_safe(
             {
                 "schema": LLM_STRUCTURED_EXTRACTION_SCHEMA,
@@ -937,6 +956,7 @@ async def _persist_reconciled_experiment_data(
                         "model_family": item.cell.model_family,
                         "source_location": item.cell.source_location,
                         "locator_verified": item.cell.locator_verified,
+                        "provenance": item.cell.provenance,
                         "extraction_source": item.extraction_source,
                         "conflict": item.conflict,
                     }
@@ -952,9 +972,7 @@ async def _persist_reconciled_experiment_data(
         }
         for stale in (
             await session.scalars(
-                select(ExperimentResult).where(
-                    ExperimentResult.structured_extraction_id == row.id
-                )
+                select(ExperimentResult).where(ExperimentResult.structured_extraction_id == row.id)
             )
         ).all():
             await session.delete(stale)
@@ -963,18 +981,26 @@ async def _persist_reconciled_experiment_data(
             session.add(
                 ExperimentResult(
                     structured_extraction_id=row.id,
-                    evidence_unit_id=unit_by_location.get(cell.source_location),
+                    evidence_unit_id=_unit_for_span(
+                        cell.verbatim_span,
+                        candidates=candidates,
+                        evidence_unit_ids=evidence_unit_ids,
+                    )
+                    if cell.verbatim_span
+                    else None,
                     task_id=None,
-                    task=extraction.task,
-                    task_variant=extraction.task_variant,
+                    task=extraction.task
+                    if cell.provenance.get("fields", {}).get("task", {}).get("status") == "verified"
+                    else None,
+                    task_variant=None,
                     dataset=cell.dataset,
-                    split_strategy=cell.split or extraction.protocol.get("split_strategy"),
+                    split_strategy=cell.split,
                     model_family=cell.model_family,
-                    loss_function=extraction.protocol.get("loss_function"),
-                    optimizer=extraction.protocol.get("optimizer"),
-                    learning_rate=extraction.protocol.get("learning_rate"),
-                    batch_size=extraction.protocol.get("batch_size"),
-                    epochs=extraction.protocol.get("epochs"),
+                    loss_function=None,
+                    optimizer=None,
+                    learning_rate=None,
+                    batch_size=None,
+                    epochs=None,
                     metric_name=cell.metric_name,
                     value=cell.value,
                     unit=cell.unit,
@@ -986,7 +1012,10 @@ async def _persist_reconciled_experiment_data(
                     # 维度齐全时 comparability_key 才稳定；缺任一维度仍按未知加盐，
                     # 语义与正则通道一致，只是现在维度真的填得上了。
                     comparability_key=comparability_key(
-                        task=extraction.task,
+                        task=extraction.task
+                        if cell.provenance.get("fields", {}).get("task", {}).get("status")
+                        == "verified"
+                        else None,
                         dataset=cell.dataset,
                         metric_name=cell.metric_name,
                         split=cell.split,
@@ -996,6 +1025,7 @@ async def _persist_reconciled_experiment_data(
                     anchor_strength=None,
                     extraction_source=item.extraction_source,
                     locator_verified=cell.locator_verified,
+                    provenance_json=cell.provenance,
                     extraction_conflict_json=item.conflict,
                 )
             )
@@ -1147,9 +1177,7 @@ def _vocabulary_pattern(terms: tuple[str, ...], *, version_suffix: bool = False)
     cleaned = [term.strip() for term in terms if term and term.strip()]
     if not cleaned:
         return None
-    alternatives = "|".join(
-        re.escape(term) for term in sorted(set(cleaned), key=len, reverse=True)
-    )
+    alternatives = "|".join(re.escape(term) for term in sorted(set(cleaned), key=len, reverse=True))
     tail = r"(?:[- ]?\d+[A-Z]?)?" if version_suffix else ""
     return rf"\b(?:{alternatives}){tail}\b"
 
@@ -1261,9 +1289,10 @@ def _evidence_candidates(
             )
     unique = _deduplicate(candidates)
     by_text = {c.text: c for c in unique}
-    ordered = balanced_evidence([{'text': c.text, 'object_ref': c.object_ref,
-                                'grade': c.grade} for c in unique])
-    return [by_text[row['text']] for row in ordered]
+    ordered = balanced_evidence(
+        [{"text": c.text, "object_ref": c.object_ref, "grade": c.grade} for c in unique]
+    )
+    return [by_text[row["text"]] for row in ordered]
 
 
 def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
@@ -1274,24 +1303,25 @@ def _located_fulltext_candidates(fulltext: str) -> list[EvidenceCandidate]:
         locator = _parse_locator(match.group("locator"))
         raw_block = fulltext[match.end() : end]
         block = raw_block.strip()
-        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        is_formula = str(locator.get("object_ref") or "").startswith(("eq:", "equation:"))
         if not block or (not is_formula and not classify_content_role(block).claim_eligible):
             continue
         # `[[...]]\s*` 已经被 `_MARKER_RE` 吃掉，所以 raw_block 从 chunk.text 的第一个
         # 字符开始；再减去 strip 掉的前导空白，就得到 block 在 chunk.text 里的偏移。
         block_offset = len(raw_block) - len(raw_block.lstrip())
-        is_formula = str(locator.get('object_ref') or '').startswith(('eq:', 'equation:'))
+        is_formula = str(locator.get("object_ref") or "").startswith(("eq:", "equation:"))
         passages = [(0, block)] if is_formula else _split_passages(block)
         for paragraph_index, (passage_offset, passage) in enumerate(passages, start=1):
-            if (not is_formula and not _RESULT_CUES.search(passage)
-                    and not re.search(r"\d", passage)):
+            if (
+                not is_formula
+                and not _RESULT_CUES.search(passage)
+                and not re.search(r"\d", passage)
+            ):
                 continue
             if is_formula and len(passage) > 12000:
                 continue  # Never silently truncate a mathematical expression.
             text = passage if is_formula else passage[:MAX_EVIDENCE_TEXT_CHARS]
-            char_start, char_end = _passage_span(
-                locator, block_offset + passage_offset, len(text)
-            )
+            char_start, char_end = _passage_span(locator, block_offset + passage_offset, len(text))
             structured_object_ref = locator.get("object_ref")
             object_ref = structured_object_ref or _object_reference(text)
             if structured_object_ref:

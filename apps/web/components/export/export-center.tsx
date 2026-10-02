@@ -1,6 +1,7 @@
 'use client';
 
 import * as React from 'react';
+import { RevisionPanel } from '@/components/export/revision-panel';
 import Link from 'next/link';
 import {
   AlertTriangle,
@@ -240,6 +241,8 @@ export function ExportCenter() {
       />
 
       {busy && <p role="status" className="text-sm text-muted-foreground">任务正在进行，完成后会自动更新文件列表。已有文件仍可下载。</p>}
+
+      <RevisionPanel projectId={projectId} onAccepted={reloadProject} />
 
       <SubmissionExportMode
         profile={qualityProfile}

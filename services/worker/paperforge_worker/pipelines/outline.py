@@ -210,7 +210,9 @@ async def generate_outline(
         synthesis_section = review_synthesis_section(
             allowed_cards, language=language, sub_question_bundles=sub_question_bundles or [])
         matrix_tables = synthesis_section.pop('inline_tables', [])
-        synthesis_section['inline_tables'] = []
+        from paperforge_worker.pipelines.scholarly_content import task_comparison_table
+        synthesis_section['inline_tables'] = task_comparison_table(
+            sub_question_bundles or [], language=language)
         body.append(synthesis_section)
         ledger = evidence_ledger_section(
             allowed_cards,
@@ -244,8 +246,9 @@ async def generate_outline(
             "research_question": research_question,
             "language": language,
             "paper_type": paper_type,
-            "review_style": review_style if search_method else "narrative",
+            "review_style": review_style,
             "search_method": search_method,
+            "evidence_policy_version": 2,
             "sub_question_bundles": sub_question_bundles or [],
             "sections": sections,
         },
@@ -278,6 +281,25 @@ def systematic_method_section(search_method: dict[str, Any], *, language: str) -
             f"{dates}. The searches retrieved {retrieved} records and {selected} works were "
             f"included. Inclusion criteria were: {criteria}. All counts come directly from the "
             "project search log."
+        )
+    if not search_method.get("complete", True):
+        text += (
+            " 检索尚未完整完成，本稿为系统综述初稿，覆盖范围仍需核验。"
+            if language == "zh"
+            else (" Search is incomplete; this is a systematic-review draft "
+                  "with unverified coverage.")
+        )
+    text += (
+        " 获取记录数含跨检索重复记录；入选数来自文献库，不等同于人工双人筛选。"
+        if language == "zh"
+        else (" Retrieved records include duplicates across searches; "
+              "selection is automated, not dual human screening.")
+    )
+    if search_method.get("exclusion_criteria"):
+        text += (
+            " "
+            + ("排除标准：" if language == "zh" else "Exclusion criteria: ")
+            + "; ".join(search_method["exclusion_criteria"])
         )
     return {
         "key": "search_methods",
@@ -888,6 +910,13 @@ async def _headline_subsections(
         named.update(headings)
         for child, heading in zip(children, headings, strict=True):
             child["title"] = heading
+        parent["argument_points"] = [
+            "仅用一个短段落介绍本节问题与子节分工；具体数字、案例和方法比较交给子节。"
+            if language == "zh"
+            else "One short orientation paragraph. Children own detailed results and comparisons."
+        ]
+        parent["synthesis"] = None
+        parent["summary"] = " / ".join(headings)
     return [item for item in sections if not item.get("_dropped")]
 
 

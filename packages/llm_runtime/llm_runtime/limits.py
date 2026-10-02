@@ -75,7 +75,11 @@ def provider_slot(config):
     def renew():
         while not stop.wait(20):
             try:
-                renewal_keys = [key, fair_keys[4], fair_keys[5], fair_keys[6]] if fair else [key]
+                renewal_keys = (
+                    [key, fair_keys[4], fair_keys[5], fair_keys[6], fair_keys[8], fair_keys[9]]
+                    if fair
+                    else [key]
+                )
                 if not client.eval(_RENEW, len(renewal_keys), *renewal_keys, token):
                     lost.set()
                     return
@@ -110,7 +114,13 @@ def provider_slot(config):
             job_inflight=int(decision[1]) if fair else None,
             total_inflight=int(decision[2]) if fair else None,
             queued_requests=int(decision[3]) if fair else None,
-            reason="least_occupied_then_oldest_grant" if fair else "available_slot",
+            reason=(
+                "background_aged"
+                if len(decision) > 4 and decision[4]
+                else "least_occupied_then_oldest_grant"
+            )
+            if fair
+            else "available_slot",
         )
         thread = threading.Thread(target=renew, daemon=True)
         thread.start()

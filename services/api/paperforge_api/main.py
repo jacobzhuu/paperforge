@@ -20,6 +20,7 @@ from paperforge_api.routers import (
     health,
     library_pdf,
     projects,
+    revisions,
     visuals,
     web_research,
     writing,
@@ -127,6 +128,7 @@ def create_app() -> FastAPI:
     app.include_router(projects.router)
     app.include_router(library_pdf.router)
     app.include_router(writing.router)
+    app.include_router(revisions.router)
     app.include_router(web_research.router)
     app.include_router(assets.router)
     app.include_router(visuals.router)

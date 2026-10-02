@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -56,6 +58,9 @@ class FulltextOutcome:
     documents_failed: int = 0
     failures: list[dict[str, Any]] = field(default_factory=list)
     coverage: float = 0.0
+    link_discovery_ms: int = 0
+    download_ms: int = 0
+    parse_ms: int = 0
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -68,6 +73,9 @@ class FulltextOutcome:
             "documents_failed": self.documents_failed,
             "parse_coverage": (self.documents_ok / self.acquired if self.acquired else 0.0),
             "coverage": round(self.coverage, 4),
+            "link_discovery_ms": self.link_discovery_ms,
+            "download_ms": self.download_ms,
+            "parse_ms": self.parse_ms,
             "failures": self.failures[:10],
         }
 
@@ -160,12 +168,16 @@ async def acquire_fulltexts(
         timeout_seconds=context.settings.scholar_timeout_seconds * 2,
     )
     try:
+        _ = http.client
+        discovery_started = time.monotonic()
         targets = await asyncio.to_thread(
             _enrich_unpaywall_targets,
             targets,
             http,
             context.settings.scholar_contact_email,
+            context.settings.fulltext_discovery_concurrency,
         )
+        outcome.link_discovery_ms = round((time.monotonic() - discovery_started) * 1000)
         plan = plan_oa_fulltext(targets, max_works=max_works)
         outcome.planned = len({c.work_id for c in plan.candidates})
         if not plan.candidates:
@@ -175,7 +187,7 @@ async def acquire_fulltexts(
         # 进线程池之前先把懒建的 httpx.Client 摸出来：`SafeHttpClient.client` 内部
         # 虽然已经加了锁，但在这里预热一次可以让所有抓取线程共用同一条连接池，
         # 少一次锁竞争，也让「这个客户端是谁建的」在时序上不含糊。
-        _ = http.client
+        download_started = time.monotonic()
         result = await asyncio.to_thread(
             acquire_oa_fulltext,
             plan,
@@ -183,6 +195,7 @@ async def acquire_fulltexts(
             concurrency=context.settings.fulltext_download_concurrency,
             per_host_concurrency=context.settings.fulltext_per_host_concurrency,
         )
+        outcome.download_ms = round((time.monotonic() - download_started) * 1000)
     finally:
         http.close()
 
@@ -212,6 +225,7 @@ async def acquire_fulltexts(
     from storage import make_object_store
 
     store = make_object_store(context.settings)
+    parse_started = time.monotonic()
     for document in result.documents:
         try:
             await _persist_one_document(
@@ -231,6 +245,7 @@ async def acquire_fulltexts(
             outcome.failures.append(failure)
             context.warn("ingest.document_failed", type(error).__name__, failure)
             await context.emit("ingest.document_failed", failure, stage="ingest")
+    outcome.parse_ms = round((time.monotonic() - parse_started) * 1000)
 
     outcome.coverage = (outcome.parsed + outcome.reused) / selected_count if selected_count else 0.0
     await context.emit(
@@ -668,9 +683,9 @@ def _enrich_unpaywall_targets(
     targets: list[OaFulltextTarget],
     http: SafeHttpClient,
     contact_email: str,
+    concurrency: int = 2,
 ) -> list[OaFulltextTarget]:
-    enriched: list[OaFulltextTarget] = []
-    for target in targets:
+    def _enrich_one(target: OaFulltextTarget) -> OaFulltextTarget:
         links = discover_unpaywall_links(
             target,
             http_client=http,
@@ -678,10 +693,12 @@ def _enrich_unpaywall_targets(
         )
         doaj_links = discover_doaj_links(target, http_client=http)
         discovered = (*links, *doaj_links)
-        enriched.append(
-            replace(target, links=(*target.links, *discovered)) if discovered else target
-        )
-    return enriched
+        return replace(target, links=(*target.links, *discovered)) if discovered else target
+
+    if not targets:
+        return []
+    with ThreadPoolExecutor(max_workers=min(max(1, concurrency), len(targets))) as pool:
+        return list(pool.map(_enrich_one, targets))
 
 
 def _document_kind(mime_type: str) -> str:

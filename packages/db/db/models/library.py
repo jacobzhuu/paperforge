@@ -509,6 +509,7 @@ class ExperimentResult(Base, TimestampMixin):
     # source_location 是否真的落在本文档的某个 DocumentChunk 上。
     # 模型回填的定位符可能指向不存在的页/表；未核验的单元格不得进入跨研究比较。
     locator_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    provenance_json: Mapped[dict | None] = mapped_column(JSONB)
     # {字段: {"regex": x, "llm": y}}——两条抽取路径对同一格给出不同维度时的留痕。
     extraction_conflict_json: Mapped[dict | None] = mapped_column(JSONB)
 
@@ -599,3 +600,4 @@ class EvidenceMeasurement(Base, TimestampMixin):
     # 与 ExperimentResult 同义：维度来源，以及定位符是否核验过。
     extraction_source: Mapped[str | None] = mapped_column(String(24))
     locator_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    provenance_json: Mapped[dict | None] = mapped_column(JSONB)

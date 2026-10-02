@@ -45,10 +45,12 @@ def _work_ids(units: list[Any]) -> set[str]:
 
 
 def _measurement_keys(unit: Mapping[str, Any] | Any) -> set[str]:
+    from paperforge_worker.pipelines.field_provenance import comparison_verified
+
     return {
         str(_get(item, "comparability_key"))
         for item in (_get(unit, "measurements") or [])
-        if _get(item, "comparability_key")
+        if _get(item, "comparability_key") and comparison_verified(_get(item, "provenance_json"))
     }
 
 
@@ -73,7 +75,7 @@ def measured_comparability(units: list[Any]) -> bool | None:
     """
     key_sets = [keys for keys in (_measurement_keys(unit) for unit in units) if keys]
     if len(key_sets) < 2:
-        return None
+        return False if sum(bool(_get(u, "measurements")) for u in units) >= 2 else None
     return bool(set.intersection(*key_sets))
 
 

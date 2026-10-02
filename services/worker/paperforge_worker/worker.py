@@ -918,6 +918,8 @@ async def run_outline_pipeline(
     ctx: dict,
     project_id: str,
     job_id: str | None = None,
+    *,
+    review_style: str = "narrative",
 ) -> dict[str, Any]:
     """OUTLINE 任务：卡片聚类 → 章节树（大纲可编辑、可重生成）。"""
     settings: Settings = ctx.get("settings") or get_settings()
@@ -937,7 +939,7 @@ async def run_outline_pipeline(
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
                 quality_profile=_prewrite_quality_profile(context),
-                review_style="narrative",
+                review_style=review_style,
                 language=project.language,
             )
             if not readiness.ready:
@@ -950,7 +952,7 @@ async def run_outline_pipeline(
         outcome = await _run_stage(
             context,
             "outline",
-            lambda: _outline(context),
+            lambda: _outline(context, review_style=review_style),
             critical=True,
         )
         await _finish(context, delivered=bool(outcome and outcome.section_count))
@@ -963,6 +965,7 @@ async def run_write_pipeline(
     job_id: str | None = None,
     *,
     coherence: bool = True,
+    review_style: str = "narrative",
 ) -> dict[str, Any]:
     """WRITE 任务：分节写作 + 连贯性 pass + R2 收口 + 落库。"""
     settings: Settings = ctx.get("settings") or get_settings()
@@ -985,7 +988,7 @@ async def run_write_pipeline(
             readiness, _enrichments = await _prewrite_evidence_gate(
                 context,
                 quality_profile=_prewrite_quality_profile(context),
-                review_style="narrative",
+                review_style=review_style,
                 language=language,
             )
             if not readiness.ready:
@@ -1009,11 +1012,19 @@ async def run_write_pipeline(
         )
         fast_draft = context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
         if fast_draft and _stage_scalar(context, "write", "section_count", outcome):
+            if settings.fast_draft_background_enabled:
+                from paperforge_worker.pipelines.background_revision import deliver_fast_draft
+
+                return await deliver_fast_draft(
+                    context,
+                    review_style=review_style,
+                )
             await _try_publish_fast_draft_preview(context)
         # 完整性是交付的前提：``section_count`` 只说明有章节行，不说明每一节都有正文。
         # 补写扫描已经尽过力，到这里还缺的章节必须体现在任务状态上。
         if not fast_draft and context.checkpoint.get("writer_execution_mode") in {
-            "dag_serial", "dag_parallel"
+            "dag_serial",
+            "dag_parallel",
         }:
             # Standalone WRITE has no downstream full-pipeline evaluator. Record
             # final-snapshot evidence checks here, preserving its draft delivery policy.
@@ -1096,6 +1107,10 @@ async def run_draft_rebuild_pipeline(
                 context.checkpoint.get(EXECUTION_PROFILE_KEY) == "fast_draft"
                 and quality_profile == "draft"
             ):
+                if settings.fast_draft_background_enabled:
+                    from paperforge_worker.pipelines.background_revision import deliver_fast_draft
+
+                    return await deliver_fast_draft(context, review_style=review_style)
                 await _try_publish_fast_draft_preview(context)
             else:
                 quality = await _run_stage(
@@ -1822,6 +1837,7 @@ async def _quality(
     quality_profile: str = "scholarly",
     review_style: str = "narrative",
     layout_checks: dict[str, Any] | None = None,
+    deterministic_only: bool = False,
 ):
     from db import (
         document_snapshot_hash,
@@ -1921,14 +1937,9 @@ async def _quality(
         }
         for row in rows
     ]
-    usages = [
-        {
-            "cite_key": item.cite_key,
-            "section_key": "",
-            "context_snippet": item.context_snippet,
-        }
-        for item in usage_rows
-    ]
+    from paperforge_worker.pipelines.citation_decisions import bound_citation_usages
+
+    usages = bound_citation_usages(rows, evidence_units, evidence_sources)
     fast_preview = context.checkpoint.get("fast_draft_preview")
     preview_matches_snapshot = (
         isinstance(fast_preview, dict)
@@ -1940,16 +1951,20 @@ async def _quality(
         if preview_matches_snapshot
         else getattr(context.settings, "typesafe_soft_check_mode", "off")
     )
-    findings = await soft_check_citations(
-        usages=usages,
-        abstracts=semantic_sources,
-        runner=context.llm_runner(),
-        decision_runner=(context.decision_runner() if soft_decision_mode != "off" else None),
-        decision_mode=soft_decision_mode,
-        decision_confidence_threshold=getattr(
-            context.settings, "typesafe_confidence_threshold", 0.90
-        ),
-        trace_context=context,
+    findings = (
+        []
+        if deterministic_only
+        else await soft_check_citations(
+            usages=usages,
+            abstracts=semantic_sources,
+            runner=context.llm_runner(),
+            decision_runner=(context.decision_runner() if soft_decision_mode != "off" else None),
+            decision_mode=soft_decision_mode,
+            decision_confidence_threshold=getattr(
+                context.settings, "typesafe_confidence_threshold", 0.90
+            ),
+            trace_context=context,
+        )
     )
     if isinstance(context.checkpoint.get("fast_draft_preview"), dict):
         from paperforge_worker.pipelines.citation_decisions import citation_pairs
@@ -2018,7 +2033,11 @@ async def _quality(
             (anchor["claim_hash"], anchor["cite_key"], anchor["evidence_hash"]),
             "unreviewed",
         )
-    claim_entailment_mode = getattr(context.settings, "claim_entailment_mode", "shadow")
+    claim_entailment_mode = (
+        "off"
+        if deterministic_only
+        else getattr(context.settings, "claim_entailment_mode", "shadow")
+    )
     verifier_runner = context.llm_runner()
     if claim_entailment_mode != "off" and verifier_runner.enabled:
         verifier_model = verifier_runner.model_for("verifier")
@@ -2047,6 +2066,7 @@ async def _quality(
         cache=context.claim_verification_cache,
         mode=claim_entailment_mode,
         verifier_concurrency=context.settings.verifier_concurrency,
+        max_checks=None if context.checkpoint.get("background_revision") else 60,
     )
     if (
         claim_verification["model_checked_count"]
@@ -2101,6 +2121,7 @@ async def _quality(
         and (getattr(row, "generation_json", None) or {}).get("body_snapshot")
         not in {None, body_hash}
     ]
+    before_stale_readiness = report.readiness_status
     if stale_frames:
         issue = {
             "code": "frame_snapshot_stale",
@@ -2226,6 +2247,49 @@ async def _quality(
                 }
             )
     report.depth_metrics = {**depth_metrics, **report.depth_metrics}
+    report.depth_metrics["review_coverage"] = {
+        "status": "pending" if deterministic_only else "not_assessed",
+        "deterministic_only": deterministic_only,
+    }
+    if not deterministic_only:
+        from paperforge_worker.pipelines.manuscript_review import review_manuscript
+
+        audit = await review_manuscript(
+            context,
+            await _section_review_inputs(context),
+            language=project.language if project else "zh",
+        )
+        report.depth_metrics["review_coverage"] = audit
+        verified_frames = {p["section_key"] for p in audit["findings"] if p["acceptable"]}
+        if stale_frames and set(stale_frames) <= verified_frames:
+            report.warnings = [
+                i for i in report.warnings if i.get("code") != "frame_snapshot_stale"
+            ]
+            report.blockers = [
+                i for i in report.blockers if i.get("code") != "frame_snapshot_stale"
+            ]
+            if not report.blockers:
+                report.readiness_status = before_stale_readiness
+
+        if audit["unassessed_count"] or audit["uncertain_count"] or audit["sections_failing"]:
+            issue = {
+                "code": "manuscript_review_incomplete",
+                "message": "整篇论断核验仍有待处理项",
+                "sections": audit["sections_failing"] + audit["unassessed"],
+                "unassessed_count": audit["unassessed_count"],
+                "uncertain_count": audit["uncertain_count"],
+            }
+            report.warnings.append(issue)
+            if quality_profile != "draft":
+                report.blockers.append(issue)
+                report.readiness_status = "needs_revision"
+    if deterministic_only:
+        report.warnings.append(
+            {
+                "code": "verification_pending",
+                "message": "首稿已生成，完整证据核验和章节评审将在后台继续",
+            }
+        )
     if document is not None and report.paper_snapshot_hash:
         await _publish_quality_report(
             context,
@@ -2686,7 +2750,7 @@ def _cited_evidence_ids(body: dict[str, Any]) -> set[str]:
 
 
 async def _section_review_inputs(
-    context: JobContext, *, include_unlinked: bool = False
+    context: JobContext, *, include_unlinked: bool = True
 ) -> list[dict[str, Any]]:
     """凑齐评审要看的三样东西：子问题、这一节的正文、这一节能用的证据。"""
     from db import (
@@ -2745,6 +2809,8 @@ async def _section_review_inputs(
 
     inputs: list[dict[str, Any]] = []
     for row in rows:
+        if row.section_key in {"evidence_ledger", "search_methods"}:
+            continue
         question_id = question_by_section.get(row.section_key)
         question = questions.get(question_id or "")
         if question is None and not include_unlinked:
@@ -2773,12 +2839,29 @@ async def _section_review_inputs(
                     evidence=all_evidence,
                     whitelist=whitelist,
                     assets=assets,
-                    scope={"project_id": str(context.project_id), "document_id": str(document.id)},
+                    scope={
+                        "project_id": str(context.project_id),
+                        "document_id": str(document.id),
+                        "section_role": "body" if question else "frame",
+                    },
                 ),
                 "pool_size": len(pool),
                 "unused_evidence": sum(1 for item in pool if item["evidence_id"] not in cited),
             }
         )
+    from paperforge_worker.orchestration.writing_graph import fingerprint
+    from paperforge_worker.pipelines.manuscript_review import FRAME_KEYS, summary_material
+
+    body_hash = fingerprint(
+        [i.get("review_input") for i in inputs if i["section_key"] not in FRAME_KEYS]
+    )
+    prior = context.checkpoint.get("verified_body_review") or {}
+    if prior.get("body_snapshot") == body_hash:
+        for item in inputs:
+            if item["section_key"] in FRAME_KEYS:
+                item["review_input"] = summary_material(
+                    item["review_input"], prior.get("claims", []), body_hash
+                )
     return inputs
 
 
@@ -3364,6 +3447,7 @@ async def _supplement_review_evidence(
     report: EvidenceReadinessReport | None = None,
     round_index: int = 1,
     question_ids: set[Any] | None = None,
+    max_provider_queries: int | None = None,
 ) -> dict[str, Any]:
     """One bounded, gap-typed retrieval pass for under-evidenced sub-questions.
 
@@ -3417,7 +3501,11 @@ async def _supplement_review_evidence(
     ]
     repair_scope = {**scope, "sub_questions": repair_questions}
     # 零候选的问题连年份窗口都可能是元凶，放宽它；只缺第二来源的不动窗口。
-    widened_scope = _widen_time_range(repair_scope)
+    widened_scope = (
+        repair_scope
+        if scope.get("review_style") == "systematic"
+        else _widen_time_range(repair_scope)
+    )
     deprioritized = {
         work_id
         for question, kind in gaps
@@ -3426,6 +3514,7 @@ async def _supplement_review_evidence(
     }
 
     search = None
+    remaining_queries = max_provider_queries
     for gap_kind, search_scope in (
         ("needs_second_source", repair_scope),
         ("no_candidates", widened_scope),
@@ -3434,6 +3523,9 @@ async def _supplement_review_evidence(
             [question for question, kind in gaps if kind == gap_kind],
             gap_kind,
         )
+        if remaining_queries is not None:
+            queries = queries[: remaining_queries // 3]
+            remaining_queries -= len(queries) * 3
         if not queries:
             continue
         outcome = await _run_stage(
@@ -3444,6 +3536,11 @@ async def _supplement_review_evidence(
                 context,
                 scope=search_scope,
                 query_texts=queries,
+                **(
+                    {"providers": ["openalex", "europe_pmc", "crossref"]}
+                    if max_provider_queries is not None
+                    else {}
+                ),
                 limit_per_provider=min(12, context.settings.search_limit_per_provider),
             ),
             kind="library",
@@ -4166,6 +4263,15 @@ async def run_full_pipeline(
         export_outcome = None
         # 续跑时 write 可能被跳过（上一轮已写完），outcome 为 None 但正文确实在库里，
         # 标量因此一律走 _stage_scalar：本轮跑过取内存对象，跳过了取 checkpoint。
+        if (
+            _stage_scalar(context, "write", "section_count", write_outcome)
+            and delivery_mode == "fast_draft"
+            and quality_profile == "draft"
+            and settings.fast_draft_background_enabled
+        ):
+            from paperforge_worker.pipelines.background_revision import deliver_fast_draft
+
+            return await deliver_fast_draft(context, review_style=review_style)
         if _stage_scalar(context, "write", "section_count", write_outcome):
             if delivery_mode == "fast_draft" and quality_profile == "draft":
                 await _try_publish_fast_draft_preview(context)
@@ -4432,7 +4538,7 @@ async def _outline(context: JobContext, *, review_style: str = "narrative"):
     completed_search = bool(search_runs) and all(
         run.status == "succeeded" and not run.error for run in search_runs
     )
-    criteria = list(scope.get("inclusion_criteria") or [])
+    criteria = list(scope.get("inclusion_criteria") or scope.get("inclusion_notes") or [])
     if not criteria:
         criteria = [
             "direct relevance to the research question",
@@ -4448,8 +4554,14 @@ async def _outline(context: JobContext, *, review_style: str = "narrative"):
             "retrieved_count": sum(int(run.retrieved_count or 0) for run in search_runs),
             "selected_count": len(entries),
             "inclusion_criteria": criteria,
+            "complete": completed_search,
+            "exclusion_criteria": scope.get("exclusion_notes") or [],
+            "failed_search_count": sum(
+                r.status != "succeeded" or bool(r.error) for r in search_runs
+            ),
+            "query_filters": [r.filters_json for r in search_runs],
         }
-        if review_style == "systematic" and completed_search
+        if review_style == "systematic"
         else None
     )
 
@@ -4723,19 +4835,21 @@ async def shutdown(ctx: dict) -> None:
 
 from paperforge_worker.citation_shadow import citation_shadow_tick  # noqa: E402
 from paperforge_worker.evaluator_shadow import after_job_end, shadow_tick  # noqa: E402
+from paperforge_worker.pipelines.background_revision import run_background_revision  # noqa: E402
 
 
 class WorkerSettings:
     after_job_end = after_job_end
     cron_jobs = (
         []
-        if get_settings().worker_queue_name == "arq:short"
+        if get_settings().worker_queue_name in {"arq:short", "arq:background"}
         else [
             cron(shadow_tick, minute=set(range(60)), second=35, timeout=1800, max_tries=1),
             cron(citation_shadow_tick, minute=set(range(60)), second=10, timeout=120, max_tries=1),
         ]
     )
     functions = [
+        func(run_background_revision, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         func(run_intake_pipeline, timeout=LONG_RUNNING_PIPELINE_TIMEOUT_SECONDS),
         run_research_pipeline,
         run_web_research_pipeline,

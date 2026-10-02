@@ -1192,7 +1192,7 @@ async def resume_job(
     # Lock the source through dispatch so repeated submissions cannot fork a resume chain.
     await session.refresh(job, with_for_update=True)
     response_checkpoint = await validate_response(session, job, response)
-    if job.status != "paused":
+    if job.status != "paused" and not (job.kind == "revision" and job.status == "failed"):
         raise HTTPException(status_code=409, detail="only a paused job can be resumed")
     spec = job_resume_spec(job)
     if spec is None:
@@ -1212,6 +1212,17 @@ async def resume_job(
         checkpoint={**resume_checkpoint(job), **response_checkpoint},
         **spec["kwargs"],
     )
+    if job.kind == "revision":
+        from db.models.revision import DraftRevision
+
+        revision = await session.scalar(
+            select(DraftRevision).where(
+                DraftRevision.job_id == job.id, DraftRevision.project_id == job.project_id
+            ).with_for_update()
+        )
+        if revision is None:
+            raise HTTPException(409, "修订候选不存在")
+        revision.job_id, revision.status = resumed.id, "pending"
     await consume_response(session, job, resumed)
     return _job_response(resumed)
 
@@ -1518,6 +1529,7 @@ def _project_response(
         paper_type=project.paper_type,
         writing_mode=project.writing_mode,
         execution_profile=project.execution_profile,
+        review_style=(project.scope_json or {}).get("review_style", "narrative"),
         language=project.language,
         status=project.status,
         venue_template=project.venue_template,

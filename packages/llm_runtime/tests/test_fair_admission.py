@@ -279,3 +279,47 @@ def test_long_request_renewal_retains_fairness_sequence(redis_fair):
     renewal_keys = [keys[0], keys[4], keys[5], keys[6]]
     assert r.eval(_RENEW, len(renewal_keys), *renewal_keys, "a") == 1
     assert all(r.pttl(k) > 120000 for k in renewal_keys)
+
+
+def test_background_cap_leaves_capacity_for_foreground(redis_fair):
+    r, keys = redis_fair
+    assert acquire(r, keys, "bg1", "background", priority=1)[0] == 1
+    assert acquire(r, keys, "bg2", "background", priority=1)[0] == 1
+    assert acquire(r, keys, "bg3", "background", priority=1)[0] == 0
+    assert acquire(r, keys, "fg1", "foreground")[0] == 1
+    release(r, keys, "bg1")
+    assert acquire(r, keys, "bg3", "background", priority=1)[0] == 1
+
+
+def test_aged_background_gets_next_free_slot_and_total_background_is_bounded(redis_fair):
+    r, keys = redis_fair
+    fill_legacy(r, keys)
+    acquire(r, keys, 'background', 'bg', 1)
+    acquire(r, keys, 'foreground', 'fg')
+    r.hset(keys[7], 'background', r.time()[0] * 1000 - 61000)
+    release(r, keys, 'legacy0')
+    assert acquire(r, keys, 'foreground', 'fg')[0] == 0
+    assert acquire(r, keys, 'background', 'bg', 1)[0] == 1
+    release(r, keys, 'legacy1')
+    assert acquire(r, keys, 'foreground', 'fg')[0] == 1
+    release(r, keys, 'legacy2')
+    assert acquire(r, keys, 'bg2', 'other-bg', 1)[0] == 1
+    release(r, keys, 'legacy3')
+    assert acquire(r, keys, 'bg3', 'third-bg', 1)[0] == 0
+    assert acquire(r, keys, 'fg2', 'new-fg')[0] == 1
+
+
+def test_single_slot_allows_aged_background_after_five_foreground_grants(redis_fair):
+    r, keys = redis_fair
+    assert acquire(r, keys, 'f0', 'fg', cap=1)[0] == 1
+    assert acquire(r, keys, 'b', 'bg', 1, cap=1)[0] == 0
+    r.hset(keys[7], 'b', r.time()[0] * 1000 - 61000)
+    for i in range(1, 5):
+        acquire(r, keys, f'f{i}', 'fg', cap=1)
+        release(r, keys, f'f{i-1}')
+        assert acquire(r, keys, 'b', 'bg', 1, cap=1)[0] == 0
+        assert acquire(r, keys, f'f{i}', 'fg', cap=1)[0] == 1
+    acquire(r, keys, 'f5', 'fg', cap=1)
+    release(r, keys, 'f4')
+    assert acquire(r, keys, 'f5', 'fg', cap=1)[0] == 0
+    assert acquire(r, keys, 'b', 'bg', 1, cap=1)[0] == 1

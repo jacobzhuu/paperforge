@@ -192,6 +192,21 @@ def _stub_extraction(*, dataset: str = "CORE-BENCH", split: str = "test") -> Exp
                 split=split,
                 source_location="table:3, p.7",
                 locator_verified=True,
+                provenance={
+                    "version": "experiment-v4-provenance",
+                    "fields": {
+                        f: {"status": "verified"}
+                        for f in (
+                            "metric_name",
+                            "value",
+                            "unit",
+                            "dataset",
+                            "split",
+                            "model_family",
+                            "task",
+                        )
+                    },
+                },
                 verbatim_span=SPAN,
             ),
         ),
@@ -249,9 +264,7 @@ async def test_off_mode_writes_no_llm_extraction_row(session_factory, monkeypatc
     assert calls == [], "off 档不得调用模型"
     assert outcome.llm_extraction_works == 0
     async with session_factory() as session:
-        schemas = list(
-            (await session.scalars(select(StructuredExtraction.schema_version))).all()
-        )
+        schemas = list((await session.scalars(select(StructuredExtraction.schema_version))).all())
     assert schemas == [STRUCTURED_EXTRACTION_SCHEMA], "off 档只应留下正则那一份"
 
 
@@ -274,9 +287,7 @@ async def test_shadow_mode_persists_v3_but_leaves_measurements_untouched(
     assert outcome.to_payload()["llm_extraction"]["locator_verification_rate"] == 1.0
 
     async with session_factory() as session:
-        schemas = sorted(
-            (await session.scalars(select(StructuredExtraction.schema_version))).all()
-        )
+        schemas = sorted((await session.scalars(select(StructuredExtraction.schema_version))).all())
         sources = sorted(
             {
                 value
@@ -387,9 +398,7 @@ async def test_different_datasets_stay_incomparable(session_factory, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_unverified_locator_never_reaches_measurements(
-    session_factory, monkeypatch
-) -> None:
+async def test_unverified_locator_never_reaches_measurements(session_factory, monkeypatch) -> None:
     """定位没核验过的单元格入库供诊断，但不得进入可比性计算。"""
     project_id = await _seed_project(session_factory)
     work_id = await _seed_work(session_factory, project_id, title="A", doi="10.1/a")
@@ -457,9 +466,7 @@ async def test_budget_exhaustion_falls_back_to_regex_only(session_factory, monke
 
 
 @pytest.mark.asyncio
-async def test_evidence_units_are_unchanged_by_the_extractor(
-    session_factory, monkeypatch
-) -> None:
+async def test_evidence_units_are_unchanged_by_the_extractor(session_factory, monkeypatch) -> None:
     """证据分级与定位仍由确定性通道独占；模型碰不到它们。"""
     project_id = await _seed_project(session_factory)
     work_id = await _seed_work(session_factory, project_id, title="A", doi="10.1/a")

@@ -63,7 +63,7 @@ def _draft() -> SectionDraft:
     return draft
 
 
-async def test_an_unsourced_number_is_rewritten_qualitatively() -> None:
+async def test_an_unsourced_number_requires_evidence_before_qualitative_rewrite() -> None:
     """首选是保住论断：把数字换成定性说法，而不是删掉整句。"""
     runner, provider = _runner(
         [{"sentences": [{"index": 0, "text": "已鉴定出大量具有生态功能的化合物。"}]}]
@@ -77,9 +77,9 @@ async def test_an_unsourced_number_is_rewritten_qualitatively() -> None:
 
     body = " ".join(p["text"] for p in draft.paragraphs)
     assert "200" not in body
-    assert "大量具有生态功能的化合物" in body
+    assert "大量具有生态功能的化合物" not in body
     assert "根系分泌物塑造根际群落。" in body, "没问题的句子不许被牵连"
-    assert stats == {"rewritten": 1, "removed": 0, "kept": 0}
+    assert stats == {"rewritten": 0, "removed": 1, "kept": 0}
     assert "200" in provider.prompts[0], "改写请求要指名是哪个数值"
 
 
@@ -151,3 +151,37 @@ async def test_a_section_without_flagged_numbers_is_untouched() -> None:
     assert json.dumps(draft.paragraphs, ensure_ascii=False) == before
     assert stats == {"rewritten": 0, "removed": 0, "kept": 0}
     assert provider.prompts == [], "没有待修数值时不许发调用"
+
+
+async def test_supported_rewrite_requires_a_separate_bound_verdict():
+    from unittest.mock import AsyncMock, patch
+    from paperforge_worker.pipelines.semantic_review import build_section_verdict
+    runner, _ = _runner([{"sentences": [{"index": 0, "text": "已鉴定出化合物。"}]}])
+    verdict = build_section_verdict({
+        "answers_question": "full", "support": "sufficient", "calibration": "matched",
+        "synthesis_mode": "synthesized", "claim_checks": [
+            {"claim_id": "s1:repair:0", "status": "supported", "evidence_ids": ["e-1"]}]},
+        section_key="s1")
+    with patch("paperforge_worker.pipelines.semantic_review.review_section",
+               AsyncMock(return_value=verdict)) as review:
+        draft, stats = await repair_unsourced_numbers(
+            draft=_draft(), values={"200"}, language="zh", runner=runner,
+            evidence=[{"evidence_id": "e-1", "text": "已鉴定出化合物。"}])
+    assert stats["rewritten"] == 1
+    assert review.call_args.kwargs["review_input"]["evidence"][0]["evidence_id"] == "e-1"
+    assert draft.paragraphs[0]["sentences"][0]["numeric_repair_audit"]["accepted"]
+
+
+async def test_hiding_wrong_number_behind_universal_superiority_is_rejected():
+    from unittest.mock import AsyncMock, patch
+    from paperforge_worker.pipelines.semantic_review import build_section_verdict
+    runner, _ = _runner([{"sentences": [{"index": 0, "text": "所有实验均显著优于对照。"}]}])
+    rejected = build_section_verdict({"unsupported_claims": ["s1:repair:0: no evidence"]},
+                                     section_key="s1")
+    with patch("paperforge_worker.pipelines.semantic_review.review_section",
+               AsyncMock(return_value=rejected)):
+        draft, stats = await repair_unsourced_numbers(
+            draft=_draft(), values={"200"}, language="zh", runner=runner,
+            evidence=[{"evidence_id": "e-1", "text": "Chemical identities were reported."}])
+    assert stats["removed"] == 1
+    assert "显著" not in " ".join(p["text"] for p in draft.paragraphs)

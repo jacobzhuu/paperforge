@@ -252,6 +252,21 @@ The method assumes independent observations and defines x as prediction.""",
 def measurement(key="same", value=0.8):
     return {
         "comparability_key": key,
+        "provenance_json": {
+            "version": "experiment-v4-provenance",
+            "fields": {
+                f: {"status": "verified"}
+                for f in (
+                    "metric_name",
+                    "value",
+                    "unit",
+                    "dataset",
+                    "split",
+                    "model_family",
+                    "task",
+                )
+            },
+        },
         "dataset": "D",
         "metric_name": "accuracy",
         "value": value,

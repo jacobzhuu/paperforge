@@ -58,6 +58,13 @@ async def start_job(
     project = await session.get(PaperProject, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if "review_style" in kwargs or function in {
+        "run_full_pipeline", "run_outline_pipeline", "run_write_pipeline",
+        "run_draft_rebuild_pipeline", "run_quality_pipeline", "run_quality_repair_pipeline",
+    }:
+        kwargs["review_style"] = kwargs.get("review_style") or (
+            (getattr(project, "scope_json", None) or {}).get("review_style") or "narrative"
+        )
     intake = (getattr(project, "scope_json", None) or {}).get("intake")
     if intake and intake.get("status") != "ready" and function != "run_intake_pipeline":
         raise HTTPException(409, "请先完成研究方向理解或澄清")

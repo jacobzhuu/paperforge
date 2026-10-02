@@ -21,6 +21,8 @@ _SHORT_FUNCTIONS = {"run_export_pipeline", "run_pdf_match_pipeline", "run_upload
 
 
 def lane(function):
+    if function == "run_background_revision":
+        return "background"
     return "short" if get_settings().job_short_slots and function in _SHORT_FUNCTIONS else "long"
 
 
@@ -90,8 +92,12 @@ async def dispatch_once(session, queue):
             )
         ).all()
     )
-    busy = {row.owner_id for row in active}
-    slots = {"long": settings.job_dispatch_slots, "short": settings.job_short_slots}
+    busy = {row.owner_id for row in active if lane(row.function) != "background"}
+    slots = {
+        "long": settings.job_dispatch_slots,
+        "short": settings.job_short_slots,
+        "background": 1,
+    }
     for row in active:
         if row.queue_identity == queue_identity():
             slots[lane(row.function)] -= 1
@@ -123,8 +129,11 @@ async def dispatch_once(session, queue):
         ).all()
     )
     candidates.sort(key=lambda item: grants.get(item.owner_id) or datetime.min.replace(tzinfo=UTC))
+    foreground_waiting = any(lane(i.function) != "background" for i in candidates + active)
     sent = 0
     for intent in candidates:
+        if lane(intent.function) == "background" and foreground_waiting:
+            continue
         selected_lane = lane(intent.function)
         if intent.owner_id in busy or slots[selected_lane] <= 0:
             continue
@@ -138,7 +147,11 @@ async def dispatch_once(session, queue):
                     str(job.project_id),
                     str(job.id),
                     _job_id=str(job.id),
-                    **({"_queue_name": "arq:short"} if selected_lane == "short" else {}),
+                    **(
+                        {"_queue_name": f"arq:{selected_lane}"}
+                        if selected_lane in {"short", "background"}
+                        else {}
+                    ),
                     **intent.kwargs_json,
                 ),
                 timeout=5,
@@ -166,6 +179,7 @@ async def dispatch_loop(app):
             if app.state.arq_pool is None:
                 app.state.arq_pool = await create_arq_pool(get_settings())
             async with get_session_factory()() as session:
+                await recover_revision_intents(session)
                 await recover_dispatches(session, app.state.arq_pool)
                 await session.commit()
                 await dispatch_once(session, app.state.arq_pool)
@@ -229,3 +243,45 @@ async def recover_dispatches(session, queue):
                 == JobStatus.not_found
             ):
                 intent.dispatched_at = None
+
+
+async def recover_revision_intents(session):
+    """Recover a committed first export whose candidate registration was interrupted."""
+    import uuid
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from paperforge_worker.pipelines.background_revision import schedule_revision
+
+    jobs = await session.scalars(
+        select(GenerationJob)
+        .join(JobDispatch)
+        .where(
+            JobDispatch.queue_identity == queue_identity(),
+            GenerationJob.status == "succeeded",
+            GenerationJob.checkpoint_json["revision_intent"].astext.is_not(None),
+        )
+        .limit(4)
+    )
+
+    @asynccontextmanager
+    async def same_transaction():
+        yield session
+
+    for job in jobs:
+        intent = (job.checkpoint_json or {}).get("revision_intent")
+        if not intent:
+            continue
+        context = SimpleNamespace(
+            project_id=job.project_id,
+            job_id=job.id,
+            settings=get_settings(),
+            session=same_transaction,
+        )
+        await schedule_revision(
+            context,
+            document_id=uuid.UUID(intent["document_id"]),
+            snapshot=intent["snapshot"],
+            review_style=intent["review_style"],
+        )
+        job.checkpoint_json = {**job.checkpoint_json, "revision_intent": None}

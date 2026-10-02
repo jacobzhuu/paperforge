@@ -135,25 +135,20 @@ async def test_complete_prompt_artifact_and_oversize_unassessed(tmp_path):
     assert verdict is not None
     artifact = events[0][1]["artifact_key"]
     stored = json.loads(make_object_store(context.settings).get(artifact))
-    assert stored["review_input"] == material
+    assert stored["review_input"]["claims"] == material["claims"]
+    assert stored["review_input"]["evidence"] == material["evidence"]
     assert stored["user_prompt"] == runner.calls[0]["user_prompt"]
     assert stored["system_prompt"] == runner.calls[0]["system_prompt"]
-    assert runner.calls[0]["metadata"]["review_input_hash"] == material["input_hash"]
+    assert runner.calls[0]["metadata"]["review_input_hash"] == stored["review_input"]["input_hash"]
     assert "support-19" in runner.calls[0]["user_prompt"]
     oversized = deepcopy(material)
-    oversized["prose"] = "x" * 64001
-    assert (
-        await review_section(
-            section_key="s",
-            question="Q",
-            prose="P",
-            evidence=[],
-            review_input=oversized,
-            runner=runner,
-            trace_context=context,
-        )
-        is None
+    oversized["claims"][0]["paragraph_context"] = "x" * 64001
+    oversized_verdict = await review_section(
+        section_key="s", question="Q", prose="P", evidence=[], review_input=oversized,
+        runner=runner, trace_context=context,
     )
+    assert not oversized_verdict.acceptable
+    assert oversized_verdict.claim_checks[0]["status"] == "unassessed"
     assert len(runner.calls) == 1
     assert events[-1][1]["reason"] == "input_budget_exceeded"
 

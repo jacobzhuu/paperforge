@@ -13,6 +13,9 @@ from visuals import ImageProviderConfig
 
 
 class WorkerSettings(BaseSettings):
+    fast_draft_background_enabled: bool = False
+    background_revision_max_sections: int = 8
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     worker_max_jobs: int = Field(default=4, ge=1, le=32)
@@ -123,6 +126,9 @@ class WorkerSettings(BaseSettings):
     # （arXiv/PMC/DOAJ/出版商落地页），无界扇出会被限流甚至封禁——那会表现为
     # 全文变少、卡片变薄，也就是**质量退化**。没有正当理由不要调高 per_host。
     fulltext_download_concurrency: int = 6
+    # Metadata APIs are queried for each selected work before downloads begin.
+    # Two workers bound requests to each metadata host without changing coverage.
+    fulltext_discovery_concurrency: int = Field(default=2, ge=1, le=4)
     fulltext_per_host_concurrency: int = 1
 
     # LLM 结构化实验抽取（P0-3 / Phase 2）。

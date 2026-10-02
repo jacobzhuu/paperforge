@@ -193,11 +193,15 @@ async def write_document(
             )
             return outcome
         outline = dict(outline_row.tree_json or {})
-        if (context.checkpoint.get("writer_outline_hash") and
-                fingerprint(outline) != context.checkpoint["writer_outline_hash"]):
+        if (
+            context.checkpoint.get("writer_outline_hash")
+            and fingerprint(outline) != context.checkpoint["writer_outline_hash"]
+        ):
             raise JobStopped("pause", reason="writing_inputs_changed")
-        if (outline.get("dependency_contract", {}).get("requires_confirmation", False)
-                and outline_row.status != "confirmed"):
+        if (
+            outline.get("dependency_contract", {}).get("requires_confirmation", False)
+            and outline_row.status != "confirmed"
+        ):
             raise JobStopped("pause", reason="outline_confirmation_required")
         whitelist = await get_writing_whitelist(session, context.project_id)
         cards = await _card_context(session, context.project_id)
@@ -237,11 +241,16 @@ async def write_document(
         )
     )
     if "writer_polish_policy" not in context.checkpoint:
-        await context.emit("polish.policy", {}, checkpoint={
-            "writer_polish_policy": "legacy" if document_id is not None else
-                context.settings.writer_polish_policy,
-            "writer_polish_concurrency": context.settings.writer_polish_concurrency,
-        })
+        await context.emit(
+            "polish.policy",
+            {},
+            checkpoint={
+                "writer_polish_policy": "legacy"
+                if document_id is not None
+                else context.settings.writer_polish_policy,
+                "writer_polish_concurrency": context.settings.writer_polish_concurrency,
+            },
+        )
     if document_id is None:
         async with context.session() as session:
             document = await create_document(
@@ -767,9 +776,17 @@ async def _polish_all(
     if context.checkpoint.get("writer_polish_policy", "legacy") != "legacy":
         from paperforge_worker.pipelines.parallel_polish import polish
 
-        return await polish(context, drafts=drafts, document_id=document_id,
-                            order_by_key=order_by_key, whitelist=whitelist, language=language,
-                            writing_context=writing_context, runner=runner, outcome=outcome)
+        return await polish(
+            context,
+            drafts=drafts,
+            document_id=document_id,
+            order_by_key=order_by_key,
+            whitelist=whitelist,
+            language=language,
+            writing_context=writing_context,
+            runner=runner,
+            outcome=outcome,
+        )
     polished_before = {str(key) for key in (context.checkpoint.get(WRITE_POLISHED_KEY) or [])}
     polishable = [
         key
@@ -945,9 +962,9 @@ def _draft_from_section(section: PaperSection) -> SectionDraft:
         level=int((section.body_ir_json or {}).get("level") or 1),
         parent_key=section.parent_key,
         inline_tables=list((section.generation_json or {}).get("inline_tables") or []),
-        preserved_blocks=deepcopy((section.body_ir_json or {}).get('blocks') or []),
-        citation_warnings=deepcopy((section.body_ir_json or {}).get('citation_warnings') or []),
-        appendix=bool((section.body_ir_json or {}).get('appendix')),
+        preserved_blocks=deepcopy((section.body_ir_json or {}).get("blocks") or []),
+        citation_warnings=deepcopy((section.body_ir_json or {}).get("citation_warnings") or []),
+        appendix=bool((section.body_ir_json or {}).get("appendix")),
     )
 
 
@@ -1022,11 +1039,15 @@ async def _persist_draft(
             if fingerprint(current) != frame_guard["body_hash"]:
                 raise JobStopped("pause", reason="writing_inputs_changed")
         if polish_guard is not None:
-            await session.scalar(select(PaperDocument).where(
-                PaperDocument.id == document_id).with_for_update())
+            await session.scalar(
+                select(PaperDocument).where(PaperDocument.id == document_id).with_for_update()
+            )
             rows = await list_sections(session, document_id)
-            current = {r.section_key: fingerprint(r.body_ir_json) for r in rows
-                       if r.section_key in polish_guard["expected"]}
+            current = {
+                r.section_key: fingerprint(r.body_ir_json)
+                for r in rows
+                if r.section_key in polish_guard["expected"]
+            }
             if current != polish_guard["expected"]:
                 raise JobStopped("pause", reason="polish_inputs_changed")
         await _upsert_draft(
@@ -1505,6 +1526,27 @@ async def repair_document_sections(
     unsupported claims" nudge, and a section that failed for listing its evidence
     one-sentence-at-a-time gets rewritten into the same list.
     """
+    from paperforge_worker import worker as w
+    from paperforge_worker.pipelines.claim_repair import repair_local
+    from paperforge_worker.pipelines.semantic_review import review_section
+
+    remaining = set(section_keys)
+    for item in await w._section_review_inputs(context):
+        if item["section_key"] not in remaining:
+            continue
+        verdict = await review_section(
+            section_key=item["section_key"],
+            question=item["question"],
+            prose=item["prose"],
+            evidence=item["evidence"],
+            review_input=item["review_input"],
+            runner=context.llm_runner(),
+            trace_context=context,
+            language=language,
+        )
+        if verdict and await repair_local(context, item, verdict, language=language):
+            remaining.remove(item["section_key"])
+    section_keys = remaining
     outcome = WriteOutcome()
     async with context.session() as session:
         document = await latest_document(session, context.project_id)
@@ -1530,7 +1572,7 @@ async def repair_document_sections(
 
     # Frame sections summarize the repaired body and must never remain attached
     # to claims that were removed in a prior round.
-    targets = set(section_keys) | {"abstract", "introduction", "conclusion"}
+    targets = set(section_keys)
     order_by_key = {str(item.get("key") or ""): index for index, item in enumerate(sections)}
     outline_keys = [str(item.get("key") or "") for item in sections]
     section_by_key = {key: item for key, item in zip(outline_keys, sections, strict=True)}
@@ -1929,6 +1971,15 @@ async def _repair_unsourced_numbers(
     和有出处的数据毫无区别。这里按章节把受影响的句子交回模型改写成定性表述，
     改不动的直接删句；引用绑定全程不动。
     """
+    from db import evidence_payload, list_evidence_units
+
+    async with context.session() as session:
+        repair_evidence = [
+            evidence_payload(u)
+            for u in await list_evidence_units(session, context.project_id)
+            if u.work_id in set(whitelist.values())
+        ]
+        repair_assets = await grounded_asset_payloads(session, context.project_id)
     by_section: dict[str, set[str]] = {}
     for finding in report.unsourced:
         by_section.setdefault(finding.section_key, set()).add(finding.value)
@@ -1946,6 +1997,8 @@ async def _repair_unsourced_numbers(
             values=values,
             language=language,
             runner=runner,
+            evidence=repair_evidence,
+            assets=repair_assets,
         )
         if not (stats["rewritten"] or stats["removed"]):
             continue

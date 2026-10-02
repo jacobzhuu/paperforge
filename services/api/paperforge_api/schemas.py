@@ -208,6 +208,7 @@ class SubmissionReadinessResponse(BaseModel):
 
 
 class ProjectResponse(BaseModel):
+    review_style: Literal["narrative", "systematic"] = "narrative"
     intake: dict[str, Any] | None = None
     id: str
     title: str
@@ -805,7 +806,7 @@ class IngestRequest(BaseModel):
 
 class GenerationOptionsRequest(BaseModel):
     quality_profile: Literal["draft", "scholarly", "submission"] = "scholarly"
-    review_style: Literal["narrative", "systematic"] = "narrative"
+    review_style: Literal["narrative", "systematic"] | None = None
 
 
 class FullPipelineOptionsRequest(GenerationOptionsRequest):

@@ -606,3 +606,24 @@ def _clean_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     return " ".join(value.split())
+
+
+def systematic_query_plan(
+    scope: dict, fallback: list[str], *, task_queries: list[str] | None = None
+) -> tuple[list[str], list[dict]]:
+    """Spend the existing twelve-query budget on task and time coverage."""
+    questions = [str(q.get("search_query") or "").strip()
+                 for q in scope.get("sub_questions", []) if isinstance(q, dict)]
+    if task_queries is not None:
+        questions = task_queries
+    questions = list(dict.fromkeys(q for q in questions if _is_english_query(q)))[:6]
+    filters = scope_filters(scope)
+    if not questions:
+        return fallback, [filters for _ in fallback]
+    years = filters.get("time_range", {})
+    start, end = years.get("start_year"), years.get("end_year")
+    if not (isinstance(start, int) and isinstance(end, int) and end > start):
+        queries = list(dict.fromkeys(questions + fallback))[:12]
+        return queries, [filters for _ in queries]
+    early = {**filters, "time_range": {"start_year": start, "end_year": (start + end) // 2}}
+    return questions + questions, [filters for _ in questions] + [early for _ in questions]

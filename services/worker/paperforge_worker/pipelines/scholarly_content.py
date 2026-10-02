@@ -173,6 +173,21 @@ def accept_math(draft, raw: dict, catalog: dict[str, dict]) -> None:
     accepted = []
     issues = []
     seen = set()
+    inline_only = {
+        key
+        for key, source in catalog.items()
+        if re.fullmatch(
+            r"(?:\\(?:leq?|geq?|lt|gt|approx|times|pm)|[≤≥<>≈=+−-]|[A-Za-z]|\\mathrm\{[A-Za-z]+\})",
+            str(source.get("latex") or "").strip(),
+        )
+    }
+    # Demote meaningless display equations before building labels or explanations.
+    for paragraph in draft.paragraphs:
+        for item in [paragraph, *(paragraph.get("sentences") or [])]:
+            for key in inline_only:
+                item["text"] = str(item.get("text") or "").replace(
+                    "{{eq:" + key + "}}", "{{math:" + key + "}}"
+                )
     for item in (raw.get("equations") or []) if isinstance(raw.get("equations"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -188,7 +203,7 @@ def accept_math(draft, raw: dict, catalog: dict[str, dict]) -> None:
         ):
             issues.append({"code": "formula_source_or_explanation_missing", "source_id": key})
             continue
-        if key in seen:
+        if key in seen or key in inline_only:
             continue
         seen.add(key)
         accepted.append(
@@ -268,8 +283,11 @@ def thematic_tables(section: dict, evidence: list[dict], *, language: str) -> li
     groups: dict[str, list[tuple[dict, dict]]] = defaultdict(list)
     for row in usable:
         for m in row.get("measurements") or []:
+            from paperforge_worker.pipelines.field_provenance import comparison_verified
+
             if (
-                m.get("comparability_key")
+                comparison_verified(m.get("provenance_json"))
+                and m.get("comparability_key")
                 and m.get("dataset")
                 and m.get("metric_name")
                 and m.get("value") is not None
@@ -435,3 +453,95 @@ def math_quality_issues(rows: list[Any]) -> list[dict[str, Any]]:
                         }
                     )
     return issues
+
+
+def task_comparison_table(bundles: list[dict], *, language: str) -> list[dict]:
+    """A source-bound task map; absent fields are not claims of absent validation."""
+    if len(bundles) < 2:
+        return []
+    zh = language == "zh"
+    missing = "未提取" if zh else "Not extracted"
+    rows, citations, ids = [], [], []
+    for bundle in bundles:
+        task = str(
+            bundle.get("question_text") or bundle.get("question") or bundle.get("text") or missing
+        )
+        evidence = [
+            r for r in bundle.get("evidence", []) if r.get("cite_key") and r.get("evidence_id")
+        ]
+        located = [
+            r for r in evidence if r.get("grade") in {"A_located_structured", "B_located_prose"}
+        ]
+        quantitative = [
+            (r, m) for r in located for m in r.get("measurements", []) if m.get("metric_name")
+        ]
+        selected = quantitative[:3] or [(located[0], {})] if located else []
+        if not selected:
+            rows.append([task, missing, missing, missing, missing, missing])
+        for source, measurement in selected:
+            citations.append(source["cite_key"])
+            ids.append(source["evidence_id"])
+            model = measurement.get("model") or measurement.get("method") or missing
+            data = (
+                "; ".join(str(measurement[k]) for k in ("dataset", "split") if measurement.get(k))
+                or missing
+            )
+            metric = (
+                " ".join(
+                    str(measurement[k])
+                    for k in ("metric_name", "value", "unit")
+                    if measurement.get(k) is not None
+                )
+                or missing
+            )
+            validation = (
+                "; ".join(
+                    str(measurement[k])
+                    for k in ("external_validation", "wet_lab_validation")
+                    if measurement.get(k)
+                )
+                or missing
+            )
+            locator = "; ".join(
+                str(source[k]) for k in ("page", "section_path", "object_ref") if source.get(k)
+            )
+            rows.append(
+                [
+                    task,
+                    str(model),
+                    data,
+                    metric,
+                    validation,
+                    source["cite_key"] + ": " + (locator or missing),
+                ]
+            )
+    if not rows:
+        return []
+    return [
+        {
+            "headers": (
+                ["任务", "模型/版本", "数据/划分", "指标/结果", "外部/湿实验验证", "来源定位"]
+                if zh
+                else [
+                    "Task",
+                    "Model/version",
+                    "Data/split",
+                    "Metric/result",
+                    "External/wet-lab validation",
+                    "Source",
+                ]
+            ),
+            "rows": rows,
+            "cite_keys": list(dict.fromkeys(citations)),
+            "evidence_ids": list(dict.fromkeys(ids)),
+            "label": "tab:task-comparison",
+            "caption": (
+                "各任务已提取的比较证据；未提取不代表不存在验证，不同协议不可直接排名。"
+                if zh
+                else (
+                    "Extracted task evidence. Missing fields do not establish absence; "
+                    "different protocols do not support direct ranking."
+                )
+            ),
+        }
+    ]

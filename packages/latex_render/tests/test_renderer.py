@@ -675,3 +675,12 @@ def test_appendix_sections_start_latex_appendix_once():
     project = build_latex_project(ir, template="article")
     sections = "".join(v for key, v in project.files.items() if key.startswith("sections/"))
     assert sections.count("\\appendix") == 1
+
+
+def test_long_identifiers_after_prose_wrap_without_losing_cell_content():
+    from latex_render.renderer import _escape_table_cell
+
+    value = "model abcdefghijklmnopqrstuvwxyz" + "x" * 250
+    rendered = _escape_table_cell(value)
+    assert rendered.replace(r"\hspace{0pt}", "").replace(r"\allowbreak{}", "") == value
+    assert rendered.count(r"\allowbreak{}") >= 30

@@ -108,6 +108,21 @@ def test_synthesis_detects_conflict_only_within_same_comparability_key():
         task="classification",
         sample_size=100,
         split="test",
+        provenance_json={
+            "version": "experiment-v4-provenance",
+            "fields": {
+                f: {"status": "verified"}
+                for f in (
+                    "metric_name",
+                    "value",
+                    "unit",
+                    "dataset",
+                    "split",
+                    "model_family",
+                    "task",
+                )
+            },
+        },
         comparability_key=key,
     )
     context = {
@@ -165,7 +180,25 @@ _LEXICAL_LIMIT = 24
 
 def _measurement(key: str, *, metric: str = "NDCG@10"):
     return SimpleNamespace(
-        comparability_key=key, metric_name=metric, dataset="Beauty", split="test"
+        provenance_json={
+            "version": "experiment-v4-provenance",
+            "fields": {
+                f: {"status": "verified"}
+                for f in (
+                    "metric_name",
+                    "value",
+                    "unit",
+                    "dataset",
+                    "split",
+                    "model_family",
+                    "task",
+                )
+            },
+        },
+        comparability_key=key,
+        metric_name=metric,
+        dataset="Beauty",
+        split="test",
     )
 
 
@@ -196,9 +229,7 @@ def test_without_measurements_the_same_table_stays_out():
     filler = [_unit(text=f"filler {index}") for index in range(30)]
     table = _unit(text="Table 4 | 0.4471")
 
-    selected = _diverse_ranked_candidates(
-        _ranked(anchor, *filler, table), limit=_LEXICAL_LIMIT
-    )
+    selected = _diverse_ranked_candidates(_ranked(anchor, *filler, table), limit=_LEXICAL_LIMIT)
 
     assert not any(item[0] is table for item in selected)
 

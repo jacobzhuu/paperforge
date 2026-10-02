@@ -73,6 +73,7 @@ services:
       - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
     environment:
       REQUEST_LIMITS_ENABLED: "true"
+      LLM_FAIR_ADMISSION_ENABLED: "true"
       JOB_DISPATCH_SLOTS: "8"
       JOB_SHORT_SLOTS: "2"
       DB_MAX_OVERFLOW: "4"
@@ -145,6 +146,8 @@ services:
     env_file:
       - ${PAPERFORGE_ENV_FILE:?set PAPERFORGE_ENV_FILE}
     environment: &capacity-worker-env
+      FAST_DRAFT_BACKGROUND_ENABLED: "true"
+      LLM_FAIR_ADMISSION_ENABLED: "true"
       DB_MAX_OVERFLOW: "6"
       WORKER_METRICS_PORT: "9090"
       WORKER_MAX_JOBS: "4"
@@ -188,12 +191,29 @@ services:
     pids_limit: 512
     restart: unless-stopped
 
+  worker-background:
+    <<: *capacity-worker
+    environment:
+      <<: *capacity-worker-env
+      WORKER_MAX_JOBS: "1"
+      WORKER_QUEUE_NAME: arq:background
+      # Keep the deployment's 36-connection database budget unchanged.
+      DB_MAX_OVERFLOW: "0"
+      SECTION_REVIEW_CONCURRENCY: "2"
+      VERIFIER_CONCURRENCY: "2"
+      WRITER_REPAIR_CONCURRENCY: "2"
+    deploy:
+      replicas: 1
+    cpus: 1.0
+    mem_limit: 2g
+
   worker-short:
     <<: *capacity-worker
     environment:
       <<: *capacity-worker-env
       WORKER_MAX_JOBS: "2"
       WORKER_QUEUE_NAME: arq:short
+      DB_MAX_OVERFLOW: "4"
     deploy:
       replicas: 1
     cpus: 1.0

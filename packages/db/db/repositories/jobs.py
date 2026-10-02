@@ -17,6 +17,7 @@ from db.models.paper import GenerationJob, JobEvent, LlmCallLog
 
 JOB_KINDS = frozenset(
     {
+        "revision",
         "intake",
         "web_research",
         "research",

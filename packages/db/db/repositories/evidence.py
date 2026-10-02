@@ -219,6 +219,7 @@ async def upsert_evidence_measurement(
     protocol: dict | None = None,
     extraction_source: str | None = None,
     locator_verified: bool = False,
+    provenance: dict | None = None,
 ) -> EvidenceMeasurement:
     key = comparability_key(
         task=task,
@@ -276,6 +277,7 @@ async def upsert_evidence_measurement(
     measurement.comparability_key = key
     measurement.extraction_source = extraction_source
     measurement.locator_verified = locator_verified
+    measurement.provenance_json = provenance
     await session.flush()
     return measurement
 
@@ -340,6 +342,7 @@ def evidence_payload(
                     "comparability_key",
                     "extraction_source",
                     "locator_verified",
+                    "provenance_json",
                 )
             }
             for item in measurements or []

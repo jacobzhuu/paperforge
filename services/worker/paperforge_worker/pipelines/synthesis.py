@@ -360,6 +360,7 @@ def _synthesize_bundle(
                 "sample_size": item.sample_size,
                 "split": item.split,
                 "comparability_key": item.comparability_key,
+                "provenance_json": getattr(item, "provenance_json", None),
             }
             for item in unit_measurements
         ]
@@ -389,7 +390,10 @@ def _synthesize_bundle(
         if unit.grade in FULLTEXT_GRADES:
             eligible_work_ids.add(str(unit.work_id))
         for measurement in measurement_rows:
-            groups.setdefault(measurement["comparability_key"], []).append(row)
+            from paperforge_worker.pipelines.field_provenance import comparison_verified
+
+            if comparison_verified(measurement.get("provenance_json")):
+                groups.setdefault(measurement["comparability_key"], []).append(row)
 
     comparison_clusters: list[dict[str, Any]] = []
     has_conflict = False

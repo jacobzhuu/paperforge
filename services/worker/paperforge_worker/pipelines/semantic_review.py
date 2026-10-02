@@ -96,6 +96,8 @@ class SectionVerdict:
         使植物进入防御准备状态」当成已知事实，而证据里说的是细胞壁多糖（LPS/EPS）
         这类激发子诱导 ISR/SAR——换了机制的主语。这种话读起来最顺，也最该拦。
         """
+        if any(c.get("status") in {"uncertain", "unassessed"} for c in self.claim_checks):
+            return False
         if self.answers_question == "no":
             return False
         if self.answers_question == "partial" and not self.gap_declared:
@@ -403,7 +405,13 @@ def repair_route(
     return "none"
 
 
-async def review_section(
+async def review_section(**kwargs) -> SectionVerdict | None:
+    from paperforge_worker.pipelines.claim_review import review_batched
+
+    return await review_batched(**kwargs)
+
+
+async def _review_section_batch(
     *,
     section_key: str,
     question: str,
@@ -413,6 +421,7 @@ async def review_section(
     language: str = "zh",
     review_input: dict[str, Any] | None = None,
     trace_context: Any = None,
+    repair_invalid: bool = False,
 ) -> SectionVerdict | None:
     """Review a complete frozen input; unavailable/oversized inputs are unassessed."""
     if not prose.strip() or not question.strip():
@@ -437,6 +446,25 @@ async def review_section(
     )
     strict = "claims" in material
     prompt = _SECTION_PROMPT_ZH + EVIDENCE_REVIEW_RULES + (CLAIM_CHECK_SCHEMA if strict else "")
+    prompt += (
+        "\n逐项核对方法名称和版本、数据集/划分、指标和值的归属。综述表中共同列出的多个方法"
+        "不共享全部机制或限制；不能把一篇论文的相关工作当成本方法实验。优先原始研究。"
+        "严格区分本轮未检索到、原文未报告、原文明确否定；不能因摘录缺失就认定整个领域不存在。"
+        "将此类错误列入 unsupported_claims，保留原文定位。"
+    )
+    if material.get("section_role") == "frame":
+        prompt += "\n本节为摘要/引言/结论：核对事实与限定即可，不要求本节独立完成跨研究综合。"
+    if material.get("summary_consistency_required"):
+        prompt += (
+            "\n本节是全文总结。对每条事实性总结，核对 verified_body_claims 中已核验正文："
+            "主体、条件、数值方向与结论强度必须一致，不得把局部结果推广为普遍结论。"
+            "每条 supported/inference 的 claim_check 增加 body_claim_ids，"
+            "只能从该论断 allowed_body_claim_ids 选择；找不到支持须标 uncertain/unsupported，"
+            "正文与总结冲突须标 contradicted，并说明冲突。正文引用只作一致性检查，"
+            "不替代当前论断自己的来源绑定。evidence_ids 只能填写该 claim 的 resolved_evidence_ids，"
+            "不要复制正文的 evidence_ids；无直接来源绑定的摘要用空 evidence_ids "
+            "和有效 body_claim_ids。"
+        )
     artifact = {
         "review_input": material,
         "system_prompt": prompt,
@@ -485,20 +513,64 @@ async def review_section(
         user_prompt=user_prompt,
         metadata=metadata,
         trace_context=trace_context,
-        retry_invalid=strict,
+        retry_invalid=False,
         max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
     )
-    raw_payload = payload
     invalid = None
-    if payload is not None and strict:
-        invalid = validate_claim_checks(payload, material)
-        if invalid is None:
-            try:
-                payload = checked_payload(payload, material)
-            except ValueError as error:
-                invalid = str(error)
-        if invalid:
+    raw_payload = payload
+    if strict:
+        from paperforge_worker.pipelines.claim_review import subset, unknown, valid_checks
+
+        good, errors = valid_checks(payload, material)
+        base = payload
+        if errors and repair_invalid:
+            pending = subset(material, [c for c in material["claims"] if c["claim_id"] in errors])
+            retry = await _judge(
+                runner,
+                system_prompt=prompt,
+                user_prompt=(
+                    "只核验以下待处理论断，保留不确定性。上一轮校验原因："
+                    + json.dumps(errors, ensure_ascii=False)
+                    + "\n"
+                    + json.dumps(pending, ensure_ascii=False, default=str)
+                ),
+                metadata={**metadata, "validation_retry": True},
+                trace_context=trace_context,
+                retry_invalid=False,
+                max_output_tokens=SECTION_MAX_OUTPUT_TOKENS,
+            )
+            repaired, errors = valid_checks(retry, pending)
+            good.extend(repaired)
+            if base is None:
+                base = retry
+        if base is None:
             payload = None
+        else:
+            by_id = {c["claim_id"]: c for c in good}
+            checks = [
+                by_id.get(c["claim_id"], unknown(c, errors.get(c["claim_id"], "invalid_review")))
+                for c in material["claims"]
+            ]
+            defaults = {
+                "answers_question": "partial",
+                "support": "thin",
+                "calibration": "matched",
+                "synthesis_mode": "mixed",
+                "diagnosis": "none",
+                "gap_declared": False,
+            }
+            # Only valid aggregate fields survive; incomplete coverage remains explicit.
+            fields_valid = (
+                validate_claim_checks({**base, "claim_checks": []}, {"claims": []}) is None
+            )
+            payload = checked_payload(
+                {
+                    **(base if fields_valid else defaults),
+                    "claim_checks": checks,
+                    "unsupported_claims": [],
+                },
+                material,
+            )
     if trace_context is not None:
         await trace_context.emit(
             "review.result",

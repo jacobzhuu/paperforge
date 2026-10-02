@@ -29,7 +29,27 @@ def _unit(work: str, *, keys: list[str] | None = None, **extra) -> dict:
         "grade": "B_located_prose",
         "section_path": "Results",
         "paragraph_index": 1,
-        "measurements": [{"comparability_key": k} for k in (keys or [])],
+        "measurements": [
+            {
+                "comparability_key": k,
+                "provenance_json": {
+                    "version": "experiment-v4-provenance",
+                    "fields": {
+                        f: {"status": "verified"}
+                        for f in (
+                            "metric_name",
+                            "value",
+                            "unit",
+                            "dataset",
+                            "split",
+                            "model_family",
+                            "task",
+                        )
+                    },
+                },
+            }
+            for k in (keys or [])
+        ],
         **extra,
     }
 
@@ -97,8 +117,52 @@ def test_units_may_be_objects_as_well_as_dicts():
     from types import SimpleNamespace
 
     objs = [
-        SimpleNamespace(work_id="A", measurements=[SimpleNamespace(comparability_key="acc")]),
-        SimpleNamespace(work_id="B", measurements=[SimpleNamespace(comparability_key="acc")]),
+        SimpleNamespace(
+            work_id="A",
+            measurements=[
+                SimpleNamespace(
+                    comparability_key="acc",
+                    provenance_json={
+                        "version": "experiment-v4-provenance",
+                        "fields": {
+                            f: {"status": "verified"}
+                            for f in (
+                                "metric_name",
+                                "value",
+                                "unit",
+                                "dataset",
+                                "split",
+                                "model_family",
+                                "task",
+                            )
+                        },
+                    },
+                )
+            ],
+        ),
+        SimpleNamespace(
+            work_id="B",
+            measurements=[
+                SimpleNamespace(
+                    comparability_key="acc",
+                    provenance_json={
+                        "version": "experiment-v4-provenance",
+                        "fields": {
+                            f: {"status": "verified"}
+                            for f in (
+                                "metric_name",
+                                "value",
+                                "unit",
+                                "dataset",
+                                "split",
+                                "model_family",
+                                "task",
+                            )
+                        },
+                    },
+                )
+            ],
+        ),
     ]
     assert comparison_admissible(objs) is True
 
@@ -211,3 +275,10 @@ def test_a_within_study_comparison_with_no_evidence_binding_is_still_removed():
         language="zh",
     )
     assert _survivors(out) == []
+
+
+def test_legacy_measurements_do_not_acquire_comparison_eligibility():
+    a, b = _unit("a", keys=["k"]), _unit("b", keys=["k"])
+    for unit in (a, b):
+        unit["measurements"][0].pop("provenance_json")
+    assert measured_comparability([a, b]) is False

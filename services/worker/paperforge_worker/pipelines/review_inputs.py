@@ -8,8 +8,8 @@ from paperforge_worker.orchestration.writing_graph import fingerprint
 from paperforge_worker.pipelines.quality import _claims_with_local_citations
 from paperforge_worker.pipelines.review_contract import table_role_conflicts
 
-REVIEW_INPUT_VERSION = "section-review-v3"
-MAX_REVIEW_INPUT_CHARS = 64_000
+REVIEW_INPUT_VERSION = "section-review-v4"
+MAX_REVIEW_INPUT_CHARS = 48_000
 
 
 def build_review_input(
@@ -30,6 +30,7 @@ def build_review_input(
         for k in ("_asset_ref", "_asset_id", "source_ref")
         if a.get(k)
     }
+    work_keys = {str(work): key for key, work in whitelist.items()}
     claims, selected, selected_assets, issues = [], {}, {}, []
     for bi, block in enumerate(body.get("blocks") or []):
         containers = (
@@ -37,6 +38,41 @@ def build_review_input(
             if block.get("type") == "paragraph"
             else [i.get("runs") or [] for i in block.get("items") or []]
         )
+        if block.get("type") in {"table", "equation", "figure", "algorithm"}:
+            import json
+
+            source = block.get("source") or {}
+            data = source.get("data") or {}
+            keys = data.get("cite_keys") or []
+            ids = data.get("evidence_ids") or block.get("source_ids") or []
+            refs = [r for r in [source.get("ref"), block.get("asset_ref")] if r]
+            if block.get("type") == "equation":
+                ids = []
+                for source_id in block.get("source_ids") or []:
+                    if source_id in units:
+                        ids.append(source_id)
+                        key = work_keys.get(str(units[source_id].get("work_id")))
+                        if key:
+                            keys.append(key)
+                    elif source_id in assets_by_ref:
+                        refs.append(source_id)
+                    else:
+                        ids.append(source_id)
+            if block.get("type") == "table" and not keys and bi > 0:
+                # Older inline tables store their explicit sources in a preceding cite-only block.
+                previous = (body.get("blocks") or [])[bi - 1]
+                prior_runs = previous.get("runs") or []
+                if prior_runs and all(r.get("t") == "cite" for r in prior_runs):
+                    keys = [k for r in prior_runs for k in r.get("keys", [])]
+                    ids = [e for r in prior_runs for e in r.get("evidence_ids", [])]
+            text = json.dumps(block, ensure_ascii=False, sort_keys=True)
+            containers = [
+                [
+                    {"t": "text", "v": text},
+                    {"t": "cite", "keys": keys, "evidence_ids": ids},
+                    {"t": "grounding", "source_refs": refs},
+                ]
+            ]
         for ci, runs in enumerate(containers):
             for si, (text, cites, ids, refs) in enumerate(
                 _claims_with_local_citations(runs, min_chars=1)
@@ -85,6 +121,9 @@ def build_review_input(
                     {
                         "claim_id": claim_id,
                         "text": text,
+                        "paragraph_context": " ".join(
+                            str(r.get("v", "")) for r in runs if r.get("t") == "text"
+                        ),
                         "cite_keys": cites,
                         "evidence_ids": ids,
                         "resolved_evidence_ids": valid,
@@ -92,6 +131,7 @@ def build_review_input(
                     }
                 )
     payload = {
+        "section_role": (scope or {}).get("section_role", "body"),
         "version": REVIEW_INPUT_VERSION,
         "scope": scope or {},
         "section_key": section_key,
@@ -108,6 +148,9 @@ def build_review_input(
             "binding_issues": len(issues),
         },
     }
+    from paperforge_worker.pipelines.field_provenance import derived_comparisons
+
+    payload["derived_comparisons"] = derived_comparisons(payload["evidence"])
     payload["table_role_conflicts"] = table_role_conflicts(payload)
     payload["input_hash"] = fingerprint(payload)
     return payload

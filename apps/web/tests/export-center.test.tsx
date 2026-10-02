@@ -11,6 +11,7 @@ vi.mock('@/components/ui/toast', () => ({ useToast: () => ({ toast: mock.toast }
 vi.mock('@/components/project/publication-metadata', () => ({ PublicationMetadata: () => null }));
 vi.mock('@/components/project/workbench-footer-nav', () => ({ WorkbenchFooterNav: () => null }));
 vi.mock('@/lib/api', () => ({
+  listDraftRevisions: () => Promise.resolve({ data: [] }),
   ALL_EXPORT_FORMATS: ['pdf', 'markdown'],
   ApiError: class extends Error {},
   listExports: () => ok([]), listJobs: () => ok([]), getQuality: () => ok(undefined),

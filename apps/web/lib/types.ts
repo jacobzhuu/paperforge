@@ -66,6 +66,7 @@ export interface IntakeRequest {
 }
 
 export interface Project {
+  review_style?: ReviewStyle;
   intake?: IntakeState | null;
   web_research_enabled?: boolean;
   id: string;
@@ -365,6 +366,7 @@ export interface ScopePayload {
 // ---- 任务与进度（设计 §4.3 generation_job / job_event） ----
 
 export type JobKind =
+  | 'revision'
   | 'intake'
   | 'research'
   | 'web_research'

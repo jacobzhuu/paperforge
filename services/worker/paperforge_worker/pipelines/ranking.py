@@ -139,6 +139,7 @@ def balanced_selection_indices(
     *,
     limit: int,
     now: datetime | None = None,
+    time_range: dict | None = None,
 ) -> set[int]:
     """按相关性、年代与 OA 可得性分层选取，避免 top-K 只追逐最新年份。"""
     if limit <= 0:
@@ -177,7 +178,20 @@ def balanced_selection_indices(
             if len([item for item in selected if item in pool]) >= count or len(selected) >= limit:
                 return
 
-    take(foundational, max(1, round(limit * 0.25)) if foundational else 0)
+    if (
+        time_range
+        and isinstance(time_range.get("start_year"), int)
+        and isinstance(time_range.get("end_year"), int)
+    ):
+        start, end = time_range["start_year"], time_range["end_year"]
+        for left, right in ((start, (start + end) // 2), ((start + end) // 2 + 1, end)):
+            pool = [
+                i for i in eligible if left <= (ranked[i].candidate.publication_year or 0) <= right
+            ]
+            if pool:
+                take(pool, max(1, limit // 4))
+    else:
+        take(foundational, max(1, round(limit * 0.25)) if foundational else 0)
     take(recent, max(1, round(limit * 0.4)) if recent else 0)
     take(oa, max(1, round(limit * 0.4)) if oa else 0)
     # Fill remaining slots only from the eligible pool — never drop the absolute

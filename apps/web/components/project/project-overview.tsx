@@ -166,7 +166,10 @@ export function ProjectOverview() {
   const exports = exportsModule.data;
   const lint = lintModule.data;
   const [qualityProfile, setQualityProfile] = React.useState<QualityProfile>('draft');
-  const [reviewStyle, setReviewStyle] = React.useState<ReviewStyle>('narrative');
+  const [reviewStyle, setReviewStyle] = React.useState<ReviewStyle>(project?.review_style ?? 'narrative');
+  React.useEffect(() => {
+    setReviewStyle(project?.review_style ?? 'narrative');
+  }, [projectId, project?.review_style]);
   /** 点击到 busy 置位之间有一次网络往返，不自己置位就能连点两下起两条管线。 */
   const [starting, setStarting] = React.useState(false);
   const [polishAction, setPolishAction] = React.useState<'start' | 'skip' | null>(null);

@@ -409,6 +409,7 @@ async def shadow_tick(ctx: dict) -> None:
                     await update_shadow(factory, run_id, status="pending")
                     return
                 # No reuse of outputs across repeats; identical frozen inputs every time.
+                context.checkpoint.pop("claim_review_batches", None)
                 context.events = []
                 context.prefix = f"{prefix}/repeat-{repeat}/{material['input_hash']}"
                 start = asyncio.get_running_loop().time()

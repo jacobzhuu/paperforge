@@ -77,12 +77,24 @@ def validate_claim_checks(payload: dict, material: dict) -> str | None:
             return "invalid_evidence_ids"
         if not set(ids) <= set(claims[cid]["resolved_evidence_ids"]):
             return "foreign_claim_evidence"
-        if status in {"supported", "inference"} and not ids and not claims[cid]["source_refs"]:
+        if (
+            status in {"supported", "inference"}
+            and not ids
+            and not claims[cid]["source_refs"]
+            and not (material.get("summary_consistency_required") and check.get("body_claim_ids"))
+        ):
             return "support_without_binding"
+        if material.get("summary_consistency_required") and status in {"supported", "inference"}:
+            body_ids = check.get("body_claim_ids")
+            if (
+                not isinstance(body_ids, list)
+                or not body_ids
+                or any(not isinstance(i, str) for i in body_ids)
+                or not set(body_ids) <= set(claims[cid].get("allowed_body_claim_ids", []))
+            ):
+                return "missing_or_invalid_body_claim_binding"
         if not isinstance(check.get("reason"), str) or not check["reason"].strip():
             return "missing_claim_reason"
-        if status == "uncertain":
-            return "uncertain_claim"
     return None
 
 

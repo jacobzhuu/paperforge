@@ -236,15 +236,19 @@ def _escape_table_cell(value: Any) -> str:
     产生 50--110pt 的 Overfull hbox。先按原字符切段、再逐段转义，避免直接在
     已转义 LaTeX 上做替换而破坏 ``\\textbackslash{}`` 等命令。
     """
-    raw = str(value)[:240]
+    raw = str(value)
     parts: list[str] = []
     start = 0
+    word_length = 0
     for index, character in enumerate(raw):
-        if character not in _TABLE_SOFT_BREAK_CHARS:
+        word_length = word_length + 1 if character.isascii() and character.isalnum() else 0
+        long_word = word_length >= 8
+        if character not in _TABLE_SOFT_BREAK_CHARS and not long_word:
             continue
         parts.append(latex_escape(raw[start : index + 1]))
         parts.append("\\allowbreak{}")
         start = index + 1
+        word_length = 0
     parts.append(latex_escape(raw[start:]))
     # p 列的首个单词默认可能无法断词；零宽盒让 TeX 从单元格开头就能分行。
     return "\\hspace{0pt}" + "".join(parts)

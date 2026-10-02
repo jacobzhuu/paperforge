@@ -62,6 +62,7 @@ async def create_quality_report(
         update(QualityReportRecord)
         .where(
             QualityReportRecord.project_id == project_id,
+            QualityReportRecord.document_id == document_id,
             QualityReportRecord.quality_profile == quality_profile,
             QualityReportRecord.stale.is_(False),
         )
@@ -93,7 +94,15 @@ async def latest_quality_report(
     *,
     quality_profile: str | None = None,
 ) -> QualityReportRecord | None:
-    stmt = select(QualityReportRecord).where(QualityReportRecord.project_id == project_id)
+    from db.repositories.documents import latest_document
+
+    document = await latest_document(session, project_id)
+    if document is None:
+        return None
+    stmt = select(QualityReportRecord).where(
+        QualityReportRecord.project_id == project_id,
+        QualityReportRecord.document_id == document.id,
+    )
     if quality_profile:
         stmt = stmt.where(QualityReportRecord.quality_profile == quality_profile)
     return await session.scalar(stmt.order_by(QualityReportRecord.created_at.desc()).limit(1))

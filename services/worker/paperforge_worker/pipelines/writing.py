@@ -237,7 +237,9 @@ def writer_policy(language: str, paper_type: str) -> str:
             else (_SYSTEM_PROMPT_ZH if language == "zh" else _SYSTEM_PROMPT_EN),
             "abstract": (
                 _ABSTRACT_SYSTEM_PROMPT_ZH if language == "zh" else _ABSTRACT_SYSTEM_PROMPT_EN
-            ) if paper_type == "review" else None,
+            )
+            if paper_type == "review"
+            else None,
             "coherence": _COHERENCE_PROMPT_ZH if language == "zh" else _COHERENCE_PROMPT_EN,
         }
     )
@@ -287,11 +289,16 @@ class SectionDraft:
     def to_ir_section(self, *, level: int | None = None) -> Section:
         """转成 PaperIR Section：cite 是原子节点，不是正文里的字符串。"""
         if self.preserved_blocks is not None:
-            return Section(key=self.section_key, title=self.title, level=self.level,
-                           appendix=self.appendix, blocks=self.preserved_blocks,
-                           citation_warnings=self.citation_warnings)
+            return Section(
+                key=self.section_key,
+                title=self.title,
+                level=self.level,
+                appendix=self.appendix,
+                blocks=self.preserved_blocks,
+                citation_warnings=self.citation_warnings,
+            )
         blocks: list[Any] = []
-        labels = {e['source_id']: e['label'] for e in self.equations}
+        labels = {e["source_id"]: e["label"] for e in self.equations}
         for paragraph_index, paragraph in enumerate(self.paragraphs):
             sentence_rows = [
                 sentence
@@ -340,20 +347,28 @@ class SectionDraft:
                 )
             )
             for equation in self.equations:
-                if equation['after_paragraph'] != paragraph_index:
+                if equation["after_paragraph"] != paragraph_index:
                     continue
                 blocks.append(equation_block(equation))
-                explanation_runs: list[Any] = [TextRun(v=equation['explanation'])]
-                if equation.get('cite_keys'):
-                    explanation_runs.append(CiteRun(keys=equation['cite_keys'],
-                                                    evidence_ids=equation['evidence_ids']))
-                if equation.get('source_refs'):
-                    explanation_runs.append(GroundingRun(source_refs=equation['source_refs']))
+                explanation_runs: list[Any] = [TextRun(v=equation["explanation"])]
+                if equation.get("cite_keys"):
+                    explanation_runs.append(
+                        CiteRun(keys=equation["cite_keys"], evidence_ids=equation["evidence_ids"])
+                    )
+                if equation.get("source_refs"):
+                    explanation_runs.append(GroundingRun(source_refs=equation["source_refs"]))
                 blocks.append(ParagraphBlock(runs=explanation_runs))
         for table in self.inline_tables:
-            if table.get('cite_keys'):
-                blocks.append(ParagraphBlock(runs=[CiteRun(keys=table['cite_keys'],
-                    evidence_ids=table.get('evidence_ids', []))]))
+            if table.get("cite_keys"):
+                blocks.append(
+                    ParagraphBlock(
+                        runs=[
+                            CiteRun(
+                                keys=table["cite_keys"], evidence_ids=table.get("evidence_ids", [])
+                            )
+                        ]
+                    )
+                )
             headers = table.get("headers") or []
             rows = table.get("rows") or []
             if headers and rows:
@@ -361,7 +376,12 @@ class SectionDraft:
                     TableBlock(
                         source=TableSource(
                             kind="inline",
-                            data={"headers": headers, "rows": rows},
+                            data={
+                                "headers": headers,
+                                "rows": rows,
+                                "cite_keys": table.get("cite_keys", []),
+                                "evidence_ids": table.get("evidence_ids", []),
+                            },
                         ),
                         caption=str(table.get("caption") or ""),
                         label=str(table.get("label") or "") or None,
@@ -445,11 +465,28 @@ async def write_section(
     ``corrections`` 是上一版的具体问题（照抄原文、语种不对、太短），
     直接回灌给模型，重试才有理由产生不同的结果。
     """
+    if section.get("has_children"):
+        corrections = list(corrections or []) + [
+            "This is a parent orientation, not a full review. Write ONE brief paragraph; "
+            "do not repeat children's numbers, examples, mechanisms or conclusions."
+        ]
+    # Pin the prompt contract to the persisted outline. Resuming an older manuscript
+    # must keep its original writing inputs; every newly planned outline opts into v2.
+    if context.outline.get("evidence_policy_version", 1) >= 2:
+        corrections = list(corrections or []) + [
+            "Bind every method/version, dataset/split, metric/value and validation claim "
+            "to its own source passage. Do not transfer properties between methods "
+            "in a review table. "
+            "Attribute secondary-review findings to that review, not to the entire field. "
+            "Distinguish not retrieved, not reported in the source, and explicitly not validated. "
+            "A missing excerpt is not proof of absence. Prefer original studies for mechanisms."
+        ]
     section_key = str(section.get("key") or "section")
     title = str(section.get("title") or section_key)
     allowed = {key for key in section.get("cite_keys", []) if key in whitelist}
-    section_evidence = [e for e in section_evidence_for(section, context.outline)
-                        if e.get('cite_key') in allowed]
+    section_evidence = [
+        e for e in section_evidence_for(section, context.outline) if e.get("cite_key") in allowed
+    ]
     evidence_by_id = {
         str(item.get("evidence_id")): item for item in section_evidence if item.get("evidence_id")
     }
@@ -474,16 +511,24 @@ async def write_section(
             dict(table) for table in section.get("inline_tables") or [] if isinstance(table, dict)
         ],
     )
-    if context.paper_type == 'review' and section_key != 'evidence_ledger':
+    if context.paper_type == "review" and section_key != "evidence_ledger":
         # Re-plan legacy automatic matrices during an explicitly requested regeneration.
-        retained = [t for t in draft.inline_tables if not t.get('automatic') and
-                    t.get('label') != 'tab:literature-matrix']
-        planned = thematic_tables(section, section_evidence, language=context.language) if (
-            section.get('synthesis_kind') != 'comparison_limitations_conflicts'
-            and section.get('kind', 'body') == 'body' and not section.get('parent_key')
-        ) else []
+        retained = [
+            t
+            for t in draft.inline_tables
+            if not t.get("automatic") and t.get("label") != "tab:literature-matrix"
+        ]
+        planned = (
+            thematic_tables(section, section_evidence, language=context.language)
+            if (
+                section.get("synthesis_kind") != "comparison_limitations_conflicts"
+                and section.get("kind", "body") == "body"
+                and not section.get("parent_key")
+            )
+            else []
+        )
         draft.inline_tables = retained + planned
-        section = {**section, 'inline_tables': draft.inline_tables}
+        section = {**section, "inline_tables": draft.inline_tables}
     if section.get("deterministic_text"):
         draft.paragraphs = [{"text": str(section["deterministic_text"]), "cite_keys": []}]
         draft.generator = "deterministic_search_log"
@@ -528,8 +573,7 @@ async def write_section(
         if section_key == "abstract" and context.paper_type == "review" and context.language == "zh"
         else _ABSTRACT_SYSTEM_PROMPT_EN
         if section_key == "abstract" and context.paper_type == "review"
-        else
-        _ORIGINAL_SYSTEM_PROMPT_ZH
+        else _ORIGINAL_SYSTEM_PROMPT_ZH
         if context.paper_type == "original" and context.language == "zh"
         else _ORIGINAL_SYSTEM_PROMPT_EN
         if context.paper_type == "original"
@@ -538,7 +582,7 @@ async def write_section(
         else _SYSTEM_PROMPT_EN
     )
 
-    if section_key != 'abstract':
+    if section_key != "abstract":
         system_prompt += MATH_INSTRUCTION
 
     # 第一轮：report 模式——不改动内容，只报告越权 key。
@@ -612,7 +656,7 @@ async def write_section(
         allowed_evidence_ids=allowed_evidence_ids,
         allowed_source_refs=allowed_source_refs,
     )
-    catalog = formula_catalog(section_evidence, source_assets) if section_key != 'abstract' else {}
+    catalog = formula_catalog(section_evidence, source_assets) if section_key != "abstract" else {}
     accept_math(draft, result.value, catalog)
     original_paragraphs = list(draft.paragraphs)
     if context.paper_type == "original" and allowed_source_refs:
@@ -630,20 +674,22 @@ async def write_section(
         )
     # Evidence rules may remove an introducing paragraph. Do not orphan its formula.
     for equation in draft.equations:
-        introduction = original_paragraphs[equation['after_paragraph']]
-        equation['after_paragraph'] = next(
-            (i for i, p in enumerate(draft.paragraphs) if p is introduction), -1)
-    usable_positions = {i for i, p in enumerate(draft.paragraphs) if p.get('text', '').strip()}
-    removed = [e for e in draft.equations if e['after_paragraph'] not in usable_positions]
+        introduction = original_paragraphs[equation["after_paragraph"]]
+        equation["after_paragraph"] = next(
+            (i for i, p in enumerate(draft.paragraphs) if p is introduction), -1
+        )
+    usable_positions = {i for i, p in enumerate(draft.paragraphs) if p.get("text", "").strip()}
+    removed = [e for e in draft.equations if e["after_paragraph"] not in usable_positions]
     if removed:
-        draft.generation['formula_issues'].append({'code': 'formula_introduction_removed'})
+        draft.generation["formula_issues"].append({"code": "formula_introduction_removed"})
         draft.equations = [e for e in draft.equations if e not in removed]
-        missing = {e['source_id'] for e in removed}
+        missing = {e["source_id"] for e in removed}
         for paragraph in draft.paragraphs:
-            for sentence in paragraph.get('sentences') or []:
-                if any(kind == 'eq' and key in missing
-                       for kind, key in math_tokens(sentence['text'])):
-                    sentence['text'] = ''
+            for sentence in paragraph.get("sentences") or []:
+                if any(
+                    kind == "eq" and key in missing for kind, key in math_tokens(sentence["text"])
+                ):
+                    sentence["text"] = ""
     draft.terms = normalize_terms(result.value.get("terms"))
     draft.model = result.model
     draft.generator = f"llm:{result.model}"
@@ -686,11 +732,11 @@ async def coherence_pass(
     if runner is None or not runner.enabled or not draft.paragraphs:
         return rejected("disabled_or_empty")
     if draft.preserved_blocks is not None and any(
-        b.get('type') != 'paragraph' or any(r.get('t') not in {'text', 'cite', 'grounding'}
-                                          for r in b.get('runs', []))
+        b.get("type") != "paragraph"
+        or any(r.get("t") not in {"text", "cite", "grounding"} for r in b.get("runs", []))
         for b in draft.preserved_blocks
     ):
-        return rejected('preserve_restored_structured_content')
+        return rejected("preserve_restored_structured_content")
     allowed = {key for p in draft.paragraphs for key in p.get("cite_keys", [])} & whitelist
     body = "\n\n".join(p.get("text", "") for p in draft.paragraphs)
     numbers_before = extract_numbers(body)
@@ -734,8 +780,8 @@ async def coherence_pass(
         if len(original_sentences) != len(candidate_sentences):
             return rejected("sentence_count")
         for before, after in zip(original_sentences, candidate_sentences, strict=True):
-            if math_tokens(before.get('text', '')) != math_tokens(after.get('text', '')):
-                return rejected('math_binding')
+            if math_tokens(before.get("text", "")) != math_tokens(after.get("text", "")):
+                return rejected("math_binding")
             if before["sentence_id"] != after.get("sentence_id"):
                 return rejected("sentence_identity")
             if any(
@@ -794,7 +840,7 @@ async def coherence_pass(
         "reason": None,
     }
     if len(rewritten) != len(draft.paragraphs) and draft.equations:
-        return rejected('formula_position')
+        return rejected("formula_position")
     draft.paragraphs = rewritten
     draft.preserved_blocks = None
     return draft
@@ -865,8 +911,9 @@ def _build_prompt(
         remaining_context = max(0, remaining_context - len(rendered))
 
     points = section.get("argument_points") or []
-    section_evidence = [e for e in section_evidence_for(section, context.outline)
-                        if e.get('cite_key') in allowed]
+    section_evidence = [
+        e for e in section_evidence_for(section, context.outline) if e.get("cite_key") in allowed
+    ]
     evidence_block = _evidence_context_block(
         section=section,
         evidence=section_evidence,
@@ -914,19 +961,28 @@ def _build_prompt(
                 else "Completed body findings (abstract source of truth):\n"
                 if section.get("key") == "abstract"
                 else "Preceding sections summary:\n"
-            ) + context.section_summary(str(section.get("key"))),
+            )
+            + context.section_summary(str(section.get("key"))),
             f"Glossary (reuse these): {_format_glossary(context.glossary)}",
             "",
             f"Write section: {section.get('title')}",
             f"Section goal: {section.get('summary') or ''}",
-            'SOURCE_FORMULAS: ' + json.dumps(
-                formula_catalog(section_evidence, _source_assets_for_section(
-                    assets or [], section=section, paper_type=context.paper_type))
-                if section.get('key') != 'abstract' else {}, ensure_ascii=False),
-            'Explain mechanisms, assumptions and experimental differences using source passages. '
-            'Discuss supplied thematic comparisons in prose; never invent a numerical ranking.',
-            'THEMATIC_TABLES: ' + json.dumps(section.get('inline_tables') or [],
-                                                       ensure_ascii=False),
+            "SOURCE_FORMULAS: "
+            + json.dumps(
+                formula_catalog(
+                    section_evidence,
+                    _source_assets_for_section(
+                        assets or [], section=section, paper_type=context.paper_type
+                    ),
+                )
+                if section.get("key") != "abstract"
+                else {},
+                ensure_ascii=False,
+            ),
+            "Explain mechanisms, assumptions and experimental differences using source passages. "
+            "Discuss supplied thematic comparisons in prose; never invent a numerical ranking.",
+            "THEMATIC_TABLES: "
+            + json.dumps(section.get("inline_tables") or [], ensure_ascii=False),
             f"Argument points: {'; '.join(str(p) for p in points) or '(derive from cards)'}",
             f"Target length: about {target} {'字' if zh else 'words'}",
             f"Available cite keys: {', '.join(sorted(allowed)) or '(none)'}",
@@ -1063,9 +1119,11 @@ def _evidence_context_block(
         "D_abstract_only": 3,
     }
     used = len("\n".join(lines))
-    for item in balanced_evidence(dedupe_evidence_by_text(
-        sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9))
-    )):
+    for item in balanced_evidence(
+        dedupe_evidence_by_text(
+            sorted(evidence, key=lambda row: grade_order.get(str(row.get("grade")), 9))
+        )
+    ):
         grade = str(item.get("grade") or "")
         locator = locator_display(item) or "unlocated"
         measurements = "; ".join(
@@ -1366,8 +1424,9 @@ def enforce_sentence_grounding_rules(
         dropped: list[dict[str, Any]] = []
         for sentence in paragraph.get("sentences") or []:
             refs = [ref for ref in sentence.get("source_refs") or [] if ref in assets_by_ref]
-            claim_kind = classify_claim(re.sub(r'\{\{(?:math|eq):[^}]+\}\}', '',
-                                                str(sentence.get('text') or '')))
+            claim_kind = classify_claim(
+                re.sub(r"\{\{(?:math|eq):[^}]+\}\}", "", str(sentence.get("text") or ""))
+            )
             must_bind = require_grounding or claim_kind not in {"background", "attribution"}
             values = {
                 normalize_number(str(value))
@@ -1650,8 +1709,9 @@ def enforce_sentence_evidence_rules(
     attributions = 0
     for paragraph in paragraphs:
         for sentence in paragraph.get("sentences") or []:
-            claim_kind = classify_claim(re.sub(r'\{\{(?:math|eq):[^}]+\}\}', '',
-                                                str(sentence.get('text') or '')))
+            claim_kind = classify_claim(
+                re.sub(r"\{\{(?:math|eq):[^}]+\}\}", "", str(sentence.get("text") or ""))
+            )
             if claim_kind in {"background", "attribution"}:
                 continue
             units = [
@@ -1826,7 +1886,7 @@ _NUMBER_REPAIR_PROMPT_ZH = """你是学术论文的事实校订编辑。给定�
 {"sentences": [{"index": 0, "text": "改写后的句子"}]}
 
 硬性要求：
-- 优先保留论断本身，只把无出处的数字改成定性表述（如「显著增加」「多数研究报告」）；
+- 只能保留绑定证据明确支持的事实；不能用「显著增加」「多数研究」替代无依据的数字；
 - 改写后的句子里**不得出现任何新的数字**，也不得保留清单里的那些数值；
 - 不得新增、删除或调换引用；不在正文里写 [1]、(Smith 2020) 之类的标记；
 - 如果去掉数字后这句话就没有内容了，把 text 设为空字符串——删掉好过留一句空话。"""
@@ -1839,7 +1899,8 @@ Output JSON only, same shape as the input:
 {"sentences": [{"index": 0, "text": "rewritten sentence"}]}
 
 Requirements:
-- keep the claim, restate the untraceable figure qualitatively (e.g. "substantially increased");
+- retain only facts directly supported by the bound evidence; never hide unsupported numbers
+  behind qualitative claims such as "substantially increased";
 - the rewritten sentence must contain NO digits at all, and must not keep the listed values;
 - never add, drop, or swap citations; never write inline markers like [1] or (Smith 2020);
 - if the sentence has nothing left once the number goes, return an empty string — deleting it
@@ -1948,6 +2009,8 @@ def section_minimum_words(
         else (MIN_BODY_WORDS_ZH if zh else MIN_BODY_WORDS_EN)
     )
     section = section or {}
+    if section.get("has_children"):
+        return 60 if zh else 35
     if section.get("evidence_limited"):
         return floor
     declared = section.get("target_words")
@@ -2067,6 +2130,8 @@ async def repair_unsourced_numbers(
     values: set[str],
     language: str,
     runner: LLMRunner | None = None,
+    evidence: list[dict[str, Any]] | None = None,
+    assets: list[dict[str, Any]] | None = None,
 ) -> tuple[SectionDraft, dict[str, int]]:
     """把查不到出处的数值从正文里清掉：先改写，改不动就删句。
 
@@ -2094,11 +2159,30 @@ async def repair_unsourced_numbers(
     if not targets:
         return draft, stats
 
+    from paperforge_worker.pipelines.semantic_review import review_section
+
+    units = {str(e.get("evidence_id") or e.get("id")): e for e in evidence or []}
+    asset_map = {
+        str(a.get(k)): a
+        for a in assets or []
+        for k in ("_asset_ref", "_asset_id", "source_ref")
+        if a.get(k)
+    }
+    materials = []
+    for index, sentence in enumerate(targets):
+        bound = [units[e] for e in sentence.get("evidence_ids", []) if e in units]
+        refs = [r for r in sentence.get("source_refs", []) if r in asset_map]
+        materials.append(
+            {
+                "index": index,
+                "text": sentence.get("text", ""),
+                "evidence": bound,
+                "assets": [asset_map[r] for r in refs],
+            }
+        )
     rewritten: dict[int, str] = {}
     if runner is not None and runner.enabled:
-        listing = "\n".join(
-            f"{index}. {str(sentence.get('text') or '')}" for index, sentence in enumerate(targets)
-        )
+        listing = json.dumps(materials, ensure_ascii=False, default=str)
         result = await runner.agenerate_json(
             "writer",
             system_prompt=(
@@ -2131,7 +2215,50 @@ async def repair_unsourced_numbers(
         candidate = rewritten.get(index)
         # 校验：改写后一个数字都不许剩（既清掉了目标值，也堵住「换一个数字」）。
         # 引用绑定不动——这里只改 text，cite_keys/evidence_ids 逐字保留。
-        if candidate and not numbers_in(candidate):
+        accepted = False
+        audit = {
+            "original": sentence.get("text"),
+            "candidate": candidate,
+            "reason": "unverified_or_unsupported",
+        }
+        material = materials[index]
+        if candidate and not numbers_in(candidate) and (material["evidence"] or material["assets"]):
+            claim = {
+                "claim_id": f"{draft.section_key}:repair:{index}",
+                "text": candidate,
+                "resolved_evidence_ids": [
+                    str(e.get("evidence_id") or e.get("id")) for e in material["evidence"]
+                ],
+                "source_refs": [r for r in sentence.get("source_refs", []) if r in asset_map],
+            }
+            from paperforge_worker.orchestration.writing_graph import fingerprint
+
+            audit["evidence_hash"] = fingerprint(material)
+            verdict = await review_section(
+                section_key=draft.section_key,
+                question="核对改写句的事实、主体、条件、方向和强度",
+                prose=candidate,
+                evidence=material["evidence"],
+                runner=runner,
+                language=language,
+                review_input={
+                    "claims": [claim],
+                    "evidence": material["evidence"],
+                    "assets": material["assets"],
+                    "section_role": "frame",
+                },
+            )
+            accepted = bool(
+                verdict
+                and verdict.acceptable
+                and verdict.claim_checks
+                and all(c.get("status") in {"supported", "inference"} for c in verdict.claim_checks)
+            )
+            audit["review"] = verdict.to_payload() if verdict else None
+        audit["accepted"] = accepted
+        sentence["numeric_repair_audit"] = audit
+        draft.generation.setdefault("numeric_repair_audit", []).append(audit)
+        if accepted:
             sentence["text"] = candidate
             sentence["repaired_reason"] = "numlint_unsourced_number"
             stats["rewritten"] += 1
@@ -2175,9 +2302,15 @@ def _draft_as_section_row(draft: SectionDraft) -> Any:
         section_key=draft.section_key,
         title=draft.title,
         status="generated",
-        cite_keys_json=sorted({key for block in draft.to_ir_section().blocks
-                              for run in getattr(block, 'runs', [])
-                              if isinstance(run, CiteRun) for key in run.keys}),
+        cite_keys_json=sorted(
+            {
+                key
+                for block in draft.to_ir_section().blocks
+                for run in getattr(block, "runs", [])
+                if isinstance(run, CiteRun)
+                for key in run.keys
+            }
+        ),
         body_ir_json=draft.to_ir_section().model_dump(mode="json"),
     )
 

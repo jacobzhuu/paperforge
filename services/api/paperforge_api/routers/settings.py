@@ -138,7 +138,8 @@ async def version_history(project_id: str, session: SessionDep) -> VersionHistor
         (
             await session.scalars(
                 select(PaperDocument)
-                .where(PaperDocument.project_id == project.id)
+                .where(PaperDocument.project_id == project.id,
+                       PaperDocument.status.notin_(["revision_candidate", "revision_discarded"]))
                 .order_by(PaperDocument.version.desc())
             )
         ).all()
@@ -205,7 +206,11 @@ async def restore_document_version(
     except ValueError as error:
         raise HTTPException(status_code=404, detail="document version not found") from error
     source = await session.get(PaperDocument, source_uuid)
-    if source is None or source.project_id != project.id:
+    if (
+        source is None
+        or source.project_id != project.id
+        or source.status in {"revision_candidate", "revision_discarded"}
+    ):
         raise HTTPException(status_code=404, detail="document version not found")
     current = await latest_document(session, project.id)
     if current is not None and current.id == source.id:

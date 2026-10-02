@@ -103,9 +103,16 @@ async def latest_document(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> PaperDocument | None:
+    from db.repositories.revisions import selected_document
+
+    explicit = selected_document(project_id)
+    if explicit:
+        return await session.scalar(select(PaperDocument).where(
+            PaperDocument.id == explicit, PaperDocument.project_id == project_id))
     return await session.scalar(
         select(PaperDocument)
-        .where(PaperDocument.project_id == project_id)
+        .where(PaperDocument.project_id == project_id,
+               PaperDocument.status.notin_(["revision_candidate", "revision_discarded"]))
         .order_by(PaperDocument.version.desc())
         .limit(1)
     )
