@@ -8,6 +8,7 @@ from db.repositories.jobs import resume_checkpoint
 def test_resume_keeps_pinned_profile_and_recovers_legacy_fast_job():
     pinned = SimpleNamespace(
         id=uuid.uuid4(),
+        kind="full",
         checkpoint_json={
             "execution_profile": "standard",
             "resume": {"function": "run_full_pipeline", "kwargs": {"delivery_mode": "fast_draft"}},
@@ -19,6 +20,7 @@ def test_resume_keeps_pinned_profile_and_recovers_legacy_fast_job():
 
     legacy = SimpleNamespace(
         id=uuid.uuid4(),
+        kind="full",
         checkpoint_json={
             "resume": {"function": "run_full_pipeline", "kwargs": {"delivery_mode": "fast_draft"}}
         },

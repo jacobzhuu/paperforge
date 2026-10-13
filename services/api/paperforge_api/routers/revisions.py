@@ -7,6 +7,7 @@ from typing import Annotated
 from db import document_snapshot_hash, get_writing_whitelist, latest_document, list_sections
 from db.models.paper import ExportArtifact, GenerationJob, PaperDocument, PaperProject
 from db.models.revision import DraftRevision
+from db.repositories.revision_recovery import MESSAGES, recovery_block
 from db.repositories.revisions import clone_document
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -39,6 +40,11 @@ async def revisions(project_id: str, session: Session):
                 ExportArtifact.document_version == document.version,
             )
         )
+        reason = (
+            recovery_block(row, job.checkpoint_json or {})
+            if job.status in {"paused", "failed"}
+            else None
+        )
         result.append(
             {
                 "id": str(row.id),
@@ -46,6 +52,12 @@ async def revisions(project_id: str, session: Session):
                 "job_id": str(row.job_id),
                 "job_status": job.status,
                 "job_error": job.error_json,
+                "can_resume": job.status in {"paused", "failed"} and reason is None,
+                "resume_block_reason": MESSAGES.get(reason),
+                "recovery_message": MESSAGES.get(
+                    reason or (job.error_json or {}).get("code")
+                ),
+                "resume_block_code": reason,
                 "source_document_id": str(row.source_document_id),
                 "candidate_document_id": str(row.candidate_document_id),
                 "review": (

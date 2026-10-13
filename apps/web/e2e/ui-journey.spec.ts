@@ -32,6 +32,7 @@ async function fixture(page: Page, mode: 'ready' | 'empty' | 'failed' | 'paused'
     else if (path.endsWith('/readiness')) body = { state: 'unknown', items: [] };
     else if (path.endsWith('/cost/detail')) body = { totals: {}, stages: [], models: [] };
     else if (path.endsWith('/versions')) body = { documents: [], outlines: [] };
+    else if (path.endsWith('/revisions')) body = { data: [] };
     else if (path.endsWith('/citations/audit')) body = { rows: [], hallucinated_cite_keys: [], used_cite_keys: [] };
     else if (path.endsWith('/quality')) body = { readiness_status: 'preflight_ready', issues: [], core_claim_fulltext_coverage: 1 };
     else if (path.endsWith('/exports') && method === 'POST') { exported = true; body = { id: 'export1', project_id: project.id, kind: 'compile', status: 'succeeded', stage: 'done', progress: 1 }; }
@@ -100,11 +101,11 @@ test('mobile navigation traps focus, restores focus and releases scroll on resiz
   expect(await page.evaluate(() => document.body.style.overflow)).toBe('hidden');
   await page.keyboard.press('Escape');
   await expect(open).toBeFocused();
-  expect(await page.evaluate(() => document.body.style.overflow)).not.toBe('hidden');
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).not.toBe('hidden');
   await open.click();
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(dialog).toHaveCount(0);
-  expect(await page.evaluate(() => document.body.style.overflow)).not.toBe('hidden');
+  await expect.poll(() => page.evaluate(() => document.body.style.overflow)).not.toBe('hidden');
 });
 
 test('project load failure offers retry', async ({ page }) => {

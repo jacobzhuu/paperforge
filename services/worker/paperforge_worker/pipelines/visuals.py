@@ -30,7 +30,6 @@ from db import (
 )
 from storage import make_object_store
 from visuals import (
-    AIImageSemantics,
     AIImageSpec,
     ChartSpec,
     DiagramSpec,
@@ -41,14 +40,12 @@ from visuals import (
     VisualdClient,
     classify_visual_error,
     create_image_provider,
-    image_provider_configured,
     parse_visual_spec,
 )
 from visuals.errors import CONTENT_REJECTED, INVALID_REQUEST, PROVIDER_NOT_CONFIGURED
 
 from paperforge_worker.context import JobContext
 from paperforge_worker.pipelines.image_prompt import (
-    analyze_image_prompt,
     build_paper_context,
     rewrite_rejected_image_prompt,
 )
@@ -57,6 +54,7 @@ from paperforge_worker.pipelines.visual_planner import (
     MAX_PROPOSALS,
     PlannedProposal,
     SectionBrief,
+    plan_summary_diagram,
     plan_visuals,
 )
 
@@ -190,9 +188,8 @@ async def suggest_visuals(
         超时或输出不合法时，回退到「论文结构概览 + 概念插图」这套原有的
         确定性建议，`visual_plan` 永远有产物。
 
-    ``summary_only`` 是“跑通全流程”的专用策略：只创建一张论文摘要图；
-    ``auto_generate`` 同时开启时只通过 Yunwu 自动生成这一张。Yunwu 未配置或
-    临时失败会保留为可重试建议，不把可选视觉失败升级成全流程错误。
+    ``summary_only`` 是“跑通全流程”的专用策略：只创建一张基于正文的研究框架图，使用本地渲染。
+    模型无法提出可信结构时跳过可选图，不用通用目录冒充研究框架。
     """
     if not context.settings.visuals_enabled:
         return VisualPlanOutcome(0, 0, 0, 0)
@@ -216,10 +213,6 @@ async def suggest_visuals(
         project_title = project.title if project is not None else "the research topic"
         paper_type = project.paper_type if project is not None else "review"
 
-        abstract_section = next(
-            (row for row in sections if row.section_key == "abstract"),
-            None,
-        )
         chart_proposals = [] if summary_only else _chart_proposals(assets, sections)
         body_sections = [row for row in sections if row.section_key != "abstract"]
         briefs = [
@@ -233,45 +226,15 @@ async def suggest_visuals(
         short_review = _is_short_review(paper_type, briefs)
         full_paper_context = _paper_context(project_title, sections)
 
-    analyzed_prompt_ready = True
     if summary_only:
-        summary = _summary_visual_proposal(
-            project_title,
-            abstract_section=abstract_section,
-            body_sections=body_sections,
-        )
-        analysis = await analyze_image_prompt(
-            user_intent=(
-                "Create a publication-ready graphical abstract that synthesizes the entire paper."
-            ),
-            full_paper=full_paper_context,
+        planned, generator = await plan_summary_diagram(
+            sections=[
+                SectionBrief(key=row.section_key, title=row.title, excerpt=_section_excerpt(row))
+                for row in sections
+            ],
             runner=context.llm_runner(),
-            current_spec=summary.spec,
+            paper_context=full_paper_context,
         )
-        if analysis:
-            summary.spec.update(
-                {
-                    "prompt": analysis.prompt,
-                    "refined_prompt": analysis.prompt,
-                    "quality": "high",
-                    "semantics": {
-                        "subject": analysis.subject,
-                        "composition": analysis.composition,
-                        "elements": list(analysis.elements),
-                        "text_policy": analysis.text_policy,
-                        "aspect_ratio": "3:2",
-                    },
-                }
-            )
-            summary.title = analysis.title
-            summary.caption = analysis.caption
-            summary.alt_text = analysis.alt_text
-        else:
-            # 全流程不得绕过模型分析把模板提示词直接发给 Yunwu。草稿保留，
-            # 用户之后可在工作台重试论文上下文分析。
-            analyzed_prompt_ready = False
-        planned = [summary]
-        generator = "graphical_abstract"
     else:
         # 第二段：规划。allow_ai_images 只控制**是否提出**插图建议——即使允许，
         # 也仍然只是 proposal，生图要用户再确认一次。
@@ -327,6 +290,7 @@ async def suggest_visuals(
                     summary_only
                     and existing_visual is not None
                     and existing_visual.review_status == "pending"
+                    and existing_visual.kind == "diagram"
                     and existing_visual.generation_status in {"proposed", "failed"}
                 ):
                     generation_candidates.append(existing_visual.id)
@@ -345,7 +309,7 @@ async def suggest_visuals(
                 **metadata,
             )
             created.append(visual)
-            if summary_only and visual.kind == "ai_image":
+            if summary_only and visual.kind == "diagram":
                 generation_candidates.append(visual.id)
             if spec["kind"] == "chart":
                 source_ref = str(spec["source_asset_ref"])
@@ -361,7 +325,11 @@ async def suggest_visuals(
                         source_hash=_source_hash(context, source),
                     )
             existing_hashes.add(visual.input_hash)
-        deterministic_ids = [visual.id for visual in created if visual.kind in {"chart", "diagram"}]
+        deterministic_ids = (
+            generation_candidates
+            if summary_only
+            else [visual.id for visual in created if visual.kind in {"chart", "diagram"}]
+        )
         counts = {
             "chart": sum(item.kind == "chart" for item in created),
             "diagram": sum(item.kind == "diagram" for item in created),
@@ -378,33 +346,25 @@ async def suggest_visuals(
             for visual_id in deterministic_ids
         )
     )
-    auto_results: list[VisualOutcome] = []
-    generation_deferred = 0
-    if summary_only and auto_generate and generation_candidates and analyzed_prompt_ready:
-        yunwu_config = context.settings.image_provider_config("yunwu")
-        if context.settings.ai_images_enabled and image_provider_configured(yunwu_config):
-            # 全流程的唯一一张付费图固定走 Yunwu。generate_visual 自己会完成网络重试、
-            # 内容合规改写、画布修复和预检；它返回失败状态而不会向外抛异常。
-            auto_results = [
-                await generate_visual(
-                    context,
-                    generation_candidates[0],
-                    provider_override="yunwu",
-                )
-            ]
-            if auto_results[0].status != "ready":
-                # 可选摘要图失败不应在视觉工作台留下红色报错卡，也不能让全流程失败；
-                # provider attempt 仍完整保留用于排查，资产退回 proposed 供用户重试。
-                await _defer_failed_auto_generation(context, generation_candidates[0])
-                generation_deferred = 1
-        else:
-            generation_deferred = 1
-
-    elif summary_only and auto_generate and generation_candidates:
-        generation_deferred = 1
-
+    # Rendering errors remain visible on the asset; do not mask them as a proposal.
+    generation_deferred = int(summary_only and not planned)
+    if generation_deferred:
+        reason = {
+            "context_or_model_unavailable": "正文或文字模型暂不可用",
+            "model_timeout": "文字模型构图超时",
+            "model_failed": "文字模型构图失败",
+            "no_supported_diagram": "正文不足以支持一张完整框架图",
+            "invalid_spec": "生成的框图结构或章节引用未通过校验",
+        }.get(generator.removeprefix("summary_diagram:"), "框图暂未生成")
+        message = f"{reason}；正文继续导出，可在视觉工作台新建框架／流程图。"
+        context.warn("visual_plan", "summary_diagram_skipped", {"message": message})
+        await context.emit(
+            "visual_plan.failed",
+            {"error": "summary_diagram_skipped", "message": message},
+            stage="visual_plan",
+        )
     if summary_only:
-        counts = {"chart": 0, "diagram": 0, "ai_image": 1 if proposals else 0}
+        counts = {"chart": 0, "diagram": len(planned), "ai_image": 0}
     return VisualPlanOutcome(
         proposed=proposed,
         chart_count=counts["chart"],
@@ -412,7 +372,11 @@ async def suggest_visuals(
         ai_image_count=counts["ai_image"],
         preview_ready_count=sum(item.status == "ready" for item in previews),
         preview_failed_count=sum(item.status == "failed" for item in previews),
-        auto_generated_count=sum(item.status == "ready" for item in auto_results),
+        auto_generated_count=(
+            sum(item.status == "ready" for item in previews)
+            if summary_only and auto_generate
+            else 0
+        ),
         generation_deferred_count=generation_deferred,
         generator=generator,
     )
@@ -462,97 +426,6 @@ def _chart_proposals(
         if len(proposals) >= 4:
             break
     return proposals
-
-
-def _summary_visual_proposal(
-    project_title: str,
-    *,
-    abstract_section: Any | None,
-    body_sections: list[Any],
-) -> PlannedProposal:
-    """为“一键全流程”构造唯一的论文摘要图，不引入虚构数字或结论。"""
-    abstract = _image_safe_text(
-        _section_excerpt(abstract_section) if abstract_section is not None else "",
-        limit=900,
-    )
-    title = _image_safe_text(project_title, limit=140) or "the paper's central research topic"
-    concepts = [
-        _image_safe_text(item, limit=120)
-        for item in re.split(r"[。！？.!?;；]\s*", abstract)
-        if item.strip()
-    ][:4]
-    if not concepts:
-        concepts = [
-            _image_safe_text(getattr(row, "title", ""), limit=80)
-            for row in body_sections[:4]
-            if _image_safe_text(getattr(row, "title", ""), limit=80)
-        ]
-    subject = f"Graphical abstract of {title}"
-    if abstract:
-        subject = f"{subject}: {abstract[: max(0, 197 - len(subject))]}".rstrip(": ")
-    summary_text = abstract or (
-        "the central question, research approach, and main synthesis of the paper"
-    )
-    spec = AIImageSpec(
-        prompt=(
-            f"Create one publication-ready graphical abstract for {title}. "
-            f"Faithfully synthesize this paper abstract without inventing measurements: "
-            f"{summary_text}."
-        ),
-        size="1536x1024",
-        quality="high",
-        style="clean journal graphical abstract, restrained scientific palette, uncluttered",
-        semantics=AIImageSemantics(
-            subject=subject[:200],
-            composition=(
-                "one coherent left-to-right visual narrative connecting the research question, "
-                "approach, core mechanism, and conclusion"
-            ),
-            elements=concepts,
-            text_policy="auto",
-            aspect_ratio="3:2",
-        ),
-    ).model_dump(mode="json")
-    target = getattr(abstract_section, "section_key", None) or (
-        getattr(body_sections[0], "section_key", None) if body_sections else None
-    )
-    source_keys = [
-        key
-        for key in (
-            getattr(abstract_section, "section_key", None),
-            *(getattr(row, "section_key", None) for row in body_sections[:4]),
-        )
-        if key
-    ]
-    return PlannedProposal(
-        kind="ai_image",
-        spec=spec,
-        title="论文摘要图",
-        caption="论文核心问题、研究路径与主要结论的视觉摘要",
-        alt_text="以单幅横向学术插图概括论文核心问题、研究路径与主要结论",
-        target_section_key=target,
-        reason="“跑通全流程”仅生成一张可概览全文的论文摘要图",
-        source_section_keys=source_keys,
-    )
-
-
-def _image_safe_text(value: Any, *, limit: int) -> str:
-    """清除 VisualSpec 明确禁止的 URL/代码片段，同时保留论文语义。"""
-    text = str(value or "")
-    text = re.sub(r"https?://\S+", "", text, flags=re.IGNORECASE)
-    text = text.replace("```", " ")
-    text = re.sub(r"\b(?:import|exec|eval|subprocess)\b", "process", text, flags=re.IGNORECASE)
-    return " ".join(text.split())[:limit].strip()
-
-
-async def _defer_failed_auto_generation(context: JobContext, visual_id: uuid.UUID) -> None:
-    """全流程的可选付费图失败后退回可重试状态；attempt 审计记录不删除。"""
-    async with context.session() as session:
-        visual = await get_visual(session, visual_id)
-        if visual is not None and visual.generation_status == "failed":
-            visual.generation_status = "proposed"
-            visual.error_code = None
-            visual.error_message = None
 
 
 def _fallback_proposals(

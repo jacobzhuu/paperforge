@@ -155,6 +155,7 @@ async def test_a_section_without_flagged_numbers_is_untouched() -> None:
 
 async def test_supported_rewrite_requires_a_separate_bound_verdict():
     from unittest.mock import AsyncMock, patch
+
     from paperforge_worker.pipelines.semantic_review import build_section_verdict
     runner, _ = _runner([{"sentences": [{"index": 0, "text": "已鉴定出化合物。"}]}])
     verdict = build_section_verdict({
@@ -174,6 +175,7 @@ async def test_supported_rewrite_requires_a_separate_bound_verdict():
 
 async def test_hiding_wrong_number_behind_universal_superiority_is_rejected():
     from unittest.mock import AsyncMock, patch
+
     from paperforge_worker.pipelines.semantic_review import build_section_verdict
     runner, _ = _runner([{"sentences": [{"index": 0, "text": "所有实验均显著优于对照。"}]}])
     rejected = build_section_verdict({"unsupported_claims": ["s1:repair:0: no evidence"]},

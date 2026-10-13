@@ -4356,8 +4356,8 @@ async def run_full_pipeline(
                 await _run_stage(
                     context,
                     "visual_plan",
-                    # 一键全流程不再铺开多条视觉建议：只创建并尝试通过 Yunwu
-                    # 生成一张论文摘要图。视觉失败会退回可重试建议，不阻断导出。
+                    # 一键全流程生成一张基于正文的框图并本地渲染。
+                    # 可选视觉失败保留具体原因，不阻断正文导出。
                     lambda: suggest_visuals(
                         context,
                         summary_only=True,

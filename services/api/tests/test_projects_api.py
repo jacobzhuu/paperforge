@@ -2175,6 +2175,11 @@ def test_visual_draft_fills_the_whole_spec_from_one_sentence(
     用户的一句话必须先由 DeepSeek 结合全文扩展，不能直接变成 Yunwu 提示词。
     """
     _install_deepseek_image_stub(monkeypatch)
+    # Legacy opt-in remains testable; the deployed default uses local diagrams.
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_API_KEY", "test-image-key")
+    import paperforge_api.config as api_config
+    api_config._settings = None
     project = _create_project(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/visuals/draft",
@@ -2192,7 +2197,14 @@ def test_visual_draft_fills_the_whole_spec_from_one_sentence(
     assert body["generator"] == "llm:deepseek-test"
 
 
-def test_ai_image_draft_fails_closed_when_deepseek_is_unavailable(client: TestClient) -> None:
+def test_ai_image_draft_fails_closed_when_deepseek_is_unavailable(
+    client: TestClient, monkeypatch
+) -> None:
+    # Legacy opt-in remains testable; the deployed default uses local diagrams.
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_API_KEY", "test-image-key")
+    import paperforge_api.config as api_config
+    api_config._settings = None
     project = _create_project(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/visuals/draft",
@@ -2335,6 +2347,11 @@ def test_visual_draft_survives_intents_that_cannot_go_into_a_prompt(
     注入类内容（URL、代码片段）进不了提示词。
     """
     _install_deepseek_image_stub(monkeypatch)
+    # Legacy opt-in remains testable; the deployed default uses local diagrams.
+    monkeypatch.setenv("AI_IMAGES_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_API_KEY", "test-image-key")
+    import paperforge_api.config as api_config
+    api_config._settings = None
     project = _create_project(client)
     for intent in ("准确率 95% 的对比示意", "参照 https://example.com/figure.png 的构图"):
         response = client.post(
@@ -2476,8 +2493,9 @@ def test_visual_auto_prefers_configured_yunwu_over_graphviz_for_process_intent(
         api_config._settings = None
 
 
+@pytest.mark.parametrize("requested_kind", ["auto", "ai_image"])
 def test_visual_auto_falls_back_to_a_diagram_when_ai_images_are_off(
-    client: TestClient,
+    client: TestClient, requested_kind: str,
 ) -> None:
     """AI 插图关闭时，「auto」不能选一种根本生成不了的类型。
 
@@ -2486,7 +2504,7 @@ def test_visual_auto_falls_back_to_a_diagram_when_ai_images_are_off(
     project = _create_project(client)
     response = client.post(
         f"/api/v1/projects/{project['id']}/visuals/draft",
-        json={"kind": "auto", "intent": "生成彩色的带有 icon 图标示意的技术发展图"},
+        json={"kind": requested_kind, "intent": "生成彩色的带有 icon 图标示意的技术发展图"},
     )
     assert response.status_code == 200, response.text
     assert response.json()["kind"] == "diagram"

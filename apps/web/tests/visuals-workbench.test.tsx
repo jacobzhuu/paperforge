@@ -632,7 +632,7 @@ describe('视觉工作台', () => {
     expect(screen.queryByLabelText('图注')).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/替代文本/)).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/节点/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: '本地直出 · 示意图' }));
+    await userEvent.click(screen.getByRole('button', { name: '框架／流程图' }));
     fireEvent.change(screen.getByLabelText('视觉意图'), {
       target: { value: '展示检索、筛选和证据整合流程' },
     });
@@ -665,7 +665,7 @@ describe('视觉工作台', () => {
     );
     expect(screen.getByText(/概念内容优先使用 AI 生成/)).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole('button', { name: '本地直出 · 示意图' }));
+    await userEvent.click(screen.getByRole('button', { name: '框架／流程图' }));
     expect(screen.getByText(/本地直出：适合表达步骤/)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'AI 生成' }));
@@ -673,16 +673,16 @@ describe('视觉工作台', () => {
     expect(screen.queryByText(/Yunwu|Cloudflare|OpenAI|API/)).not.toBeInTheDocument();
   });
 
-  it('AI 生图不可用时说明原因，并保留禁用的类型覆盖选项', async () => {
+  it('外部生图关闭时保留本地框图入口并隐藏生图选项', async () => {
     getRuntimeSettings.mockReturnValue(
       ok({ ai_images_enabled: false, image_provider_configured: false, image_capabilities: null }),
     );
     render(<VisualsWorkbench />);
 
-    expect((await screen.findAllByText(/AI 生成当前不可用/)).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/框图由文字模型生成结构/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /限定正文范围或素材/ }));
-    const aiOption = await screen.findByRole('button', { name: 'AI 生成' });
-    expect(aiOption).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'AI 生成' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '框架／流程图' })).toBeEnabled();
   });
 
   it('AI 可用时类型覆盖选项开放', async () => {

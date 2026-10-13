@@ -1060,6 +1060,14 @@ async def _persist_draft(
             whitelist=whitelist,
             job_id=context.job_id,
         )
+        from db.repositories.revision_recovery import complete_section
+
+        await complete_section(
+            session,
+            context,
+            draft.section_key,
+            ir_section.model_dump(mode="json") if ir_section else {},
+        )
         if polish_guard is not None:
             polish_guard["expected"][draft.section_key] = draft.expected_body_hash
             polish_guard["results"][draft.section_key] = {
@@ -1527,12 +1535,47 @@ async def repair_document_sections(
     one-sentence-at-a-time gets rewritten into the same list.
     """
     from paperforge_worker import worker as w
+    from paperforge_worker.pipelines import revision_recovery as recovery
     from paperforge_worker.pipelines.claim_repair import repair_local
     from paperforge_worker.pipelines.semantic_review import review_section
 
+    managed = bool(getattr(context, "revision_id", None))
+    review_inputs = await w._section_review_inputs(context)
+    inputs_by_key = {item["section_key"]: item for item in review_inputs}
+    outcome = WriteOutcome()
+    async with context.session() as session:
+        document = await latest_document(session, context.project_id)
+        outline_row = (
+            await get_outline(session, document.outline_id)
+            if document and document.outline_id
+            else None
+        )
+        if document is None:
+            if managed:
+                raise JobStopped("pause", reason="writing_inputs_changed")
+            return outcome
+        outline = dict(outline_row.tree_json or {}) if outline_row else {}
+        rows = await list_sections(session, document.id)
+        whitelist = await get_writing_whitelist(session, context.project_id)
+        cards = await _card_context(session, context.project_id)
+        assets = await grounded_asset_payloads(session, context.project_id)
+    await recovery.guard_sources(
+        context,
+        {
+            "outline": outline,
+            "cards": cards,
+            "assets": assets,
+            "whitelist": whitelist,
+            "language": language,
+            "paper_type": paper_type,
+        },
+    )
     remaining = set(section_keys)
-    for item in await w._section_review_inputs(context):
+    for item in review_inputs:
         if item["section_key"] not in remaining:
+            continue
+        if await recovery.section_completed(context, item):
+            remaining.remove(item["section_key"])
             continue
         verdict = await review_section(
             section_key=item["section_key"],
@@ -1547,21 +1590,13 @@ async def repair_document_sections(
         if verdict and await repair_local(context, item, verdict, language=language):
             remaining.remove(item["section_key"])
     section_keys = remaining
-    outcome = WriteOutcome()
-    async with context.session() as session:
-        document = await latest_document(session, context.project_id)
-        outline_row = (
-            await get_outline(session, document.outline_id)
-            if document and document.outline_id
-            else None
-        )
-        if outline_row is None or document is None:
-            return outcome
-        outline = dict(outline_row.tree_json or {})
-        rows = await list_sections(session, document.id)
-        whitelist = await get_writing_whitelist(session, context.project_id)
-        cards = await _card_context(session, context.project_id)
-        assets = await grounded_asset_payloads(session, context.project_id)
+    if outline_row is None:
+        if managed and remaining:
+            raise JobStopped("pause", reason="writing_inputs_changed")
+        return outcome
+    if managed:
+        async with context.session() as session:
+            rows = await list_sections(session, document.id)
     sections = [item for item in outline.get("sections") or [] if isinstance(item, dict)]
     existing = {row.section_key: _draft_from_section(row) for row in rows}
     writing_context = WritingContext(outline=outline, language=language, paper_type=paper_type)
@@ -1583,6 +1618,7 @@ async def repair_document_sections(
     )
     if explicit_graph is not None:
         targets = descendants(explicit_graph, targets)
+    targets = await recovery.repair_targets(context, targets)
     body_targets = {
         key for key in targets if key in section_by_key and not is_frame(section_by_key[key])
     }
@@ -1630,6 +1666,11 @@ async def repair_document_sections(
             *,
             wave_summaries: dict[str, str] = wave_summaries,
         ) -> tuple[SectionDraft, WriteOutcome, list[tuple[Any, Any]], list[Any]]:
+            if managed:
+                if not await recovery.section_started(
+                    context, inputs_by_key[key], (notes or {}).get(key)
+                ):
+                    return None
             section = section_by_key[key]
             repair_section = {
                 **section,
@@ -1696,7 +1737,13 @@ async def repair_document_sections(
             return draft, local_outcome, events, warns
 
         async def _commit(_index: int, key: str, result: Any) -> None:
+            if result is None:
+                return
             if isinstance(result, BaseException):
+                if managed:
+                    await recovery.finish(
+                        context, "section:" + key, error=type(result).__name__, unknown=True
+                    )
                 # 一节修复失败只损失这一节：保留库里原来的正文，记降级标记。
                 context.warn(
                     "quality_repair",
@@ -1712,6 +1759,9 @@ async def repair_document_sections(
                 )
                 return
             draft, local_outcome, events, warns = result
+            if managed and draft.generator in _NOT_GENERATED_GENERATORS:
+                await recovery.finish(context, "section:" + key, error="no_valid_draft")
+                return
             # 缓冲的告警与事件按 outline 顺序重放，事件流与串行时一致。
             for warn_args in warns:
                 context.warn(*warn_args)
@@ -1732,6 +1782,13 @@ async def repair_document_sections(
                 # 每一轮都是一次全新生成，长度上下摆动 ±50%，最后交付的是**最后一次**
                 # 而不是最好的一次。这里给刷新加一道棘轮，正文小节不受影响（它们的重写
                 # 是冲着具体缺陷去的，变短可能正是修复本身）。
+                if managed:
+                    from db.repositories.revision_recovery import complete_section
+
+                    async with context.session() as session:
+                        rows = await list_sections(session, document.id)
+                        body = next(r.body_ir_json for r in rows if r.section_key == key)
+                        await complete_section(session, context, key, body)
                 await context.emit(
                     "quality_repair.refresh_rejected",
                     {

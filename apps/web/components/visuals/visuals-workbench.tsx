@@ -160,7 +160,7 @@ export function VisualsWorkbench() {
       {preparingVisualId && (
         <div className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-sm" role="status">
           <Loader2 className="h-4 w-4 animate-spin" />
-          正在读取论文全文、分析意图并生成最终生图提示词…
+          正在读取论文内容、分析意图并生成图形结构…
         </div>
       )}
       <ModuleError label="章节列表" error={sectionsModule.error} onRetry={sectionsModule.reload} />
@@ -284,7 +284,7 @@ function IntentComposer({
           ? 'AI 生成：先创建可编辑草稿，确认提示词后再生成图片。'
           : aiAvailable
             ? '自动选择：数据内容本地直出，概念内容优先使用 AI 生成。'
-            : '自动选择：AI 生成当前不可用，将使用本地直出。';
+            : '自动选择：文字模型生成结构，本地渲染框图；数据图表使用项目素材。';
 
   const submit = async () => {
     if (!intent.trim() || drafting) return;
@@ -321,7 +321,7 @@ function IntentComposer({
         <div className="min-w-0 flex-1 space-y-3">
           <div>
             <h3 id="visual-intent-title" className="font-medium">描述你想让读者理解什么</h3>
-            <p className="mt-0.5 text-xs text-muted-foreground">只需选择 AI 生成或本地直出；自动选择会根据内容判断。</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">描述研究框架、方法步骤或关系，文字模型构图后在本地渲染。</p>
           </div>
           <fieldset className="space-y-2">
             <legend className="text-sm font-medium">生成方式</legend>
@@ -329,9 +329,9 @@ function IntentComposer({
               {([
                 ['auto', '自动选择'],
                 ['ai_image', 'AI 生成'],
-                ['diagram', '本地直出 · 示意图'],
-                ['chart', '本地直出 · 数据图'],
-              ] as const).map(([value, label]) => (
+                ['diagram', '框架／流程图'],
+                ['chart', '数据图表'],
+              ] as const).filter(([value]) => value !== 'ai_image' || aiAvailable).map(([value, label]) => (
                 <button
                   key={value}
                   type="button"
@@ -419,7 +419,7 @@ function AIAvailabilityNotice({ available, settingsLoaded }: { available: boolea
   return (
     <p className="flex items-start gap-2 rounded-lg border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
       <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      AI 生成当前不可用；数据图表与示意图仍可本地直出。启用 AI 生成后，每次生成仍需单独确认。
+      框图由文字模型生成结构，在本地渲染，不调用外部生图服务。历史图片仍可查看和导出。
     </p>
   );
 }

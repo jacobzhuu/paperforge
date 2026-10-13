@@ -421,8 +421,8 @@ def test_independent_quality_repair_reuses_monotonic_convergence():
     assert "quality_repair_history" in source
 
 
-def test_full_pipeline_only_auto_generates_one_yunwu_graphical_abstract():
-    """普通建议入口不变；只有一键全流程启用单摘要图 + Yunwu 自动生成策略。"""
+def test_full_pipeline_requests_one_summary_diagram():
+    """一键全流程启用单摘要框图和本地自动渲染。"""
     import inspect
 
     source = inspect.getsource(worker.run_full_pipeline)

@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     texd_url: str = "http://localhost:8081"
     texd_timeout_seconds: int = 120
     visuals_enabled: bool = True
-    ai_images_enabled: bool = True
+    ai_images_enabled: bool = False
     # 与 WorkerSettings 同名同义：未绑定任务的项目如何解析任务集。API 只读它，
     # 用来告诉界面「当前生效的任务集是从哪来的」；真正的抽取行为由 worker 决定。
     # 两边必须配同一个值，否则界面显示的生效任务集与实际抽取用的不一致。

@@ -309,6 +309,17 @@ def resume_checkpoint(job: GenerationJob) -> dict[str, Any]:
     }
     from db.execution_profile import EXECUTION_PROFILE_KEY, source_execution_profile
 
+    if job.kind == "revision":
+        budget = dict(seeded.get("agent_budget") or {})
+        if budget.get("started_at") and "active_seconds" not in budget:
+            from datetime import datetime
+
+            # Legacy checkpoints have no active clock. Bound elapsed by the old
+            # job's terminal update, never by today's resume time, and never refund spend.
+            budget["active_seconds"] = max(
+                0, (job.updated_at - datetime.fromisoformat(budget["started_at"])).total_seconds()
+            )
+            seeded["agent_budget"] = budget
     seeded[EXECUTION_PROFILE_KEY] = source_execution_profile(job)
     seeded[JOB_RESUMED_FROM_KEY] = str(job.id)
     return seeded

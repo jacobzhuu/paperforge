@@ -846,7 +846,12 @@ async def test_review_synthesis_table_becomes_inline_table_ir() -> None:
     table = draft.to_ir_section().blocks[-1]
     assert table.type == "table"
     assert table.source.kind == "inline"
-    assert table.source.data == {"headers": ["Study", "Evidence"], "rows": [["A", "Full text"]]}
+    assert table.source.data == {
+        "headers": ["Study", "Evidence"],
+        "rows": [["A", "Full text"]],
+        "cite_keys": [],
+        "evidence_ids": [],
+    }
 
 
 async def test_evidence_ledger_is_appendix_only_and_deduplicates_units() -> None:

@@ -629,6 +629,15 @@ def test_scholarly_profile_blocks_evidence_but_warns_about_submission_metadata()
 def test_depth_metrics_cover_synthesis_comparability_and_question_answers() -> None:
     first_id, second_id = str(uuid.uuid4()), str(uuid.uuid4())
     first_work, second_work = uuid.uuid4(), uuid.uuid4()
+    provenance = {
+        "version": "experiment-v4-provenance",
+        "fields": {
+            field: {"status": "verified"}
+            for field in (
+                "metric_name", "value", "unit", "dataset", "split", "model_family", "task"
+            )
+        },
+    }
     row = _row("Method A was higher than Method B.")
     row.cite_keys_json = ["first2024", "second2024"]
     row.body_ir_json["blocks"][0].update(
@@ -652,7 +661,9 @@ def test_depth_metrics_cover_synthesis_comparability_and_question_answers() -> N
             "text": "Method A was higher than Method B.",
             "section_path": "Methods and Results",
             "object_ref": "table:1",
-            "measurements": [{"comparability_key": "same", "value": 0.8}],
+            "measurements": [
+                {"comparability_key": "same", "value": 0.8, "provenance_json": provenance}
+            ],
         },
         second_id: {
             "id": second_id,
@@ -661,7 +672,9 @@ def test_depth_metrics_cover_synthesis_comparability_and_question_answers() -> N
             "text": "Method A was higher than Method B.",
             "section_path": "Methods and Results",
             "object_ref": "table:2",
-            "measurements": [{"comparability_key": "same", "value": 0.7}],
+            "measurements": [
+                {"comparability_key": "same", "value": 0.7, "provenance_json": provenance}
+            ],
         },
     }
     anchors = build_claim_evidence(

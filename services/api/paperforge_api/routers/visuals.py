@@ -187,7 +187,9 @@ Rules:
 - For "ai_image": write what the figure shows, how it is arranged and what is in it.
   A separate step turns this brief into the final image prompt, so do not worry about
   phrasing, style keywords, or the output language here.
-- For "diagram": 3-7 nodes, every edge must reference existing node ids."""
+- For "diagram": 3-7 concrete nodes grounded in the paper, not generic chapter titles.
+  Label relationships; do not invent numbers or turn associations into causal claims.
+  Every edge must reference existing node ids."""
 
 _QUANTITATIVE_INTENT = re.compile(
     r"比较|对比|趋势|变化|分布|差异|结果|性能|随.+变化|compare|comparison|trend|"
@@ -494,7 +496,7 @@ def _select_draft_kind(
         return "diagram", "数据图表必须来自已解析的项目素材。", warnings
     if requested in {"diagram", "ai_image"}:
         if requested == "ai_image" and not ai_images_available:
-            warnings.append("AI 插图生成当前未配置；草稿仍可保存，外部生成保持不可用。")
+            return "diagram", "由文字模型构图，在本地渲染为框架或流程图。", warnings
         return (
             requested,
             (
@@ -947,7 +949,10 @@ async def generate(
             status_code=409, detail="visual cannot be generated in its current state"
         )
     if visual.kind == "ai_image" and not get_settings().ai_images_enabled:
-        raise HTTPException(status_code=409, detail="AI image generation is disabled")
+        raise HTTPException(
+            status_code=409,
+            detail="外部生图已关闭，请新建框架／流程图；历史图片仍可查看和导出",
+        )
     if visual.kind == "ai_image":
         spec = AIImageSpec.model_validate(visual.spec_json)
         snapshot = await _current_snapshot_hash(session, project.id)

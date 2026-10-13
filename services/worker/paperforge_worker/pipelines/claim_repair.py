@@ -41,6 +41,10 @@ async def repair_local(context, item, verdict, *, language):
     }
     if not failed or verdict.deterministic_findings:
         return False
+    from paperforge_worker.pipelines.revision_recovery import section_started
+
+    if not await section_started(context, item, "local_claim_repair"):
+        return True
     material = item["review_input"]
     async with context.session() as session:
         document = await latest_document(session, context.project_id)
@@ -120,6 +124,10 @@ async def repair_local(context, item, verdict, *, language):
             },
         )
     if fingerprint(body) == original_hash:
+        if getattr(context, "revision_id", None):
+            from paperforge_worker.pipelines.revision_recovery import finish
+
+            await finish(context, "section:" + item["section_key"], error="no_valid_patch")
         return True
     async with context.session() as session:
         await session.scalar(
@@ -139,4 +147,7 @@ async def repair_local(context, item, verdict, *, language):
             asset_refs=refs,
             **metadata,
         )
+        from db.repositories.revision_recovery import complete_section
+
+        await complete_section(session, context, item["section_key"], body)
     return True

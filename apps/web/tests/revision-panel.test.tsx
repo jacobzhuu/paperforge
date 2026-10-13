@@ -43,3 +43,26 @@ it('shows partial claim coverage and uncertainty while review continues', async 
   expect(await screen.findByText('论断核验 12/20；不确定 3；未评估 8')).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: '采纳为新版本' })).not.toBeInTheDocument();
 });
+
+it('explains blocked recovery without offering an ineffective resume', async () => {
+  mock.list.mockResolvedValue({ data: [{ id: 'r1', job_id: 'j1', job_status: 'paused',
+    status: 'running', can_resume: false, resume_block_reason: '累计执行预算已用尽', artifacts: [] }] });
+  render(<RevisionPanel projectId="p1" onAccepted={vi.fn()} />);
+  expect(await screen.findByRole('alert')).toHaveTextContent('累计执行预算已用尽');
+  expect(screen.queryByRole('button', { name: '继续后台核验' })).not.toBeInTheDocument();
+});
+
+it('allows resuming an explicitly retryable failure', async () => {
+  mock.list.mockResolvedValue({ data: [{ id: 'r1', job_id: 'j1', job_status: 'paused',
+    status: 'running', can_resume: true, artifacts: [] }] });
+  render(<RevisionPanel projectId="p1" onAccepted={vi.fn()} />);
+  expect(await screen.findByRole('button', { name: '继续后台核验' })).toBeEnabled();
+});
+
+it('does not offer pause for a queued job', async () => {
+  mock.list.mockResolvedValue({ data: [{ id: 'r1', job_id: 'j1', job_status: 'queued',
+    status: 'pending', artifacts: [] }] });
+  render(<RevisionPanel projectId="p1" onAccepted={vi.fn()} />);
+  expect(await screen.findByRole('button', { name: '取消后台核验' })).toBeEnabled();
+  expect(screen.queryByRole('button', { name: '暂停后台核验' })).not.toBeInTheDocument();
+});

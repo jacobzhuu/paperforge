@@ -1656,6 +1656,10 @@ export interface DraftRevision {
   status: string;
   job_id: string;
   job_status: string;
+  can_resume?: boolean;
+  resume_block_reason?: string | null;
+  resume_block_code?: string | null;
+  recovery_message?: string | null;
   source_document_id: string;
   candidate_document_id: string;
   review?: { claim_count?: number; checked_count?: number; uncertain_count?: number; unassessed_count?: number; supported_count?: number; status?: string; sections_reviewed?: number; unassessed?: string[]; sections_failing?: string[]; quality_warnings?: Array<{ code?: string; message?: string }>; layout_checks?: { passed?: boolean } } | null;

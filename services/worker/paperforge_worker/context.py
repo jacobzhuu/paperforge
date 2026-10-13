@@ -182,12 +182,47 @@ class JobContext:
     _agent_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _loop: Any = field(default=None, repr=False)
     _budget_exhausted: bool = False
+    _revision_clock: float | None = field(default=None, repr=False)
+    _revision_elapsed: float = field(default=0.0, repr=False)
     _persisted_calls: set[int] = field(default_factory=set, repr=False)
     _decision_runner: DecisionRunner | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         with suppress(RuntimeError):
             self._loop = asyncio.get_running_loop()
+
+    def start_revision_clock(self) -> None:
+        if not self.checkpoint.get("background_revision") or self._revision_clock is not None:
+            return
+        budget = dict(self.checkpoint.get("agent_budget") or {})
+        self._revision_elapsed = float(budget.get("active_seconds", 0))
+        self._revision_clock = time.monotonic()
+
+    def revision_active_seconds(self) -> float:
+        if self._revision_clock is None:
+            return self._revision_elapsed
+        return self._revision_elapsed + max(0, time.monotonic() - self._revision_clock)
+
+    def revision_budget(self, budget=None) -> dict:
+        state = dict(budget if budget is not None else self.checkpoint.get("agent_budget") or {})
+        state.update(
+            version=2,
+            active_seconds=self.revision_active_seconds(),
+            limits={
+                "calls": self.settings.agent_max_calls,
+                "reserved_tokens": self.settings.agent_max_reserved_tokens,
+                "active_seconds": self.settings.agent_max_seconds,
+            },
+        )
+        return state
+
+    async def save_revision_clock(self) -> None:
+        if self._revision_clock is None:
+            return
+        async with self._agent_lock:
+            await self.emit(
+                "revision.execution_time", {}, checkpoint={"agent_budget": self.revision_budget()}
+            )
 
     @asynccontextmanager
     async def span(self, kind: str, name: str, **attributes: Any):
@@ -257,6 +292,7 @@ class JobContext:
         """
         if getattr(self, "shadow_admission", False) and self.checkpoint.get("background_revision"):
             from paperforge_worker.pipelines.background_revision import yield_to_foreground
+
             await yield_to_foreground(self)
         async with self._agent_lock:
             now = datetime.now(UTC)
@@ -269,6 +305,9 @@ class JobContext:
                 0, request.max_output_tokens
             )
             elapsed = (now - datetime.fromisoformat(state["started_at"])).total_seconds()
+            if self._revision_clock is not None:
+                state = self.revision_budget(state)
+                elapsed = state["active_seconds"]
             reason = (
                 "calls"
                 if state["calls"] >= self.settings.agent_max_calls
@@ -532,6 +571,7 @@ async def _heartbeat(
     job_id: uuid.UUID,
     *,
     interval: float = JOB_HEARTBEAT_INTERVAL_SECONDS,
+    context: JobContext | None = None,
 ) -> None:
     """在任务运行期间持续证明「这个进程还拿着它」。
 
@@ -546,6 +586,8 @@ async def _heartbeat(
         try:
             async with _committing_session(factory) as session:
                 await touch_job_heartbeat(session, job_id)
+            if context is not None:
+                await context.save_revision_clock()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - 观测信号不该淹没任务本身
@@ -618,7 +660,9 @@ async def job_context(
         owner_id=owner_id,
         checkpoint=seeded,
     )
-    heartbeat = asyncio.create_task(_heartbeat(factory, job_id)) if job_id else None
+    heartbeat = (
+        asyncio.create_task(_heartbeat(factory, job_id, context=context)) if job_id else None
+    )
     try:
         # 这里**不能**先查停止开关再 yield：@asynccontextmanager 的生成器一旦在
         # yield 之前抛异常，__aenter__ 会变成 RuntimeError("generator didn't yield")。
@@ -630,6 +674,10 @@ async def job_context(
         # 也会让 `_mark_interrupted` 把任务改写成 failed。异常在这里被吞掉后，
         # `async with` 块剩下的代码不再执行，各 `run_*_pipeline` 返回 None——
         # run_full_pipeline 依赖这一点做早退（它分两段开 job_context）。
+        try:
+            await _shielded(context.save_revision_clock())
+        except Exception:
+            logger.warning("revision clock flush failed", exc_info=True)
         await _mark_stopped(context, stop.mode, reason=stop.reason)
     except (Exception, asyncio.CancelledError) as error:
         # CancelledError 必须单列（它不是 Exception）：arq 的 job_timeout 走
@@ -637,6 +685,10 @@ async def job_context(
         # 任务于是永远停在 running——前端的「进行中」再也不消失，用户也分不清
         # 这轮到底是跑完了还是被掐了。GeneratorExit/KeyboardInterrupt 不接：
         # 那种场景下再 await 只会把退出流程搅得更乱。
+        try:
+            await _shielded(context.save_revision_clock())
+        except Exception:
+            logger.warning("revision clock flush failed", exc_info=True)
         await _mark_interrupted(context, error)
         raise
     finally:
@@ -647,6 +699,10 @@ async def job_context(
         # 取消只投递一次，被取消后继续 await 通常还能跑完；但再来一次取消
         # （worker 连收两个停机信号就是这样）会把收尾打断。收尾动作因此都放进
         # 独立 task 并 shield，免得这一轮的 LLM 记账——成本面板的数据源——跟着丢。
+        try:
+            await _shielded(context.save_revision_clock())
+        except Exception:
+            logger.warning("revision clock flush failed", exc_info=True)
         try:
             await _shielded(context.flush_llm_calls())
         except Exception:  # noqa: BLE001 - 记账失败不该淹没任务本身的结果

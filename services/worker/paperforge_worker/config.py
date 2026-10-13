@@ -213,7 +213,7 @@ class WorkerSettings(BaseSettings):
     texd_url: str = "http://localhost:8081"
     texd_timeout_seconds: int = 120
     visuals_enabled: bool = True
-    ai_images_enabled: bool = True
+    ai_images_enabled: bool = False
     visuald_url: str = "http://localhost:8082"
     visuald_timeout_seconds: int = 30
     #: 默认走 Yunwu 的 OpenAI-compatible Images API：它接受尺寸与质量参数，
@@ -293,8 +293,7 @@ class WorkerSettings(BaseSettings):
     def image_provider_config(self, provider_override: str | None = None) -> ImageProviderConfig:
         """解析生效的图像配置；Yunwu 凭据不与其他 provider 混用。
 
-        普通生图使用 ``IMAGE_PROVIDER``；全流程论文摘要图显式传 ``yunwu``，
-        从而不会被一个旧的 Cloudflare 环境变量悄悄改走其他供应商。
+        仅供显式启用的历史图片生成路径使用；摘要框图使用本地渲染。
         """
         provider = (provider_override or self.image_provider).strip().lower()
         if provider == "yunwu":

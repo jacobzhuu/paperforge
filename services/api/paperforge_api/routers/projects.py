@@ -1203,6 +1203,21 @@ async def resume_job(
             status_code=409,
             detail="PDF jobs cannot be resumed; retry the upload instead",
         )
+    revision = None
+    if job.kind == "revision":
+        from db.models.revision import DraftRevision
+        from db.repositories.revision_recovery import MESSAGES, recovery_block
+
+        revision = await session.scalar(
+            select(DraftRevision)
+            .where(DraftRevision.job_id == job.id, DraftRevision.project_id == job.project_id)
+            .with_for_update()
+        )
+        if revision is None:
+            raise HTTPException(409, "修订候选不存在")
+        reason = recovery_block(revision, job.checkpoint_json or {})
+        if reason:
+            raise HTTPException(409, detail={"code": reason, "message": MESSAGES[reason]})
     resumed = await start_job(
         session,
         queue,
@@ -1212,16 +1227,7 @@ async def resume_job(
         checkpoint={**resume_checkpoint(job), **response_checkpoint},
         **spec["kwargs"],
     )
-    if job.kind == "revision":
-        from db.models.revision import DraftRevision
-
-        revision = await session.scalar(
-            select(DraftRevision).where(
-                DraftRevision.job_id == job.id, DraftRevision.project_id == job.project_id
-            ).with_for_update()
-        )
-        if revision is None:
-            raise HTTPException(409, "修订候选不存在")
+    if revision is not None:
         revision.job_id, revision.status = resumed.id, "pending"
     await consume_response(session, job, resumed)
     return _job_response(resumed)

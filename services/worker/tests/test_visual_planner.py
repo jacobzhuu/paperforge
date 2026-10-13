@@ -359,36 +359,77 @@ def test_short_review_detection_suppresses_generic_visual_fallbacks() -> None:
     assert _is_short_review("original", short) is False
 
 
-def test_full_pipeline_summary_proposal_is_one_landscape_ai_image() -> None:
-    from types import SimpleNamespace
-
-    from paperforge_worker.pipelines.visuals import _summary_visual_proposal
-
-    abstract = SimpleNamespace(
-        section_key="abstract",
-        body_ir_json={
-            "blocks": [
-                {
-                    "type": "paragraph",
-                    "runs": [
-                        {
-                            "t": "text",
-                            "v": "本文综述根系损伤检测的核心问题、技术路径与主要结论。",
-                        }
+def _summary_payload():
+    return {
+        "proposals": [
+            {
+                "kind": "diagram",
+                "title": "序列推荐流程",
+                "caption": "交互编码与候选评分",
+                "target_section_key": "method",
+                "source_section_keys": ["method"],
+                "diagram": {
+                    "direction": "LR",
+                    "groups": [{"id": "m", "label": "推荐模型"}],
+                    "nodes": [
+                        {"id": "n1", "label": "交互序列", "group": "m"},
+                        {"id": "n2", "label": "序列编码", "group": "m"},
+                        {"id": "n3", "label": "候选评分"},
                     ],
-                }
-            ]
-        },
+                    "edges": [
+                        {"source": "n1", "target": "n2", "label": "编码"},
+                        {"source": "n2", "target": "n3", "label": "评分"},
+                    ],
+                },
+            }
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_summary_diagram_preserves_grounded_structure_without_image_calls(monkeypatch):
+    from paperforge_worker.pipelines import visuals
+    from paperforge_worker.pipelines.visual_planner import plan_summary_diagram
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("External image provider must not be constructed")
+
+    monkeypatch.setattr(visuals, "create_image_provider", forbidden)
+    runner = _Runner(_summary_payload())
+    proposals, generator = await plan_summary_diagram(
+        sections=SECTIONS,
+        runner=runner,
+        paper_context="模型先编码交互，再对候选打分。",
     )
-    proposal = _summary_visual_proposal(
-        "根系损伤检测综述",
-        abstract_section=abstract,
-        body_sections=[],
+    assert generator == "llm:stub-model"
+    assert len(runner.calls) == 1
+    spec = proposals[0].spec
+    assert proposals[0].kind == "diagram"
+    assert spec["groups"] == [{"id": "m", "label": "推荐模型"}]
+    assert spec["nodes"][0]["group"] == "m"
+    assert spec["edges"][0]["label"] == "编码"
+    assert spec["width"] == "full"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["dangling", "unknown_source", "image", "empty", "model"])
+async def test_summary_diagram_rejects_invalid_graph_without_generic_fallback(failure):
+    from paperforge_worker.pipelines.visual_planner import plan_summary_diagram
+
+    payload = _summary_payload()
+    item = payload["proposals"][0]
+    if failure == "dangling":
+        item["diagram"]["edges"][0]["target"] = "missing"
+    elif failure == "unknown_source":
+        item["source_section_keys"] = ["invented"]
+    elif failure == "image":
+        item["kind"] = "ai_image"
+    elif failure == "empty":
+        payload["proposals"] = []
+    proposals, generator = await plan_summary_diagram(
+        sections=SECTIONS,
+        runner=_Runner(payload, ok=failure != "model"),
+        paper_context="paper",
     )
-    assert proposal.kind == "ai_image"
-    assert proposal.title == "论文摘要图"
-    assert proposal.target_section_key == "abstract"
-    assert proposal.spec["size"] == "1536x1024"
-    assert proposal.spec["semantics"]["aspect_ratio"] == "3:2"
-    assert proposal.spec["semantics"]["text_policy"] == "auto"
-    assert proposal.spec["quality"] == "high"
+    assert proposals == []
+    assert generator.startswith("summary_diagram:")

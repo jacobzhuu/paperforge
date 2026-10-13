@@ -113,7 +113,12 @@ async def plan_visuals(
     planning_context = bound_paper_context(paper_context or outline)
     result = await runner.agenerate_json(
         "planner",
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=_SYSTEM_PROMPT
+        + (
+            "\nOnly propose diagrams. External image generation is disabled."
+            if not allow_ai_images
+            else ""
+        ),
         user_prompt=(
             f"Section keys: {', '.join(sorted(allowed))}\n\nSections:\n{planning_context}"
         ),
@@ -139,6 +144,88 @@ async def plan_visuals(
         paper_context=planning_context,
     )
     return proposals, f"llm:{result.model}"
+
+
+async def plan_summary_diagram(
+    *,
+    sections: list[SectionBrief],
+    runner: LLMRunner | None,
+    paper_context: str,
+) -> tuple[list[PlannedProposal], str]:
+    """One grounded summary, with no generic fallback or image-provider calls."""
+    from visuals import DiagramSpec
+
+    from paperforge_worker.context import JobStopped
+
+    if runner is None or not runner.enabled or not sections:
+        return [], "summary_diagram:context_or_model_unavailable"
+    try:
+        result = await asyncio.wait_for(
+            runner.agenerate_json(
+                "planner",
+                system_prompt=_SYSTEM_PROMPT
+                + """
+Generate exactly ONE diagram summarizing the paper's actual research framework.
+Use 3-9 concise nodes for concrete research objects, methods, or findings, not generic
+chapter titles. Label relationships explicitly; do not turn association into causation.
+Do not invent measurements, findings, or mechanisms. Use the paper's language.
+Optional diagram groups: [{"id":"g1","label":"..."}]; nodes may reference a group
+and use shape box/rounded/ellipse/diamond. Use full width and LR or TB direction.
+Source sections must support the nodes AND relations. If the text is insufficient,
+return {"proposals": []}. Never output ai_image or chart.""",
+                user_prompt=(
+                    f"Section keys: {', '.join(section.key for section in sections)}\n"
+                    f"Paper:\n{bound_paper_context(paper_context)}"
+                ),
+                max_output_tokens=2200,
+                temperature=0.2,
+                metadata={"stage": "summary_diagram"},
+            ),
+            timeout=45,
+        )
+    except JobStopped:
+        raise
+    except TimeoutError:
+        return [], "summary_diagram:model_timeout"
+    except Exception:
+        return [], "summary_diagram:model_failed"
+    if not result.ok or not isinstance(result.value, dict):
+        return [], "summary_diagram:model_failed"
+    raw = result.value.get("proposals")
+    if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], dict):
+        return [], "summary_diagram:no_supported_diagram"
+    item = raw[0]
+    allowed = {section.key for section in sections}
+    sources = item.get("source_section_keys")
+    if (
+        item.get("kind") != "diagram"
+        or not isinstance(item.get("target_section_key"), str)
+        or item.get("target_section_key") not in allowed
+        or not isinstance(sources, list)
+        or not sources
+        or any(not isinstance(key, str) or key not in allowed for key in sources)
+        or not _text(item.get("caption"))
+    ):
+        return [], "summary_diagram:invalid_spec"
+    try:
+        # Validate the whole graph; never silently drop a relationship from the model.
+        spec = DiagramSpec.model_validate({**item["diagram"], "kind": "diagram", "width": "full"})
+        if not 3 <= len(spec.nodes) <= 9 or not spec.edges:
+            return [], "summary_diagram:invalid_spec"
+    except (KeyError, TypeError, ValueError):
+        return [], "summary_diagram:invalid_spec"
+    return [
+        PlannedProposal(
+            kind="diagram",
+            spec=spec.model_dump(mode="json"),
+            title=_text(item.get("title")) or "论文框架图",
+            caption=_text(item.get("caption")),
+            alt_text=_text(item.get("alt_text")) or _text(item.get("caption")),
+            target_section_key=item["target_section_key"],
+            reason=_text(item.get("reason")) or "根据论文内容生成的研究框架",
+            source_section_keys=sources,
+        )
+    ], f"llm:{result.model}"
 
 
 async def _refine_ai_image_prompts(
@@ -251,7 +338,14 @@ def _diagram_spec(raw: Any) -> dict[str, Any] | None:
         if not node_id or not label or node_id in seen:
             continue
         seen.add(node_id)
-        nodes.append({"id": node_id, "label": label[:80]})
+        nodes.append(
+            {
+                "id": node_id,
+                "label": label[:80],
+                "group": item.get("group"),
+                "shape": item.get("shape", "rounded"),
+            }
+        )
     if len(nodes) < 2:
         return None
     edges = []
@@ -273,6 +367,7 @@ def _diagram_spec(raw: Any) -> dict[str, Any] | None:
             direction="LR" if direction not in {"TB", "LR"} else direction,
             nodes=nodes,
             edges=edges,
+            groups=raw.get("groups") or [],
             width="full" if len(nodes) > 5 else "column",
         ).model_dump(mode="json")
     except ValueError:

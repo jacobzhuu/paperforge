@@ -275,6 +275,44 @@ verify_public_deployment() {
   echo "✓ Funnel target and public content match the new deployment (${public_hash})"
 }
 
+verify_visual_runtime() {
+  local project="$1"
+  docker exec "${project}-worker-1" python -c '
+import httpx
+from paperforge_worker.config import get_settings
+from visuals import VisualdClient
+
+settings = get_settings()
+if settings.visuals_enabled:
+    client = VisualdClient(settings.visuald_url, timeout_seconds=20)
+    try:
+        result = client.render_diagram_result({
+            "kind": "diagram", "direction": "LR", "width": "full",
+            "groups": [{"id": "method", "label": "研究方法"}],
+            "nodes": [
+                {"id": "input", "label": "输入材料", "group": "method"},
+                {"id": "analysis", "label": "证据分析", "group": "method"},
+                {"id": "output", "label": "研究结果"},
+            ],
+            "edges": [
+                {"source": "input", "target": "analysis", "label": "分析"},
+                {"source": "analysis", "target": "output", "label": "综合"},
+            ],
+        })
+        assert {item.format for item in result.renditions} == {"svg", "png", "pdf"}
+        assert result.provenance["visual_qa"]["passed"], result.provenance["visual_qa"]
+        print("✓ Local diagram rendering passed (Chinese, groups, SVG/PNG/PDF)")
+    finally:
+        client.close()
+if settings.visuals_enabled and settings.ai_images_enabled:
+    config = settings.image_provider_config()
+    response = httpx.get(config.base_url, timeout=20)
+    print(f"✓ Image provider route reachable (HTTP {response.status_code})")
+else:
+    print("✓ External image generation disabled; no image-provider request")
+'
+}
+
 verify_texd_runtime() {
   local project="$1"
   # 健康端点只证明 uvicorn 活着，不能证明离线 Tectonic 缓存含有模板依赖。
@@ -969,12 +1007,8 @@ deploy() {
     return 1
   fi
 
-  # The public UI must not be switched to a worker that still cannot reach the
-  # image provider.  Any HTTP response proves DNS/TLS/proxy connectivity; only
-  # transport failures should abort the rollout.
-  if ! docker exec "${compose_project}-worker-1" python -c \
-    "import httpx; response=httpx.get('https://yunwu.ai', timeout=20); print(f'✓ image provider route reachable (HTTP {response.status_code})')"; then
-    echo "Image provider route is unavailable from the new worker; refusing to switch Funnel." >&2
+  if ! verify_visual_runtime "${compose_project}"; then
+    echo "Visual rendering is unavailable from the new worker; refusing to switch Funnel." >&2
     return 1
   fi
 

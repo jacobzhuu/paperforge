@@ -55,13 +55,14 @@ export function RevisionPanel({ projectId, onAccepted }: { projectId: string; on
         {revision.review.claim_count == null ? '逐条核验覆盖率：未记录' :
           `论断核验 ${revision.review.checked_count ?? 0}/${revision.review.claim_count}；不确定 ${revision.review.uncertain_count ?? 0}；未评估 ${revision.review.unassessed_count ?? 0}`}
       </p>}
+      {(revision.recovery_message || revision.resume_block_reason) && <p role="alert" className="text-sm">{revision.recovery_message || revision.resume_block_reason}</p>}
       {revision.job_status === 'queued' && <p className="text-sm">后台任务排队中；前台优先，等待较久的核验会获得执行机会。</p>}
       {!!revision.review?.quality_warnings?.length && <details className="text-sm"><summary>查看 {revision.review.quality_warnings.length} 项质量提示</summary><ul className="list-disc pl-5 mt-2">{revision.review.quality_warnings.map((warning, i) => <li key={i}>{warning.message || warning.code}</li>)}</ul></details>}
       {revision.review?.layout_checks?.passed === false && <p className="text-sm">排版检查尚未通过，请预览 PDF 后处理。</p>}
       <div className="flex flex-wrap gap-3 items-center">
         {pdf && <><a className="text-sm underline" href={exportPreviewUrl(projectId, pdf.id)} target="_blank" rel="noreferrer">预览修订候选</a><a className="text-sm underline" href={exportDownloadUrl(projectId, pdf.id)}>下载修订 PDF</a></>}
-        {['queued', 'running'].includes(revision.job_status) && <><Button variant="outline" disabled={!!action} onClick={() => control(revision.job_id, 'pause')}>暂停后台核验</Button><Button variant="ghost" disabled={!!action} onClick={() => control(revision.job_id, 'cancel')}>取消后台核验</Button></>}
-        {['paused', 'failed'].includes(revision.job_status) && !complete && <Button variant="outline" disabled={!!action} onClick={() => control(revision.job_id, 'resume')}>继续后台核验</Button>}
+        {['queued', 'running'].includes(revision.job_status) && <>{revision.job_status === 'running' && <Button variant="outline" disabled={!!action} onClick={() => control(revision.job_id, 'pause')}>暂停后台核验</Button>}<Button variant="ghost" disabled={!!action} onClick={() => control(revision.job_id, 'cancel')}>取消后台核验</Button></>}
+        {['paused', 'failed'].includes(revision.job_status) && revision.can_resume !== false && !complete && <Button variant="outline" disabled={!!action} onClick={() => control(revision.job_id, 'resume')}>继续后台核验</Button>}
         {complete && <><Button disabled={!!action} onClick={() => decide(revision.id, 'accept')}>采纳为新版本</Button><Button variant="outline" disabled={!!action} onClick={() => decide(revision.id, 'discard')}>丢弃候选</Button></>}
       </div>
     </div>;

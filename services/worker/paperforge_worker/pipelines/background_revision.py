@@ -23,19 +23,17 @@ from paperforge_worker.context import JobStopped, job_context
 
 async def yield_to_foreground(context):
     """Cancellation/deadline checkpoint; provider admission owns fair scheduling."""
-    from datetime import UTC, datetime
-
     await context.raise_if_stopped()
-    budget = context.checkpoint.get("agent_budget") or {}
-    started = budget.get("started_at")
-    if (
-        started
-        and (datetime.now(UTC) - datetime.fromisoformat(started)).total_seconds()
-        >= context.settings.agent_max_seconds
-    ):
-        raise TimeoutError(
-            "background revision deadline exceeded; resume to inspect remaining work"
-        )
+    if hasattr(context, "revision_active_seconds"):
+        if context.revision_active_seconds() >= context.settings.agent_max_seconds:
+            budget = dict(context.checkpoint.get("agent_budget") or {})
+            budget["stop_reason"] = "deadline"
+            await context.emit(
+                "agent.budget_exhausted",
+                {"reason": "deadline"},
+                checkpoint={"agent_budget": budget},
+            )
+            raise JobStopped("pause", reason="budget_exhausted")
 
 
 async def schedule_revision(context, *, document_id, snapshot, review_style):
@@ -80,6 +78,7 @@ async def schedule_revision(context, *, document_id, snapshot, review_style):
             candidate_document_id=candidate.id,
             source_hash=snapshot,
             status="pending",
+            recovery_json={"version": 1, "operations": {}},
         )
         session.add(record)
         owner = await session.scalar(
@@ -213,21 +212,38 @@ async def run_background_revision(
         context.shadow_admission = True
         async with context.session() as session:
             record = await session.scalar(
-                select(DraftRevision).where(
+                select(DraftRevision)
+                .where(
                     DraftRevision.id == uuid.UUID(revision_id),
                     DraftRevision.project_id == context.project_id,
                 )
+                .with_for_update()
             )
             if record is None:
                 raise ValueError("revision not found")
             if record.status in {"accepted", "discarded", "ready", "needs_review"}:
                 await w._finish(context, delivered=True)
                 return {"status": record.status}
+            if record.job_id != context.job_id:
+                raise JobStopped("pause", reason="revision_owner_changed")
             record.job_id = context.job_id
             candidate_id = record.candidate_document_id
             record.status = "running"
             project = await get_project(session, context.project_id)
             language, paper_type = project.language, project.paper_type
+            project_inputs = {
+                "language": language,
+                "paper_type": paper_type,
+                "scope": project.scope_json or {},
+            }
+        from paperforge_worker.pipelines import revision_recovery as recovery
+
+        if await recovery.initialize(context, revision_id) is None:
+            return {"status": "already_running"}
+        if hasattr(context, "start_revision_clock"):
+            context.start_revision_clock()
+            await context.save_revision_clock()
+        await recovery.guard_sources(context, project_inputs, field="project_input_hash")
         await w._mark_running(context)
         with revision_document(context.project_id, candidate_id):
             await yield_to_foreground(context)
@@ -236,8 +252,7 @@ async def run_background_revision(
             )
             inputs, verdicts, unassessed = await _review(context, language)
             failing = [v for v in verdicts.values() if not v.acceptable]
-            # One rewrite per section; ambiguous attempts are not replayed blindly.
-            attempts = set(context.checkpoint.get("revision_repair_attempts") or [])
+            # The durable per-section ledger owns retries, not a pre-call attempt flag.
             selected = sorted(
                 failing, key=lambda v: (not bool(v.unsupported_claims), v.section_key)
             )[: settings.background_revision_max_sections]
@@ -246,7 +261,6 @@ async def run_background_revision(
                     v, next(i for i in inputs if i["section_key"] == v.section_key)
                 )
                 for v in selected
-                if v.section_key not in attempts
             }
             # Numeric/locator and manuscript-wide findings must also reach the writer,
             # even if a section reviewer is unavailable or mistakenly accepts the prose.
@@ -264,7 +278,7 @@ async def run_background_revision(
                     deterministic_notes.setdefault(key, []).append(str(finding))
             available = {i["section_key"] for i in inputs}
             for key, items in deterministic_notes.items():
-                if key not in available or key in attempts:
+                if key not in available:
                     continue
                 if key not in notes and len(notes) >= settings.background_revision_max_sections:
                     continue
@@ -278,22 +292,20 @@ async def run_background_revision(
                     for v in selected
                 )
             }
-            if gap_questions and not context.checkpoint.get("revision_retrieval_attempted"):
-                await context.emit(
-                    "revision.retrieval_started",
-                    {"query_budget": 12},
-                    checkpoint={"revision_retrieval_attempted": True},
-                )
-                await yield_to_foreground(context)
-                await w._supplement_review_evidence(
-                    context, language=language, question_ids=gap_questions, max_provider_queries=12
-                )
+            plan = await recovery.save_plan(
+                context,
+                {
+                    "notes": notes,
+                    "question_ids": sorted(str(q) for q in gap_questions),
+                },
+            )
+            notes = plan["notes"]
+            gap_questions = {uuid.UUID(q) for q in plan["question_ids"]}
+            if gap_questions:
+                from paperforge_worker.pipelines.revision_retrieval import supplement
+
+                await supplement(context, language=language, question_ids=gap_questions)
             if notes:
-                await context.emit(
-                    "revision.repair_started",
-                    {"sections": sorted(notes)},
-                    checkpoint={"revision_repair_attempts": sorted(attempts | set(notes))},
-                )
                 await w.repair_document_sections(
                     context,
                     section_keys=set(notes),
@@ -302,6 +314,7 @@ async def run_background_revision(
                     notes=notes,
                     concurrency=2,
                 )
+                await recovery.ensure_settled(context)
                 inputs, verdicts, unassessed = await _review(context, language)
             await yield_to_foreground(context)
             report = (
@@ -314,11 +327,11 @@ async def run_background_revision(
                 "sections_reviewed": len(verdicts),
                 "unassessed": sorted(unassessed),
                 "sections_failing": sorted(k for k, v in verdicts.items() if not v.acceptable),
-                "repair_attempts": sorted(attempts | set(notes)),
+                "repair_attempts": sorted(notes),
                 "findings": [v.to_payload() for v in verdicts.values()],
             }
             review = {**review, **report.depth_metrics.get("review_coverage", {})}
-            review["repair_attempts"] = sorted(attempts | set(notes))
+            review["repair_attempts"] = sorted(notes)
             report.depth_metrics["review_coverage"] = review
             await w._publish_quality_report(
                 context,
