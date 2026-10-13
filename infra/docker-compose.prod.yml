@@ -88,6 +88,9 @@ services:
 
   visuald:
     image: paperforge-visuald:local
+    environment:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
     build:
       context: ..
       dockerfile: services/visuald/Dockerfile

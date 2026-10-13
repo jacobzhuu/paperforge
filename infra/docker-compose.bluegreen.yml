@@ -35,6 +35,9 @@ services:
 
   visuald:
     image: ${PAPERFORGE_DEPLOY_VISUALD_IMAGE:?set PAPERFORGE_DEPLOY_VISUALD_IMAGE}
+    environment:
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
     read_only: true
     tmpfs:
       - /tmp
